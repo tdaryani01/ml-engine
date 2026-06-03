@@ -1,0 +1,18 @@
+# Python bytecode and caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Data and large binaries (Don't track massive training datasets)
+*.csv
+*.npy
+*.npz
+*.datasets/
+
+# IDE and Environment
+.venv/
+venv/
+.env
+.cursor/

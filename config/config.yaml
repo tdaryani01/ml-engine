@@ -1,0 +1,54 @@
+# =====================================================================
+# Production Configuration Matrix
+# =====================================================================
+
+environment:
+  stage: "development"
+  data_file: ".\\data\\generator\\hard_regression.csv"
+  output_dir: "diagnostics_output"
+  model_asset_path: "deployed_model.npz"
+  load_saved_model: false
+
+data:
+  feature_names: ["Velocity"]
+  train_split: 0.5
+  val_split: 0.2
+
+architecture:
+  use_batch_norm: false
+  bn_momentum: 0.9
+  model_type: "regression"                 # Toggles: "multi_class" | "regression" | "binary_classification"
+  hidden_layers: [128, 128, 64]               # UPDATED: New 3-layer architecture sequence
+  p_dropout: 0.05        # UPDATED
+
+training:
+  optimizer: "adam"
+  epochs: 2000
+  batch_size: 32                            # UPDATED
+  learning_rate: 0.0005
+  sparsity_tolerance: 1.0e-5
+  bn_momentum: 0.9
+
+  # Dynamic Scheduler Directives
+  lr_scheduler: "none"                      
+  scheduler_decay_rate: 0.9608624831255391
+  scheduler_drop_ratio:   0.2258570644141966           # UPDATED
+  scheduler_epochs_per_drop: 40             # UPDATED
+
+  # Convergence Monitors
+  early_stopping_enabled: true
+  patience: 50                              # UPDATED
+  min_delta: 1.5149892401016267e-05
+
+regularization:
+  lam_l1: 0.0           # UPDATED
+  lam_l2: 0.0001           # UPDATED
+
+diagnostics:
+  enabled: true
+  metric_to_plot: "all"
+
+pipeline:
+  name: "spiral_tuning_run"
+  suppress_logging: true
+  logging_level: "INFO"  # Options: DEBUG, INFO, WARNING, ERROR, CRITICAL
