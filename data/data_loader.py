@@ -9,14 +9,18 @@ def load_pipeline_splits(data_config, csv_file_path):
     data = np.genfromtxt(csv_file_path, delimiter=',', skip_header=1)
     
     # --- CRITICAL FIX: Shuffle rows globally before splitting ---
-    # This mixes the sequential Class 0, 1, and 2 rows evenly across all splits
+    # This mixes the sequential rows evenly across all splits
     np.random.seed(42)  # Fixed seed ensures reproducible matrix splitting
     np.random.shuffle(data)
     
     num_features = len(data_config["feature_names"])
     
+    # Isolate inputs cleanly
     X = data[:, :num_features]
-    y = data[:, num_features].reshape(-1, 1)
+    
+    # DYNAMIC TRACKING: Slice all remaining trailing dimensions as the target matrix footprint.
+    # This cleanly handles both single-column regression and multi-column target matrices.
+    y = data[:, num_features:].reshape(len(data), -1)
     
     total_samples = len(data)
     train_end = int(total_samples * data_config["train_split"])

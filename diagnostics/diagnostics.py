@@ -9,7 +9,27 @@ class NeuralNetworkDiagnostics:
         os.makedirs(output_dir, exist_ok=True)
         selection = str(metric_to_plot).strip().lower()
 
-        X_test_norm = (X_test_raw - mean) / std
+        # =====================================================================
+        # DYNAMIC RECONSTRUCTION: Scale raw coordinates to match statistics
+        # =====================================================================
+        config = getattr(model, "config", {}) if hasattr(model, "config") else {}
+        training_cfg = config.get("training", {})
+        fourier_cfg = training_cfg.get("fourier_expansion", {})
+        
+        # If Fourier engineering is active but inputs are still raw, project them up
+        if fourier_cfg.get("enabled", False) and X_test_raw.shape[1] < mean.shape[0]:
+            num_freqs = fourier_cfg.get("num_frequencies", 4)
+            features = [X_test_raw]
+            for i in range(num_freqs):
+                freq = 2.0 ** i
+                features.append(np.sin(X_test_raw * freq))
+                features.append(np.cos(X_test_raw * freq))
+            X_processing = np.hstack(features)
+        else:
+            X_processing = X_test_raw
+
+        # Align normalization vectors flawlessly against the correct matrix space
+        X_test_norm = (X_processing - mean) / std
 
         # Calculate and print raw accuracy metrics for classification tasks (forcing inference mode)
         raw_preds = model.forward(X_test_norm, training=False)
@@ -30,7 +50,21 @@ class NeuralNetworkDiagnostics:
             NeuralNetworkDiagnostics.plot_metric_3_efficiency(train_history, output_dir)
         if selection in ['4', 'all']:
             def predict_unscaled(X_raw_input):
-                X_input_norm = (X_raw_input - mean) / std
+                # Dynamically apply multi-feature spatial expansion to evaluation slices
+                if fourier_cfg.get("enabled", False) and X_raw_input.shape[1] < mean.shape[0]:
+                    num_freqs = fourier_cfg.get("num_frequencies", 4)
+                    
+                    features = [X_raw_input]
+                    for i in range(num_freqs):
+                        freq = 2.0 ** i
+                        features.append(np.sin(X_raw_input * freq))
+                        features.append(np.cos(X_raw_input * freq))
+                    X_eval_processing = np.hstack(features)
+                else:
+                    X_eval_processing = X_raw_input
+
+                # Align normalization vectors against the processed space
+                X_input_norm = (X_eval_processing - mean) / std
                 scaled_pred = model.forward(X_input_norm, training=False)
                 if y_mean is not None and y_std is not None:
                     return (scaled_pred * y_std) + y_mean
@@ -68,41 +102,104 @@ class NeuralNetworkDiagnostics:
 
     @staticmethod
     def plot_metric_4_space(X, y, features, predict_fn, out_dir):
-        x_min, x_max = X[:, 0].min() - 2, X[:, 0].max() + 2
-        y_min, y_max = X[:, 1].min() - 2, X[:, 1].max() + 2
-        xx, yy = np.meshgrid(np.linspace(x_min, x_max, 200), np.linspace(y_min, y_max, 200))
-        
-        raw_preds = predict_fn(np.c_[xx.ravel(), yy.ravel()])
-        if len(raw_preds.shape) > 1 and raw_preds.shape[1] > 1:
-            zz = np.argmax(raw_preds, axis=1).reshape(xx.shape)
-            num_classes = raw_preds.shape[1]
+        num_features = X.shape[1]
+        fig = plt.figure(figsize=(10, 5), dpi=100)
+
+        # =====================================================================
+        # 1D FEATURE INPUT WINDOW (e.g., Single Feature Hard Regression)
+        # =====================================================================
+        if num_features == 1:
+            x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
+            xx = np.linspace(x_min, x_max, 500).reshape(-1, 1)
+            raw_preds = predict_fn(xx)
             
-            # Keep original discrete map settings for classification tasks
-            levels = np.arange(-0.5, num_classes + 0.5, 1)
-            cmap_to_use = "Set1"
-        else:
-            zz = raw_preds.reshape(xx.shape)
-            num_classes = 1
+            plt.plot(xx, raw_preds, color="#ff7f0e", linewidth=2.5, label="Model Prediction")
+            plt.scatter(X[:, 0], y.ravel(), color="#1f77b4", alpha=0.6, edgecolor="k", linewidth=0.5, label="Actual Data")
+            plt.xlabel(features[0])
+            plt.ylabel("Target Value" if len(features) < 2 else features[1])
+            plt.legend()
+            plt.grid(True, linestyle="--", alpha=0.5)
+
+        # =====================================================================
+        # 2D FEATURE INPUT WINDOW (Original Contour Landscape Topology)
+        # =====================================================================
+        elif num_features == 2:
+            x_min, x_max = X[:, 0].min() - 2, X[:, 0].max() + 2
+            y_min, y_max = X[:, 1].min() - 2, X[:, 1].max() + 2
+            xx, yy = np.meshgrid(np.linspace(x_min, x_max, 200), np.linspace(y_min, y_max, 200))
             
-            # Dynamic continuous normalization resolution bounds for regression
-            levels = 50
-            cmap_to_use = "coolwarm"
-        
-        plt.figure(figsize=(10, 5), dpi=100)
-        contour = plt.contourf(xx, yy, zz, levels=levels, cmap=cmap_to_use, alpha=0.6)
-        
-        if num_classes > 1:
-            cbar = plt.colorbar(contour, ticks=list(range(num_classes)))
-            cbar.set_label("Assigned Class Category", rotation=270, labelpad=15, fontweight="bold")
-            cbar.ax.set_yticklabels([f'Class {i}' for i in range(num_classes)])
-            plt.scatter(X[:, 0], X[:, 1], c=y.ravel(), cmap="Set1", edgecolor="k", linewidth=0.5)
+            raw_preds = predict_fn(np.c_[xx.ravel(), yy.ravel()])
+            if len(raw_preds.shape) > 1 and raw_preds.shape[1] > 1:
+                zz = np.argmax(raw_preds, axis=1).reshape(xx.shape)
+                num_classes = raw_preds.shape[1]
+                levels = np.arange(-0.5, num_classes + 0.5, 1)
+                cmap_to_use = "Set1"
+            else:
+                zz = raw_preds.reshape(xx.shape)
+                num_classes = 1
+                levels = 50
+                cmap_to_use = "coolwarm"
+            
+            contour = plt.contourf(xx, yy, zz, levels=levels, cmap=cmap_to_use, alpha=0.6)
+            
+            if num_classes > 1:
+                cbar = plt.colorbar(contour, ticks=list(range(num_classes)))
+                cbar.set_label("Assigned Class Category", rotation=270, labelpad=15, fontweight="bold")
+                cbar.ax.set_yticklabels([f'Class {i}' for i in range(num_classes)])
+                plt.scatter(X[:, 0], X[:, 1], c=y.ravel(), cmap="Set1", edgecolor="k", linewidth=0.5)
+            else:
+                cbar = plt.colorbar(contour)
+                cbar.set_label("Predicted Continuous Value", rotation=270, labelpad=15, fontweight="bold")
+                plt.scatter(X[:, 0], X[:, 1], c=y.ravel(), cmap="coolwarm", edgecolor="k", linewidth=0.5)
+            
+            plt.xlabel(features[0])
+            plt.ylabel(features[1])
+
+        # =====================================================================
+        # 3D FEATURE INPUT WINDOW (Stereoscopic Hypervolume Projection)
+        # =====================================================================
+        elif num_features == 3:
+            ax = fig.add_subplot(111, projection='3d')
+            raw_preds = predict_fn(X)
+            
+            if len(raw_preds.shape) > 1 and raw_preds.shape[1] > 1:
+                display_values = np.argmax(raw_preds, axis=1)
+                cmap_to_use = "Set1"
+            else:
+                display_values = raw_preds.ravel()
+                cmap_to_use = "coolwarm"
+                
+            sc = ax.scatter(X[:, 0], X[:, 1], X[:, 2], c=display_values, cmap=cmap_to_use, edgecolor='k', s=40, alpha=0.8)
+            
+            ax.set_xlabel(features[0])
+            ax.set_ylabel(features[1])
+            ax.set_zlabel(features[2] if len(features) > 2 else "Feature 3")
+            
+            cbar = plt.colorbar(sc, pad=0.1)
+            cbar.set_label("Model Prediction Matrix Mapping", rotation=270, labelpad=15, fontweight="bold")
+
+        # =====================================================================
+        # HIGH-DIMENSIONAL FALLBACK (>3 FEATURES UPPER BOUND RESIDUALS)
+        # =====================================================================
         else:
-            cbar = plt.colorbar(contour)
-            cbar.set_label("Predicted Continuous Value", rotation=270, labelpad=15, fontweight="bold")
-            plt.scatter(X[:, 0], X[:, 1], c=y.ravel(), cmap="coolwarm", edgecolor="k", linewidth=0.5)
-        
-        plt.title("Metric 4: Dynamic Target Prediction Landscape", fontweight="bold")
-        plt.xlabel(features[0]); plt.ylabel(features[1])
+            raw_preds = predict_fn(X)
+            if len(raw_preds.shape) > 1 and raw_preds.shape[1] > 1:
+                display_preds = np.argmax(raw_preds, axis=1)
+                plt.scatter(range(len(y)), y.ravel(), color="#2ca02c", alpha=0.6, label="True Categorical Labels", marker="o")
+                plt.scatter(range(len(display_preds)), display_preds, color="#d62728", alpha=0.6, label="Predicted Class Matrix", marker="x")
+                plt.ylabel("Discrete Class Index")
+            else:
+                display_preds = raw_preds.ravel()
+                plt.scatter(y.ravel(), display_preds, color="#9467bd", alpha=0.6, edgecolor="k", linewidth=0.5)
+                ideal_line = np.linspace(min(y.min(), display_preds.min()), max(y.max(), display_preds.max()), 100)
+                plt.plot(ideal_line, ideal_line, color="black", linestyle="--", linewidth=1.5, label="Ideal Performance Horizon")
+                plt.xlabel("Ground Truth Target Landscape")
+                plt.ylabel("Predicted Target Output")
+            
+            plt.legend()
+            plt.grid(True, linestyle="--", alpha=0.5)
+
+        plt.title(f"Metric 4: Dynamic Target Prediction Landscape ({num_features}D Space)", fontweight="bold")
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, "Figure_4.png")); plt.close()
 
