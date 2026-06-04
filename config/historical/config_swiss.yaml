@@ -1,0 +1,40 @@
+environment:
+  stage: development
+  data_file: .\data\generator\swiss_helix.csv
+  output_dir: diagnostics_output
+  model_asset_path: deployed_model.npz
+  load_saved_model: false
+data:
+  feature_names:
+  - X
+  - Y
+  - Z
+  train_split: 0.6
+  val_split: 0.2
+architecture:
+  use_batch_norm: false
+  bn_momentum: 0.9
+  model_type: binary_classification
+  hidden_layers: [128, 64, 32]
+  p_dropout: 0.0
+training:
+  optimizer: adam
+  epochs: 500
+  batch_size: 32
+  learning_rate: 0.001
+  sparsity_tolerance: 1.0e-05
+  early_stopping_enabled: true
+  patience: 50
+  min_delta: 1.0e-05
+  fourier_expansion:
+    enabled: false
+regularization:
+  lam_l1: 0
+  lam_l2: 1.0e-05
+diagnostics:
+  enabled: true
+  metric_to_plot: all
+pipeline:
+  name: swiss_helix_run
+  suppress_logging: false
+  logging_level: INFO

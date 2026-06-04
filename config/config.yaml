@@ -1,46 +1,46 @@
 environment:
   stage: development
-  data_file: .\data\generator\chaotic_oscillator.csv
+  data_file: .\data\generator\supply_chain.csv
   output_dir: diagnostics_output
   model_asset_path: deployed_model.npz
   load_saved_model: false
 data:
   feature_names:
-  - Time
-  - Radius
-  - Angle
-  train_split: 0.6
-  val_split: 0.2
+  - Supplier_Lead_Time
+  - Logistics_Delay_Index
+  - Resource_Reserve_Percent
+  - Labor_Capacity_Utilization
+  - Macro_Inflation_Rate
+  train_split: 0.7
+  val_split: 0.15
 architecture:
-  use_batch_norm: false
+  use_batch_norm: false          # Disabled: Stop shifting boundaries on crisp tabular formulas
   bn_momentum: 0.9
-  model_type: regression
-  hidden_layers: [217, 210, 316]
-  p_dropout: 0.0
+  model_type: multi_class
+  hidden_layers: [128, 64]
+  p_dropout: 0.0                 # Dropped to 0 to unlock maximum representation capacity
 training:
   optimizer: adam
-  epochs: 400
-  batch_size: 32
-  learning_rate: 0.0006377024100266827
+  epochs: 300
+  batch_size: 64
+  learning_rate: 0.0001           # Reset to standard 0.001 for stable convergence
+  lr_scheduler: none
+  scheduler_drop_ratio: 0.5
+  scheduler_epochs_per_drop: 50  # Widened drop window to give Adam time to aggressively minimize loss
   sparsity_tolerance: 1.0e-05
-  bn_momentum: 0.9
+  early_stopping_enabled: true
+  patience: 40                   # Extended patience to give the unconstrained network room to learn
+  min_delta: 1.0e-05
+  gradient_clipping_max_norm: 5.0
   fourier_expansion:
     enabled: false
-    num_frequencies: 4
-  lr_scheduler: none
-  scheduler_decay_rate: 0.995
-  scheduler_drop_ratio: 0.2
-  scheduler_epochs_per_drop: 40
-  early_stopping_enabled: true
-  patience: 140
-  min_delta: 1.938234878433713e-05
 regularization:
   lam_l1: 0
-  lam_l2: 2.953279201734388e-05
+  lam_l2: 0                      # Stripped out L2 penalty to let weights map non-linear curves freely
 diagnostics:
   enabled: true
   metric_to_plot: all
 pipeline:
-  name: spiral_tuning_run
+  name: industrial_risk_unconstrained_run
   suppress_logging: false
   logging_level: INFO

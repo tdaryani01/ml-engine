@@ -4,7 +4,7 @@ import logging
 import numpy as np
 
 class BaseNeuralNetwork(ABC):
-    def __init__(self, layer_sizes, optimizer_instance, lam_l1=0.01, lam_l2=0.01, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9) -> None:
+    def __init__(self, layer_sizes, optimizer_instance, lam_l1=0.01, lam_l2=0.01, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9, max_norm=5.0) -> None:
         self.optimizer = optimizer_instance  
         self.lam_l1 = lam_l1
         self.lam_l2 = lam_l2
@@ -12,6 +12,7 @@ class BaseNeuralNetwork(ABC):
         self.layer_sizes = layer_sizes
         self.use_batch_norm = use_batch_norm
         self.bn_momentum = bn_momentum
+        self.max_norm = max_norm
         self.eps = 1e-5
         
         self.weights = []
@@ -234,6 +235,20 @@ class BaseNeuralNetwork(ABC):
         # Apply L1 weight regularization adjustments
         for i in range(num_layers):
             grad_weights[i] += (self.lam_l1 / m) * np.sign(self.weights[i])
+
+        # =====================================================================
+        # 🛡️ DEFENSIVE ENGINEERING: GLOBAL GRADIENT CLIPPING
+        # =====================================================================
+        # Calculate the square of the L2 norm across all weight gradients combined
+        total_norm = np.sqrt(sum(np.sum(gw**2) for gw in grad_weights))
+        
+        if total_norm > self.max_norm:  # <-- Changed from max_norm to self.max_norm
+            scaling_factor = self.max_norm / (total_norm + 1e-15)
+            logging.debug(f"[Backward Stability] Exploding gradient threat detected! Total Norm: {total_norm:.4f} | Scaling down by factor: {scaling_factor:.4f}")
+            for i in range(num_layers):
+                grad_weights[i] *= scaling_factor
+                if grad_biases[i] is not None:
+                    grad_biases[i] *= scaling_factor
 
         # Ship aligned gradients to your Adam optimizer instance
         self.optimizer.update(
