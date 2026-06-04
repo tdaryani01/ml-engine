@@ -193,7 +193,7 @@ class BaseNeuralNetwork(ABC):
         grad_gammas = [None] * (num_layers - 1)
         grad_betas = [None] * (num_layers - 1)
         
-        # FIX: Explicitly clear activation memory arrays before building mini-batch states
+        # Explicitly clear activation memory arrays before building mini-batch states
         self.zs = []            
         self.z_bns = []         
         self.z_hats = []        
@@ -206,31 +206,36 @@ class BaseNeuralNetwork(ABC):
         output = self.forward(X, training=True)
         delta = self.compute_output_delta(output, y)
         
+        # Step backward through the network layers
         for i in reversed(range(num_layers)):
+            # 1. Compute gradients for the weights and biases of the current layer
             grad_weights[i] = np.dot(self.activations[i].T, delta) / m
             grad_biases[i] = np.sum(delta, axis=0, keepdims=True) / m
             
             if i > 0:
+                # 2. Backpropagate delta through the weights to the layer below (i-1)
+                delta = np.dot(delta, self.weights[i].T)
+                
+                # 3. Apply the activation derivative belonging strictly to layer i-1
                 activation_z = self.z_bns[i-1] if self.use_batch_norm else self.zs[i-1]
-                delta = np.dot(delta, self.weights[i].T) * self.leaky_relu_der(activation_z)
+                delta = delta * self.leaky_relu_der(activation_z)
                 
                 if self.masks[i-1] is not None:
                     delta = delta * self.masks[i-1]
                 
+                # 4. FIX: Apply BN backward using the exact index matching the layer (i-1)
+                # Ensure the layer index actually possesses BN parameters (excluding output head)
                 if self.use_batch_norm and (i - 1 < len(self.gammas)):
+                    # Pass the correctly matched layer index (i-1)
                     delta, dgamma, dbeta = self._bn_backward(delta, layer_idx=i-1, m=m)
                     grad_gammas[i-1] = dgamma
                     grad_betas[i-1] = dbeta
                 
+        # Apply L1 weight regularization adjustments
         for i in range(num_layers):
             grad_weights[i] += (self.lam_l1 / m) * np.sign(self.weights[i])
 
-        # for idx, grad in enumerate(grad_weights):
-        #     if grad is not None:
-        #         norm = np.linalg.norm(grad)
-        #         mean_abs = np.mean(np.abs(grad))
-        #         logging.info(f"[DEBUG] Layer {idx} | Grad Norm: {norm:.8f} | Mean Abs Grad: {mean_abs:.8f}")
-
+        # Ship aligned gradients to your Adam optimizer instance
         self.optimizer.update(
             weights=self.weights, biases=self.biases,
             grad_weights=grad_weights, grad_biases=grad_biases,
@@ -241,8 +246,7 @@ class BaseNeuralNetwork(ABC):
             grad_betas=grad_betas if self.use_batch_norm else None
         )
         
-        # Increment to lock logging so it fires only on the very first training batch step
         self.diagnostic_counter += 1
-
+        
     def predict(self, raw_data, mean, std):
         return self.forward((raw_data - mean) / std, training=False)

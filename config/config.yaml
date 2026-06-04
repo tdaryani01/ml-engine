@@ -15,19 +15,19 @@ architecture:
   use_batch_norm: false
   bn_momentum: 0.9
   model_type: regression
-  hidden_layers: [128, 128, 64]
-  p_dropout: 0.05
+  hidden_layers: [217, 210, 316]
+  p_dropout: 0.0
 training:
   optimizer: adam
   epochs: 400
-  batch_size: 64
-  learning_rate: 0.001
+  batch_size: 32
+  learning_rate: 0.0006377024100266827
   sparsity_tolerance: 1.0e-05
   bn_momentum: 0.9
   fourier_expansion:
-    enabled: true
+    enabled: false
     num_frequencies: 4
-  lr_scheduler: exponential
+  lr_scheduler: none
   scheduler_decay_rate: 0.995
   scheduler_drop_ratio: 0.2
   scheduler_epochs_per_drop: 40
@@ -36,7 +36,7 @@ training:
   min_delta: 1.938234878433713e-05
 regularization:
   lam_l1: 0
-  lam_l2: 0.00025
+  lam_l2: 2.953279201734388e-05
 diagnostics:
   enabled: true
   metric_to_plot: all

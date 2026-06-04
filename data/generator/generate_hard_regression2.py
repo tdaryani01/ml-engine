@@ -20,7 +20,7 @@ def generate_chaotic_regression_data(num_samples=6000, noise_std=0.03, out_dir="
     spatial_coupling = np.cos(Angle * 3.0) / (Radius + 0.1)
     
     # =====================================================================
-    # CRITICAL FIX: Replace step-barrier with a steep, smooth tanh transition
+    # CONTINUOUS MANIFOLD TRANSITION
     # =====================================================================
     # Sharpness scale (20.0) creates a steep cliff, but keeps the manifold continuous
     coordinate_intersection = (Time * Radius) - 4.5

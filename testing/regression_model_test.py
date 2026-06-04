@@ -13,11 +13,11 @@ class TestModelArchitectureRegression(unittest.TestCase):
     def setUpClass(cls):
         """Runs once before testing begins to ensure all test fixtures exist."""
         # Define mock paths or use your active workspace data file paths
-        cls.regression_data_path = r".\data\generator\regression_data.csv"
+        cls.regression_data_path = r".\data\regression_data.csv"
         
         # NOTE: Update these paths to point to your real class-type test files
-        cls.binary_data_path = r".\data\test\binary_data.csv"
-        cls.multiclass_data_path = r".\data\test\multiclass_data.csv"
+        cls.binary_data_path = r".\data\binary_data.csv"
+        cls.multiclass_data_path = r".\data\multiclass_data.csv"
 
     def get_base_test_config(self, task_type):
         """Hydrates a clean baseline configuration dictionary instance for the test harness."""
@@ -77,7 +77,7 @@ class TestModelArchitectureRegression(unittest.TestCase):
             os.makedirs(os.path.dirname(self.binary_data_path), exist_ok=True)
             df.to_csv(self.binary_data_path, index=False)
 
-        cfg = self.get_base_test_config("binary")
+        cfg = self.get_base_test_config("binary_classification")
         cfg["data"]["feature_names"] = ["Time", "Radius", "Angle"]
         
         splits = load_pipeline_splits(cfg["data"], self.binary_data_path)

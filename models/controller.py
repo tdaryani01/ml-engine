@@ -24,7 +24,6 @@ class ModelController:
         """Reconstructs identical Fourier features for evaluation splits."""
         fourier_cfg = self.trn_cfg.get("fourier_expansion", {})
         
-        # REMOVED: shape[1] == 1 constraint to match the orchestrator pipeline
         if fourier_cfg.get("enabled", False):
             num_freqs = fourier_cfg.get("num_frequencies", 4)
             features = [X_matrix]
@@ -79,7 +78,7 @@ class ModelController:
             elif task_type == "binary_classification":
                 output_dim = 1 
             else:
-                distinct_classes
+                output_dim = distinct_classes
         else:
             output_dim = splits["y_train"].shape[1]
             
@@ -105,10 +104,8 @@ class ModelController:
         if self.model is None:
             raise ValueError("[Model Controller] Execution Error: Cannot call fit before calling setup_model.")
 
-        # DYNAMIC FIX: Protect validation coordinates from broadcasting misalignment corruption
         X_val_expanded = self._apply_fourier_expansion_if_needed(splits["X_val"])
 
-        # Standardize features safely over aligned spatial dimensions
         X_train_norm = (splits["X_train"] - self.mean) / self.std
         X_val_norm = (X_val_expanded - self.mean) / self.std
         
@@ -142,51 +139,33 @@ class ModelController:
 
             active_lr = self.scheduler.step(epoch) if self.scheduler else self.trn_cfg["learning_rate"]
             
-            # # =====================================================================
-            # # 🛠️ UPDATED DEBUGGING PROBE IN MODELS/CONTROLLER.PY
-            # # =====================================================================
-            # if epoch % 10 == 0:
-            #     logging.info(f"=== DIAGNOSTIC PROBE EPOCH {epoch} ===")
-            #     logging.info(f"[PROBE] X_train_norm shape: {X_train_norm.shape} | Mean: {np.mean(X_train_norm):.4f} | Std: {np.std(X_train_norm):.4f}")
-            #     logging.info(f"[PROBE] X_val_norm shape:   {X_val_norm.shape} | Mean: {np.mean(X_val_norm):.4f} | Std: {np.std(X_val_norm):.4f}")
-                
-            #     # Check if the validation features completely decouple from training bounds
-            #     feat_mismatch = np.abs(np.mean(X_train_norm, axis=0) - np.mean(X_val_norm, axis=0))
-            #     logging.info(f"[PROBE] Max feature mean divergence between splits: {np.max(feat_mismatch):.4f}")
-                
-            #     # Test a raw forward pass validation prediction printout
-            #     raw_val_preds = self.model.forward(X_val_norm, training=False)
-            #     logging.info(f"[PROBE] Validation Predictions - Min: {np.min(raw_val_preds):.4f} | Max: {np.max(raw_val_preds):.4f} | Mean: {np.mean(raw_val_preds):.4f}")
-                
-            #     # ─── ADD THIS EXACT LINE HERE ────────────────────────────────────
-            #     residuals = raw_val_preds - y_val_target
-            #     logging.info(f"[PROBE] Top 5 Max Absolute Residual Errors: {np.sort(np.abs(residuals.ravel()))[-5:]}")
-            #     # ─────────────────────────────────────────────────────────────────
-                
-            #     # Temporary diagnostic patch inside the evaluation loop of models/controller.py
-            #     val_errors = raw_val_preds - y_val_target
-            #     trimmed_val_loss = np.mean(val_errors[np.abs(val_errors) <= 1.0] ** 2)
-            #     logging.info(f"[PROBE] Trimmed Validation Loss (No Outliers): {trimmed_val_loss:.6f}")
-
-
-            #     logging.info(f"[PROBE] Validation Targets     - Min: {np.min(y_val_target):.4f} | Max: {np.max(y_val_target):.4f} | Mean: {np.mean(y_val_target):.4f}")
-            # # =====================================================================
-            
             train_iterator = DatasetIterator(X_train_norm, y_train_target, batch_size=batch_size, shuffle=True)
             
             for batch_idx, (X_b, y_b) in enumerate(train_iterator):
                 self.model.backward(X_b, y_b, active_lr=active_lr)
                 
-            current_train_loss = self.model.compute_total_loss(self.model.forward(X_train_norm, training=False), y_train_target)
-            current_val_loss = self.model.compute_total_loss(self.model.forward(X_val_norm, training=False), y_val_target)
+            # ─── 🛠️ FIXED: Assign forward passes to clean scoped variable names ───
+            train_preds = self.model.forward(X_train_norm, training=False)
+            val_preds = self.model.forward(X_val_norm, training=False)
+            
+            current_train_loss = self.model.compute_total_loss(train_preds, y_train_target)
+            current_val_loss = self.model.compute_total_loss(val_preds, y_val_target)
             
             self.train_history.append(current_train_loss)
             self.val_history.append(current_val_loss)
             
             if epoch % 10 == 0 or epoch == epochs_to_run - 1:
-                logging.info(f"Epoch {epoch:3d}/{epochs_to_run} | Train Loss: {current_train_loss:.6f} | Val Loss: {current_val_loss:.6f} | Active LR: {active_lr:.6f}")
+                # FIXED: Called self reference on class method pass
+                val_r2_score = self.compute_r2_score(y_val_target, val_preds)
+        
+                logging.info(
+                    f"Epoch {epoch:3d}/{epochs_to_run} | "
+                    f"Train Loss: {current_train_loss:.6f} | "
+                    f"Val Loss: {current_val_loss:.6f} | "
+                    f"Val Score (R²): {val_r2_score:.6f} | "
+                    f"Active LR: {active_lr:.6f}"
+                )
             
-               
             if es_enabled:
                 if current_val_loss < (best_val_loss - min_delta):
                     best_val_loss = current_val_loss
@@ -218,3 +197,17 @@ class ModelController:
             raise ValueError("[Model Controller] Execution Error: Cannot run prediction before model is fitted or loaded.")
         expanded_data = self._apply_fourier_expansion_if_needed(raw_data)
         return self.model.predict(expanded_data, self.mean, self.std)
+
+    # ─── 🛠️ FIXED: Added missing 'self' method signature ─────────────────────
+    def compute_r2_score(self, y_true, y_pred):
+        y_true_flat = y_true.ravel()
+        y_pred_flat = y_pred.ravel()
+        
+        y_mean = np.mean(y_true_flat)
+        ss_tot = np.sum((y_true_flat - y_mean) ** 2)
+        ss_res = np.sum((y_true_flat - y_pred_flat) ** 2)
+        
+        if ss_tot < 1e-10:
+            return 0.0
+        
+        return float(1.0 - (ss_res / ss_tot))
