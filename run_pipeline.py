@@ -1,134 +1,99 @@
 # run_pipeline.py
-import numpy as np
 import logging
 from config.config_loader import load_production_config
-from data.data_loader import load_pipeline_splits
+from data.csv_provider import CSVDataProvider
+from data.stream_provider import StreamDataProvider
 from models.controller import ModelController
-from diagnostics.diagnostics import NeuralNetworkDiagnostics
-from utils.logger import initialize_global_logging
+from config.constants import IngestionMode, ModelType
 
-def pre_compute_fourier_space(X_matrix, num_frequencies=4):
-    """
-    Transforms an (N, D) matrix into a higher-dimensional coordinate space
-    using sin/cos mappings at progressive frequency scales across all features.
-    Runs exactly once before the epoch loop to minimize CPU overhead.
-    """
-    features = [X_matrix]
-    for i in range(num_frequencies):
-        freq = 2.0 ** i
-        features.append(np.sin(X_matrix * freq))
-        features.append(np.cos(X_matrix * freq))
-    return np.hstack(features)
-
-def execute_training_pipeline(config, controller, splits, X_test_clean_raw=None, original_features=None):
-    """Orchestration root isolated completely from execution mechanics."""
-    env_cfg = config["environment"]
-    dat_cfg = config["data"]
-    trn_cfg = config["training"]
-    diag_cfg = config["diagnostics"]
-
-    # Fire the controller's training cycle (which handles schedulers and auto-saving internally)
-    train_history, val_history = controller.fit(splits)
-
-    # Handle telemetry reporting if stage flags match development requirements
-    is_dev = env_cfg.get("stage", "").lower() == "development"
-    if is_dev and diag_cfg.get("enabled", False):
-        logging.info("Dispatching data metrics to diagnostics manager...")
-        
-        y_mean = getattr(controller.model, "y_mean", None)
-        y_std = getattr(controller.model, "y_std", None)
-        
-        # DYNAMIC HOOK: If the problem space was raw, match the visual diagnostic inputs 
-        # to the clean unpolluted raw copy so plotting indices don't corrupt.
-        fourier_cfg = trn_cfg.get("fourier_expansion", {})
-        if fourier_cfg.get("enabled", False) and X_test_clean_raw is not None:
-            X_diagnostic_input = X_test_clean_raw
-            diagnostic_features = original_features if original_features else ["Input_X"]
-        else:
-            X_diagnostic_input = splits["X_test"]
-            diagnostic_features = dat_cfg["feature_names"]
-
-        NeuralNetworkDiagnostics.run_diagnostics(
-            metric_to_plot=diag_cfg["metric_to_plot"], model=controller.model,
-            train_history=train_history, val_history=val_history,
-            X_test_raw=X_diagnostic_input, y_test=splits["y_test"],
-            feature_names=diagnostic_features, 
-            mean=controller.mean, std=controller.std,
-            output_dir=env_cfg["output_dir"],
-            y_mean=y_mean, y_std=y_std
-        )
-        NeuralNetworkDiagnostics.inspect_model_sparsity(controller.model, tolerance=trn_cfg["sparsity_tolerance"])
-
-# =====================================================================
-# Unified Composition Root Block
-# =====================================================================
-if __name__ == "__main__":
-    # Load production configurations from the YAML matrix
-    global_config = load_production_config()
+def execute_training_pipeline():
+    # 1. Hydrate the immutable, typed configuration object from your structured YAML
+    cfg = load_production_config("config/config.yaml")
     
-    # Fire up global system logger and error catch configurations immediately
-    initialize_global_logging(global_config)
+    # Configure baseline logging properties mapped directly from the meta sub-config
+    if not cfg.meta.suppress_logging:
+        log_level = getattr(logging, cfg.meta.logging_level.upper(), logging.INFO)
+        logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s", force=True)
     
-    # Ingest dataset splits from source paths (Single Unified Source of Truth)
-    logging.info("Loading framework raw pipeline splits...")
-    dataset_splits = load_pipeline_splits(global_config["data"], global_config["environment"]["data_file"])
+    logging.info(f"[Pipeline Root] Commencing pipeline initialization: {cfg.meta.pipeline_name}")
 
-    # DYNAMIC CACHE: Preserve unpolluted features before any potential list extensions occur
-    original_feature_names = list(global_config["data"]["feature_names"])
-    X_test_clean_raw = dataset_splits["X_test"].copy()
-
-    # Dynamic Preprocessing Layer Execution nested under the training config block
-    training_cfg = global_config.get("training", {})
-    fourier_cfg = training_cfg.get("fourier_expansion", {})
-    
-    # REMOVED: Slicing restriction 'shape[1] == 1'. Spans safely over arbitrary dimensions.
-    if fourier_cfg.get("enabled", False):
-        num_freqs = fourier_cfg.get("num_frequencies", 4)
-        logging.info(f"[Preprocessing] Applying Multivariable Fourier Feature Expansion (Frequencies: {num_freqs})...")
-        
-        # Transform the training and testing matrices exactly once in memory
-        dataset_splits["X_train"] = pre_compute_fourier_space(dataset_splits["X_train"], num_frequencies=num_freqs)
-        dataset_splits["X_test"] = pre_compute_fourier_space(dataset_splits["X_test"], num_frequencies=num_freqs)
-        
-        # Automatically generate structural column layouts for all features dynamically
-        patched_feature_names = []
-        for base_name in original_feature_names:
-            patched_feature_names.append(base_name)
-            for i in range(num_freqs):
-                patched_feature_names.extend([f"{base_name}_sin_{i}", f"{base_name}_cos_{i}"])
-            
-        # Patch the configuration dictionary in-memory to guide framework initialization
-        global_config['data']['feature_names'] = patched_feature_names
-
-    # Unified Framework Target Sanity Check
-    logging.info("="*50)
-    logging.info("          DATASTREAM TARGET MATRIX PROFILE")
-    logging.info("="*50)
-    logging.info(f"Unique target element footprint: {np.unique(dataset_splits['y_train'])}")
-    logging.info(f"Target underlying array data type: {dataset_splits['y_train'].dtype}")
-    logging.info(f"Target structural matrix shape  : {dataset_splits['y_train'].shape}")
-    logging.info("="*50)
-    
-    # Run temporary debug log right after target validation pass
-    logging.info("="*50)
-    logging.info("          INPUT FEATURE SCALE PROFILE")
-    logging.info("="*50)
-    logging.info(f"X_train Min bounds: {np.min(dataset_splits['X_train'], axis=0)}")
-    logging.info(f"X_train Max bounds: {np.max(dataset_splits['X_train'], axis=0)}")
-    logging.info(f"X_train Mean vector: {np.mean(dataset_splits['X_train'], axis=0)}")
-    logging.info("="*50)
-    
-    # Instantiate the lightweight controller container
-    active_controller = ModelController(config=global_config)
-    
-    # Setup handles configuration routing or checkpoint restoration internally using the serializer
-    active_controller.setup_model(dataset_splits)
-    
-    # Fire execution pipeline with the identical data splits passed along
-    execute_training_pipeline(
-        config=global_config, 
-        controller=active_controller, 
-        splits=dataset_splits, 
-        X_test_clean_raw=X_test_clean_raw,
-        original_features=original_feature_names
+    # 2. Instantiate your ModelController first so it exists for down-funnel dependencies
+    controller = ModelController(
+        learning_rate=cfg.optimization.learning_rate,
+        lr_scheduler_type=cfg.optimization.lr_scheduler,
+        scheduler_decay_rate=cfg.optimization.scheduler_decay_rate,
+        scheduler_drop_ratio=cfg.optimization.scheduler_drop_ratio,
+        scheduler_epochs_per_drop=cfg.optimization.scheduler_epochs_per_drop
     )
+    
+    # 3. Build the underlying network architecture topology map upfront
+    logging.info("[Pipeline Root] Initializing network topology matrix dimensions...")
+    controller.initialize_network_from_dimensions(
+        input_dim=len(cfg.ingestion.feature_names),
+        output_dim=3,  # Mapped to match your structural multi-class tracking layout
+        model_type=cfg.architecture.model_type,
+        hidden_layers=cfg.architecture.hidden_layers,
+        optimizer_name=cfg.optimization.optimizer,
+        lam_l1=cfg.regularization.lam_l1,
+        lam_l2=cfg.regularization.lam_l2,
+        p_dropout=cfg.architecture.p_dropout,
+        use_batch_norm=cfg.architecture.use_batch_norm,
+        bn_momentum=cfg.architecture.bn_momentum,
+        max_norm=cfg.optimization.gradient_clipping_max_norm
+    )
+
+    # 4. Extract the resolved Enum object from your config to route ingestion safely
+    source_mode = cfg.ingestion.source_mode
+
+    if source_mode == IngestionMode.CSV:
+        data_provider = CSVDataProvider(
+            data_file_path=cfg.ingestion.data_file_path,  # Explicit primitive string
+            feature_names=cfg.ingestion.feature_names,     # Explicit primitive list
+            batch_size=cfg.optimization.batch_size,        # Explicit primitive int
+            model_instance=controller.model                # Injected to compute one-hot targets safely upfront
+        )
+    elif source_mode == IngestionMode.STREAM:
+        if not cfg.ingestion.amqp_url or not cfg.ingestion.queue_name:
+            raise ValueError("[Ingestion Error] AMQP properties must be defined in config when source_mode='stream'")
+            
+        data_provider = StreamDataProvider(
+            amqp_url=cfg.ingestion.amqp_url,
+            queue_name=cfg.ingestion.queue_name,
+            feature_names=cfg.ingestion.feature_names
+        )
+    else:
+        raise ValueError(f"[Ingestion Error] Unknown source_mode option: '{source_mode}'.")
+        
+    # 5. Handle pre-trained network loading if required by context rules
+    if cfg.persistence.load_saved_model:
+        controller.hydrate_from_asset(cfg.persistence.model_asset_path)
+        
+    # 6. Kick off optimization loops using the unified strategy engine interface
+    train_history, val_history = controller.fit_via_provider(
+        data_provider=data_provider,
+        epochs=cfg.optimization.epochs,
+        batch_size=cfg.optimization.batch_size,
+        source_mode=source_mode,
+        model_type=cfg.architecture.model_type,
+        early_stopping_enabled=cfg.optimization.early_stopping_enabled,
+        patience=cfg.optimization.patience,
+        min_delta=cfg.optimization.min_delta
+    )
+    
+    # 7. Execute state serialization if continuous saving paths are active
+    if cfg.persistence.load_saved_model:
+        legacy_config_dict = {
+            "meta": vars(cfg.meta),
+            "ingestion": vars(cfg.ingestion),
+            "architecture": vars(cfg.architecture),
+            "optimization": vars(cfg.optimization),
+            "regularization": vars(cfg.regularization),
+            "persistence": vars(cfg.persistence)
+        }
+        controller.serialize_current_state(
+            target_asset_path=cfg.persistence.model_asset_path,
+            serialized_config_dict=legacy_config_dict
+        )
+
+if __name__ == "__main__":
+    execute_training_pipeline()
