@@ -42,14 +42,18 @@ def execute_training_pipeline():
 
     # 5. Extract the resolved Enum object from your config to route ingestion safely
     source_mode = cfg.ingestion.source_mode
+    steps = cfg.optimization.steps_streaming
 
     if source_mode == IngestionMode.CSV:
         data_provider = CSVDataProvider(
             data_file_path=cfg.ingestion.data_file_path,
             feature_names=cfg.ingestion.feature_names,
             batch_size=cfg.optimization.batch_size,
-            model_instance=controller.model
+            model_instance=controller.model,
+            epochs=cfg.optimization.epochs_full_dataset
         )
+        steps = data_provider.recomment_steps();
+
     elif source_mode == IngestionMode.STREAM:
         if not cfg.ingestion.amqp_url or not cfg.ingestion.queue_name:
             raise ValueError("[Ingestion Error] AMQP properties must be defined in config when source_mode='stream'")
@@ -57,7 +61,8 @@ def execute_training_pipeline():
         data_provider = StreamDataProvider(
             amqp_url=cfg.ingestion.amqp_url,
             queue_name=cfg.ingestion.queue_name,
-            feature_names=cfg.ingestion.feature_names
+            feature_names=cfg.ingestion.feature_names,
+            batch_size=cfg.optimization.batch_size,
         )
     else:
         raise ValueError(f"[Ingestion Error] Unknown source_mode option: '{source_mode}'.")
@@ -67,10 +72,9 @@ def execute_training_pipeline():
         controller.hydrate_from_asset(cfg.persistence.model_asset_path)
         
     # 7. Kick off optimization loops using the unified strategy engine interface
-    train_history, val_history = controller.fit_via_provider(
+    train_history, val_history = controller.fit(
         data_provider=data_provider,
-        epochs=cfg.optimization.epochs,
-        batch_size=cfg.optimization.batch_size,
+        steps=steps,
         source_mode=source_mode,
         model_type=cfg.architecture.model_type,
         early_stopping_enabled=cfg.optimization.early_stopping_enabled,

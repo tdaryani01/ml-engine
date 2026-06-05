@@ -12,8 +12,8 @@ meta:
 # DATA INGESTION MATRIX
 # =====================================================================
 ingestion:
-  source_mode: "stream"                # Changed from "csv" to activate AMQP streaming
-  data_file_path: ".\\data\\generator\\supply_chain.csv"
+  source_mode: "csv"                # Changed from "csv" to activate AMQP streaming
+  data_file_path: ".\\data\\samples\\csv\\supply_chain.csv"
   feature_names:
     - "Supplier_Lead_Time"
     - "Logistics_Delay_Index"
@@ -42,7 +42,8 @@ architecture:
 # =====================================================================
 optimization:
   optimizer: "adam"
-  epochs: 300
+  epochs_full_dataset: 500
+  steps_streaming: 50
   batch_size: 64
   learning_rate: 0.0001                # Reset to standard 0.001 for stable convergence if needed
   

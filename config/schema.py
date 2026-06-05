@@ -36,7 +36,8 @@ class ArchitectureConfig:
 @dataclass(frozen=True)
 class OptimizationConfig:
     optimizer: str
-    epochs: int
+    epochs_full_dataset: int
+    steps_streaming: int
     batch_size: int
     learning_rate: float
     lr_scheduler: LRHierarchy   # Enforced Enum Type!
