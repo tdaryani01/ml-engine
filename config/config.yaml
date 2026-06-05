@@ -12,7 +12,7 @@ meta:
 # DATA INGESTION MATRIX
 # =====================================================================
 ingestion:
-  source_mode: "csv"                   # Options: "csv" or "stream"
+  source_mode: "stream"                # Changed from "csv" to activate AMQP streaming
   data_file_path: ".\\data\\generator\\supply_chain.csv"
   feature_names:
     - "Supplier_Lead_Time"
@@ -23,8 +23,9 @@ ingestion:
   splits:
     train: 0.70
     val: 0.15
-  # amqp_url: "amqp://guest:guest@localhost:5672/%2f" # Staged for Option 1
-  # queue_name: "supply_chain.incoming_batches"        # Staged for Option 1
+  amqp_url: "amqp://guest:guest@localhost:5672/%2f"   # Activated
+  queue_name: "supply_chain.incoming_batches"         # Activated
+  # shard_dir: "data/samples/shards/supply_chain"       # Added explicit tracking path for your shards
 
 # =====================================================================
 # NETWORK ARCHITECTURE CONFIGURATION
@@ -88,3 +89,8 @@ persistence:
 diagnostics:
   enabled: true
   metric_to_plot: "all"
+  save_raw_logs: true
+  figure_width: 10
+  figure_height: 6
+  plot_style: "seaborn-v0_8-darkgrid"
+  output_format: "png"

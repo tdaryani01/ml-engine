@@ -61,5 +61,5 @@ def load_production_config(file_path="config/config.yaml") -> PipelineConfig:
         regularization=RegularizationConfig(**raw["regularization"]),
         transformations=transform_obj,
         persistence=PersistenceConfig(**raw["persistence"]),
-        diagnostics=DiagnosticsConfig(**raw["diagnostics"])
+        diagnostics=DiagnosticsConfig(**raw["diagnostics"])  # Explicit unpacking of new parameters
     )

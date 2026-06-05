@@ -1,4 +1,4 @@
-# test_model_regression.py
+# testing/regression_model_test.py
 import unittest
 import os
 import numpy as np
@@ -34,7 +34,7 @@ class TestModelArchitectureRegression(unittest.TestCase):
             ),
             ingestion=IngestionConfig(
                 source_mode=IngestionMode.CSV,
-                data_file_path="",  # Populated dynamically by specific test cases
+                data_file_path="",  
                 feature_names=["Time", "Radius", "Angle"],
                 splits=SplitConfig(train=0.70, val=0.30)
             ),
@@ -73,7 +73,12 @@ class TestModelArchitectureRegression(unittest.TestCase):
             ),
             diagnostics=DiagnosticsConfig(
                 enabled=False,
-                metric_to_plot="loss"
+                metric_to_plot="loss",
+                save_raw_logs=False,       
+                figure_width=8,            
+                figure_height=4,           
+                plot_style="default",      
+                output_format="png"        
             )
         )
 
@@ -84,7 +89,6 @@ class TestModelArchitectureRegression(unittest.TestCase):
 
         cfg = self.get_base_test_config(ModelType.REGRESSION)
         
-        # 1. Pipeline Splitting Sanity Check via explicit primitive parameters
         splits = load_pipeline_splits(
             data_file_path=self.regression_data_path,
             feature_names=cfg.ingestion.feature_names
@@ -92,14 +96,13 @@ class TestModelArchitectureRegression(unittest.TestCase):
         self.assertIn("X_train", splits)
         self.assertEqual(splits["X_train"].shape[1], 3)
 
-        # 2. Controller Setup and Architecture Compilation
         controller = ModelController(
             learning_rate=cfg.optimization.learning_rate,
             lr_scheduler_type=cfg.optimization.lr_scheduler
         )
         controller.initialize_network_from_dimensions(
             input_dim=len(cfg.ingestion.feature_names),
-            output_dim=1,  # Continuous regression tracking head target scalar
+            output_dim=1,  
             model_type=cfg.architecture.model_type,
             hidden_layers=cfg.architecture.hidden_layers,
             optimizer_name=cfg.optimization.optimizer,
@@ -111,7 +114,6 @@ class TestModelArchitectureRegression(unittest.TestCase):
             max_norm=cfg.optimization.gradient_clipping_max_norm
         )
 
-        # 3. Polymorphic Data Strategy Execution Pass
         data_provider = CSVDataProvider(
             data_file_path=self.regression_data_path,
             feature_names=cfg.ingestion.feature_names,
@@ -131,7 +133,6 @@ class TestModelArchitectureRegression(unittest.TestCase):
         self.assertEqual(len(train_hist), 5)
         self.assertTrue(np.isfinite(train_hist[-1]), "Loss encountered non-finite NaN/Inf bounds.")
         
-        # 4. Dimension Verification
         X_val, y_val = data_provider.get_validation_set()
         val_preds = controller.predict(X_val)
         self.assertEqual(val_preds.shape, y_val.shape, "Prediction matrix shape mismatch.")
@@ -153,7 +154,7 @@ class TestModelArchitectureRegression(unittest.TestCase):
         )
         controller.initialize_network_from_dimensions(
             input_dim=len(cfg.ingestion.feature_names),
-            output_dim=1,  # Binary classification uses a single sigmoidal logit channel
+            output_dim=1,  
             model_type=cfg.architecture.model_type,
             hidden_layers=cfg.architecture.hidden_layers,
             optimizer_name=cfg.optimization.optimizer,
@@ -204,7 +205,7 @@ class TestModelArchitectureRegression(unittest.TestCase):
         )
         controller.initialize_network_from_dimensions(
             input_dim=len(cfg.ingestion.feature_names),
-            output_dim=3,  # Multi-class footprint mapped matching your output space
+            output_dim=3,  
             model_type=cfg.architecture.model_type,
             hidden_layers=cfg.architecture.hidden_layers,
             optimizer_name=cfg.optimization.optimizer,

@@ -4,20 +4,18 @@ from config.config_loader import load_production_config
 from data.csv_provider import CSVDataProvider
 from data.stream_provider import StreamDataProvider
 from models.controller import ModelController
-from config.constants import IngestionMode, ModelType
+from config.constants import IngestionMode
+from utils.logger import initialize_global_logging              # Injected custom logger
+from utils.diagnostics import NeuralNetworkDiagnostics
 
 def execute_training_pipeline():
     # 1. Hydrate the immutable, typed configuration object from your structured YAML
     cfg = load_production_config("config/config.yaml")
     
-    # Configure baseline logging properties mapped directly from the meta sub-config
-    if not cfg.meta.suppress_logging:
-        log_level = getattr(logging, cfg.meta.logging_level.upper(), logging.INFO)
-        logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(message)s", force=True)
-    
-    logging.info(f"[Pipeline Root] Commencing pipeline initialization: {cfg.meta.pipeline_name}")
+    # 2. Boot up your custom enterprise dual-destination logging architecture
+    initialize_global_logging(cfg)
 
-    # 2. Instantiate your ModelController first so it exists for down-funnel dependencies
+    # 3. Instantiate your ModelController first so it exists for down-funnel dependencies
     controller = ModelController(
         learning_rate=cfg.optimization.learning_rate,
         lr_scheduler_type=cfg.optimization.lr_scheduler,
@@ -26,7 +24,7 @@ def execute_training_pipeline():
         scheduler_epochs_per_drop=cfg.optimization.scheduler_epochs_per_drop
     )
     
-    # 3. Build the underlying network architecture topology map upfront
+    # 4. Build the underlying network architecture topology map upfront
     logging.info("[Pipeline Root] Initializing network topology matrix dimensions...")
     controller.initialize_network_from_dimensions(
         input_dim=len(cfg.ingestion.feature_names),
@@ -42,15 +40,15 @@ def execute_training_pipeline():
         max_norm=cfg.optimization.gradient_clipping_max_norm
     )
 
-    # 4. Extract the resolved Enum object from your config to route ingestion safely
+    # 5. Extract the resolved Enum object from your config to route ingestion safely
     source_mode = cfg.ingestion.source_mode
 
     if source_mode == IngestionMode.CSV:
         data_provider = CSVDataProvider(
-            data_file_path=cfg.ingestion.data_file_path,  # Explicit primitive string
-            feature_names=cfg.ingestion.feature_names,     # Explicit primitive list
-            batch_size=cfg.optimization.batch_size,        # Explicit primitive int
-            model_instance=controller.model                # Injected to compute one-hot targets safely upfront
+            data_file_path=cfg.ingestion.data_file_path,
+            feature_names=cfg.ingestion.feature_names,
+            batch_size=cfg.optimization.batch_size,
+            model_instance=controller.model
         )
     elif source_mode == IngestionMode.STREAM:
         if not cfg.ingestion.amqp_url or not cfg.ingestion.queue_name:
@@ -64,11 +62,11 @@ def execute_training_pipeline():
     else:
         raise ValueError(f"[Ingestion Error] Unknown source_mode option: '{source_mode}'.")
         
-    # 5. Handle pre-trained network loading if required by context rules
+    # 6. Handle pre-trained network loading if required by context rules
     if cfg.persistence.load_saved_model:
         controller.hydrate_from_asset(cfg.persistence.model_asset_path)
         
-    # 6. Kick off optimization loops using the unified strategy engine interface
+    # 7. Kick off optimization loops using the unified strategy engine interface
     train_history, val_history = controller.fit_via_provider(
         data_provider=data_provider,
         epochs=cfg.optimization.epochs,
@@ -80,7 +78,14 @@ def execute_training_pipeline():
         min_delta=cfg.optimization.min_delta
     )
     
-    # 7. Execute state serialization if continuous saving paths are active
+    # 8. Trigger pipeline diagnostics generation pass (Plots Figures 1-5 + history.csv)
+    NeuralNetworkDiagnostics.run_diagnostics(
+        controller=controller,
+        data_provider=data_provider,
+        cfg=cfg
+    )
+    
+    # 9. Execute state serialization if continuous saving paths are active
     if cfg.persistence.load_saved_model:
         legacy_config_dict = {
             "meta": vars(cfg.meta),

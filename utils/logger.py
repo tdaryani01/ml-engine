@@ -3,26 +3,33 @@ import os
 import sys
 import logging
 from datetime import datetime
+from config.schema import PipelineConfig
 
-def initialize_global_logging(config):
-    """Sets up dual-destination logging (terminal + file) and global exception handling."""
-    env_cfg = config.get("environment", {})
-    output_dir = env_cfg.get("output_dir", "diagnostics_output")
-    os.makedirs(output_dir, exist_ok=True)
+def initialize_global_logging(cfg: PipelineConfig) -> None:
+    """
+    Sets up dual-destination logging (terminal + file) and global exception handling
+    using properties hydrated via the pipeline's strongly-typed configuration schema.
+    """
+    # 1. Enforce output target directory creation boundaries from the meta sub-config
+    meta_cfg = cfg.meta
+    os.makedirs(meta_cfg.output_dir, exist_ok=True)
     
+    # 2. Build unique rolling timestamp filename layouts matching your conventions
     log_filename = f"pipeline_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    log_filepath = os.path.join(output_dir, log_filename)
+    log_filepath = os.path.join(meta_cfg.output_dir, log_filename)
     
-    # Configure root logger format matching enterprise standards
+    # 3. Configure root logger format matching enterprise standards
     log_formatter = logging.Formatter(
         fmt="[%(asctime)s] [%(levelname)s] [%(filename)s:%(lineno)d]: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
     
-    # --- READ LOGGING LEVEL FROM CONFIG ---
-    pipeline_cfg = config.get("pipeline", {})
-    yaml_level_str = pipeline_cfg.get("logging_level", "INFO").upper()
-    
+    # 4. Read log suppressions and target levels safely from config
+    if meta_cfg.suppress_logging:
+        logging.disable(logging.CRITICAL)
+        return
+        
+    yaml_level_str = meta_cfg.logging_level.upper()
     level_mapping = {
         "DEBUG": logging.DEBUG,
         "INFO": logging.INFO,
@@ -34,6 +41,7 @@ def initialize_global_logging(config):
     
     root_logger = logging.getLogger()
     root_logger.setLevel(target_level)
+    root_logger.handlers.clear()  # Clear any default boilerplate tracking streams
     
     # Stream Handler (Terminal Output)
     console_handler = logging.StreamHandler(sys.stdout)
@@ -45,7 +53,7 @@ def initialize_global_logging(config):
     file_handler.setFormatter(log_formatter)
     root_logger.addHandler(file_handler)
     
-    # Intercept unhandled exceptions globally
+    # 5. Intercept unhandled exceptions globally to maintain robust execution histories
     def unhandled_exception_hook(exctype, value, traceback):
         if issubclass(exctype, KeyboardInterrupt):
             sys.__excepthook__(exctype, value, traceback)

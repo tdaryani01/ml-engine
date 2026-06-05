@@ -72,6 +72,11 @@ class PersistenceConfig:
 class DiagnosticsConfig:
     enabled: bool
     metric_to_plot: str
+    save_raw_logs: bool
+    figure_width: int          # Configurable plotting dimensions
+    figure_height: int         # Configurable plotting dimensions
+    plot_style: str            # e.g., 'seaborn-v0_8-darkgrid', 'ggplot', 'default'
+    output_format: str         # e.g., 'png', 'pdf', 'svg'
 
 @dataclass(frozen=True)
 class PipelineConfig:
