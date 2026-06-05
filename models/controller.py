@@ -2,9 +2,7 @@
 import os
 import logging
 import copy
-from sqlite3.dbapi2 import SQLITE_ERROR_SNAPSHOT
 import numpy as np
-from sqlalchemy import true
 from models.model_factory import ModelFactory
 from models.serializer import ModelSerializer
 from models.schedulers import StepDecay, ExponentialDecay
@@ -17,10 +15,6 @@ class ModelController:
         self.model = None
         self.train_history = []
         self.val_history = []
-        
-        # In memory standardization states
-        self.mean = None
-        self.std = None
         self.steps_completed = 0
         
         if lr_scheduler_type == LRHierarchy.STEP:
@@ -98,8 +92,8 @@ class ModelController:
         # Ingest validation sets from our data strategy provider
         X_val, y_val_target = data_provider.get_validation_set()
         
-        self._initialize_standardization_bounds(data_provider, X_val)
-        X_val_norm = (X_val - self.mean) / self.std
+        # 🚨 Changed: Routing standardization call straight to the provider's native normalization layer
+        X_val_norm = data_provider.normalize(X_val)
         
         if steps <= 0:
             logging.info("[Model Controller] Steps count set to 0. Skipping training execution loops.")
@@ -120,13 +114,14 @@ class ModelController:
                 break
             self.train_history.append(epoch_train_loss)
             
+            # Re-normalize validation window space to ensure it adapts to rolling streaming bounds
+            X_val_norm = data_provider.normalize(X_val)
             val_preds = self.model.forward(X_val_norm, training=False)
             current_val_loss = self.model.compute_total_loss(val_preds, y_val_target)
             current_val_raw_cost = self.model.calculate_raw_cost(val_preds, y_val_target)
             
             self.val_history.append(current_val_loss)
             
-            # Pass data_provider explicitly down so metrics can fetch global training subsets
             self._evaluate_epoch_performance(epoch, data_provider, epoch_train_loss, val_preds, y_val_target, current_val_loss, active_lr, is_classification, model_type)
             
             if early_stopping_enabled:
@@ -138,18 +133,6 @@ class ModelController:
         self._generate_final_summary_report(data_provider, X_val_norm, y_val_target, source_mode, is_classification, model_type, es_state, early_stopping_enabled)
         return self.train_history, self.val_history
 
-    # =====================================================================
-    # PRIVATE DECOUPLED PIPELINE OPERATIONS
-    # =====================================================================
-    def _initialize_standardization_bounds(self, data_provider, X_val: np.ndarray) -> None:
-        if self.mean is None or self.std is None:
-            if hasattr(data_provider, "splits") and DataKeys.X_TRAIN in data_provider.splits:
-                self.mean = np.mean(data_provider.splits[DataKeys.X_TRAIN], axis=0)
-                self.std = np.std(data_provider.splits[DataKeys.X_TRAIN], axis=0) + 1e-24
-            else:
-                self.mean = np.zeros((1, X_val.shape[1]))
-                self.std = np.ones((1, X_val.shape[1])) + 1e-24
-
     def _run_epoch_training_pass(self, data_provider, active_lr: float, steps: int) -> float:
         data_provider.reset_epoch()
         batch_losses = []
@@ -159,7 +142,8 @@ class ModelController:
             if X_b.size == 0:
                 break
             
-            X_b_norm = (X_b - self.mean) / self.std
+            # 🚨 Changed: Delegate normalization straight to provider
+            X_b_norm = data_provider.normalize(X_b)
             batch_loss = self.model.backward(X_b_norm, y_b, active_lr=active_lr)
             
             if batch_loss is None:
@@ -168,24 +152,21 @@ class ModelController:
                 
             batch_losses.append(batch_loss)
             self.steps_completed += 1
-            if(self.steps_completed >= steps):
+            if self.steps_completed >= steps:
                 self.steps_completed = 0
                 break
         return float(np.mean(batch_losses)) if batch_losses else 0.0
 
     def _evaluate_epoch_performance(self, epoch: int, data_provider, train_loss: float, val_preds: np.ndarray, y_val_target: np.ndarray, 
                                     current_val_loss: float, active_lr: float, is_classification: bool, model_type: ModelType) -> None:
-        """Handles diagnostic monitoring steps at specified intervals and calculates dual metrics."""
         if epoch % 10 == 0 or not data_provider.has_more_batches():
             metric_name_step = "Acc" if is_classification else "R²"
             
-            # Fetch full training split arrays to monitor training convergence
             if hasattr(data_provider, "splits") and DataKeys.X_TRAIN in data_provider.splits:
                 X_train = data_provider.splits[DataKeys.X_TRAIN]
-                X_train_norm = (X_train - self.mean) / self.std
+                # 🚨 Changed: Delegate normalization straight to provider
+                X_train_norm = data_provider.normalize(X_train)
                 train_preds = self.model.forward(X_train_norm, training=False)
-                
-                # Fetch processed targets from provider
                 y_train_target = data_provider.y_train_processed
                 
                 if is_classification:
@@ -225,17 +206,13 @@ class ModelController:
 
     def _generate_final_summary_report(self, data_provider, X_val_norm: np.ndarray, y_val_target: np.ndarray, source_mode, 
                                        is_classification: bool, model_type: ModelType, es_state: dict, es_enabled: bool) -> None:
-        """
-        Compiles structural telemetry, dual optimization performance benchmarks, and mathematical 
-        sparsity metrics into a clean, highly readable corporate terminal execution report.
-        """
         final_val_preds = self.model.forward(X_val_norm, training=False)
         val_loss = self.val_history[-1] if self.val_history else float('inf')
         
-        # Calculate full training metrics tracking
         if hasattr(data_provider, "splits") and DataKeys.X_TRAIN in data_provider.splits:
             X_train = data_provider.splits[DataKeys.X_TRAIN]
-            X_train_norm = (X_train - self.mean) / self.std
+            # 🚨 Changed: Delegate normalization straight to provider
+            X_train_norm = data_provider.normalize(X_train)
             final_train_preds = self.model.forward(X_train_norm, training=False)
             y_train_target = data_provider.y_train_processed
             
@@ -249,7 +226,6 @@ class ModelController:
             val_acc = np.mean(np.argmax(final_val_preds, axis=1) == np.argmax(y_val_target, axis=1)) if is_classification else 0.0
             val_r2 = self.compute_r2_score(y_val_target, final_val_preds)
 
-        # Compute Network Sparsity Tracking Metrics
         total_weights_count = 0
         zeroed_weights_count = 0
         sparsity_tolerance = 1e-5
@@ -262,7 +238,6 @@ class ModelController:
         sparsity_percentage = (zeroed_weights_count / total_weights_count * 100) if total_weights_count > 0 else 0.0
         mode_str = source_mode.name.upper() if hasattr(source_mode, 'name') else str(source_mode).upper()
         
-        # Dynamic metrics string block output mapping
         performance_metrics_block = ""
         if is_classification:
             performance_metrics_block += f"  • Final Training Accuracy : {train_acc * 100:.2f}%\n"
@@ -305,9 +280,10 @@ class ModelController:
         ModelSerializer.save_model(self.model, serialized_config_dict, file_path=target_asset_path)
 
     def predict(self, raw_data_matrix: np.ndarray) -> np.ndarray:
-        if self.mean is None or self.std is None:
-            raise ValueError("[Model Controller] Execution Error: Cannot run prediction before model is fitted or loaded.")
-        return self.model.predict(raw_data_matrix, self.mean, self.std)
+        if self.model is None:
+            raise ValueError("[Model Controller] Cannot run prediction before model is fitted or loaded.")
+        # Predictions bypass internal namespaces, relying on direct model execution
+        return self.model.predict(raw_data_matrix)
 
     def compute_r2_score(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
         y_true_flat = y_true.ravel()

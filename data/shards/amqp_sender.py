@@ -4,18 +4,20 @@ import time
 import logging
 import pika
 import numpy as np
+import random  # 🚨 Added for in-place list shuffling
 
 def stream_shards_to_queue(shard_dir: str, queue_name: str, amqp_url: str, epochs: int = 1) -> None:
     """
     Scans directory for .npy shards, serializes matrices to raw bytes,
-    and publishes them directly into the AMQP broker queue, repeating for specified epochs.
+    and publishes them directly into the AMQP broker queue, shuffling shard order
+    at the start of every epoch loop to break temporal dependencies.
     """
-    # 1. Gather and sort target binary shard frames sequentially
+    # 1. Gather and sort target binary shard frames sequentially initially
     if not os.path.exists(shard_dir):
         raise FileNotFoundError(f"Target shard index path missing: {shard_dir}")
         
-    shard_files = sorted([f for f in os.listdir(shard_dir) if f.endswith(".npy")])
-    if not shard_files:
+    base_shard_files = sorted([f for f in os.listdir(shard_dir) if f.endswith(".npy")])
+    if not base_shard_files:
         logging.warning(f"No binary primitive .npy files detected in {shard_dir}")
         return
 
@@ -29,14 +31,19 @@ def stream_shards_to_queue(shard_dir: str, queue_name: str, amqp_url: str, epoch
     # Ensure queue exists and is durable
     channel.queue_declare(queue=queue_name, durable=True)
     
-    logging.info(f"Target egress channel locked. Sending {len(shard_files)} shards per epoch across {epochs} epochs to queue: '{queue_name}'")
+    logging.info(f"Target egress channel locked. Sending {len(base_shard_files)} shards per epoch across {epochs} epochs to queue: '{queue_name}'")
 
     try:
-        # 🚨 Added: Outer Epoch Loop Sequence
+        # Outer Epoch Loop Sequence
         for current_epoch in range(epochs):
             logging.info(f"=== Commencing Streaming Epoch {current_epoch + 1}/{epochs} ===")
             
-            for idx, filename in enumerate(shard_files):
+            # 🚨 Create a fresh copy and shuffle the files for the current epoch pass
+            epoch_shard_files = base_shard_files.copy()
+            random.shuffle(epoch_shard_files)
+            logging.info(f"[Egress Stream] Shuffled {len(epoch_shard_files)} shards for epoch optimization pass.")
+            
+            for idx, filename in enumerate(epoch_shard_files):
                 file_path = os.path.join(shard_dir, filename)
                 
                 # Load optimized numpy payload back into active memory
@@ -62,7 +69,7 @@ def stream_shards_to_queue(shard_dir: str, queue_name: str, amqp_url: str, epoch
                 logging.info(f"[Egress Stream] [Epoch {current_epoch + 1}] Successfully pushed {filename} | Shape: ({shape_string})")
                 
                 # Light throttle pace to mimic dynamic production pipeline flow
-                time.sleep(0)
+                time.sleep(0.1)
                 
     except KeyboardInterrupt:
         logging.info("\nSender execution interrupted manually by user. Closing streams.")
@@ -78,5 +85,5 @@ if __name__ == "__main__":
         shard_dir=r"data\samples\shards\supply_chain",
         queue_name="supply_chain.incoming_batches",
         amqp_url="amqp://guest:guest@localhost:5672/%2f",
-        epochs=200  # 🚨 Added: Loops the shard sequence 10 times consecutively
+        epochs=600  
     )

@@ -23,8 +23,10 @@ class NeuralNetworkDiagnostics:
         # 2. Extract out-of-sample arrays and state structures cleanly from our providers
         X_test_raw, y_test = data_provider.get_validation_set()
         feature_names = cfg.ingestion.feature_names
-        mean = controller.mean
-        std = controller.std
+        
+        # 🚨 Fixed: Pull normalization bounds directly from the data_provider strategy layer
+        mean = data_provider.mean
+        std = data_provider.std
         
         # Pull parameters dynamically from configuration hooks
         selection = str(diag_cfg.metric_to_plot).strip().lower()
@@ -46,8 +48,8 @@ class NeuralNetworkDiagnostics:
         else:
             X_processing = X_test_raw
 
-        # Align normalization vectors flawlessly against the correct matrix space
-        X_test_norm = (X_processing - mean) / std
+        # 🚨 Fixed: Use the data_provider's uniform normalization function to process inputs cleanly
+        X_test_norm = data_provider.normalize(X_processing)
 
         # Calculate and print raw accuracy metrics for classification tasks (forcing inference mode)
         raw_preds = controller.model.forward(X_test_norm, training=False)
@@ -78,7 +80,8 @@ class NeuralNetworkDiagnostics:
                 else:
                     X_eval_processing = X_raw_input
 
-                X_input_norm = (X_eval_processing - mean) / std
+                # 🚨 Fixed: Map closures securely via the data_provider API wrapper
+                X_input_norm = data_provider.normalize(X_eval_processing)
                 return controller.model.forward(X_input_norm, training=False)
 
             NeuralNetworkDiagnostics.plot_metric_4_space(X_test_raw, y_test, feature_names, predict_unscaled, meta_cfg.output_dir, diag_cfg)
