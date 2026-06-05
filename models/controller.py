@@ -2,7 +2,9 @@
 import os
 import logging
 import copy
+from sqlite3.dbapi2 import SQLITE_ERROR_SNAPSHOT
 import numpy as np
+from sqlalchemy import true
 from models.model_factory import ModelFactory
 from models.serializer import ModelSerializer
 from models.schedulers import StepDecay, ExponentialDecay
@@ -19,6 +21,7 @@ class ModelController:
         # In memory standardization states
         self.mean = None
         self.std = None
+        self.steps_completed = 0
         
         if lr_scheduler_type == LRHierarchy.STEP:
             self.scheduler = StepDecay(learning_rate, drop_ratio=scheduler_drop_ratio, epochs_per_drop=scheduler_epochs_per_drop)
@@ -84,11 +87,12 @@ class ModelController:
             return True
         return False
 
-    def fit_via_provider(self, data_provider, epochs: int, batch_size: int, source_mode, model_type: ModelType,
+    def fit(self, data_provider, steps: int, source_mode, model_type: ModelType,
                          early_stopping_enabled: bool = True, patience: int = 15, min_delta: float = 1e-5) -> tuple:
         if self.model is None:
             raise ValueError("[Model Controller] Execution Error: Cannot call fit before initializing the network.")
 
+        epoch = 0
         is_classification = model_type in (ModelType.BINARY_CLASSIFICATION, ModelType.MULTI_CLASS)
         
         # Ingest validation sets from our data strategy provider
@@ -97,8 +101,8 @@ class ModelController:
         self._initialize_standardization_bounds(data_provider, X_val)
         X_val_norm = (X_val - self.mean) / self.std
         
-        if epochs <= 0:
-            logging.info("[Model Controller] Epoch count set to 0. Skipping training execution loops.")
+        if steps <= 0:
+            logging.info("[Model Controller] Steps count set to 0. Skipping training execution loops.")
             return self.train_history, self.val_history
 
         if hasattr(self.model.optimizer, '_setup_done'):
@@ -108,11 +112,12 @@ class ModelController:
 
         es_state = {"best_val_loss": float("inf"), "best_epoch": 0, "patience_counter": 0, "weights": None, "biases": None}
 
-        logging.info(f"[Model Controller] Running optimization loops via Data Provider strategy for {epochs} epochs...")
-        for epoch in range(epochs):
+        while True:
             active_lr = self.scheduler.step(epoch) if self.scheduler else self.initial_lr
             
-            epoch_train_loss = self._run_epoch_training_pass(data_provider, active_lr)
+            epoch_train_loss = self._run_epoch_training_pass(data_provider, active_lr, steps)
+            if epoch_train_loss == 0.0:
+                break
             self.train_history.append(epoch_train_loss)
             
             val_preds = self.model.forward(X_val_norm, training=False)
@@ -122,13 +127,14 @@ class ModelController:
             self.val_history.append(current_val_loss)
             
             # Pass data_provider explicitly down so metrics can fetch global training subsets
-            self._evaluate_epoch_performance(epoch, epochs, data_provider, epoch_train_loss, val_preds, y_val_target, current_val_loss, active_lr, is_classification, model_type)
+            self._evaluate_epoch_performance(epoch, data_provider, epoch_train_loss, val_preds, y_val_target, current_val_loss, active_lr, is_classification, model_type)
             
             if early_stopping_enabled:
                 should_stop = self._handle_early_stopping(epoch, current_val_raw_cost, min_delta, patience, es_state)
                 if should_stop:
                     break
-        
+            epoch += 1
+
         self._generate_final_summary_report(data_provider, X_val_norm, y_val_target, source_mode, is_classification, model_type, es_state, early_stopping_enabled)
         return self.train_history, self.val_history
 
@@ -144,7 +150,7 @@ class ModelController:
                 self.mean = np.zeros((1, X_val.shape[1]))
                 self.std = np.ones((1, X_val.shape[1])) + 1e-24
 
-    def _run_epoch_training_pass(self, data_provider, active_lr: float) -> float:
+    def _run_epoch_training_pass(self, data_provider, active_lr: float, steps: int) -> float:
         data_provider.reset_epoch()
         batch_losses = []
         
@@ -161,13 +167,16 @@ class ModelController:
                 batch_loss = self.model.compute_total_loss(preds_b, y_b)
                 
             batch_losses.append(batch_loss)
-            
+            self.steps_completed += 1
+            if(self.steps_completed >= steps):
+                self.steps_completed = 0
+                break
         return float(np.mean(batch_losses)) if batch_losses else 0.0
 
-    def _evaluate_epoch_performance(self, epoch: int, total_epochs: int, data_provider, train_loss: float, val_preds: np.ndarray, y_val_target: np.ndarray, 
+    def _evaluate_epoch_performance(self, epoch: int, data_provider, train_loss: float, val_preds: np.ndarray, y_val_target: np.ndarray, 
                                     current_val_loss: float, active_lr: float, is_classification: bool, model_type: ModelType) -> None:
         """Handles diagnostic monitoring steps at specified intervals and calculates dual metrics."""
-        if epoch % 10 == 0 or epoch == total_epochs - 1:
+        if epoch % 10 == 0 or not data_provider.has_more_batches():
             metric_name_step = "Acc" if is_classification else "R²"
             
             # Fetch full training split arrays to monitor training convergence
@@ -190,7 +199,7 @@ class ModelController:
                 val_score = np.mean(np.argmax(val_preds, axis=1) == np.argmax(y_val_target, axis=1)) if is_classification else self.compute_r2_score(y_val_target, val_preds)
 
             logging.info(
-                f"Epoch {epoch:3d}/{total_epochs} | "
+                f"Epoch {epoch:3d} | "
                 f"Train Loss: {train_loss:.4f} | Val Loss: {current_val_loss:.4f} | "
                 f"Train {metric_name_step}: {train_score * 100:.2f}% | " if is_classification else f"Train {metric_name_step}: {train_score:.4f} | "
                 f"Val {metric_name_step}: {val_score * 100:.2f}% | " if is_classification else f"Val {metric_name_step}: {val_score:.4f} | "
