@@ -22,12 +22,14 @@ class IngestionConfig:
     data_file_path: str
     feature_names: List[str]
     splits: SplitConfig
+    ipc_pipe_path: str
     amqp_url: Optional[str] = None
     queue_name: Optional[str] = None
 
 @dataclass(frozen=True)
 class ArchitectureConfig:
     model_type: ModelType      # Enforced Enum Type!
+    num_classes: int
     hidden_layers: List[int]
     p_dropout: float = 0.0
     use_batch_norm: bool = True

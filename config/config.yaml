@@ -25,13 +25,14 @@ ingestion:
     val: 0.15
   amqp_url: "amqp://guest:guest@localhost:5672/%2f"   # Activated
   queue_name: "supply_chain.incoming_batches"         # Activated
-  # shard_dir: "data/samples/shards/supply_chain"       # Added explicit tracking path for your shards
+  ipc_pipe_path: "supply_chain_ipc.pipe"
 
 # =====================================================================
 # NETWORK ARCHITECTURE CONFIGURATION
 # =====================================================================
 architecture:
   model_type: "multi_class"
+  num_classes: 3
   hidden_layers: [128, 64]
   p_dropout: 0.0                       # Dropped to 0 to unlock maximum representation capacity
   use_batch_norm: false                # Disabled: Stop shifting boundaries on crisp tabular formulas
