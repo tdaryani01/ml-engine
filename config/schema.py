@@ -22,6 +22,7 @@ class IngestionConfig:
     data_file_path: str
     feature_names: List[str]
     splits: SplitConfig
+    drain_on_empty: bool
     val_queue_name: str
     amqp_url: Optional[str] = None
     queue_name: Optional[str] = None

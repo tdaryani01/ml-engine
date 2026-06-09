@@ -66,7 +66,8 @@ def execute_training_pipeline():
             batch_size=cfg.optimization.batch_size,
             steps_per_epoch=steps,
             val_split_size=cfg.ingestion.splits.val,
-            num_classes=cfg.architecture.num_classes
+            num_classes=cfg.architecture.num_classes,
+            drain_on_empty = cfg.ingestion.drain_on_empty
         )
     else:
         raise ValueError(f"[Ingestion Error] Unknown source_mode option: '{source_mode}'.")

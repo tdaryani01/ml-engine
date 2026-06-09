@@ -23,6 +23,7 @@ ingestion:
   splits:
     train: 0.70
     val: 0.15
+  drain_on_empty: false
   amqp_url: "amqp://guest:guest@localhost:5672/%2f"   # Activated
   queue_name: "supply_chain.incoming_batches"         # Activated
   val_queue_name: "supply_chain.validation_batches"

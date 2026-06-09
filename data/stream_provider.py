@@ -8,7 +8,11 @@ from data.base_provider import BaseDataProvider
 from config.constants import DataKeys
 
 class StreamDataProvider(BaseDataProvider):
-    def __init__(self, amqp_url: str, queue_name: str, val_queue_name: str, feature_names: List[str], batch_size: int, steps_per_epoch: int = 100, val_split_size: int = 100, num_classes: int = 3):
+    def __init__(self, amqp_url: str, queue_name: str, val_queue_name: str, 
+                 feature_names: List[str], batch_size: int, steps_per_epoch: int = 100, 
+                 val_split_size: int = 100, num_classes: int = 3, 
+                 drain_on_empty: bool = False): # 🚨 Added explicit configuration rule toggle
+        
         self.amqp_url = amqp_url
         self.queue_name = queue_name
         self.val_queue_name = val_queue_name  
@@ -17,6 +21,7 @@ class StreamDataProvider(BaseDataProvider):
         self.steps_per_epoch = steps_per_epoch
         self.val_split_size = val_split_size
         self.num_classes = num_classes
+        self.drain_on_empty = drain_on_empty # 🚨 Hydrated state tracker
         
         self._connection = None
         self._channel = None
@@ -48,7 +53,6 @@ class StreamDataProvider(BaseDataProvider):
             self._connection = pika.BlockingConnection(params)
             self._channel = self._connection.channel()
             
-            # Declare both queues to ensure they exist safely
             self._channel.queue_declare(queue=self.queue_name, durable=True)
             self._channel.queue_declare(queue=self.val_queue_name, durable=True)
             
@@ -58,13 +62,11 @@ class StreamDataProvider(BaseDataProvider):
             raise
 
     def update_running_statistics(self, X_batch: np.ndarray) -> None:
-        """Implements parallel Welford algorithm to update rolling parameters matrix metrics incrementally."""
         batch_count = X_batch.shape[0]
         if batch_count == 0:
             return
             
         self.total_count += batch_count
-        
         delta_old = X_batch - self.mean
         self.mean += np.sum(delta_old, axis=0) / self.total_count
         
@@ -75,7 +77,6 @@ class StreamDataProvider(BaseDataProvider):
         self.std = np.sqrt(variance) + 1e-24
 
     def normalize(self, data_matrix: np.ndarray) -> np.ndarray:
-        """Uniform API standard called by the Model Controller engine."""
         return (data_matrix - self.mean) / self.std
 
     def _to_one_hot(self, labels: np.ndarray) -> np.ndarray:
@@ -89,22 +90,32 @@ class StreamDataProvider(BaseDataProvider):
         return self._epoch_open
 
     def next_batch(self) -> Tuple[np.ndarray, np.ndarray]:
-        # 1. Strict Boundary Check: If we have served the true data limit for this epoch, stop immediately.
         if self._batches_served_this_epoch >= self.steps_per_epoch or not self._epoch_open:
             self._epoch_open = False
             return np.array([]), np.array([])
 
-        # 2. Force a True Blocking Wait until we have enough rows for a legitimate batch
+        dry_polls_counter = 0
+        max_dry_polls_before_drain = 20  
+        
         while len(self._X_train_buffer) < self.batch_size:
             method_frame, properties, body = self._channel.basic_get(queue=self.queue_name, auto_ack=True)
             
             if method_frame is None:
-                # 🚨 CORRECT BEHAVIOR: The queue is temporarily dry. 
-                # Freeze execution and wait for amqp_sender to deliver the next shard.
-                # Absolutely do not fall through or return empty data to the engine.
+                # 🚨 CONFIGURABLE DECISION NODE:
+                # If drain_on_empty is enabled, allow the tracking loop to drop out after a dry timeout window.
+                if self.drain_on_empty and len(self._X_train_buffer) > 0:
+                    dry_polls_counter += 1
+                    if dry_polls_counter >= max_dry_polls_before_drain:
+                        logging.warning(f"[Stream Provider] Stream dry condition triggered. Draining partial batch.")
+                        break
+                
+                # If drain_on_empty is FALSE (Production Mode), reset counters and block indefinitely
+                dry_polls_counter = 0
                 time.sleep(0.05)  
                 continue
 
+            dry_polls_counter = 0
+            
             shape_str = properties.headers.get("shape", "")
             shard_shape = tuple(map(int, shape_str.split(",")))
             shard_matrix = np.frombuffer(body, dtype=np.float32).reshape(shard_shape)
@@ -112,7 +123,6 @@ class StreamDataProvider(BaseDataProvider):
             X_shard = shard_matrix[:, :-1]
             y_shard = self._to_one_hot(shard_matrix[:, -1:])
 
-            # Maintain your exact logic for filling validation/training buffers
             current_val_count = len(self.splits[DataKeys.X_VAL])
             if current_val_count < self.val_split_size:
                 needed_rows = self.val_split_size - current_val_count
@@ -127,12 +137,19 @@ class StreamDataProvider(BaseDataProvider):
                 self._X_train_buffer = np.vstack([self._X_train_buffer, X_shard])
                 self._y_train_buffer = np.vstack([self._y_train_buffer, y_shard])
 
-        # 3. Slice a clean, full batch of real data
-        X_batch = self._X_train_buffer[:self.batch_size]
-        y_batch = self._y_train_buffer[:self.batch_size]
+        # 3. Dynamic Slicing Engine Evaluator
+        current_available_rows = len(self._X_train_buffer)
+        if current_available_rows == 0:
+            self._epoch_open = False
+            return np.array([]), np.array([])
+            
+        current_slice_size = min(self.batch_size, current_available_rows)
 
-        self._X_train_buffer = self._X_train_buffer[self.batch_size:]
-        self._y_train_buffer = self._y_train_buffer[self.batch_size:]
+        X_batch = self._X_train_buffer[:current_slice_size]
+        y_batch = self._y_train_buffer[:current_slice_size]
+
+        self._X_train_buffer = self._X_train_buffer[current_slice_size:]
+        self._y_train_buffer = self._y_train_buffer[current_slice_size:]
 
         self.update_running_statistics(X_batch)
 
@@ -140,14 +157,20 @@ class StreamDataProvider(BaseDataProvider):
             self.splits[DataKeys.X_TRAIN] = np.vstack([self.splits[DataKeys.X_TRAIN], X_batch])
             self.y_train_processed = np.vstack([self.y_train_processed, y_batch])
         else:
-            self.splits[DataKeys.X_TRAIN] = np.vstack([self.splits[DataKeys.X_TRAIN][self.batch_size:], X_batch])
-            self.y_train_processed = np.vstack([self.y_train_processed[self.batch_size:], y_batch])
+            self.splits[DataKeys.X_TRAIN] = np.vstack([self.splits[DataKeys.X_TRAIN][current_slice_size:], X_batch])
+            self.y_train_processed = np.vstack([self.y_train_processed[current_slice_size:], y_batch])
         
         self._batches_served_this_epoch += 1
+        
+        # Shutdown epoch marker if a partial batch had to be squeezed out
+        if current_slice_size < self.batch_size:
+            self._epoch_open = False
+            
         return X_batch, y_batch
+
     def get_validation_set(self) -> Tuple[np.ndarray, np.ndarray]:
         if len(self.splits[DataKeys.X_VAL]) < self.val_split_size:
-            logging.info(f"[Stream Provider] Seeding validation split array ({self.val_split_size} rows) from validation wire frames...")
+            logging.info(f"[Stream Provider] Seeding validation split array ({self.val_split_size} rows)...")
             
             while len(self.splits[DataKeys.X_VAL]) < self.val_split_size:
                 method_frame, properties, body = self._channel.basic_get(queue=self.val_queue_name, auto_ack=True)
@@ -188,11 +211,7 @@ class StreamDataProvider(BaseDataProvider):
     def reset_epoch(self) -> None:
         self._batches_served_this_epoch = 0
         self._epoch_open = True
-        
-        # 🚨 FIX: Clear old memory arrays on epoch rollover so we don't bleed stale 
-        # shard residue into the next optimization generation loop.
         self._X_train_buffer = np.zeros((0, len(self.feature_names)), dtype=np.float32)
         self._y_train_buffer = np.zeros((0, self.num_classes), dtype=np.float32)
-        
         self.splits[DataKeys.X_TRAIN] = np.zeros((0, len(self.feature_names)), dtype=np.float32)
         self.y_train_processed = np.zeros((0, self.num_classes), dtype=np.float32)
