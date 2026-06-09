@@ -20,22 +20,18 @@ class NeuralNetworkDiagnostics:
         # 1. Enforce output target directory creation boundaries
         os.makedirs(meta_cfg.output_dir, exist_ok=True)
         
-        # 2. Extract out-of-sample arrays and state structures cleanly from our providers
+        # 2. Extract out-of-sample arrays cleanly from our providers (using RAW data)
         X_test_raw, y_test = data_provider.get_validation_set()
         feature_names = cfg.ingestion.feature_names
-        
-        # 🚨 Fixed: Pull normalization bounds directly from the data_provider strategy layer
-        mean = data_provider.mean
-        std = data_provider.std
         
         # Pull parameters dynamically from configuration hooks
         selection = str(diag_cfg.metric_to_plot).strip().lower()
 
         # =====================================================================
-        # DYNAMIC RECONSTRUCTION: Scale raw coordinates to match statistics
+        # DYNAMIC RECONSTRUCTION: Handle Fourier expansions if enabled
         # =====================================================================
-        # Look up transformations using our strict transformations config sub-schema
         fourier_cfg = cfg.transformations.fourier_expansion
+        mean = data_provider.mean
         
         if fourier_cfg.enabled and X_test_raw.shape[1] < mean.shape[0]:
             num_freqs = fourier_cfg.num_frequencies
@@ -48,17 +44,23 @@ class NeuralNetworkDiagnostics:
         else:
             X_processing = X_test_raw
 
-        # 🚨 Fixed: Use the data_provider's uniform normalization function to process inputs cleanly
-        X_test_norm = data_provider.normalize(X_processing)
-
-        # Calculate and print raw accuracy metrics for classification tasks (forcing inference mode)
-        raw_preds = controller.model.forward(X_test_norm, training=False)
-        if len(raw_preds.shape) > 1 and raw_preds.shape[1] > 1:
+        # 🚨 FIXED: Route raw values directly through the clean controller.predict() framework
+        raw_preds = controller.predict(X_processing)
+        
+        # 🚨 FIXED: Collapse probabilities (450, 3) down to class indices (450,) via argmax to prevent ValueError broadcast crashes
+        if raw_preds.ndim > 1 and raw_preds.shape[1] > 1:
             pred_classes = np.argmax(raw_preds, axis=1)
+        else:
+            pred_classes = raw_preds.ravel()
+        
+        # Pull topology boundaries using the correct property name 'layer_sizes'
+        num_classes = controller.model.layer_sizes[-1]
+
+        if num_classes > 1:
             true_classes = np.argmax(y_test, axis=1) if len(y_test.shape) > 1 and y_test.shape[1] > 1 else y_test.ravel().astype(int)
             accuracy = np.mean(pred_classes == true_classes) * 100
             logging.info(f"[Diagnostics Check] Out-of-Sample Final Verification Accuracy: {accuracy:.2f}%")
-            NeuralNetworkDiagnostics.plot_confusion_matrix(true_classes, pred_classes, raw_preds.shape[1], meta_cfg.output_dir, diag_cfg)
+            NeuralNetworkDiagnostics.plot_confusion_matrix(true_classes, pred_classes, num_classes, meta_cfg.output_dir, diag_cfg)
 
         # 3. Route to configured figure metrics
         if selection in ['1', 'loss', 'all']:
@@ -68,6 +70,8 @@ class NeuralNetworkDiagnostics:
         if selection in ['3', 'efficiency', 'all']:
             NeuralNetworkDiagnostics.plot_metric_3_efficiency(controller.train_history, meta_cfg.output_dir, diag_cfg)
         if selection in ['4', 'space', 'all']:
+            
+            # Re-architect closure logic to use your clean controller layer
             def predict_unscaled(X_raw_input):
                 if fourier_cfg.enabled and X_raw_input.shape[1] < mean.shape[0]:
                     num_freqs = fourier_cfg.num_frequencies
@@ -80,9 +84,8 @@ class NeuralNetworkDiagnostics:
                 else:
                     X_eval_processing = X_raw_input
 
-                # 🚨 Fixed: Map closures securely via the data_provider API wrapper
-                X_input_norm = data_provider.normalize(X_eval_processing)
-                return controller.model.forward(X_input_norm, training=False)
+                # Returns clean class predictions or distributions seamlessly via the gateway
+                return controller.predict(X_eval_processing)
 
             NeuralNetworkDiagnostics.plot_metric_4_space(X_test_raw, y_test, feature_names, predict_unscaled, meta_cfg.output_dir, diag_cfg)
 
@@ -157,7 +160,11 @@ class NeuralNetworkDiagnostics:
             x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
             xx = np.linspace(x_min, x_max, 500).reshape(-1, 1)
             raw_preds = predict_fn(xx)
-            plt.plot(xx, raw_preds, color="#ff7f0e", linewidth=2.5, label="Model Prediction")
+            if raw_preds.ndim > 1 and raw_preds.shape[1] > 1:
+                classes = np.argmax(raw_preds, axis=1)
+            else:
+                classes = raw_preds.ravel()
+            plt.plot(xx, classes, color="#ff7f0e", linewidth=2.5, label="Model Prediction")
             plt.scatter(X[:, 0], y.ravel(), color="#1f77b4", alpha=0.6, edgecolor="k", label="Actual Data")
             plt.xlabel(features[0])
             plt.ylabel("Target Value")
@@ -173,19 +180,19 @@ class NeuralNetworkDiagnostics:
             
             y_eval_flat = np.argmax(y, axis=1) if len(y.shape) > 1 and y.shape[1] > 1 else y.ravel()
             
-            if len(raw_preds.shape) > 1 and raw_preds.shape[1] > 1:
+            if raw_preds.ndim > 1 and raw_preds.shape[1] > 1:
                 zz = np.argmax(raw_preds, axis=1).reshape(xx.shape)
                 num_classes = raw_preds.shape[1]
                 levels = np.arange(-0.5, num_classes + 0.5, 1)
                 cmap_to_use = "Set1"
             else:
                 zz = raw_preds.reshape(xx.shape)
-                num_classes = 1
+                num_classes = len(np.unique(y_eval_flat))
                 levels = 50
                 cmap_to_use = "coolwarm"
             
             contour = plt.contourf(xx, yy, zz, levels=levels, cmap=cmap_to_use, alpha=0.6)
-            if num_classes > 1:
+            if num_classes > 1 and raw_preds.ndim > 1 and raw_preds.shape[1] > 1:
                 cbar = plt.colorbar(contour, ticks=list(range(num_classes)))
                 cbar.set_label("Assigned Class Category", rotation=270, labelpad=15, fontweight="bold")
                 cbar.ax.set_yticklabels([f'Class {i}' for i in range(num_classes)])
@@ -203,14 +210,14 @@ class NeuralNetworkDiagnostics:
             raw_preds = predict_fn(X)
             y_eval_flat = np.argmax(y, axis=1) if len(y.shape) > 1 and y.shape[1] > 1 else y.ravel()
             
-            if len(raw_preds.shape) > 1 and raw_preds.shape[1] > 1:
+            if raw_preds.ndim > 1 and raw_preds.shape[1] > 1:
                 display_values = np.argmax(raw_preds, axis=1)
                 cmap_to_use = "Set1"
             else:
                 display_values = raw_preds.ravel()
                 cmap_to_use = "coolwarm"
                 
-            sc = ax.scatter(X[:, 0], X[:, 1], X[:, 2], c=display_values, cmap=cmap_to_use, edgecolor='k', s=40, alpha=0.8)
+            sc = ax.scatter(X[:, 0], X[:, 1], X[:, 2], c=display_values.ravel(), cmap=cmap_to_use, edgecolor='k', s=40, alpha=0.8)
             ax.set_xlabel(features[0])
             ax.set_ylabel(features[1])
             ax.set_zlabel(features[2] if len(features) > 2 else "Feature 3")
@@ -222,7 +229,7 @@ class NeuralNetworkDiagnostics:
             raw_preds = predict_fn(X)
             y_eval_flat = np.argmax(y, axis=1) if len(y.shape) > 1 and y.shape[1] > 1 else y.ravel()
             
-            if len(raw_preds.shape) > 1 and raw_preds.shape[1] > 1:
+            if raw_preds.ndim > 1 and raw_preds.shape[1] > 1:
                 display_preds = np.argmax(raw_preds, axis=1)
                 plt.scatter(range(len(y_eval_flat)), y_eval_flat, color="#2ca02c", alpha=0.6, label="True Categorical Labels", marker="o")
                 plt.scatter(range(len(display_preds)), display_preds, color="#d62728", alpha=0.6, label="Predicted Class Matrix", marker="x")

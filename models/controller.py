@@ -13,6 +13,7 @@ class ModelController:
                  scheduler_drop_ratio: float = 0.5, scheduler_epochs_per_drop: int = 20):
         self.initial_lr = learning_rate
         self.model = None
+        self.data_provider = None  # 🚨 Added to hold the active data scaling instance reference
         self.train_history = []
         self.val_history = []
         self.steps_completed = 0
@@ -48,6 +49,7 @@ class ModelController:
                                         optimizer_name: str, lam_l1: float, lam_l2: float, 
                                         p_dropout: float = 0.0, use_batch_norm: bool = True, 
                                         bn_momentum: float = 0.9, max_norm: float = 5.0) -> None:
+        self.data_provider = data_provider  # 🚨 Retain baseline provider reference maps
         X_val, y_val = data_provider.get_validation_set()
         input_dim = X_val.shape[1]
         
@@ -81,19 +83,30 @@ class ModelController:
             return True
         return False
 
+    def predict(self, raw_data_matrix: np.ndarray) -> np.ndarray:
+        """
+        🚨 REFACTORED CENTRAL GATEWAY: Orchestrates the data normalization pass internally 
+        before executing predictions down against the protected base model contract layers.
+        """
+        if self.model is None:
+            raise ValueError("[Model Controller] Cannot run prediction before model is fitted or loaded.")
+        
+        # Fall back gracefully to raw data matrix if no scaling provider instance is mapped yet
+        if self.data_provider is not None:
+            raw_data_matrix = self.data_provider.normalize(raw_data_matrix)
+            
+        return self.model.predict(raw_data_matrix)
+
     def fit(self, data_provider, steps: int, source_mode, model_type: ModelType,
-                         early_stopping_enabled: bool = True, patience: int = 15, min_delta: float = 1e-5) -> tuple:
+            early_stopping_enabled: bool = True, patience: int = 15, min_delta: float = 1e-5) -> tuple:
         if self.model is None:
             raise ValueError("[Model Controller] Execution Error: Cannot call fit before initializing the network.")
 
+        self.data_provider = data_provider  # Bind provider instance reference
         epoch = 0
         is_classification = model_type in (ModelType.BINARY_CLASSIFICATION, ModelType.MULTI_CLASS)
         
-        # Ingest validation sets from our data strategy provider
         X_val, y_val_target = data_provider.get_validation_set()
-        
-        # 🚨 Changed: Routing standardization call straight to the provider's native normalization layer
-        X_val_norm = data_provider.normalize(X_val)
         
         if steps <= 0:
             logging.info("[Model Controller] Steps count set to 0. Skipping training execution loops.")
@@ -114,9 +127,8 @@ class ModelController:
                 break
             self.train_history.append(epoch_train_loss)
             
-            # Re-normalize validation window space to ensure it adapts to rolling streaming bounds
-            X_val_norm = data_provider.normalize(X_val)
-            val_preds = self.model.forward(X_val_norm, training=False)
+            # 🚨 CLEANED: Replaced legacy provider.normalize manually managed code blocks with central predict wrapper 
+            val_preds = self.predict(X_val)
             current_val_loss = self.model.compute_total_loss(val_preds, y_val_target)
             current_val_raw_cost = self.model.calculate_raw_cost(val_preds, y_val_target)
             
@@ -130,7 +142,7 @@ class ModelController:
                     break
             epoch += 1
 
-        self._generate_final_summary_report(data_provider, X_val_norm, y_val_target, source_mode, is_classification, model_type, es_state, early_stopping_enabled)
+        self._generate_final_summary_report(data_provider, X_val, y_val_target, source_mode, is_classification, model_type, es_state, early_stopping_enabled)
         return self.train_history, self.val_history
 
     def _run_epoch_training_pass(self, data_provider, active_lr: float, steps: int) -> float:
@@ -142,12 +154,13 @@ class ModelController:
             if X_b.size == 0:
                 break
             
-            # 🚨 Changed: Delegate normalization straight to provider
+            # NOTE: Backward matrix updates fundamentally require the exact normalized array values used to compile the gradients.
             X_b_norm = data_provider.normalize(X_b)
             batch_loss = self.model.backward(X_b_norm, y_b, active_lr=active_lr)
             
             if batch_loss is None:
-                preds_b = self.model.forward(X_b_norm, training=False)
+                # 🚨 CLEANED: Evaluates predictions cleanly via internal wrapper boundary
+                preds_b = self.model.predict(X_b_norm)
                 batch_loss = self.model.compute_total_loss(preds_b, y_b)
                 
             batch_losses.append(batch_loss)
@@ -164,9 +177,8 @@ class ModelController:
             
             if hasattr(data_provider, "splits") and DataKeys.X_TRAIN in data_provider.splits:
                 X_train = data_provider.splits[DataKeys.X_TRAIN]
-                # 🚨 Changed: Delegate normalization straight to provider
-                X_train_norm = data_provider.normalize(X_train)
-                train_preds = self.model.forward(X_train_norm, training=False)
+                # 🚨 CLEANED: Invoking self.predict(X_train) safely strips out redundancy 
+                train_preds = self.predict(X_train)
                 y_train_target = data_provider.y_train_processed
                 
                 if is_classification:
@@ -204,16 +216,15 @@ class ModelController:
                 return True
         return False
 
-    def _generate_final_summary_report(self, data_provider, X_val_norm: np.ndarray, y_val_target: np.ndarray, source_mode, 
+    def _generate_final_summary_report(self, data_provider, X_val_raw: np.ndarray, y_val_target: np.ndarray, source_mode, 
                                        is_classification: bool, model_type: ModelType, es_state: dict, es_enabled: bool) -> None:
-        final_val_preds = self.model.forward(X_val_norm, training=False)
+        # 🚨 CLEANED: Route raw matrices through our clean controller prediction loop boundary
+        final_val_preds = self.predict(X_val_raw)
         val_loss = self.val_history[-1] if self.val_history else float('inf')
         
         if hasattr(data_provider, "splits") and DataKeys.X_TRAIN in data_provider.splits:
             X_train = data_provider.splits[DataKeys.X_TRAIN]
-            # 🚨 Changed: Delegate normalization straight to provider
-            X_train_norm = data_provider.normalize(X_train)
-            final_train_preds = self.model.forward(X_train_norm, training=False)
+            final_train_preds = self.predict(X_train)
             y_train_target = data_provider.y_train_processed
             
             train_acc = np.mean(np.argmax(final_train_preds, axis=1) == np.argmax(y_train_target, axis=1))
@@ -278,12 +289,6 @@ class ModelController:
     def serialize_current_state(self, target_asset_path: str, serialized_config_dict: dict) -> None:
         logging.info(f"[Model Controller] Executing state preservation write out to: {target_asset_path}")
         ModelSerializer.save_model(self.model, serialized_config_dict, file_path=target_asset_path)
-
-    def predict(self, raw_data_matrix: np.ndarray) -> np.ndarray:
-        if self.model is None:
-            raise ValueError("[Model Controller] Cannot run prediction before model is fitted or loaded.")
-        # Predictions bypass internal namespaces, relying on direct model execution
-        return self.model.predict(raw_data_matrix)
 
     def compute_r2_score(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
         y_true_flat = y_true.ravel()

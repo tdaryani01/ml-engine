@@ -28,14 +28,10 @@ class BaseNeuralNetwork(ABC):
         
         for i in range(len(layer_sizes) - 1):
             input_dim, output_dim = layer_sizes[i], layer_sizes[i+1]
-            # scale = np.sqrt(2.0 / input_dim)
-            scale = np.sqrt(2.0 / (input_dim))
-            # self.weights.append(np.random.randn(input_dim, output_dim) * scale)
             limit = np.sqrt(6.0 / (input_dim + output_dim))
             self.weights.append(np.random.uniform(-limit, limit, (input_dim, output_dim)))
             self.biases.append(np.zeros((1, output_dim)))
             
-            # Conditionally populate BN properties based on config flag
             if self.use_batch_norm and (i < len(layer_sizes) - 2):
                 self.gammas.append(np.random.uniform(0.8, 1.2, size=(1, output_dim)))
                 self.betas.append(np.random.uniform(-0.1, 0.1, size=(1, output_dim)))
@@ -60,7 +56,6 @@ class BaseNeuralNetwork(ABC):
             mean = np.mean(z, axis=0, keepdims=True)
             var = np.var(z, axis=0, keepdims=True)
             
-            # Debug pre-normalized input variance anomalies
             logging.debug(f"[BN Layer {layer_idx}] PRE-NORM - z shape: {z.shape} | mean global: {np.mean(mean):.4f} | var global: {np.mean(var):.4f}")
             if np.any(var < 1e-8):
                 logging.debug(f"[BN Layer {layer_idx}] WARNING: Near-zero variance detected in raw activations! Minimum variance column: {np.min(var):.4e}")
@@ -75,7 +70,6 @@ class BaseNeuralNetwork(ABC):
             self.batch_vars.append(var)
             self.z_hats.append(z_hat)
             
-            # Track if gammas/betas are blowing up or collapsing
             logging.debug(f"[BN Layer {layer_idx}] POST-NORM - z_bn mean: {np.mean(z_bn):.4f} | z_bn var: {np.var(z_bn):.4f}")
             logging.debug(f"[BN Layer {layer_idx}] PARAM METRICS - gammas range: [{np.min(self.gammas[layer_idx]):.4f}, {np.max(self.gammas[layer_idx]):.4f}] | betas range: [{np.min(self.betas[layer_idx]):.4f}, {np.max(self.betas[layer_idx]):.4f}]")
             
@@ -85,13 +79,11 @@ class BaseNeuralNetwork(ABC):
             z_hat = (z - self.running_means[layer_idx]) / np.sqrt(self.running_vars[layer_idx] + self.eps)
             z_bn = self.gammas[layer_idx] * z_hat + self.betas[layer_idx]
             
-            # Monitor inference path scaling mismatch
             logging.debug(f"[BN Layer {layer_idx}] INFERENCE EVAL - running_mean global: {np.mean(self.running_means[layer_idx]):.4f} | running_var global: {np.mean(self.running_vars[layer_idx]):.4f}")
 
         return z_bn
 
     def _bn_backward(self, delta, layer_idx, m):
-        """Computes balanced backpropagation gradients mapped to engine-scaled delta states."""
         z_hat = self.z_hats[layer_idx]
         var = self.batch_vars[layer_idx]
         
@@ -124,7 +116,6 @@ class BaseNeuralNetwork(ABC):
         current_act = X
         num_hidden_layers = len(self.weights) - 1
         
-        # --- ENGINE TRACE: CAPTURE MATRIX ENTRANCE PROFILE ---
         if self.diagnostic_counter < 1:
             logging.info(f"[ENGINE TRACE] Hidden Input Shape: {X.shape} | Max: {np.max(X):.4f} | Min: {np.min(X):.4f} | Mean: {np.mean(X):.4f}")
         
@@ -140,7 +131,6 @@ class BaseNeuralNetwork(ABC):
             
             current_act = self.leaky_relu(z_layer)
             
-            # --- ENGINE TRACE: HIDDEN ACTIVATION SATURATION ---
             if self.diagnostic_counter < 1:
                 logging.info(f"[ENGINE TRACE] Layer {i} Pre-Activation (z) -> Max: {np.max(z):.4f} | Min: {np.min(z):.4f} | Mean: {np.mean(z):.4f}")
                 logging.info(f"[ENGINE TRACE] Layer {i} Post-Activation (a) -> Max: {np.max(current_act):.4f} | Min: {np.min(current_act):.4f} | Mean: {np.mean(current_act):.4f}")
@@ -158,11 +148,14 @@ class BaseNeuralNetwork(ABC):
         self.zs.append(z_out)
         return z_out
 
-    def forward(self, X, training=True):
+    def _forward(self, X, training=True):
+        """
+        PROTECTED INTERNAL METHOD: Sweeps through topological network states,
+        calculating forward evaluation sequences. Replaces legacy exposed forward path.
+        """
         z_out = self.forward_hidden(X, training=training)
         output = self.apply_output_activation(z_out)
         
-        # --- ENGINE TRACE: OUTPUT HEAD COMPOSITION ---
         if self.diagnostic_counter < 1:
             logging.info(f"[ENGINE TRACE] Final Out Pre-Activation (z_out) Shape: {z_out.shape} | Max: {np.max(z_out):.4f} | Min: {np.min(z_out):.4f}")
             logging.info(f"[ENGINE TRACE] Final Out Activation Layer (output) Shape: {output.shape} | Max: {np.max(output):.4f} | Min: {np.min(output):.4f} | Mean: {np.mean(output):.4f}")
@@ -194,7 +187,6 @@ class BaseNeuralNetwork(ABC):
         grad_gammas = [None] * (num_layers - 1)
         grad_betas = [None] * (num_layers - 1)
         
-        # Explicitly clear activation memory arrays before building mini-batch states
         self.zs = []            
         self.z_bns = []         
         self.z_hats = []        
@@ -203,46 +195,33 @@ class BaseNeuralNetwork(ABC):
         self.activations = [X]
         self.masks = []
         
-        # Compute forward pass explicitly for THIS specific mini-batch
-        output = self.forward(X, training=True)
+        output = self._forward(X, training=True)
         delta = self.compute_output_delta(output, y)
         
-        # Step backward through the network layers
         for i in reversed(range(num_layers)):
-            # 1. Compute gradients for the weights and biases of the current layer
             grad_weights[i] = np.dot(self.activations[i].T, delta) / m
             grad_biases[i] = np.sum(delta, axis=0, keepdims=True) / m
             
             if i > 0:
-                # 2. Backpropagate delta through the weights to the layer below (i-1)
                 delta = np.dot(delta, self.weights[i].T)
                 
-                # 3. Apply the activation derivative belonging strictly to layer i-1
                 activation_z = self.z_bns[i-1] if self.use_batch_norm else self.zs[i-1]
                 delta = delta * self.leaky_relu_der(activation_z)
                 
                 if self.masks[i-1] is not None:
                     delta = delta * self.masks[i-1]
                 
-                # 4. FIX: Apply BN backward using the exact index matching the layer (i-1)
-                # Ensure the layer index actually possesses BN parameters (excluding output head)
                 if self.use_batch_norm and (i - 1 < len(self.gammas)):
-                    # Pass the correctly matched layer index (i-1)
                     delta, dgamma, dbeta = self._bn_backward(delta, layer_idx=i-1, m=m)
                     grad_gammas[i-1] = dgamma
                     grad_betas[i-1] = dbeta
                 
-        # Apply L1 weight regularization adjustments
         for i in range(num_layers):
             grad_weights[i] += (self.lam_l1 / m) * np.sign(self.weights[i])
 
-        # =====================================================================
-        # 🛡️ DEFENSIVE ENGINEERING: GLOBAL GRADIENT CLIPPING
-        # =====================================================================
-        # Calculate the square of the L2 norm across all weight gradients combined
         total_norm = np.sqrt(sum(np.sum(gw**2) for gw in grad_weights))
         
-        if total_norm > self.max_norm:  # <-- Changed from max_norm to self.max_norm
+        if total_norm > self.max_norm:  
             scaling_factor = self.max_norm / (total_norm + 1e-15)
             logging.debug(f"[Backward Stability] Exploding gradient threat detected! Total Norm: {total_norm:.4f} | Scaling down by factor: {scaling_factor:.4f}")
             for i in range(num_layers):
@@ -250,7 +229,6 @@ class BaseNeuralNetwork(ABC):
                 if grad_biases[i] is not None:
                     grad_biases[i] *= scaling_factor
 
-        # Ship aligned gradients to your Adam optimizer instance
         self.optimizer.update(
             weights=self.weights, biases=self.biases,
             grad_weights=grad_weights, grad_biases=grad_biases,
@@ -263,5 +241,13 @@ class BaseNeuralNetwork(ABC):
         
         self.diagnostic_counter += 1
         
-    def predict(self, raw_data, mean, std):
-        return self.forward((raw_data - mean) / std, training=False)
+    def predict(self, processed_data: np.ndarray) -> np.ndarray:
+        """
+        UNIVERSAL CONTRACT METHOD: Encapsulates inference execution logic securely.
+        Assumes data is already scaled/normalized before reaching the network.
+        """
+        # 🚨 Self-defense shape check lives here permanently
+        if processed_data.ndim == 1:
+            processed_data = processed_data.reshape(1, -1)
+            
+        return self._forward(processed_data, training=False)

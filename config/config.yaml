@@ -12,7 +12,7 @@ meta:
 # DATA INGESTION MATRIX
 # =====================================================================
 ingestion:
-  source_mode: "stream"                # Changed from "csv" to activate AMQP streaming
+  source_mode: "csv"                # Changed from "csv" to activate AMQP streaming
   data_file_path: ".\\data\\samples\\csv\\supply_chain.csv"
   feature_names:
     - "Supplier_Lead_Time"
