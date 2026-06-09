@@ -25,7 +25,7 @@ ingestion:
     val: 0.15
   amqp_url: "amqp://guest:guest@localhost:5672/%2f"   # Activated
   queue_name: "supply_chain.incoming_batches"         # Activated
-  ipc_pipe_path: "supply_chain_ipc.pipe"
+  val_queue_name: "supply_chain.validation_batches"
 
 # =====================================================================
 # NETWORK ARCHITECTURE CONFIGURATION
@@ -44,7 +44,7 @@ architecture:
 optimization:
   optimizer: "adam"
   epochs_full_dataset: 500
-  steps_streaming: 50
+  steps_streaming: 31
   batch_size: 64
   learning_rate: 0.0001                # Reset to standard 0.001 for stable convergence if needed
   

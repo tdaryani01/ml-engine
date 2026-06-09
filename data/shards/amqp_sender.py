@@ -4,72 +4,88 @@ import time
 import logging
 import pika
 import numpy as np
-import random  # 🚨 Added for in-place list shuffling
+import random
 
-def stream_shards_to_queue(shard_dir: str, queue_name: str, amqp_url: str, epochs: int = 1) -> None:
+def stream_shards_to_queue(shard_dir: str, queue_name: str, val_queue_name: str, amqp_url: str, epochs: int = 1) -> None:
     """
-    Scans directory for .npy shards, serializes matrices to raw bytes,
-    and publishes them directly into the AMQP broker queue, shuffling shard order
-    at the start of every epoch loop to break temporal dependencies.
+    Scans directory for prefixed .npy shards and routes them to independent queues:
+    - Files starting with 'val_' go to the validation queue (sent once on Epoch 0).
+    - Files starting with 'train_' go to the training queue (shuffled and sent every epoch).
     """
-    # 1. Gather and sort target binary shard frames sequentially initially
     if not os.path.exists(shard_dir):
         raise FileNotFoundError(f"Target shard index path missing: {shard_dir}")
         
-    base_shard_files = sorted([f for f in os.listdir(shard_dir) if f.endswith(".npy")])
-    if not base_shard_files:
-        logging.warning(f"No binary primitive .npy files detected in {shard_dir}")
+    all_files = os.listdir(shard_dir)
+    
+    # 1. Separate files based on the prefix created by shard_creator.py
+    train_shards = sorted([f for f in all_files if f.startswith("train_") and f.endswith(".npy")])
+    val_shards = sorted([f for f in all_files if f.startswith("val_") and f.endswith(".npy")])
+    
+    if not train_shards and not val_shards:
+        logging.warning(f"No prefixed binary primitive .npy files detected in {shard_dir}")
         return
 
+    logging.info(f"Detected {len(train_shards)} training shards and {len(val_shards)} validation shards.")
     logging.info(f"Connecting to AMQP Broker: {amqp_url}")
     
-    # 2. Establish connection topology boundaries
     params = pika.URLParameters(amqp_url)
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
     
-    # Ensure queue exists and is durable
+    # Declare both queues to make sure they exist securely on the broker
     channel.queue_declare(queue=queue_name, durable=True)
-    
-    logging.info(f"Target egress channel locked. Sending {len(base_shard_files)} shards per epoch across {epochs} epochs to queue: '{queue_name}'")
+    channel.queue_declare(queue=val_queue_name, durable=True)
 
     try:
         # Outer Epoch Loop Sequence
         for current_epoch in range(epochs):
-            logging.info(f"=== Commencing Streaming Epoch {current_epoch + 1}/{epochs} ===")
+            logging.info(f"\n=== Commencing Streaming Epoch {current_epoch + 1}/{epochs} ===")
             
-            # 🚨 Create a fresh copy and shuffle the files for the current epoch pass
-            epoch_shard_files = base_shard_files.copy()
-            random.shuffle(epoch_shard_files)
-            logging.info(f"[Egress Stream] Shuffled {len(epoch_shard_files)} shards for epoch optimization pass.")
+            # 🚨 STEP 1: Process Validation Shards ONLY on the very first epoch pass
+            if current_epoch == 0:
+                if val_shards:
+                    logging.info(f"[Validation Egress] Seeding validation channel with {len(val_shards)} prefixed shards...")
+                    for filename in val_shards:
+                        file_path = os.path.join(shard_dir, filename)
+                        matrix_payload = np.load(file_path)
+                        byte_stream = matrix_payload.tobytes()
+                        shape_string = ",".join(map(str, matrix_payload.shape))
+                        
+                        properties = pika.BasicProperties(
+                            delivery_mode=2,  # Persistent message storage
+                            headers={"shape": shape_string, "shard_index": "val", "epoch": current_epoch}
+                        )
+                        channel.basic_publish(exchange="", routing_key=val_queue_name, body=byte_stream, properties=properties)
+                        logging.info(f"[Validation Egress] Pushed {filename} to queue: '{val_queue_name}'")
+                else:
+                    logging.warning("[Validation Egress] No files starting with 'val_' were found to seed the validation queue.")
+
+            # 🚨 STEP 2: Shuffle and stream the dedicated training shards for this epoch pass
+            epoch_train_files = train_shards.copy()
+            random.shuffle(epoch_train_files)
+            logging.info(f"[Training Egress] Shuffled {len(epoch_train_files)} files for epoch optimization pass.")
             
-            for idx, filename in enumerate(epoch_shard_files):
+            for idx, filename in enumerate(epoch_train_files):
                 file_path = os.path.join(shard_dir, filename)
-                
-                # Load optimized numpy payload back into active memory
                 matrix_payload = np.load(file_path)
-                
-                # Serialize the array straight into its underlying raw byte footprint
                 byte_stream = matrix_payload.tobytes()
-                
-                # Send shape details via AMQP property headers so receiver knows array dimensions
                 shape_string = ",".join(map(str, matrix_payload.shape))
+                
                 properties = pika.BasicProperties(
-                    delivery_mode=2,  # Make message persistent on disk inside the broker
-                    headers={"shape": shape_string, "shard_index": idx, "epoch": current_epoch}
+                    delivery_mode=2,
+                    headers={"shape": shape_string, "shard_index": f"train_{idx}", "epoch": current_epoch}
                 )
                 
-                # Publish to default exchange targeting your specific queue
                 channel.basic_publish(
                     exchange="",
                     routing_key=queue_name,
                     body=byte_stream,
                     properties=properties
                 )
-                logging.info(f"[Egress Stream] [Epoch {current_epoch + 1}] Successfully pushed {filename} | Shape: ({shape_string})")
+                logging.info(f"[Training Egress] [Epoch {current_epoch + 1}] Successfully pushed {filename} to queue: '{queue_name}'")
                 
                 # Light throttle pace to mimic dynamic production pipeline flow
-                time.sleep(0.1)
+                time.sleep(0.01)
                 
     except KeyboardInterrupt:
         logging.info("\nSender execution interrupted manually by user. Closing streams.")
@@ -78,12 +94,12 @@ def stream_shards_to_queue(shard_dir: str, queue_name: str, amqp_url: str, epoch
         logging.info("AMQP Connection channel closed cleanly.")
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s]: %(message)s")
+    logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)s]: %(message)s")
     
-    # Pointing directly to your active configuration workspace parameters
     stream_shards_to_queue(
         shard_dir=r"data\samples\shards\supply_chain",
         queue_name="supply_chain.incoming_batches",
+        val_queue_name="supply_chain.validation_batches",
         amqp_url="amqp://guest:guest@localhost:5672/%2f",
         epochs=600  
     )

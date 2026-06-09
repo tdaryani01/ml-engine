@@ -61,8 +61,12 @@ def execute_training_pipeline():
         data_provider = StreamDataProvider(
             amqp_url=cfg.ingestion.amqp_url,
             queue_name=cfg.ingestion.queue_name,
+            val_queue_name=cfg.ingestion.val_queue_name,  # 🚨 Route this via your schema/config
             feature_names=cfg.ingestion.feature_names,
             batch_size=cfg.optimization.batch_size,
+            steps_per_epoch=steps,
+            val_split_size=cfg.ingestion.splits.val,
+            num_classes=cfg.architecture.num_classes
         )
     else:
         raise ValueError(f"[Ingestion Error] Unknown source_mode option: '{source_mode}'.")
