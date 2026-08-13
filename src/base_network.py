@@ -1,9 +1,13 @@
-# models/base_network.py
+# src/base_network.py
 from abc import ABC, abstractmethod
 import logging
 import numpy as np
 
 class BaseNeuralNetwork(ABC):
+    """
+    Abstract base class for a custom multi-layer neural network implemented from scratch using NumPy.
+    Supports L1/L2 regularization, dropout, batch normalization, and configurable optimizers.
+    """
     def __init__(self, layer_sizes, optimizer_instance, lam_l1=0.01, lam_l2=0.01, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9, max_norm=5.0) -> None:
         self.optimizer = optimizer_instance  
         self.lam_l1 = lam_l1
@@ -18,7 +22,7 @@ class BaseNeuralNetwork(ABC):
         self.weights = []
         self.biases = []
         
-        # --- BATCH NORMALIZATION VECTORS ---
+        # Batch normalization parameters and running statistics
         self.gammas = []
         self.betas = []
         self.running_means = []
@@ -26,32 +30,34 @@ class BaseNeuralNetwork(ABC):
         
         self.diagnostic_counter = 0
         
+        # Initialize weights and biases using Xavier/Glorot uniform initialization
         for i in range(len(layer_sizes) - 1):
             input_dim, output_dim = layer_sizes[i], layer_sizes[i+1]
             limit = np.sqrt(6.0 / (input_dim + output_dim))
             self.weights.append(np.random.uniform(-limit, limit, (input_dim, output_dim)))
             self.biases.append(np.zeros((1, output_dim)))
             
+            # Initialize batch normalization parameters for hidden layers
             if self.use_batch_norm and (i < len(layer_sizes) - 2):
                 self.gammas.append(np.random.uniform(0.8, 1.2, size=(1, output_dim)))
                 self.betas.append(np.random.uniform(-0.1, 0.1, size=(1, output_dim)))
-    
                 self.running_means.append(np.zeros((1, output_dim)))
                 self.running_vars.append(np.ones((1, output_dim)))
 
     def preprocess_targets(self, y_train, y_val, y_test=None):
+        """Hook for target preprocessing subclasses."""
         return y_train, y_val, y_test
 
     def leaky_relu(self, z): 
+        """Leaky ReLU activation function."""
         return np.where(z > 0, z, z * 0.01)
         
     def leaky_relu_der(self, z): 
+        """Derivative of the Leaky ReLU activation function."""
         return np.where(z > 0, 1.0, 0.01)
 
-    # =====================================================================
-    # ISOLATED BATCH NORMALIZATION UTILITIES
-    # =====================================================================
     def _bn_forward(self, z, layer_idx, training):
+        """Computes the forward pass for Batch Normalization with diagnostic logging."""
         if training:
             mean = np.mean(z, axis=0, keepdims=True)
             var = np.var(z, axis=0, keepdims=True)
@@ -63,6 +69,7 @@ class BaseNeuralNetwork(ABC):
             z_hat = (z - mean) / np.sqrt(var + self.eps)
             z_bn = self.gammas[layer_idx] * z_hat + self.betas[layer_idx]
             
+            # Update running statistics using momentum
             self.running_means[layer_idx] = self.bn_momentum * self.running_means[layer_idx] + (1 - self.bn_momentum) * mean
             self.running_vars[layer_idx] = self.bn_momentum * self.running_vars[layer_idx] + (1 - self.bn_momentum) * var
             
@@ -84,6 +91,7 @@ class BaseNeuralNetwork(ABC):
         return z_bn
 
     def _bn_backward(self, delta, layer_idx, m):
+        """Computes gradients for Batch Normalization parameters during backpropagation with tracking logs."""
         z_hat = self.z_hats[layer_idx]
         var = self.batch_vars[layer_idx]
         
@@ -101,10 +109,8 @@ class BaseNeuralNetwork(ABC):
             
         return dx, dgamma, dbeta
 
-    # =====================================================================
-    # CORE EXECUTION PIPELINE INTERFACES
-    # =====================================================================
     def forward_hidden(self, X, training=True):
+        """Executes the forward pass through all hidden layers with engine trace logs."""
         self.zs = []            
         self.z_bns = []         
         self.z_hats = []        
@@ -135,6 +141,7 @@ class BaseNeuralNetwork(ABC):
                 logging.info(f"[ENGINE TRACE] Layer {i} Pre-Activation (z) -> Max: {np.max(z):.4f} | Min: {np.min(z):.4f} | Mean: {np.mean(z):.4f}")
                 logging.info(f"[ENGINE TRACE] Layer {i} Post-Activation (a) -> Max: {np.max(current_act):.4f} | Min: {np.min(current_act):.4f} | Mean: {np.mean(current_act):.4f}")
             
+            # Apply inverted dropout during training
             if training and self.p_dropout > 0.0:
                 mask = (np.random.rand(*current_act.shape) >= self.p_dropout) / (1.0 - self.p_dropout)
                 current_act = current_act * mask
@@ -149,10 +156,7 @@ class BaseNeuralNetwork(ABC):
         return z_out
 
     def _forward(self, X, training=True):
-        """
-        PROTECTED INTERNAL METHOD: Sweeps through topological network states,
-        calculating forward evaluation sequences. Replaces legacy exposed forward path.
-        """
+        """Performs a full forward pass including hidden layers and output activation with logging traces."""
         z_out = self.forward_hidden(X, training=training)
         output = self.apply_output_activation(z_out)
         
@@ -173,6 +177,7 @@ class BaseNeuralNetwork(ABC):
     def calculate_raw_cost(self, output, y): pass
 
     def compute_total_loss(self, output, y):
+        """Computes total loss including L1 and L2 regularization penalties."""
         raw_cost = self.calculate_raw_cost(output, y)
         m = y.shape[0]
         l2_penalty = (self.lam_l2 / (2 * m)) * sum(np.sum(w**2) for w in self.weights)
@@ -180,6 +185,7 @@ class BaseNeuralNetwork(ABC):
         return raw_cost + l2_penalty + l1_penalty
 
     def backward(self, X, y, active_lr):
+        """Performs backpropagation, applies gradient stability clipping, and updates weights."""
         m = X.shape[0]
         num_layers = len(self.weights)
         grad_weights, grad_biases = [None] * num_layers, [None] * num_layers
@@ -242,11 +248,7 @@ class BaseNeuralNetwork(ABC):
         self.diagnostic_counter += 1
         
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
-        """
-        UNIVERSAL CONTRACT METHOD: Encapsulates inference execution logic securely.
-        Assumes data is already scaled/normalized before reaching the network.
-        """
-        # 🚨 Self-defense shape check lives here permanently
+        """Performs model inference securely with input shape verification."""
         if processed_data.ndim == 1:
             processed_data = processed_data.reshape(1, -1)
             

@@ -5,6 +5,7 @@ from data.iterator import DatasetIterator
 from config.constants import DataKeys
 
 class CSVDataProvider(BaseDataProvider):
+    """Data provider for loading, normalizing, and batching tabular datasets from CSV files[cite: 9]."""
     def __init__(self, data_file_path: str, feature_names: list, batch_size: int, model_instance, epochs: int):
         from data.data_loader import load_pipeline_splits
         
@@ -16,7 +17,7 @@ class CSVDataProvider(BaseDataProvider):
         self._has_more = True
         self._epochs_completed = 0
         
-        # 🚨 Added: Static initialization matching the unified normalization interface
+        # Static initialization matching the unified normalization interface[cite: 9]
         self.mean = np.mean(self.splits[DataKeys.X_TRAIN], axis=0)
         self.std = np.std(self.splits[DataKeys.X_TRAIN], axis=0) + 1e-24
         
@@ -28,10 +29,11 @@ class CSVDataProvider(BaseDataProvider):
         self.reset_epoch()
 
     def normalize(self, data_matrix: np.ndarray) -> np.ndarray:
-        """🚨 Uniform API standard matching the Stream Provider signature."""
+        """Uniform API standard matching the Stream Provider signature[cite: 9]."""
         return (data_matrix - self.mean) / self.std
 
     def reset_epoch(self) -> None:
+        """Resets the epoch iterator and updates completed epoch counts[cite: 9]."""
         if self.batch_generator is not None or self.iterator is not None:
             self._epochs_completed += 1
             
@@ -49,9 +51,11 @@ class CSVDataProvider(BaseDataProvider):
         self._has_more = True
 
     def has_more_batches(self) -> bool:
+        """Determines if additional batches remain in the current epoch[cite: 9]."""
         return self._has_more
 
     def next_batch(self) -> tuple:
+        """Retrieves the next feature and target batch from the generator[cite: 9]."""
         if not self.has_more_batches():
             return np.zeros((0, len(self.splits[DataKeys.X_TRAIN].shape[1])), dtype=np.float32), np.zeros((0, 1), dtype=np.float32)
         try:
@@ -61,7 +65,9 @@ class CSVDataProvider(BaseDataProvider):
             return np.array([]), np.array([])
 
     def get_validation_set(self) -> tuple:
+        """Retrieves the processed validation features and targets[cite: 9]."""
         return self.splits[DataKeys.X_VAL], self.y_val_processed
 
     def recomment_steps(self) -> int:
+        """Calculates and recommends the number of steps per epoch based on batch size[cite: 9]."""
         return int(np.ceil(len(self.splits[DataKeys.X_TRAIN]) / self.batch_size))

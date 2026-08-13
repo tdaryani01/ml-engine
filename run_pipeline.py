@@ -3,19 +3,20 @@ import logging
 from config.config_loader import load_production_config
 from data.csv_provider import CSVDataProvider
 from data.stream_provider import StreamDataProvider
-from models.controller import ModelController
+from src.controller import ModelController
 from config.constants import IngestionMode
-from utils.logger import initialize_global_logging              # Injected custom logger
+from utils.logger import initialize_global_logging
 from utils.diagnostics import NeuralNetworkDiagnostics
 
 def execute_training_pipeline():
-    # 1. Hydrate the immutable, typed configuration object from your structured YAML
+    """Hydrates configuration, initializes logging, sets up the model controller, runs training, and triggers diagnostics."""
+    # 1. Hydrate the immutable, typed configuration object from the structured YAML
     cfg = load_production_config("config/config.yaml")
     
-    # 2. Boot up your custom enterprise dual-destination logging architecture
+    # 2. Boot up the custom enterprise dual-destination logging architecture
     initialize_global_logging(cfg)
 
-    # 3. Instantiate your ModelController first so it exists for down-funnel dependencies
+    # 3. Instantiate the ModelController first so it exists for down-funnel dependencies
     controller = ModelController(
         learning_rate=cfg.optimization.learning_rate,
         lr_scheduler_type=cfg.optimization.lr_scheduler,
@@ -28,7 +29,7 @@ def execute_training_pipeline():
     logging.info("[Pipeline Root] Initializing network topology matrix dimensions...")
     controller.initialize_network_from_dimensions(
         input_dim=len(cfg.ingestion.feature_names),
-        output_dim=3,  # Mapped to match your structural multi-class tracking layout
+        output_dim=3,  # Mapped to match structural multi-class tracking layout
         model_type=cfg.architecture.model_type,
         hidden_layers=cfg.architecture.hidden_layers,
         optimizer_name=cfg.optimization.optimizer,
@@ -40,7 +41,7 @@ def execute_training_pipeline():
         max_norm=cfg.optimization.gradient_clipping_max_norm
     )
 
-    # 5. Extract the resolved Enum object from your config to route ingestion safely
+    # 5. Extract the resolved Enum object from config to route ingestion safely
     source_mode = cfg.ingestion.source_mode
     steps = cfg.optimization.steps_streaming
 
@@ -52,7 +53,7 @@ def execute_training_pipeline():
             model_instance=controller.model,
             epochs=cfg.optimization.epochs_full_dataset
         )
-        steps = data_provider.recomment_steps();
+        steps = data_provider.recomment_steps()
 
     elif source_mode == IngestionMode.STREAM:
         if not cfg.ingestion.amqp_url or not cfg.ingestion.queue_name:
@@ -61,13 +62,13 @@ def execute_training_pipeline():
         data_provider = StreamDataProvider(
             amqp_url=cfg.ingestion.amqp_url,
             queue_name=cfg.ingestion.queue_name,
-            val_queue_name=cfg.ingestion.val_queue_name,  # 🚨 Route this via your schema/config
+            val_queue_name=cfg.ingestion.val_queue_name,  # Route validation queue via schema/config
             feature_names=cfg.ingestion.feature_names,
             batch_size=cfg.optimization.batch_size,
             steps_per_epoch=steps,
             val_split_size=cfg.ingestion.splits.val,
             num_classes=cfg.architecture.num_classes,
-            drain_on_empty = cfg.ingestion.drain_on_empty
+            drain_on_empty=cfg.ingestion.drain_on_empty
         )
     else:
         raise ValueError(f"[Ingestion Error] Unknown source_mode option: '{source_mode}'.")

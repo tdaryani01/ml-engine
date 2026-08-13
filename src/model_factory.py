@@ -1,10 +1,10 @@
-# models/model_factory.py
+# src/model_factory.py
 import logging
-from models.models import BinaryClassificationNetwork, RegressionNetwork, MultiClassNetwork
-from models.optimizers import AdamOptimizer, SGDOptimizer
+from src.models import BinaryClassificationNetwork, RegressionNetwork, MultiClassNetwork
+from src.optimizers import AdamOptimizer, SGDOptimizer
 
 class ModelFactory:
-    """Centralized creation matrix that maps configuration properties to subclass heads."""
+    """Centralized factory pattern implementation that maps configuration types to specific neural network subclasses."""
     _registry = {
         "binary_classification": BinaryClassificationNetwork,
         "regression": RegressionNetwork,
@@ -13,6 +13,7 @@ class ModelFactory:
 
     @classmethod
     def create_model(cls, model_type, layer_sizes, **kwargs):
+        """Instantiates and returns the requested neural network model with resolved optimizers and arguments[cite: 3]."""
         normalized_type = str(model_type).strip().lower()
         
         if normalized_type not in cls._registry:
@@ -21,14 +22,13 @@ class ModelFactory:
                 f"Available structures: {list(cls._registry.keys())}"
             )
             
-        # Clean copy of kwargs to prevent side-effects
+        # Create a clean copy of kwargs to prevent side-effects[cite: 3]
         factory_kwargs = kwargs.copy()
         
-        # --- FIXED: SAFELY CONSUME AND POP LEARNING RATE ---
-        # Extract the learning rate first so it doesn't leak into the network initialization kwargs
+        # Extract the learning rate to isolate it from network initialization kwargs[cite: 3]
         lr_val = factory_kwargs.pop("lr", 0.001) 
         
-        # Resolve decoupled optimizer injection
+        # Resolve decoupled optimizer injection[cite: 3]
         if "optimizer" in factory_kwargs and "optimizer_instance" not in factory_kwargs:
             opt_name = str(factory_kwargs.pop("optimizer")).strip().lower()
             
@@ -39,7 +39,7 @@ class ModelFactory:
             else:
                 raise ValueError(f"[Factory] Unknown optimizer strategy string configured: {opt_name}")
         
-        # Ensure a default dropout fallback is always explicitly present
+        # Ensure a default dropout fallback is explicitly defined[cite: 3]
         if "p_dropout" not in factory_kwargs:
             factory_kwargs["p_dropout"] = 0.0
 

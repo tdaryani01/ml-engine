@@ -3,6 +3,7 @@ import numpy as np
 import logging
 
 class DatasetIterator:
+    """Iterates over datasets in randomized or sequential mini-batch chunks[cite: 9]."""
     def __init__(self, X, y, batch_size, shuffle=True):
         self.X = X
         self.y = y
@@ -11,6 +12,7 @@ class DatasetIterator:
         self.num_samples = X.shape[0]
 
     def __iter__(self):
+        """Yields mini-batches of features and targets, optionally shuffling indices[cite: 9]."""
         indices = np.arange(self.num_samples)
         if self.shuffle:
             np.random.shuffle(indices)
@@ -37,4 +39,5 @@ class DatasetIterator:
             yield X_batch, y_batch
 
     def __len__(self):
+        """Returns the total number of batches in the iterator[cite: 9]."""
         return int(np.ceil(self.num_samples / self.batch_size))

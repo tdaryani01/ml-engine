@@ -1,23 +1,28 @@
-# models/controller.py
+# src/controller.py
 import os
 import logging
 import copy
 import numpy as np
-from models.model_factory import ModelFactory
-from models.serializer import ModelSerializer
-from models.schedulers import StepDecay, ExponentialDecay
+from src.model_factory import ModelFactory
+from src.serializer import ModelSerializer
+from src.schedulers import StepDecay, ExponentialDecay
 from config.constants import DataKeys, ModelType, LRHierarchy
 
 class ModelController:
+    """
+    Orchestrates the model lifecycle, including network initialization, 
+    training loops, evaluation, early stopping, and serialization.
+    """
     def __init__(self, learning_rate: float, lr_scheduler_type: LRHierarchy, scheduler_decay_rate: float = 0.98, 
                  scheduler_drop_ratio: float = 0.5, scheduler_epochs_per_drop: int = 20):
         self.initial_lr = learning_rate
         self.model = None
-        self.data_provider = None  # 🚨 Added to hold the active data scaling instance reference
+        self.data_provider = None  
         self.train_history = []
         self.val_history = []
         self.steps_completed = 0
         
+        # Configure learning rate scheduler
         if lr_scheduler_type == LRHierarchy.STEP:
             self.scheduler = StepDecay(learning_rate, drop_ratio=scheduler_drop_ratio, epochs_per_drop=scheduler_epochs_per_drop)
         elif lr_scheduler_type == LRHierarchy.EXPONENTIAL:
@@ -29,6 +34,7 @@ class ModelController:
                                            hidden_layers: list, optimizer_name: str, lam_l1: float, lam_l2: float, 
                                            p_dropout: float = 0.0, use_batch_norm: bool = True, 
                                            bn_momentum: float = 0.9, max_norm: float = 5.0) -> None:
+        """Initializes the underlying neural network based on explicit dimension parameters."""
         resolved_topology = tuple([input_dim] + hidden_layers + [output_dim])
         logging.info(f"[Model Controller] Resolved Layer Architecture Sequence: {resolved_topology}")
         
@@ -49,7 +55,8 @@ class ModelController:
                                         optimizer_name: str, lam_l1: float, lam_l2: float, 
                                         p_dropout: float = 0.0, use_batch_norm: bool = True, 
                                         bn_momentum: float = 0.9, max_norm: float = 5.0) -> None:
-        self.data_provider = data_provider  # 🚨 Retain baseline provider reference maps
+        """Initializes network topology by automatically inferring dimensions from a data provider."""
+        self.data_provider = data_provider  
         X_val, y_val = data_provider.get_validation_set()
         input_dim = X_val.shape[1]
         
@@ -77,6 +84,7 @@ class ModelController:
         )
 
     def hydrate_from_asset(self, asset_path: str) -> bool:
+        """Loads a serialized model asset from disk if it exists."""
         if os.path.exists(asset_path):
             logging.info(f"[Model Controller] Discovered serialized asset at {asset_path}. Routing hydration to Serializer...")
             self.model = ModelSerializer.load_model(asset_path)
@@ -84,14 +92,10 @@ class ModelController:
         return False
 
     def predict(self, raw_data_matrix: np.ndarray) -> np.ndarray:
-        """
-        🚨 REFACTORED CENTRAL GATEWAY: Orchestrates the data normalization pass internally 
-        before executing predictions down against the protected base model contract layers.
-        """
+        """Runs data normalization and delegates prediction execution to the underlying model."""
         if self.model is None:
             raise ValueError("[Model Controller] Cannot run prediction before model is fitted or loaded.")
         
-        # Fall back gracefully to raw data matrix if no scaling provider instance is mapped yet
         if self.data_provider is not None:
             raw_data_matrix = self.data_provider.normalize(raw_data_matrix)
             
@@ -99,10 +103,11 @@ class ModelController:
 
     def fit(self, data_provider, steps: int, source_mode, model_type: ModelType,
             early_stopping_enabled: bool = True, patience: int = 15, min_delta: float = 1e-5) -> tuple:
+        """Executes the core training loop across epochs, handling optimization, validation, and early stopping."""
         if self.model is None:
             raise ValueError("[Model Controller] Execution Error: Cannot call fit before initializing the network.")
 
-        self.data_provider = data_provider  # Bind provider instance reference
+        self.data_provider = data_provider  
         epoch = 0
         is_classification = model_type in (ModelType.BINARY_CLASSIFICATION, ModelType.MULTI_CLASS)
         
@@ -127,7 +132,6 @@ class ModelController:
                 break
             self.train_history.append(epoch_train_loss)
             
-            # 🚨 CLEANED: Replaced legacy provider.normalize manually managed code blocks with central predict wrapper 
             val_preds = self.predict(X_val)
             current_val_loss = self.model.compute_total_loss(val_preds, y_val_target)
             current_val_raw_cost = self.model.calculate_raw_cost(val_preds, y_val_target)
@@ -146,6 +150,7 @@ class ModelController:
         return self.train_history, self.val_history
 
     def _run_epoch_training_pass(self, data_provider, active_lr: float, steps: int) -> float:
+        """Processes training batches sequentially and computes parameter updates."""
         data_provider.reset_epoch()
         batch_losses = []
         
@@ -154,12 +159,10 @@ class ModelController:
             if X_b.size == 0:
                 break
             
-            # NOTE: Backward matrix updates fundamentally require the exact normalized array values used to compile the gradients.
             X_b_norm = data_provider.normalize(X_b)
             batch_loss = self.model.backward(X_b_norm, y_b, active_lr=active_lr)
             
             if batch_loss is None:
-                # 🚨 CLEANED: Evaluates predictions cleanly via internal wrapper boundary
                 preds_b = self.model.predict(X_b_norm)
                 batch_loss = self.model.compute_total_loss(preds_b, y_b)
                 
@@ -172,12 +175,12 @@ class ModelController:
 
     def _evaluate_epoch_performance(self, epoch: int, data_provider, train_loss: float, val_preds: np.ndarray, y_val_target: np.ndarray, 
                                     current_val_loss: float, active_lr: float, is_classification: bool, model_type: ModelType) -> None:
+        """Logs intermediate training metrics at defined intervals."""
         if epoch % 10 == 0 or not data_provider.has_more_batches():
             metric_name_step = "Acc" if is_classification else "R²"
             
             if hasattr(data_provider, "splits") and DataKeys.X_TRAIN in data_provider.splits:
                 X_train = data_provider.splits[DataKeys.X_TRAIN]
-                # 🚨 CLEANED: Invoking self.predict(X_train) safely strips out redundancy 
                 train_preds = self.predict(X_train)
                 y_train_target = data_provider.y_train_processed
                 
@@ -200,6 +203,7 @@ class ModelController:
             )
 
     def _handle_early_stopping(self, epoch: int, current_val_raw_cost: float, min_delta: float, patience: int, es_state: dict) -> bool:
+        """Monitors validation cost and tracks checkpoints to handle early stopping conditions."""
         if current_val_raw_cost < (es_state["best_val_loss"] - min_delta):
             es_state["best_val_loss"] = current_val_raw_cost
             es_state["best_epoch"] = epoch
@@ -218,7 +222,7 @@ class ModelController:
 
     def _generate_final_summary_report(self, data_provider, X_val_raw: np.ndarray, y_val_target: np.ndarray, source_mode, 
                                        is_classification: bool, model_type: ModelType, es_state: dict, es_enabled: bool) -> None:
-        # 🚨 CLEANED: Route raw matrices through our clean controller prediction loop boundary
+        """Generates and logs a comprehensive final execution and performance report."""
         final_val_preds = self.predict(X_val_raw)
         val_loss = self.val_history[-1] if self.val_history else float('inf')
         
@@ -287,11 +291,13 @@ class ModelController:
         logging.info(report)
 
     def serialize_current_state(self, target_asset_path: str, serialized_config_dict: dict) -> None:
+        """Serializes the current model configuration and weights to an output path."""
         logging.info(f"[Model Controller] Executing state preservation write out to: {target_asset_path}")
         ModelSerializer.save_model(self.model, serialized_config_dict, 
             data_provider=self.data_provider, file_path=target_asset_path)
 
     def compute_r2_score(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        """Computes the coefficient of determination (R² score) for regression evaluations."""
         y_true_flat = y_true.ravel()
         y_pred_flat = y_pred.ravel()
         

@@ -5,6 +5,7 @@ from config.constants import ModelType, IngestionMode, LRHierarchy
 
 @dataclass(frozen=True)
 class MetaConfig:
+    """Defines metadata settings for pipeline execution and logging[cite: 9]."""
     pipeline_name: str
     stage: str
     suppress_logging: bool
@@ -13,11 +14,13 @@ class MetaConfig:
 
 @dataclass(frozen=True)
 class SplitConfig:
+    """Defines dataset split ratios for training and validation[cite: 9]."""
     train: float
     val: float
 
 @dataclass(frozen=True)
 class IngestionConfig:
+    """Defines parameters for data ingestion sources, paths, and streaming properties[cite: 9]."""
     source_mode: IngestionMode  # Enforced Enum Type!
     data_file_path: str
     feature_names: List[str]
@@ -29,6 +32,7 @@ class IngestionConfig:
 
 @dataclass(frozen=True)
 class ArchitectureConfig:
+    """Defines structural topology settings for the neural network model[cite: 9]."""
     model_type: ModelType      # Enforced Enum Type!
     num_classes: int
     hidden_layers: List[int]
@@ -38,6 +42,7 @@ class ArchitectureConfig:
 
 @dataclass(frozen=True)
 class OptimizationConfig:
+    """Defines hyperparameter and optimization settings for training loops[cite: 9]."""
     optimizer: str
     epochs_full_dataset: int
     steps_streaming: int
@@ -54,26 +59,31 @@ class OptimizationConfig:
 
 @dataclass(frozen=True)
 class RegularizationConfig:
+    """Defines penalty coefficients and tolerances for regularization[cite: 9]."""
     lam_l1: float
     lam_l2: float
     sparsity_tolerance: float
 
 @dataclass(frozen=True)
 class FourierConfig:
+    """Defines configuration parameters for Fourier feature expansions[cite: 9]."""
     enabled: bool = False
     num_frequencies: int = 4
 
 @dataclass(frozen=True)
 class TransformationsConfig:
+    """Aggregates data transformation configurations[cite: 9]."""
     fourier_expansion: FourierConfig
 
 @dataclass(frozen=True)
 class PersistenceConfig:
+    """Defines asset paths and flags for saving and loading model states[cite: 9]."""
     load_saved_model: bool
     model_asset_path: str
 
 @dataclass(frozen=True)
 class DiagnosticsConfig:
+    """Defines plotting and output properties for pipeline diagnostics[cite: 9]."""
     enabled: bool
     metric_to_plot: str
     save_raw_logs: bool
@@ -84,6 +94,7 @@ class DiagnosticsConfig:
 
 @dataclass(frozen=True)
 class PipelineConfig:
+    """Root configuration data class containing all modular pipeline schemas[cite: 9]."""
     meta: MetaConfig
     ingestion: IngestionConfig
     architecture: ArchitectureConfig
