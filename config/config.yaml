@@ -12,14 +12,14 @@ meta:
 # DATA INGESTION MATRIX
 # =====================================================================
 ingestion:
-  source_mode: "csv"                # Changed from "csv" to activate AMQP streaming
-  data_file_path: ".\\data\\samples\\csv\\supply_chain.csv"
-  feature_names:
-    - "Supplier_Lead_Time"
-    - "Logistics_Delay_Index"
-    - "Resource_Reserve_Percent"
-    - "Labor_Capacity_Utilization"
-    - "Macro_Inflation_Rate"
+  source_mode: "csv"                # Hardcoded to disk mode for local CSV generation execution
+  data_file_path: ".\\data\\samples\\csv\\prompt_security_dataset.csv"  # 🚨 Updated path to your generated file
+  feature_names:                    # 🚨 Aligned perfectly with your text generator schema
+    - "f1"
+    - "f2"
+    - "f3"
+    - "f4"
+    - "f5"
   splits:
     train: 0.70
     val: 0.15
@@ -35,7 +35,7 @@ architecture:
   model_type: "multi_class"
   num_classes: 3
   hidden_layers: [128, 64]
-  p_dropout: 0.0                       # Dropped to 0 to unlock maximum representation capacity
+  p_dropout: 0.1                       # 🚨 Updated: Light dropout to balance feature sensitivity
   use_batch_norm: false                # Disabled: Stop shifting boundaries on crisp tabular formulas
   bn_momentum: 0.9
 
@@ -47,7 +47,7 @@ optimization:
   epochs_full_dataset: 500
   steps_streaming: 31
   batch_size: 64
-  learning_rate: 0.0001                # Reset to standard 0.001 for stable convergence if needed
+  learning_rate: 0.001                 # 🚨 Updated: Standard rate to help Adam adapt to new L2 penalty
   
   # Learning Rate Schedule
   lr_scheduler: "none"
@@ -57,7 +57,7 @@ optimization:
 
   # Early Stopping Monitor
   early_stopping_enabled: true
-  patience: 40                         # Extended patience to give the unconstrained network room to learn
+  patience: 15                         # Extended patience to give the unconstrained network room to learn
   min_delta: 1.0e-05
 
   # Numerical Defensive Guardrails
@@ -68,7 +68,7 @@ optimization:
 # =====================================================================
 regularization:
   lam_l1: 0
-  lam_l2: 0                            # Stripped out L2 penalty to let weights map non-linear curves freely
+  lam_l2: 0.001                        # 🚨 Updated: Added L2 penalty to suppress feature 0 dominance
   sparsity_tolerance: 1.0e-05          # Moved out of training block into its natural mathematical home
 
 # =====================================================================
@@ -83,7 +83,7 @@ transformations:
 # PERSISTENCE & LIFECYCLE MANAGEMENT
 # =====================================================================
 persistence:
-  load_saved_model: false
+  load_saved_model: true               # 🚨 Kept unchanged
   model_asset_path: "deployed_model.npz"
 
 # =====================================================================

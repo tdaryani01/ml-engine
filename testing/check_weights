@@ -1,0 +1,15 @@
+import numpy as np
+
+archive = np.load("deployed_model.npz")
+w_0 = archive["w_0"]  # Shape: (5, hidden_dim)
+
+print("\n" + "=" * 60)
+print("FIRST LAYER WEIGHTS SUMMARY (w_0):")
+print(f"  Shape of w_0: {w_0.shape}")
+print("-" * 60)
+print(f"  Feature 1 (Length)      - Mean magnitude: {np.mean(np.abs(w_0[0])):.6f}")
+print(f"  Feature 2 (Keywords)    - Mean magnitude: {np.mean(np.abs(w_0[1])):.6f}")
+print(f"  Feature 3 (Entropy)     - Mean magnitude: {np.mean(np.abs(w_0[2])):.6f}")
+print(f"  Feature 4 (Special)     - Mean magnitude: {np.mean(np.abs(w_0[3])):.6f}")
+print(f"  Feature 5 (Directives)  - Mean magnitude: {np.mean(np.abs(w_0[4])):.6f}")
+print("=" * 60 + "\n")

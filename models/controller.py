@@ -288,7 +288,8 @@ class ModelController:
 
     def serialize_current_state(self, target_asset_path: str, serialized_config_dict: dict) -> None:
         logging.info(f"[Model Controller] Executing state preservation write out to: {target_asset_path}")
-        ModelSerializer.save_model(self.model, serialized_config_dict, file_path=target_asset_path)
+        ModelSerializer.save_model(self.model, serialized_config_dict, 
+            data_provider=self.data_provider, file_path=target_asset_path)
 
     def compute_r2_score(self, y_true: np.ndarray, y_pred: np.ndarray) -> float:
         y_true_flat = y_true.ravel()

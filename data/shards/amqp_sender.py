@@ -10,14 +10,13 @@ def stream_shards_to_queue(shard_dir: str, queue_name: str, val_queue_name: str,
     """
     Scans directory for prefixed .npy shards and routes them to independent queues:
     - Files starting with 'val_' go to the validation queue (sent once on Epoch 0).
-    - Files starting with 'train_' go to the training queue (shuffled and sent every epoch).
+    - Files starting with 'train_' go to the training queue (rows are shuffled inside every epoch).
     """
     if not os.path.exists(shard_dir):
         raise FileNotFoundError(f"Target shard index path missing: {shard_dir}")
         
     all_files = os.listdir(shard_dir)
     
-    # 1. Separate files based on the prefix created by shard_creator.py
     train_shards = sorted([f for f in all_files if f.startswith("train_") and f.endswith(".npy")])
     val_shards = sorted([f for f in all_files if f.startswith("val_") and f.endswith(".npy")])
     
@@ -32,16 +31,14 @@ def stream_shards_to_queue(shard_dir: str, queue_name: str, val_queue_name: str,
     connection = pika.BlockingConnection(params)
     channel = connection.channel()
     
-    # Declare both queues to make sure they exist securely on the broker
     channel.queue_declare(queue=queue_name, durable=True)
     channel.queue_declare(queue=val_queue_name, durable=True)
 
     try:
-        # Outer Epoch Loop Sequence
         for current_epoch in range(epochs):
             logging.info(f"\n=== Commencing Streaming Epoch {current_epoch + 1}/{epochs} ===")
             
-            # 🚨 STEP 1: Process Validation Shards ONLY on the very first epoch pass
+            # 1. Process Validation Shards ONLY on the very first epoch pass
             if current_epoch == 0:
                 if val_shards:
                     logging.info(f"[Validation Egress] Seeding validation channel with {len(val_shards)} prefixed shards...")
@@ -52,7 +49,7 @@ def stream_shards_to_queue(shard_dir: str, queue_name: str, val_queue_name: str,
                         shape_string = ",".join(map(str, matrix_payload.shape))
                         
                         properties = pika.BasicProperties(
-                            delivery_mode=2,  # Persistent message storage
+                            delivery_mode=2,
                             headers={"shape": shape_string, "shard_index": "val", "epoch": current_epoch}
                         )
                         channel.basic_publish(exchange="", routing_key=val_queue_name, body=byte_stream, properties=properties)
@@ -60,14 +57,19 @@ def stream_shards_to_queue(shard_dir: str, queue_name: str, val_queue_name: str,
                 else:
                     logging.warning("[Validation Egress] No files starting with 'val_' were found to seed the validation queue.")
 
-            # 🚨 STEP 2: Shuffle and stream the dedicated training shards for this epoch pass
+            # 2. Shuffle BOTH the file order AND the internal data rows for this epoch
             epoch_train_files = train_shards.copy()
             random.shuffle(epoch_train_files)
-            logging.info(f"[Training Egress] Shuffled {len(epoch_train_files)} files for epoch optimization pass.")
+            logging.info(f"[Training Egress] Shuffled file queue order for epoch optimization pass.")
             
             for idx, filename in enumerate(epoch_train_files):
                 file_path = os.path.join(shard_dir, filename)
                 matrix_payload = np.load(file_path)
+                
+                # 🚨 FIXED: Scramble the individual data rows inside this matrix block on every single epoch pass!
+                shuffled_indices = np.random.permutation(matrix_payload.shape[0])
+                matrix_payload = matrix_payload[shuffled_indices]
+                
                 byte_stream = matrix_payload.tobytes()
                 shape_string = ",".join(map(str, matrix_payload.shape))
                 
@@ -82,9 +84,8 @@ def stream_shards_to_queue(shard_dir: str, queue_name: str, val_queue_name: str,
                     body=byte_stream,
                     properties=properties
                 )
-                logging.info(f"[Training Egress] [Epoch {current_epoch + 1}] Successfully pushed {filename} to queue: '{queue_name}'")
+                logging.info(f"[Training Egress] [Epoch {current_epoch + 1}] Shuffled and pushed rows from {filename} to queue")
                 
-                # Light throttle pace to mimic dynamic production pipeline flow
                 time.sleep(0.01)
                 
     except KeyboardInterrupt:
