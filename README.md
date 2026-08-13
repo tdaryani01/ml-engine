@@ -15,7 +15,7 @@ ML Engine is a high-performance, modular machine learning pipeline architecture 
 ## Core Modules
 *   `config/`: Schema definitions (`schema.py`) and constant management (`constants.py`).
 *   `data/`: Data provider interface (`base_provider.py`) and specific implementations (`csv_provider.py`, `stream_provider.py`, `ipc_stream_provider.py`).
-*   `engine/`: Core execution logic and model orchestration (internal implementations).
+*   `src/`: Core execution logic and model orchestration (internal implementations).
 
 ## Getting Started
 
