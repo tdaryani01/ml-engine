@@ -1,11 +1,16 @@
-# testing/regression_model_test.py
 import unittest
 import os
+import sys
+import tempfile
 import numpy as np
 import pandas as pd
+
+# Ensure project root is discoverable
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from data.data_loader import load_pipeline_splits
 from data.csv_provider import CSVDataProvider
-from models.controller import ModelController
+from src.controller import ModelController
 from config.constants import ModelType, IngestionMode, LRHierarchy
 from config.schema import (
     PipelineConfig, MetaConfig, IngestionConfig, ArchitectureConfig,
@@ -13,41 +18,72 @@ from config.schema import (
     FourierConfig, PersistenceConfig, DiagnosticsConfig, SplitConfig
 )
 
-class TestModelArchitectureRegression(unittest.TestCase):
+
+class TestPipelineIntegration(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        """Runs once before testing begins to ensure all test fixtures exist."""
-        cls.regression_data_path = r".\data\regression_data.csv"
-        cls.binary_data_path = r".\data\binary_data.csv"
-        cls.multiclass_data_path = r".\data\multiclass_data.csv"
+        """Creates an isolated temporary directory with synthetic CSV datasets."""
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        cls.features = ["Time", "Radius", "Angle"]
+        
+        np.random.seed(42)
+        n_samples = 120
+        X_base = np.random.uniform(-1.0, 1.0, size=(n_samples, 3))
+        
+        # 1. Synthetic Continuous Regression Data
+        y_reg = (X_base[:, 0] * 2.0 + X_base[:, 1] * -1.5 + np.random.normal(0, 0.1, size=n_samples)).reshape(-1, 1)
+        cls.regression_data_path = os.path.join(cls.temp_dir.name, "regression_data.csv")
+        df_reg = pd.DataFrame(np.hstack([X_base, y_reg]), columns=cls.features + ["Target"])
+        df_reg.to_csv(cls.regression_data_path, index=False)
+        
+        # 2. Synthetic Binary Classification Data (0 or 1)
+        y_bin = (X_base[:, 0] + X_base[:, 1] > 0).astype(int).reshape(-1, 1)
+        cls.binary_data_path = os.path.join(cls.temp_dir.name, "binary_data.csv")
+        df_bin = pd.DataFrame(np.hstack([X_base, y_bin]), columns=cls.features + ["Outcome"])
+        df_bin.to_csv(cls.binary_data_path, index=False)
+        
+        # 3. Synthetic Multi-Class Data (0, 1, or 2)
+        y_multi = np.random.randint(0, 3, size=(n_samples, 1))
+        cls.multiclass_data_path = os.path.join(cls.temp_dir.name, "multiclass_data.csv")
+        df_multi = pd.DataFrame(np.hstack([X_base, y_multi]), columns=cls.features + ["Outcome"])
+        df_multi.to_csv(cls.multiclass_data_path, index=False)
 
-    def get_base_test_config(self, task_type: ModelType) -> PipelineConfig:
-        """Hydrates a clean baseline strongly-typed PipelineConfig instance for the test harness."""
+    @classmethod
+    def tearDownClass(cls):
+        """Cleans up the temporary directory to leave zero untracked files."""
+        cls.temp_dir.cleanup()
+
+    def get_base_test_config(self, task_type: ModelType, num_classes: int = 1) -> PipelineConfig:
+        """Hydrates a clean baseline strongly-typed PipelineConfig instance matching schema parameters."""
         return PipelineConfig(
             meta=MetaConfig(
-                pipeline_name="regression_test_run",
+                pipeline_name="integration_test_run",
                 stage="testing",
                 suppress_logging=True,
-                logging_level="INFO",
+                logging_level="ERROR",
                 output_dir="test_diagnostics"
             ),
             ingestion=IngestionConfig(
                 source_mode=IngestionMode.CSV,
                 data_file_path="",  
-                feature_names=["Time", "Radius", "Angle"],
-                splits=SplitConfig(train=0.70, val=0.30)
+                feature_names=self.features,
+                splits=SplitConfig(train=0.70, val=0.30),
+                drain_on_empty=False,
+                val_queue_name=""
             ),
             architecture=ArchitectureConfig(
                 model_type=task_type,
-                hidden_layers=[32, 16],
+                num_classes=num_classes,
+                hidden_layers=[16, 8],
                 p_dropout=0.0,
                 use_batch_norm=False,
                 bn_momentum=0.9
             ),
             optimization=OptimizationConfig(
                 optimizer="adam",
-                epochs=5,
+                epochs_full_dataset=3,
+                steps_streaming=100,
                 batch_size=16,
                 learning_rate=0.01,
                 lr_scheduler=LRHierarchy.NONE,
@@ -83,11 +119,8 @@ class TestModelArchitectureRegression(unittest.TestCase):
         )
 
     def test_regression_class_pipeline(self):
-        """Validates continuous target mapping pipelines using your continuous dataset."""
-        if not os.path.exists(self.regression_data_path):
-            self.skipTest(f"Regression data missing at {self.regression_data_path}")
-
-        cfg = self.get_base_test_config(ModelType.REGRESSION)
+        """Validates continuous target mapping pipelines using CSVDataProvider and ModelController."""
+        cfg = self.get_base_test_config(ModelType.REGRESSION, num_classes=1)
         
         splits = load_pipeline_splits(
             data_file_path=self.regression_data_path,
@@ -118,19 +151,21 @@ class TestModelArchitectureRegression(unittest.TestCase):
             data_file_path=self.regression_data_path,
             feature_names=cfg.ingestion.feature_names,
             batch_size=cfg.optimization.batch_size,
+            epochs=cfg.optimization.epochs_full_dataset,
             model_instance=controller.model
         )
 
-        train_hist, val_hist = controller.fit_via_provider(
+        train_hist, val_hist = controller.fit(
             data_provider=data_provider,
-            epochs=cfg.optimization.epochs,
-            batch_size=cfg.optimization.batch_size,
+            steps=cfg.optimization.steps_streaming,
             source_mode=cfg.ingestion.source_mode,
             model_type=cfg.architecture.model_type,
-            early_stopping_enabled=cfg.optimization.early_stopping_enabled
+            early_stopping_enabled=cfg.optimization.early_stopping_enabled,
+            patience=cfg.optimization.patience,
+            min_delta=cfg.optimization.min_delta
         )
 
-        self.assertEqual(len(train_hist), 5)
+        self.assertGreater(len(train_hist), 0)
         self.assertTrue(np.isfinite(train_hist[-1]), "Loss encountered non-finite NaN/Inf bounds.")
         
         X_val, y_val = data_provider.get_validation_set()
@@ -139,14 +174,7 @@ class TestModelArchitectureRegression(unittest.TestCase):
 
     def test_binary_class_pipeline(self):
         """Validates logistic sigmoidal classification routes across binary datasets."""
-        if not os.path.exists(self.binary_data_path):
-            X_mock = np.random.uniform(0, 1, size=(100, 3))
-            y_mock = np.random.randint(0, 2, size=(100, 1))
-            df = pd.DataFrame(np.hstack([X_mock, y_mock]), columns=["Time", "Radius", "Angle", "Outcome"])
-            os.makedirs(os.path.dirname(self.binary_data_path), exist_ok=True)
-            df.to_csv(self.binary_data_path, index=False)
-
-        cfg = self.get_base_test_config(ModelType.BINARY_CLASSIFICATION)
+        cfg = self.get_base_test_config(ModelType.BINARY_CLASSIFICATION, num_classes=1)
         
         controller = ModelController(
             learning_rate=cfg.optimization.learning_rate,
@@ -170,16 +198,18 @@ class TestModelArchitectureRegression(unittest.TestCase):
             data_file_path=self.binary_data_path,
             feature_names=cfg.ingestion.feature_names,
             batch_size=cfg.optimization.batch_size,
+            epochs=cfg.optimization.epochs_full_dataset,
             model_instance=controller.model
         )
 
-        controller.fit_via_provider(
+        controller.fit(
             data_provider=data_provider,
-            epochs=cfg.optimization.epochs,
-            batch_size=cfg.optimization.batch_size,
+            steps=cfg.optimization.steps_streaming,
             source_mode=cfg.ingestion.source_mode,
             model_type=cfg.architecture.model_type,
-            early_stopping_enabled=cfg.optimization.early_stopping_enabled
+            early_stopping_enabled=cfg.optimization.early_stopping_enabled,
+            patience=cfg.optimization.patience,
+            min_delta=cfg.optimization.min_delta
         )
 
         X_val, _ = data_provider.get_validation_set()
@@ -190,14 +220,7 @@ class TestModelArchitectureRegression(unittest.TestCase):
 
     def test_multiclass_class_pipeline(self):
         """Validates categorical softmax logit paths across multi-class configurations."""
-        if not os.path.exists(self.multiclass_data_path):
-            X_mock = np.random.uniform(0, 1, size=(100, 3))
-            y_mock = np.random.randint(0, 3, size=(100, 1))
-            df = pd.DataFrame(np.hstack([X_mock, y_mock]), columns=["Time", "Radius", "Angle", "Outcome"])
-            os.makedirs(os.path.dirname(self.multiclass_data_path), exist_ok=True)
-            df.to_csv(self.multiclass_data_path, index=False)
-
-        cfg = self.get_base_test_config(ModelType.MULTI_CLASS)
+        cfg = self.get_base_test_config(ModelType.MULTI_CLASS, num_classes=3)
         
         controller = ModelController(
             learning_rate=cfg.optimization.learning_rate,
@@ -221,16 +244,18 @@ class TestModelArchitectureRegression(unittest.TestCase):
             data_file_path=self.multiclass_data_path,
             feature_names=cfg.ingestion.feature_names,
             batch_size=cfg.optimization.batch_size,
+            epochs=cfg.optimization.epochs_full_dataset,
             model_instance=controller.model
         )
 
-        controller.fit_via_provider(
+        controller.fit(
             data_provider=data_provider,
-            epochs=cfg.optimization.epochs,
-            batch_size=cfg.optimization.batch_size,
+            steps=cfg.optimization.steps_streaming,
             source_mode=cfg.ingestion.source_mode,
             model_type=cfg.architecture.model_type,
-            early_stopping_enabled=cfg.optimization.early_stopping_enabled
+            early_stopping_enabled=cfg.optimization.early_stopping_enabled,
+            patience=cfg.optimization.patience,
+            min_delta=cfg.optimization.min_delta
         )
 
         X_val, _ = data_provider.get_validation_set()
@@ -240,6 +265,7 @@ class TestModelArchitectureRegression(unittest.TestCase):
         row_sums = np.sum(val_preds, axis=1)
         np.testing.assert_allclose(row_sums, 1.0, rtol=1e-5, 
                                    err_msg="Softmax probability distribution failed unity checks.")
+
 
 if __name__ == "__main__":
     unittest.main()
