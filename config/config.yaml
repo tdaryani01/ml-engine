@@ -1,8 +1,10 @@
+# config/config.yaml
+
 # =====================================================================
 # SYSTEM META CONFIGURATION
 # =====================================================================
 meta:
-  pipeline_name: "industrial_risk_unconstrained_run"
+  pipeline_name: "synthetic_spatial_cnn_run"
   stage: "development"
   suppress_logging: false
   logging_level: "info"
@@ -12,53 +14,77 @@ meta:
 # DATA INGESTION MATRIX
 # =====================================================================
 ingestion:
-  source_mode: "csv"                # Hardcoded to disk mode for local CSV generation execution
-  data_file_path: ".\\data\\samples\\csv\\prompt_security_dataset.csv"  # 🚨 Updated path to your generated file
-  feature_names:                    # 🚨 Aligned perfectly with your text generator schema
-    - "f1"
-    - "f2"
-    - "f3"
-    - "f4"
-    - "f5"
+  source_mode: "csv"                 # IngestionMode: "csv" or "stream"[cite: 6]
+  data_file_path: "data/samples/csv/synthetic_shapes.csv"
+  feature_names: "auto"              # Ingest all pixel feature columns (px_0 to px_2351)
   splits:
     train: 0.70
     val: 0.15
   drain_on_empty: false
-  amqp_url: "amqp://guest:guest@localhost:5672/%2f"   # Activated
-  queue_name: "supply_chain.incoming_batches"         # Activated
+  amqp_url: "amqp://guest:guest@localhost:5672/%2f"
+  queue_name: "supply_chain.incoming_batches"
   val_queue_name: "supply_chain.validation_batches"
 
 # =====================================================================
 # NETWORK ARCHITECTURE CONFIGURATION
 # =====================================================================
 architecture:
-  model_type: "multi_class"
-  num_classes: 3
-  hidden_layers: [128, 64]
-  p_dropout: 0.1                       # 🚨 Updated: Light dropout to balance feature sensitivity
-  use_batch_norm: false                # Disabled: Stop shifting boundaries on crisp tabular formulas
-  bn_momentum: 0.9
+  model_type: "cnn"                  # Options: "multi_class", "binary_classification", "regression", "cnn"
+  num_classes: 4                     # 4 Synthetic Classes: Circle, Square, Cross, Diamond
+  hidden_layers: []                  # Dense MLP hidden layers (bypassed for CNN)
+  p_dropout: 0.1                     # Regularization dropout rate[cite: 3]
+  use_batch_norm: false              #[cite: 3]
+  bn_momentum: 0.9                   #[cite: 3]
+
+  # -------------------------------------------------------------------
+  # CNN SPECIFIC PIPELINE CONFIGURATION (Active when model_type: "cnn")
+  # -------------------------------------------------------------------
+  cnn:
+    input_shape: [3, 28, 28]         # [Channels, Height, Width]
+    spatial_pipeline:
+      - type: "conv"
+        in_channels: 3
+        out_channels: 8
+        kernel_size: 3
+        stride: 1
+        pad: 1
+      - type: "relu"
+      - type: "pool"
+        pool_size: 2
+        stride: 2
+      - type: "conv"
+        in_channels: 8
+        out_channels: 16
+        kernel_size: 3
+        stride: 1
+        pad: 1
+      - type: "relu"
+      - type: "pool"
+        pool_size: 2
+        stride: 2
+      - type: "flatten"
+    dense_head: [64]                 # Hidden dense dims between Flatten and Output classes
 
 # =====================================================================
 # OPTIMIZATION LOOP CONTROLS
 # =====================================================================
 optimization:
   optimizer: "adam"
-  epochs_full_dataset: 500
+  epochs_full_dataset: 100
   steps_streaming: 31
-  batch_size: 64
-  learning_rate: 0.001                 # 🚨 Updated: Standard rate to help Adam adapt to new L2 penalty
+  batch_size: 32
+  learning_rate: 0.001               # Initial learning rate for Adam
   
   # Learning Rate Schedule
-  lr_scheduler: "none"
-  scheduler_drop_ratio: 0.5
-  scheduler_epochs_per_drop: 50        # Widened drop window to give Adam time to aggressively minimize loss
+  lr_scheduler: "exponential"
   scheduler_decay_rate: 0.98
+  scheduler_epochs_per_drop: 10
+  scheduler_drop_ratio: 0.5
 
   # Early Stopping Monitor
   early_stopping_enabled: true
-  patience: 15                         # Extended patience to give the unconstrained network room to learn
-  min_delta: 1.0e-05
+  patience: 10
+  min_delta: 1.0e-04
 
   # Numerical Defensive Guardrails
   gradient_clipping_max_norm: 5.0
@@ -67,9 +93,9 @@ optimization:
 # REGULARIZATION STRAIN MATRIX
 # =====================================================================
 regularization:
-  lam_l1: 0
-  lam_l2: 0.001                        # 🚨 Updated: Added L2 penalty to suppress feature 0 dominance
-  sparsity_tolerance: 1.0e-05          # Moved out of training block into its natural mathematical home
+  lam_l1: 1.0e-05
+  lam_l2: 1.0e-04                    # L2 weight decay penalty
+  sparsity_tolerance: 1.0e-05
 
 # =====================================================================
 # PIPELINE FEATURE TRANSLATION TRANSFORMATIONS
@@ -83,8 +109,8 @@ transformations:
 # PERSISTENCE & LIFECYCLE MANAGEMENT
 # =====================================================================
 persistence:
-  load_saved_model: true               # 🚨 Kept unchanged
-  model_asset_path: "deployed_model.npz"
+  load_saved_model: false             # Set to false for clean CNN training run[cite: 3]
+  model_asset_path: "deployed_cnn_model.npz"
 
 # =====================================================================
 # DIAGNOSTICS & REPORTING

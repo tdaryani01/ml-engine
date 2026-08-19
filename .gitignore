@@ -16,5 +16,6 @@ __pycache__/
 venv/
 .env
 .cursor/
+*.log
 
 /diagnostics_output/
