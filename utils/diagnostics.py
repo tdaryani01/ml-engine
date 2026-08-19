@@ -20,7 +20,7 @@ class NeuralNetworkDiagnostics:
         # 1. Enforce output target directory creation boundaries
         os.makedirs(meta_cfg.output_dir, exist_ok=True)
         
-        # 2. Extract out-of-sample arrays cleanly from our providers (using RAW data)
+        # 2. Extract out-of-sample arrays cleanly from providers (using RAW data)
         X_test_raw, y_test = data_provider.get_validation_set()
         feature_names = cfg.ingestion.feature_names
         
@@ -31,9 +31,9 @@ class NeuralNetworkDiagnostics:
         # DYNAMIC RECONSTRUCTION: Handle Fourier expansions if enabled
         # =====================================================================
         fourier_cfg = cfg.transformations.fourier_expansion
-        mean = data_provider.mean
+        mean = getattr(data_provider, "mean", None)
         
-        if fourier_cfg.enabled and X_test_raw.shape[1] < mean.shape[0]:
+        if fourier_cfg.enabled and X_test_raw.ndim == 2 and mean is not None and X_test_raw.shape[1] < mean.shape[0]:
             num_freqs = fourier_cfg.num_frequencies
             features = [X_test_raw]
             for i in range(num_freqs):
@@ -44,16 +44,16 @@ class NeuralNetworkDiagnostics:
         else:
             X_processing = X_test_raw
 
-        # 🚨 FIXED: Route raw values directly through the clean controller.predict() framework
+        # Route raw values directly through controller.predict()
         raw_preds = controller.predict(X_processing)
         
-        # 🚨 FIXED: Collapse probabilities (450, 3) down to class indices (450,) via argmax to prevent ValueError broadcast crashes
+        # Collapse probabilities down to class indices via argmax
         if raw_preds.ndim > 1 and raw_preds.shape[1] > 1:
             pred_classes = np.argmax(raw_preds, axis=1)
         else:
             pred_classes = raw_preds.ravel()
         
-        # Pull topology boundaries using the correct property name 'layer_sizes'
+        # Pull topology boundaries dynamically
         num_classes = controller.model.layer_sizes[-1]
 
         if num_classes > 1:
@@ -71,9 +71,8 @@ class NeuralNetworkDiagnostics:
             NeuralNetworkDiagnostics.plot_metric_3_efficiency(controller.train_history, meta_cfg.output_dir, diag_cfg)
         if selection in ['4', 'space', 'all']:
             
-            # Re-architect closure logic to use your clean controller layer
             def predict_unscaled(X_raw_input):
-                if fourier_cfg.enabled and X_raw_input.shape[1] < mean.shape[0]:
+                if fourier_cfg.enabled and X_raw_input.ndim == 2 and mean is not None and X_raw_input.shape[1] < mean.shape[0]:
                     num_freqs = fourier_cfg.num_frequencies
                     features = [X_raw_input]
                     for i in range(num_freqs):
@@ -84,7 +83,6 @@ class NeuralNetworkDiagnostics:
                 else:
                     X_eval_processing = X_raw_input
 
-                # Returns clean class predictions or distributions seamlessly via the gateway
                 return controller.predict(X_eval_processing)
 
             NeuralNetworkDiagnostics.plot_metric_4_space(X_test_raw, y_test, feature_names, predict_unscaled, meta_cfg.output_dir, diag_cfg)
@@ -152,12 +150,20 @@ class NeuralNetworkDiagnostics:
     @staticmethod
     def plot_metric_4_space(X, y, features, predict_fn, out_dir, diag_cfg):
         NeuralNetworkDiagnostics._apply_configured_style(diag_cfg)
-        num_features = X.shape[1]
+        
+        # Flatten spatial tensors (N, C, H, W) to (N, D) for tabular plotting projections
+        if X.ndim > 2:
+            num_features = int(np.prod(X.shape[1:]))
+            X_flat = X.reshape(X.shape[0], -1)
+        else:
+            num_features = X.shape[1]
+            X_flat = X
+
         fig = plt.figure(figsize=(diag_cfg.figure_width, diag_cfg.figure_height), dpi=100)
 
         # 1D FEATURE INPUT WINDOW
-        if num_features == 1:
-            x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
+        if num_features == 1 and X.ndim == 2:
+            x_min, x_max = X_flat[:, 0].min() - 1, X_flat[:, 0].max() + 1
             xx = np.linspace(x_min, x_max, 500).reshape(-1, 1)
             raw_preds = predict_fn(xx)
             if raw_preds.ndim > 1 and raw_preds.shape[1] > 1:
@@ -165,16 +171,16 @@ class NeuralNetworkDiagnostics:
             else:
                 classes = raw_preds.ravel()
             plt.plot(xx, classes, color="#ff7f0e", linewidth=2.5, label="Model Prediction")
-            plt.scatter(X[:, 0], y.ravel(), color="#1f77b4", alpha=0.6, edgecolor="k", label="Actual Data")
-            plt.xlabel(features[0])
+            plt.scatter(X_flat[:, 0], y.ravel(), color="#1f77b4", alpha=0.6, edgecolor="k", label="Actual Data")
+            plt.xlabel(features[0] if isinstance(features, list) and len(features) > 0 else "Feature 1")
             plt.ylabel("Target Value")
             plt.legend()
             plt.grid(True, linestyle="--", alpha=0.5)
 
         # 2D FEATURE INPUT WINDOW (Contour Landscape Topology)
-        elif num_features == 2:
-            x_min, x_max = X[:, 0].min() - 2, X[:, 0].max() + 2
-            y_min, y_max = X[:, 1].min() - 2, X[:, 1].max() + 2
+        elif num_features == 2 and X.ndim == 2:
+            x_min, x_max = X_flat[:, 0].min() - 2, X_flat[:, 0].max() + 2
+            y_min, y_max = X_flat[:, 1].min() - 2, X_flat[:, 1].max() + 2
             xx, yy = np.meshgrid(np.linspace(x_min, x_max, 200), np.linspace(y_min, y_max, 200))
             raw_preds = predict_fn(np.c_[xx.ravel(), yy.ravel()])
             
@@ -196,16 +202,16 @@ class NeuralNetworkDiagnostics:
                 cbar = plt.colorbar(contour, ticks=list(range(num_classes)))
                 cbar.set_label("Assigned Class Category", rotation=270, labelpad=15, fontweight="bold")
                 cbar.ax.set_yticklabels([f'Class {i}' for i in range(num_classes)])
-                plt.scatter(X[:, 0], X[:, 1], c=y_eval_flat, cmap="Set1", edgecolor="k", linewidth=0.5)
+                plt.scatter(X_flat[:, 0], X_flat[:, 1], c=y_eval_flat, cmap="Set1", edgecolor="k", linewidth=0.5)
             else:
                 cbar = plt.colorbar(contour)
                 cbar.set_label("Predicted Value", rotation=270, labelpad=15, fontweight="bold")
-                plt.scatter(X[:, 0], X[:, 1], c=y_eval_flat, cmap="coolwarm", edgecolor="k", linewidth=0.5)
-            plt.xlabel(features[0])
-            plt.ylabel(features[1])
+                plt.scatter(X_flat[:, 0], X_flat[:, 1], c=y_eval_flat, cmap="coolwarm", edgecolor="k", linewidth=0.5)
+            plt.xlabel(features[0] if isinstance(features, list) and len(features) > 0 else "Feature 1")
+            plt.ylabel(features[1] if isinstance(features, list) and len(features) > 1 else "Feature 2")
 
         # 3D FEATURE INPUT WINDOW (Stereoscopic Projection)
-        elif num_features == 3:
+        elif num_features == 3 and X.ndim == 2:
             ax = fig.add_subplot(111, projection='3d')
             raw_preds = predict_fn(X)
             y_eval_flat = np.argmax(y, axis=1) if len(y.shape) > 1 and y.shape[1] > 1 else y.ravel()
@@ -217,14 +223,14 @@ class NeuralNetworkDiagnostics:
                 display_values = raw_preds.ravel()
                 cmap_to_use = "coolwarm"
                 
-            sc = ax.scatter(X[:, 0], X[:, 1], X[:, 2], c=display_values.ravel(), cmap=cmap_to_use, edgecolor='k', s=40, alpha=0.8)
-            ax.set_xlabel(features[0])
-            ax.set_ylabel(features[1])
-            ax.set_zlabel(features[2] if len(features) > 2 else "Feature 3")
+            sc = ax.scatter(X_flat[:, 0], X_flat[:, 1], X_flat[:, 2], c=display_values.ravel(), cmap=cmap_to_use, edgecolor='k', s=40, alpha=0.8)
+            ax.set_xlabel(features[0] if isinstance(features, list) and len(features) > 0 else "Feature 1")
+            ax.set_ylabel(features[1] if isinstance(features, list) and len(features) > 1 else "Feature 2")
+            ax.set_zlabel(features[2] if isinstance(features, list) and len(features) > 2 else "Feature 3")
             cbar = plt.colorbar(sc, pad=0.1)
             cbar.set_label("Model Prediction Matrix Mapping", rotation=270, labelpad=15, fontweight="bold")
 
-        # HIGH-DIMENSIONAL FALLBACK (>3 FEATURES UPPER BOUND RESIDUALS)
+        # HIGH-DIMENSIONAL / SPATIAL TENSOR FALLBACK
         else:
             raw_preds = predict_fn(X)
             y_eval_flat = np.argmax(y, axis=1) if len(y.shape) > 1 and y.shape[1] > 1 else y.ravel()

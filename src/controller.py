@@ -33,13 +33,14 @@ class ModelController:
     def initialize_network_from_dimensions(self, input_dim: int, output_dim: int, model_type: ModelType, 
                                            hidden_layers: list, optimizer_name: str, lam_l1: float, lam_l2: float, 
                                            p_dropout: float = 0.0, use_batch_norm: bool = True, 
-                                           bn_momentum: float = 0.9, max_norm: float = 5.0) -> None:
+                                           bn_momentum: float = 0.9, max_norm: float = 5.0,
+                                           cnn_config: dict = None) -> None:
         """Initializes the underlying neural network based on explicit dimension parameters."""
         resolved_topology = tuple([input_dim] + hidden_layers + [output_dim])
         logging.info(f"[Model Controller] Resolved Layer Architecture Sequence: {resolved_topology}")
         
         self.model = ModelFactory.create_model(
-            model_type=model_type.name.lower(),
+            model_type=model_type.name.lower() if hasattr(model_type, 'name') else str(model_type).lower(),
             layer_sizes=resolved_topology,
             lr=self.initial_lr,
             optimizer=optimizer_name,
@@ -48,19 +49,32 @@ class ModelController:
             p_dropout=p_dropout,
             use_batch_norm=use_batch_norm,
             bn_momentum=bn_momentum,
-            max_norm=max_norm
+            max_norm=max_norm,
+            cnn_config=cnn_config
         )
+        
+        # FORENSIC HOOK: INIT TRACE
+        if hasattr(self.model, 'weights') and hasattr(self.model, 'biases') and len(self.model.weights) > 0:
+            initial_w_norm = np.linalg.norm(self.model.weights[0])
+            initial_b = self.model.biases[-1][0] if len(self.model.biases[-1].shape) > 1 else self.model.biases[-1]
+            logging.info("=== FORENSIC INIT TRACE ===")
+            logging.info(f"Layer 0 Starting Weight Norm: {initial_w_norm:.6f}")
+            logging.info(f"Final Layer Starting Biases : {np.round(initial_b, 4).tolist()}")
+            logging.info("===========================")
 
     def initialize_network_from_provider(self, data_provider, model_type: ModelType, hidden_layers: list, 
                                         optimizer_name: str, lam_l1: float, lam_l2: float, 
                                         p_dropout: float = 0.0, use_batch_norm: bool = True, 
-                                        bn_momentum: float = 0.9, max_norm: float = 5.0) -> None:
+                                        bn_momentum: float = 0.9, max_norm: float = 5.0,
+                                        cnn_config: dict = None) -> None:
         """Initializes network topology by automatically inferring dimensions from a data provider."""
         self.data_provider = data_provider  
         X_val, y_val = data_provider.get_validation_set()
-        input_dim = X_val.shape[1]
         
-        if model_type in (ModelType.MULTI_CLASS, ModelType.BINARY_CLASSIFICATION):
+        # Safely extract total flattened dimension across all non-batch dimensions
+        input_dim = int(np.prod(X_val.shape[1:]))
+        
+        if model_type in (ModelType.MULTI_CLASS, ModelType.BINARY_CLASSIFICATION, ModelType.CNN):
             distinct_classes = len(np.unique(y_val))
             if model_type == ModelType.BINARY_CLASSIFICATION and len(y_val.shape) == 2 and y_val.shape[1] == 1:
                 output_dim = 1
@@ -80,7 +94,8 @@ class ModelController:
             p_dropout=p_dropout,
             use_batch_norm=use_batch_norm,
             bn_momentum=bn_momentum,
-            max_norm=max_norm
+            max_norm=max_norm,
+            cnn_config=cnn_config
         )
 
     def hydrate_from_asset(self, asset_path: str) -> bool:
@@ -107,11 +122,16 @@ class ModelController:
         if self.model is None:
             raise ValueError("[Model Controller] Execution Error: Cannot call fit before initializing the network.")
 
-        self.data_provider = data_provider  
+        self.data_provider = data_provider   
         epoch = 0
-        is_classification = model_type in (ModelType.BINARY_CLASSIFICATION, ModelType.MULTI_CLASS)
+        is_classification = model_type in (ModelType.BINARY_CLASSIFICATION, ModelType.MULTI_CLASS, ModelType.CNN)
         
         X_val, y_val_target = data_provider.get_validation_set()
+        
+        # FORENSIC HOOK: STATIC VALIDATION DISTRIBUTION
+        if is_classification:
+            val_class_dist = np.sum(y_val_target, axis=0).tolist() if hasattr(y_val_target, 'ndim') and y_val_target.ndim > 1 else np.unique(y_val_target, return_counts=True)[1].tolist()
+            logging.info(f"[Forensic Trace] Static Validation Set Class Distribution: {val_class_dist}")
         
         if steps <= 0:
             logging.info("[Model Controller] Steps count set to 0. Skipping training execution loops.")
@@ -127,7 +147,7 @@ class ModelController:
         while True:
             active_lr = self.scheduler.step(epoch) if self.scheduler else self.initial_lr
             
-            epoch_train_loss = self._run_epoch_training_pass(data_provider, active_lr, steps)
+            epoch_train_loss, batch_forensics = self._run_epoch_training_pass(data_provider, active_lr, steps, epoch, is_classification)
             if epoch_train_loss == 0.0:
                 break
             self.train_history.append(epoch_train_loss)
@@ -138,7 +158,8 @@ class ModelController:
             
             self.val_history.append(current_val_loss)
             
-            self._evaluate_epoch_performance(epoch, data_provider, epoch_train_loss, val_preds, y_val_target, current_val_loss, active_lr, is_classification, model_type)
+            self._evaluate_epoch_performance(epoch, data_provider, epoch_train_loss, val_preds, y_val_target, 
+                                             current_val_loss, current_val_raw_cost, active_lr, is_classification, batch_forensics)
             
             if early_stopping_enabled:
                 should_stop = self._handle_early_stopping(epoch, current_val_raw_cost, min_delta, patience, es_state)
@@ -149,10 +170,12 @@ class ModelController:
         self._generate_final_summary_report(data_provider, X_val, y_val_target, source_mode, is_classification, model_type, es_state, early_stopping_enabled)
         return self.train_history, self.val_history
 
-    def _run_epoch_training_pass(self, data_provider, active_lr: float, steps: int) -> float:
-        """Processes training batches sequentially and computes parameter updates."""
+    def _run_epoch_training_pass(self, data_provider, active_lr: float, steps: int, epoch: int, is_classification: bool) -> tuple:
+        """Processes training batches sequentially and computes parameter updates, tracking forensic batch data."""
         data_provider.reset_epoch()
         batch_losses = []
+        batch_idx = 0
+        forensic_data = {}
         
         while data_provider.has_more_batches():
             X_b, y_b = data_provider.next_batch()
@@ -167,17 +190,52 @@ class ModelController:
                 batch_loss = self.model.compute_total_loss(preds_b, y_b)
                 
             batch_losses.append(batch_loss)
+            
+            # FORENSIC HOOK: Track batch 0 dynamics every 10 epochs
+            if batch_idx == 0 and epoch % 10 == 0:
+                if is_classification:
+                    y_classes = np.sum(y_b, axis=0) if len(y_b.shape) > 1 else np.unique(y_b, return_counts=True)[1]
+                else:
+                    y_classes = "N/A"
+                    
+                # Intercept internal network state from backward pass
+                if hasattr(self.model, 'activations') and len(self.model.activations) > 0:
+                    preds = self.model.activations[-1]
+                    if is_classification and hasattr(preds, 'shape') and len(preds.shape) > 1:
+                        pred_classes = np.argmax(preds, axis=1)
+                        pred_spread = [int(np.sum(pred_classes == c)) for c in range(preds.shape[1])]
+                    else:
+                        pred_spread = "N/A"
+                        
+                    # Calculate Dead Zone in Layer 1
+                    if len(self.model.activations) > 1:
+                        l1_act = self.model.activations[1]
+                        dead_pct = float(np.mean(l1_act <= 0.0) * 100)
+                    else:
+                        dead_pct = 0.0
+                else:
+                    pred_spread = []
+                    dead_pct = 0.0
+                    
+                forensic_data = {
+                    "batch_target_dist": y_classes.tolist() if isinstance(y_classes, np.ndarray) else y_classes,
+                    "batch_pred_spread": pred_spread,
+                    "dead_zone_pct": dead_pct
+                }
+                
+            batch_idx += 1
             self.steps_completed += 1
             if self.steps_completed >= steps:
                 self.steps_completed = 0
                 break
-        return float(np.mean(batch_losses)) if batch_losses else 0.0
+                
+        return float(np.mean(batch_losses)) if batch_losses else 0.0, forensic_data
 
     def _evaluate_epoch_performance(self, epoch: int, data_provider, train_loss: float, val_preds: np.ndarray, y_val_target: np.ndarray, 
-                                    current_val_loss: float, active_lr: float, is_classification: bool, model_type: ModelType) -> None:
-        """Logs intermediate training metrics at defined intervals."""
+                                    current_val_loss: float, current_val_raw_cost: float, active_lr: float, is_classification: bool, batch_forensics: dict) -> None:
+        """Logs intermediate training metrics cleanly without trailing delimiter artifacts."""
         if epoch % 10 == 0 or not data_provider.has_more_batches():
-            metric_name_step = "Acc" if is_classification else "R²"
+            metric_name = "Acc" if is_classification else "R²"
             
             if hasattr(data_provider, "splits") and DataKeys.X_TRAIN in data_provider.splits:
                 X_train = data_provider.splits[DataKeys.X_TRAIN]
@@ -194,11 +252,15 @@ class ModelController:
                 train_score = 0.0
                 val_score = np.mean(np.argmax(val_preds, axis=1) == np.argmax(y_val_target, axis=1)) if is_classification else self.compute_r2_score(y_val_target, val_preds)
 
+            train_score_str = f"{train_score * 100:.2f}%" if is_classification else f"{train_score:.4f}"
+            val_score_str = f"{val_score * 100:.2f}%" if is_classification else f"{val_score:.4f}"
+
             logging.info(
                 f"Epoch {epoch:3d} | "
-                f"Train Loss: {train_loss:.4f} | Val Loss: {current_val_loss:.4f} | "
-                f"Train {metric_name_step}: {train_score * 100:.2f}% | " if is_classification else f"Train {metric_name_step}: {train_score:.4f} | "
-                f"Val {metric_name_step}: {val_score * 100:.2f}% | " if is_classification else f"Val {metric_name_step}: {val_score:.4f} | "
+                f"Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {current_val_loss:.4f} | "
+                f"Train {metric_name}: {train_score_str} | "
+                f"Val {metric_name}: {val_score_str} | "
                 f"Active LR: {active_lr:.6f}"
             )
 
@@ -217,6 +279,8 @@ class ModelController:
                 logging.info(f"[Early Stopping] True validation data divergence detected at epoch {epoch}. Restoring checkpoint maps from epoch {es_state['best_epoch']}.")
                 self.model.weights = es_state["weights"]
                 self.model.biases = es_state["biases"]
+                if hasattr(self.model, '_sync_restored_weights'):
+                    self.model._sync_restored_weights()
                 return True
         return False
 
@@ -272,7 +336,7 @@ class ModelController:
             f"{divider}\n"
             f"  [ PIPELINE ENVIRONMENT ]\n"
             f"  • Ingestion Strategy Mode : {mode_str}\n"
-            f"  • Network Task Profile    : {model_type.name}\n"
+            f"  • Network Task Profile    : {model_type.name if hasattr(model_type, 'name') else str(model_type)}\n"
             f"  • Total Epochs Executed   : {len(self.val_history)} / 300\n"
             f"  • Early Stopping State    : {'ACTIVE' if es_enabled else 'DISABLED'}\n"
             f"  • Best Operational Epoch  : {es_state['best_epoch'] if es_enabled else 'N/A'}\n"
@@ -289,6 +353,15 @@ class ModelController:
             f"{divider}\n"
         )
         logging.info(report)
+        
+        # FORENSIC HOOK: FINAL TRACE
+        if hasattr(self.model, 'weights') and hasattr(self.model, 'biases') and len(self.model.weights) > 0:
+            final_w_norm = np.linalg.norm(self.model.weights[0])
+            final_biases = np.round(self.model.biases[-1][0] if len(self.model.biases[-1].shape) > 1 else self.model.biases[-1], 4)
+            logging.info(f"=== FORENSIC FINAL TRACE ===")
+            logging.info(f"Layer 0 Final Weight Norm: {final_w_norm:.6f}")
+            logging.info(f"Final Layer Output Biases: {final_biases.tolist()}")
+            logging.info(f"============================")
 
     def serialize_current_state(self, target_asset_path: str, serialized_config_dict: dict) -> None:
         """Serializes the current model configuration and weights to an output path."""

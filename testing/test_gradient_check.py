@@ -17,7 +17,7 @@ class MockOptimizer:
         self.grad_betas = None
 
     def update(self, weights, biases, grad_weights, grad_biases, m_samples=1, lam_l2=0.0, grad_gammas=None, grad_betas=None, **kwargs):
-        if lam_l2 > 0.0:
+        if lam_l2 > 0.0 and grad_weights is not None:
             for i in range(len(grad_weights)):
                 grad_weights[i] += (lam_l2 / m_samples) * weights[i]
                 
@@ -92,7 +92,7 @@ class GradientChecker:
                 it.iternext()
 
         status_tag = "PASSED" if passed else "FAILED"
-        print(f"[{status_tag}] {tensor_name:<12} | Max Rel Error: {max_error:.2e} (Threshold: {self.tol:.0e})")
+        print(f"[{status_tag}] {tensor_name:<16} | Max Rel Error: {max_error:.2e} (Threshold: {self.tol:.0e})")
         
         if not passed and worst_coord:
             print(f"  └── Failure Coordinate: Layer {worst_coord[0]} Index {worst_coord[1]}")
@@ -146,7 +146,7 @@ def run_gradient_check(task_type: str, use_batch_norm: bool, p_dropout: float) -
     # Cast initial tensors to float64 precision
     model.weights = [w.astype(np.float64) for w in model.weights]
     model.biases = [b.astype(np.float64) for b in model.biases]
-    if model.use_batch_norm:
+    if getattr(model, "use_batch_norm", False):
         model.gammas = [g.astype(np.float64) for g in model.gammas]
         model.betas = [b.astype(np.float64) for b in model.betas]
 
@@ -181,8 +181,80 @@ def run_gradient_check(task_type: str, use_batch_norm: bool, p_dropout: float) -
         return 1
 
 
+def run_cnn_gradient_check() -> int:
+    """Dedicated finite-difference check for spatial CNN layers and dense classification head."""
+    seed_val = 42
+    np.random.seed(seed_val)
+    
+    print("\n" + "=" * 70)
+    print(" RUNNING CHECK: Task='cnn' (Spatial Conv2D + Dense Head)")
+    print("=" * 70)
+
+    batch_size = 2
+    in_channels, in_h, in_w = 1, 6, 6
+    num_classes = 3
+
+    # Micro spatial dataset: (N, C, H, W)
+    X_mock = np.random.randn(batch_size, in_channels, in_h, in_w).astype(np.float64)
+    raw_labels = np.random.randint(0, num_classes, size=batch_size)
+    y_mock = np.zeros((batch_size, num_classes), dtype=np.float64)
+    for i, label in enumerate(raw_labels):
+        y_mock[i, label] = 1.0
+
+    # Micro CNN Topology: 1x6x6 -> Conv(2 filters, 3x3) -> 2x4x4 (32) -> Flatten -> Dense(4) -> Output(3)
+    cnn_config = {
+        "input_shape": [in_channels, in_h, in_w],
+        "spatial_pipeline": [
+            {"type": "conv", "in_channels": in_channels, "out_channels": 2, "kernel_size": 3, "stride": 1, "pad": 0},
+            {"type": "relu"},
+            {"type": "flatten"}
+        ],
+        "dense_head": [4]
+    }
+
+    # Instantiate model using registered factory key 'cnn'
+    model = ModelFactory.create_model(
+        model_type="cnn",
+        layer_sizes=[in_channels * in_h * in_w, num_classes],
+        optimizer="sgd",
+        lr=0.01,
+        lam_l1=0.01,
+        lam_l2=0.01,
+        p_dropout=0.0,
+        use_batch_norm=False,
+        max_norm=1000.0,
+        cnn_config=cnn_config
+    )
+
+    # Cast parameters to float64
+    model.weights = [w.astype(np.float64) for w in model.weights]
+    model.biases = [b.astype(np.float64) for b in model.biases]
+
+    mock_opt = MockOptimizer()
+    model.optimizer = mock_opt
+
+    np.random.seed(seed_val)
+    model.backward(X_mock, y_mock, active_lr=0.01)
+
+    grad_weights = mock_opt.grad_weights
+    grad_biases = mock_opt.grad_biases
+
+    checker = GradientChecker(model=model, epsilon=1e-7, tolerance=1e-5)
+    passed_all = True
+    passed_all &= checker.check_tensor(model.weights, grad_weights, "CNN Weights (W)", X_mock, y_mock, seed_val)
+    passed_all &= checker.check_tensor(model.biases, grad_biases, "CNN Biases (b)", X_mock, y_mock, seed_val)
+
+    print("-" * 70)
+    if passed_all:
+        print("[SUCCESS] Test passed for CNN spatial architecture.")
+        return 0
+    else:
+        print("[ERROR] Discrepancy detected in CNN spatial architecture.")
+        return 1
+
+
 def run_all_checks():
-    # Matrix of Edge Cases to satisfy framework-grade requirements
+    # 1. Base MLP Checks (Original Test Suite)
     test_cases = [
         {"task": "multi_class", "bn": False, "p_dropout": 0.0},           # Base core engine
         {"task": "multi_class", "bn": True, "p_dropout": 0.0},            # Batch Norm isolated
@@ -195,10 +267,15 @@ def run_all_checks():
         exit_code = run_gradient_check(case["task"], case["bn"], case["p_dropout"])
         if exit_code != 0:
             overall_status = 1
+
+    # 2. CNN Spatial Check
+    cnn_exit_code = run_cnn_gradient_check()
+    if cnn_exit_code != 0:
+        overall_status = 1
             
     print("\n" + "=" * 70)
     if overall_status == 0:
-        print("[GLOBAL SUCCESS] Entire Engine Mathematically Verified Across All Tasks!")
+        print("[GLOBAL SUCCESS] Entire Engine (MLP + CNN) Mathematically Verified Across All Tasks!")
         return 0
     else:
         print("[GLOBAL ERROR] One or more gradient checks failed.")
