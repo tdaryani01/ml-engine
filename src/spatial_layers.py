@@ -1,4 +1,5 @@
 # src/spatial_layers.py
+import builtins
 import numpy as np
 from utils.im2col import (
     im2col,
@@ -7,6 +8,9 @@ from utils.im2col import (
     maxpool_backward,
     fuse_dout_transpose_and_bias
 )
+
+if 'profile' not in builtins.__dict__:
+    builtins.__dict__['profile'] = lambda x: x
 
 
 class Conv2D:
@@ -80,6 +84,7 @@ class Conv2D:
             out.reshape(N, self.out_h, self.out_w, self.out_channels).transpose(0, 3, 1, 2)
         )
 
+    @profile
     def backward(self, dout: np.ndarray) -> np.ndarray:
         if not dout.flags['C_CONTIGUOUS']:
             dout = np.ascontiguousarray(dout)
@@ -101,9 +106,9 @@ class Conv2D:
         active_dout_trans = self._dout_trans_buffer[:total_rows]
         fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
 
-        # 1. Parameter gradient Level-3 GEMM
+        # 1. Parameter gradient GEMM
         dW_flat = self.dW.reshape(self.out_channels, -1)
-        np.dot(active_dout_trans.T, self.col, out=dW_flat)
+        np.copyto(dW_flat, np.dot(self.col.T, active_dout_trans).T)
         dW_flat *= inv_m
 
         # 2. Input gradient Level-3 GEMM
