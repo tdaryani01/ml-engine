@@ -4,11 +4,11 @@ import numpy as np
 from src.model_factory import ModelFactory
 
 class ModelSerializer:
-    """Handles serialization and deserialization of trained neural network assets, normalization stats, and metadata[cite: 7]."""
+    """Handles serialization and deserialization of trained neural network assets, normalization stats, and metadata."""
     
     @staticmethod
     def save_model(model, config, data_provider=None, file_path="deployed_model.npz"):
-        """Serializes current trained parameters, normalization stats, and structural metadata to a compressed asset[cite: 7]."""
+        """Serializes current trained parameters, normalization stats, and structural metadata to a compressed asset."""
         
         if isinstance(config, dict):
             model_type_str = str(config["architecture"]["model_type"])
@@ -23,7 +23,7 @@ class ModelSerializer:
             use_batch_norm  = bool(config.architecture.use_batch_norm)
             bn_momentum     = float(config.architecture.bn_momentum)
             
-        print(f"[Saver] Serializing active {model_type_str} configuration[cite: 7]...")
+        print(f"[Saver] Serializing active {model_type_str} configuration...")
         
         payload = {
             "model_type": model_type_str,
@@ -37,7 +37,7 @@ class ModelSerializer:
             "bn_momentum": bn_momentum
         }
         
-        # Save data normalization statistics if available[cite: 7]
+        # Save data normalization statistics if available
         if data_provider is not None:
             if hasattr(data_provider, "mean") and data_provider.mean is not None:
                 payload["mean"] = data_provider.mean
@@ -56,17 +56,17 @@ class ModelSerializer:
                 payload[f"rvar_{i}"] = model.running_vars[i]
             
         np.savez_compressed(file_path, **payload)
-        print(f"[Saver] Production asset successfully saved to: {file_path}[cite: 7]")
+        print(f"[Saver] Production asset successfully saved to: {file_path}")
 
     @staticmethod
     def load_model(file_path="deployed_model.npz"):
-        """Reconstitutes a fully trained polymorphic network architecture from a saved asset[cite: 7]."""
+        """Reconstitutes a fully trained polymorphic network architecture from a saved asset."""
         if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Target serialization file asset not found at '{file_path}'[cite: 7]")
+            raise FileNotFoundError(f"Target serialization file asset not found at '{file_path}'")
             
         archive = np.load(file_path)
         
-        # Normalize the model type string to strip enum namespaces and force lowercase[cite: 7]
+        # Normalize the model type string to strip enum namespaces and force lowercase
         raw_model_type = str(archive["model_type"]).strip()
         if "ModelType." in raw_model_type:
             raw_model_type = raw_model_type.split("ModelType.")[-1]
@@ -75,7 +75,7 @@ class ModelSerializer:
         use_bn = bool(archive["use_batch_norm"]) if "use_batch_norm" in archive else False
         bn_mom = float(archive["bn_momentum"]) if "bn_momentum" in archive else 0.9
         
-        # Instantiate base framework signature directly through factory root[cite: 7]
+        # Instantiate base framework signature directly through factory root
         model = ModelFactory.create_model(
             model_type=model_type_clean,
             layer_sizes=tuple(archive["layer_sizes"]),
@@ -99,5 +99,5 @@ class ModelSerializer:
                 model.running_means[i] = archive[f"rmean_{i}"]
                 model.running_vars[i] = archive[f"rvar_{i}"]
             
-        print(f"[Saver] Reconstituted {model_type_clean} model instance from {file_path} successfully[cite: 7].")
+        print(f"[Saver] Reconstituted {model_type_clean} model instance from {file_path} successfully.")
         return model

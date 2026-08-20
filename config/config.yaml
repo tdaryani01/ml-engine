@@ -14,7 +14,7 @@ meta:
 # DATA INGESTION MATRIX
 # =====================================================================
 ingestion:
-  source_mode: "csv"                 # IngestionMode: "csv" or "stream"[cite: 6]
+  source_mode: "csv"                 # IngestionMode: "csv" or "stream"
   data_file_path: "data/samples/csv/synthetic_shapes.csv"
   feature_names: "auto"              # Ingest all pixel feature columns (px_0 to px_2351)
   splits:
@@ -32,9 +32,9 @@ architecture:
   model_type: "cnn"                  # Options: "multi_class", "binary_classification", "regression", "cnn"
   num_classes: 4                     # 4 Synthetic Classes: Circle, Square, Cross, Diamond
   hidden_layers: []                  # Dense MLP hidden layers (bypassed for CNN)
-  p_dropout: 0.1                     # Regularization dropout rate[cite: 3]
-  use_batch_norm: false              #[cite: 3]
-  bn_momentum: 0.9                   #[cite: 3]
+  p_dropout: 0.1                     # Regularization dropout rate
+  use_batch_norm: false              #
+  bn_momentum: 0.9                   #
 
   # -------------------------------------------------------------------
   # CNN SPECIFIC PIPELINE CONFIGURATION (Active when model_type: "cnn")
@@ -109,7 +109,7 @@ transformations:
 # PERSISTENCE & LIFECYCLE MANAGEMENT
 # =====================================================================
 persistence:
-  load_saved_model: false             # Set to false for clean CNN training run[cite: 3]
+  load_saved_model: false             # Set to false for clean CNN training run
   model_asset_path: "deployed_cnn_model.npz"
 
 # =====================================================================
