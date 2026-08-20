@@ -8,11 +8,11 @@ from data.base_provider import BaseDataProvider
 from config.constants import DataKeys
 
 class IPCStreamDataProvider(BaseDataProvider):
-    """Data provider for streaming data via Windows named pipes and multiprocessing connection handles[cite: 9]."""
+    """Data provider for streaming data via Windows named pipes and multiprocessing connection handles."""
     def __init__(self, ipc_pipe_path: str, feature_names: List[str], batch_size: int, 
                  steps_per_epoch: int = 100, num_classes: int = 3):
         
-        # Standardize configuration name into a valid local Windows named pipe handle URI[cite: 9]
+        # Standardize configuration name into a valid local Windows named pipe handle URI
         pipe_clean = ipc_pipe_path.replace(".pipe", "").split("\\")[-1].split("/")[-1]
         self.address = f"\\\\.\\pipe\\{pipe_clean}"
 
@@ -36,7 +36,7 @@ class IPCStreamDataProvider(BaseDataProvider):
         self._bootstrap_ipc_connection()
 
     def _bootstrap_ipc_connection(self) -> None:
-        """Connects to the standalone receiver process using high-level multiprocessing client handles[cite: 9]."""
+        """Connects to the standalone receiver process using high-level multiprocessing client handles."""
         logging.info(f"[IPC Provider] Connecting to streaming pipe: {self.address}...")
         
         while True:
@@ -51,9 +51,9 @@ class IPCStreamDataProvider(BaseDataProvider):
         self._seed_validation_cache()
 
     def _read_next_shard_from_pipe(self, timeout: float = 5.0) -> Tuple[np.ndarray, np.ndarray]:
-        """Natively deserializes the full structured tuple object with an anti-freeze timeout[cite: 9]."""
+        """Natively deserializes the full structured tuple object with an anti-freeze timeout."""
         try:
-            # Check if data is actually available within the given timeout window[cite: 9]
+            # Check if data is actually available within the given timeout window
             if timeout > 0 and not self._conn.poll(timeout):
                 raise TimeoutError(f"[IPC Provider] Stream timed out! No data received within {timeout} seconds.")
             elif timeout == 0 and not self._conn.poll(0):
@@ -62,21 +62,21 @@ class IPCStreamDataProvider(BaseDataProvider):
             X_shard, y_shard = self._conn.recv()
             return X_shard, y_shard
         except LookupError:
-            # Reraise immediately for non-blocking checks to catch[cite: 9]
+            # Reraise immediately for non-blocking checks to catch
             raise
         except Exception as e:
             logging.error(f"[IPC Provider] Connection error or timeout: {e}")
             raise EOFError("[IPC Provider] Pipe disconnected or stream terminated.")
 
     def _seed_validation_cache(self) -> None:
-        """Pulls initial frames off the pipe safely without letting an empty stream freeze execution[cite: 9]."""
+        """Pulls initial frames off the pipe safely without letting an empty stream freeze execution."""
         logging.info("[IPC Provider] Seeding validation cache from stream...")
         
         shards_collected = 0
-        # Try to gather 2 shards if they are already sitting in the pipe queue[cite: 9]
+        # Try to gather 2 shards if they are already sitting in the pipe queue
         for _ in range(2):
             try:
-                # Use timeout=0 for a strict non-blocking check[cite: 9]
+                # Use timeout=0 for a strict non-blocking check
                 X_v, y_v = self._read_next_shard_from_pipe(timeout=0)
                 self.splits[DataKeys.X_VAL] = np.vstack([self.splits[DataKeys.X_VAL], X_v])
                 self.splits[DataKeys.Y_VAL] = np.vstack([self.splits[DataKeys.Y_VAL], y_v])
@@ -84,7 +84,7 @@ class IPCStreamDataProvider(BaseDataProvider):
             except LookupError:
                 break
         
-        # Fallback stub: If queue didn't have data cached yet, keep the engine from stalling out[cite: 9]
+        # Fallback stub: If queue didn't have data cached yet, keep the engine from stalling out
         if shards_collected == 0:
             logging.warning("[IPC Provider] Pipe buffer empty on boot. Seeding fallback validation cache.")
             self.splits[DataKeys.X_VAL] = np.zeros((self.batch_size, self.feature_count), dtype=np.float32)
@@ -97,20 +97,20 @@ class IPCStreamDataProvider(BaseDataProvider):
         logging.info(f"[IPC Provider] Validation cache initialized with {len(self.splits[DataKeys.X_VAL])} rows.")
 
     def normalize(self, data_matrix: np.ndarray) -> np.ndarray:
-        """Normalizes the input data matrix[cite: 9]."""
+        """Normalizes the input data matrix."""
         return data_matrix
 
     def has_more_batches(self) -> bool:
-        """Determines if additional batches remain in the current streaming epoch[cite: 9]."""
+        """Determines if additional batches remain in the current streaming epoch."""
         return self._epoch_open
 
     def next_batch(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Retrieves the next feature and target batch from the IPC pipe[cite: 9]."""
+        """Retrieves the next feature and target batch from the IPC pipe."""
         if self._batches_served_this_epoch >= self.steps_per_epoch:
             self._epoch_open = False
             return np.array([]), np.array([])
 
-        # Training loop steps use the standard blocking 5.0 second timeout check[cite: 9]
+        # Training loop steps use the standard blocking 5.0 second timeout check
         X_batch, y_batch = self._read_next_shard_from_pipe(timeout=5.0)
 
         if len(X_batch) > self.batch_size:
@@ -123,16 +123,16 @@ class IPCStreamDataProvider(BaseDataProvider):
         return X_batch, y_batch
 
     def get_validation_set(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Retrieves the cached validation features and targets[cite: 9]."""
+        """Retrieves the cached validation features and targets."""
         return self.splits[DataKeys.X_VAL], self.splits[DataKeys.Y_VAL]
 
     def reset_epoch(self) -> None:
-        """Resets epoch counters and flags for streaming iteration[cite: 9]."""
+        """Resets epoch counters and flags for streaming iteration."""
         self._batches_served_this_epoch = 0
         self._epoch_open = True
 
     def close(self) -> None:
-        """Closes the high-level pipe link cleanly[cite: 9]."""
+        """Closes the high-level pipe link cleanly."""
         if self._conn:
             self._conn.close()
             logging.info("[IPC Provider] High-level pipe link closed cleanly.")

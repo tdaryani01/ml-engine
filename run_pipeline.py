@@ -2,11 +2,11 @@
 import logging
 import numpy as np
 from config.config_loader import load_production_config
-from data.csv_provider import CSVDataProvider
+from data.base_loader import BaseDataLoader
+from data.in_memory_provider import InMemoryDataProvider
 from data.stream_provider import StreamDataProvider
-from data.image_loader import StandardImageLoader
 from src.controller import ModelController
-from config.constants import IngestionMode, ModelType
+from config.constants import IngestionMode, ModelType, DataKeys
 from utils.logger import initialize_global_logging
 from utils.diagnostics import NeuralNetworkDiagnostics
 
@@ -19,50 +19,12 @@ def execute_training_pipeline():
     # 2. Initialize enterprise dual-destination logging
     initialize_global_logging(cfg)
 
-    # 3. Instantiate the ModelController
-    controller = ModelController(
-        learning_rate=cfg.optimization.learning_rate,
-        lr_scheduler_type=cfg.optimization.lr_scheduler,
-        scheduler_decay_rate=cfg.optimization.scheduler_decay_rate,
-        scheduler_drop_ratio=cfg.optimization.scheduler_drop_ratio,
-        scheduler_epochs_per_drop=cfg.optimization.scheduler_epochs_per_drop
-    )
-    
-    # 4. Resolve Model Architecture & Route Ingestion Provider
     is_cnn = (cfg.architecture.model_type == ModelType.CNN)
     source_mode = cfg.ingestion.source_mode
+    cnn_cfg = getattr(cfg.architecture, "cnn", None) if is_cnn else None
 
-    if is_cnn:
-        # Spatial Pipeline Ingestion (4D Tensors via StandardImageLoader)
-        cnn_cfg = getattr(cfg.architecture, "cnn", None)
-        if not cnn_cfg or "input_shape" not in cnn_cfg:
-            raise ValueError("[Config Error] 'architecture.cnn' with 'input_shape' must be defined in config.yaml when model_type is 'cnn'.")
-
-        logging.info(f"[Pipeline Ingestion] Ingesting spatial dataset from: {cfg.ingestion.data_file_path}")
-        data_provider = StandardImageLoader.load_csv_image_dataset(
-            csv_path=cfg.ingestion.data_file_path,
-            input_shape=cnn_cfg["input_shape"],
-            num_classes=cfg.architecture.num_classes,
-            val_split=cfg.ingestion.splits.val,
-            batch_size=cfg.optimization.batch_size
-        )
-        steps = int(np.ceil(len(data_provider.X_train) / cfg.optimization.batch_size))
-        input_dim = int(np.prod(cnn_cfg["input_shape"]))
-
-    elif source_mode == IngestionMode.CSV:
-        # Tabular / MLP Ingestion (2D Feature Matrices)
-        data_provider = CSVDataProvider(
-            data_file_path=cfg.ingestion.data_file_path,
-            feature_names=cfg.ingestion.feature_names,
-            batch_size=cfg.optimization.batch_size,
-            model_instance=controller.model,
-            epochs=cfg.optimization.epochs_full_dataset
-        )
-        steps = data_provider.recomment_steps()
-        input_dim = len(cfg.ingestion.feature_names) if isinstance(cfg.ingestion.feature_names, list) else data_provider.splits["X_train"].shape[1]
-
-    elif source_mode == IngestionMode.STREAM:
-        # Streaming Ingestion via RabbitMQ
+    # 3. Resolve Data Provider via Factory Loader or Stream Provider
+    if source_mode == IngestionMode.STREAM:
         if not cfg.ingestion.amqp_url or not cfg.ingestion.queue_name:
             raise ValueError("[Ingestion Error] AMQP properties must be defined in config when source_mode='stream'")
             
@@ -79,10 +41,39 @@ def execute_training_pipeline():
         )
         steps = cfg.optimization.steps_streaming
         input_dim = len(cfg.ingestion.feature_names)
-    else:
-        raise ValueError(f"[Ingestion Error] Unknown source_mode option: '{source_mode}'.")
 
-    # 5. Build the network topology
+    else:
+        # Resolve loader polymorphically via BaseDataLoader factory
+        loader = BaseDataLoader.create_loader(cfg)
+
+        data_provider = InMemoryDataProvider(
+            loader=loader,
+            batch_size=cfg.optimization.batch_size,
+            epochs=cfg.optimization.epochs_full_dataset,
+            normalize_features=(not is_cnn)
+        )
+        steps = data_provider.recomment_steps()
+
+        if is_cnn:
+            input_dim = int(np.prod(cnn_cfg["input_shape"]))
+        else:
+            input_dim = (
+                len(cfg.ingestion.feature_names) 
+                if isinstance(cfg.ingestion.feature_names, list) 
+                else data_provider.splits[DataKeys.X_TRAIN].shape[1]
+            )
+
+    # 4. Instantiate Controller
+    controller = ModelController(
+        data_provider = data_provider,
+        learning_rate=cfg.optimization.learning_rate,
+        lr_scheduler_type=cfg.optimization.lr_scheduler,
+        scheduler_decay_rate=cfg.optimization.scheduler_decay_rate,
+        scheduler_drop_ratio=cfg.optimization.scheduler_drop_ratio,
+        scheduler_epochs_per_drop=cfg.optimization.scheduler_epochs_per_drop
+    )
+
+    # 5. Build Network Topology
     logging.info(f"[Pipeline Root] Initializing network topology (Type: {cfg.architecture.model_type})...")
     controller.initialize_network_from_dimensions(
         input_dim=input_dim,
@@ -99,7 +90,7 @@ def execute_training_pipeline():
         cnn_config=cnn_cfg if is_cnn else None
     )
 
-    # 6. Handle pre-trained network loading if required
+    # 6. Pretrained Model Hydration
     if cfg.persistence.load_saved_model:
         controller.hydrate_from_asset(cfg.persistence.model_asset_path)
 
@@ -113,7 +104,6 @@ def execute_training_pipeline():
 
     # 8. Train Model
     train_history, val_history = controller.fit(
-        data_provider=data_provider,
         steps=steps,
         source_mode=source_mode,
         model_type=cfg.architecture.model_type,

@@ -11,7 +11,7 @@ class BinaryClassificationNetwork(BaseNeuralNetwork):
         self.y_std = None
 
     def preprocess_targets(self, y_train, y_val, y_test=None):
-        """Ensures targets are formatted as explicit 2D column vectors to prevent broadcasting errors[cite: 4]."""
+        """Ensures targets are formatted as explicit 2D column vectors to prevent broadcasting errors."""
         logging.info("[Model Engine: Binary] Enforcing column shape vector transformations on targets...")
         
         y_train_fixed = y_train.reshape(-1, 1) if len(y_train.shape) == 1 else y_train
@@ -21,18 +21,18 @@ class BinaryClassificationNetwork(BaseNeuralNetwork):
         return y_train_fixed, y_val_fixed, y_test_fixed
 
     def apply_output_activation(self, z_out):
-        """Applies the sigmoid activation function with clipping to prevent overflow[cite: 4]."""
+        """Applies the sigmoid activation function with clipping to prevent overflow."""
         return 1.0 / (1.0 + np.exp(-np.clip(z_out, -500, 500)))
 
     def compute_output_delta(self, output, y):
-        """Computes the output error delta for binary classification with diagnostic tracking[cite: 4]."""
+        """Computes the output error delta for binary classification with diagnostic tracking."""
         if self.diagnostic_counter < 1:
             logging.info(f"[MODEL PASS] Error Delta Math -> Output Shape: {output.shape} | Target Shape: {y.shape}")
             logging.info(f"[MODEL PASS] Error Delta Array Bounds -> Max: {np.max(output - y):.4f} | Min: {np.min(output - y):.4f} | Mean: {np.mean(output - y):.4f}")
         return output - y
 
     def calculate_raw_cost(self, output, y):
-        """Calculates binary cross-entropy loss with numerical stability clips[cite: 4]."""
+        """Calculates binary cross-entropy loss with numerical stability clips."""
         m = y.shape[0]
         eps = 1e-15
         output = np.clip(output, eps, 1.0 - eps)
@@ -56,7 +56,7 @@ class RegressionNetwork(BaseNeuralNetwork):
         self.y_std = None
 
     def preprocess_targets(self, y_train, y_val, y_test=None):
-        """Normalizes continuous target values using training set mean and standard deviation[cite: 4]."""
+        """Normalizes continuous target values using training set mean and standard deviation."""
         print("[Model Engine: Regression] Normalizing continuous target arrays...")
         self.y_mean = np.mean(y_train, axis=0)
         self.y_std = np.std(y_train, axis=0) + 1e-24
@@ -68,15 +68,15 @@ class RegressionNetwork(BaseNeuralNetwork):
         return y_train_norm, y_val_norm, y_test_norm
 
     def apply_output_activation(self, z_out):
-        """Applies a linear identity activation function for regression[cite: 4]."""
+        """Applies a linear identity activation function for regression."""
         return z_out  
 
     def compute_output_delta(self, output, y):
-        """Computes the output error delta for regression[cite: 4]."""
+        """Computes the output error delta for regression."""
         return output - y
 
     def calculate_raw_cost(self, output, y):
-        """Calculates Mean Squared Error (MSE) cost[cite: 4]."""
+        """Calculates Mean Squared Error (MSE) cost."""
         m = y.shape[0]
         return np.sum((output - y) ** 2) / (2 * m)
 
@@ -84,7 +84,7 @@ class RegressionNetwork(BaseNeuralNetwork):
 class MultiClassNetwork(BaseNeuralNetwork):
     """Neural network implementation for multi-class classification tasks using a softmax output head."""
     def preprocess_targets(self, y_train, y_val, y_test=None):
-        """Transmutes discrete class vector labels into one-hot encoded matrices[cite: 4]."""
+        """Transmutes discrete class vector labels into one-hot encoded matrices."""
         print("[Model Engine: Multi-Class] Transmuting discrete class vector states to one-hot matrices...")
         
         all_blocks = [y_train, y_val]
@@ -101,17 +101,17 @@ class MultiClassNetwork(BaseNeuralNetwork):
         return to_one_hot(y_train, num_classes), to_one_hot(y_val, num_classes), (to_one_hot(y_test, num_classes) if y_test is not None else None)
 
     def apply_output_activation(self, z_out):
-        """Applies numerically stable softmax activation across output layers[cite: 4]."""
+        """Applies numerically stable softmax activation across output layers."""
         shift_z = z_out - np.max(z_out, axis=1, keepdims=True)
         exps = np.exp(shift_z)
         return exps / np.sum(exps, axis=1, keepdims=True)
 
     def compute_output_delta(self, output, y):
-        """Computes output error delta for multi-class softmax predictions[cite: 4]."""
+        """Computes output error delta for multi-class softmax predictions."""
         return output - y
 
     def calculate_raw_cost(self, output, y):
-        """Calculates categorical cross-entropy loss with stability clipping[cite: 4]."""
+        """Calculates categorical cross-entropy loss with stability clipping."""
         m = y.shape[0]
         eps = 1e-15
         output = np.clip(output, eps, 1.0 - eps)

@@ -1,7 +1,14 @@
 # testing/test_cnn_pipeline.py
+import sys
+import os
 import numpy as np
+
+# Ensure project root is discoverable
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from src.controller import ModelController
 from config.constants import ModelType, LRHierarchy, IngestionMode
+
 
 class DummyImageProvider:
     """Mock image provider emitting 4D batches."""
@@ -48,9 +55,12 @@ def test_full_cnn_training_cycle():
         "dense_head": [16]
     }
 
+    provider = DummyImageProvider()
+
     controller = ModelController(
         learning_rate=0.005,
-        lr_scheduler_type=LRHierarchy.NONE
+        lr_scheduler_type=LRHierarchy.NONE,
+        data_provider=provider
     )
 
     controller.initialize_network_from_dimensions(
@@ -66,10 +76,7 @@ def test_full_cnn_training_cycle():
         cnn_config=cnn_cfg
     )
 
-    provider = DummyImageProvider()
-
     train_hist, val_hist = controller.fit(
-        data_provider=provider,
         steps=10,
         source_mode=IngestionMode.CSV,
         model_type=ModelType.CNN,

@@ -3,6 +3,7 @@ import logging
 import numpy as np
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten
 
+
 class CNNNetwork:
     """
     Modular Convolutional Neural Network engine.
@@ -23,27 +24,21 @@ class CNNNetwork:
         self.layers = []
         self.weights = []
         self.biases = []
-        self.param_layers = []  # Tracks which layers hold trainable weights
+        self.param_layers = []
 
-        # Build Spatial Pipeline
         self._build_spatial_layers(conv_configs)
-
-        # Build Dense Classification / Regression Head
         self._build_dense_head(dense_sizes)
 
-        # Forward caches for backpropagation
         self.spatial_inputs = []
         self.dense_inputs = []
         self.masks = []
-        self.activations = []  # Exposed for controller forensic hooks
+        self.activations = []
 
     @property
     def layer_sizes(self) -> list:
-        """Exposes layer dimensionality across spatial and dense layers for diagnostics."""
         sizes = []
         for w in self.weights:
             if w.ndim == 4:
-                # Conv weights: (Out, In, H, W) -> flattened filter in/out
                 sizes.append(w.shape[1] * w.shape[2] * w.shape[3])
             elif w.ndim == 2:
                 sizes.append(w.shape[0])
@@ -94,53 +89,52 @@ class CNNNetwork:
             self.biases.append(b)
             self.param_layers.append("dense")
 
-    def _sync_restored_weights(self):
-        """Pushes weights back into Conv2D instances after early stopping or optimizer updates."""
-        for idx, layer in enumerate(self.param_layers):
-            if isinstance(layer, Conv2D):
-                layer.W = self.weights[idx]
-                layer.b = self.biases[idx]
-
     def _forward(self, X: np.ndarray, training: bool = True) -> np.ndarray:
-        self._sync_restored_weights()
-        self.spatial_inputs = []
-        self.dense_inputs = []
-        self.masks = []
+        self.spatial_inputs.clear()
+        self.dense_inputs.clear()
+        self.masks.clear()
         self.activations = [X]
+
+        # Sync spatial parameter pointers if model.weights/model.biases were re-assigned externally
+        for i, layer in enumerate(self.param_layers):
+            if isinstance(layer, Conv2D):
+                if layer.W is not self.weights[i]:
+                    layer.W = self.weights[i]
+                if layer.b is not self.biases[i]:
+                    layer.b = self.biases[i]
 
         current_act = X
 
-        # 1. Forward through Spatial Pipeline
+        # 1. Spatial Forward Pass
         for layer in self.layers:
-            self.spatial_inputs.append(current_act)
+            if training:
+                self.spatial_inputs.append(current_act)
             if layer == "relu":
                 current_act = np.maximum(0, current_act)
             else:
                 current_act = layer.forward(current_act)
             self.activations.append(current_act)
 
-        # 2. Forward through Dense Head
+        # 2. Dense Forward Pass
         dense_w_indices = [i for i, l in enumerate(self.param_layers) if l == "dense"]
         num_dense = len(dense_w_indices)
 
         for idx, w_idx in enumerate(dense_w_indices):
-            self.dense_inputs.append(current_act)
-            W = self.weights[w_idx]
-            b = self.biases[w_idx]
-            z = np.dot(current_act, W) + b
+            if training:
+                self.dense_inputs.append(current_act)
+            z = np.dot(current_act, self.weights[w_idx]) + self.biases[w_idx]
 
             if idx == num_dense - 1:
-                # Output layer
                 current_act = self.apply_output_activation(z)
-                self.masks.append(None)
+                if training:
+                    self.masks.append(None)
             else:
-                # Hidden dense layers
                 current_act = np.maximum(0, z)
                 if training and self.p_dropout > 0.0:
                     mask = (np.random.rand(*current_act.shape) >= self.p_dropout) / (1.0 - self.p_dropout)
                     current_act = current_act * mask
                     self.masks.append(mask)
-                else:
+                elif training:
                     self.masks.append(None)
 
             self.activations.append(current_act)
@@ -154,8 +148,7 @@ class CNNNetwork:
             return exps / np.sum(exps, axis=1, keepdims=True)
         elif self.task_type == "binary":
             return 1.0 / (1.0 + np.exp(-np.clip(z_out, -500, 500)))
-        else:
-            return z_out
+        return z_out
 
     def compute_output_delta(self, output: np.ndarray, y: np.ndarray) -> np.ndarray:
         return output - y
@@ -169,8 +162,7 @@ class CNNNetwork:
         elif self.task_type == "binary":
             output = np.clip(output, eps, 1.0 - eps)
             return float(-np.sum(y * np.log(output) + (1.0 - y) * np.log(1.0 - output)) / m)
-        else:
-            return float(np.sum((output - y) ** 2) / (2 * m))
+        return float(np.sum((output - y) ** 2) / (2 * m))
 
     def compute_total_loss(self, output: np.ndarray, y: np.ndarray) -> float:
         raw_cost = self.calculate_raw_cost(output, y)
@@ -191,7 +183,7 @@ class CNNNetwork:
         dense_w_indices = [i for i, l in enumerate(self.param_layers) if l == "dense"]
         num_dense = len(dense_w_indices)
 
-        # 1. Backprop through Dense Head
+        # 1. Backprop Dense Head
         for local_idx in reversed(range(num_dense)):
             w_idx = dense_w_indices[local_idx]
             act_in = self.dense_inputs[local_idx]
@@ -201,32 +193,33 @@ class CNNNetwork:
 
             delta = np.dot(delta, self.weights[w_idx].T)
 
-            # Apply dropout & ReLU derivative to hidden dense inputs
             if local_idx > 0:
                 if self.masks[local_idx - 1] is not None:
-                    delta = delta * self.masks[local_idx - 1]
-                delta = delta * (act_in > 0)
+                    delta *= self.masks[local_idx - 1]
+                delta *= (act_in > 0)
 
-        # 2. Backprop through Spatial Pipeline
+        # 2. Backprop Spatial Pipeline
         spatial_grad = delta
         for i in reversed(range(len(self.layers))):
             layer = self.layers[i]
             in_act = self.spatial_inputs[i]
 
             if layer == "relu":
-                spatial_grad = spatial_grad * (in_act > 0)
+                spatial_grad *= (in_act > 0)
             else:
                 spatial_grad = layer.backward(spatial_grad)
                 if isinstance(layer, Conv2D):
                     c_idx = self.param_layers.index(layer)
-                    grad_weights[c_idx] = layer.dW
-                    grad_biases[c_idx] = layer.db
+                    grad_weights[c_idx] = layer.dW.copy()
+                    grad_biases[c_idx] = layer.db.copy()
 
-        # 3. Apply L1 Penalty
-        for i in range(num_params):
-            grad_weights[i] += (self.lam_l1 / m) * np.sign(self.weights[i])
+        # 3. L1 Penalty
+        if self.lam_l1 > 0.0:
+            scale = self.lam_l1 / m
+            for i in range(num_params):
+                grad_weights[i] += scale * np.sign(self.weights[i])
 
-        # 4. Gradient Stability Clipping
+        # 4. Gradient Clipping
         total_norm = np.sqrt(sum(np.sum(gw**2) for gw in grad_weights))
         if total_norm > self.max_norm:
             scaling_factor = self.max_norm / (total_norm + 1e-15)
@@ -234,7 +227,7 @@ class CNNNetwork:
                 grad_weights[i] *= scaling_factor
                 grad_biases[i] *= scaling_factor
 
-        # 5. Optimizer Parameter Update Step
+        # 5. Optimizer Update Step
         self.optimizer.update(
             weights=self.weights, biases=self.biases,
             grad_weights=grad_weights, grad_biases=grad_biases,
@@ -242,7 +235,6 @@ class CNNNetwork:
             gammas=None, betas=None, grad_gammas=None, grad_betas=None
         )
 
-        self._sync_restored_weights()
         self.diagnostic_counter += 1
         return self.compute_total_loss(output, y)
 

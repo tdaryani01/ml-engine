@@ -1,5 +1,10 @@
 # testing/test_im2col.py
+import sys
+import os
 import numpy as np
+# Ensure project root is discoverable
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from utils.im2col import im2col, col2im
 
 def test_im2col_output_shape():

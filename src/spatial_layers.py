@@ -1,12 +1,15 @@
 # src/spatial_layers.py
 import numpy as np
-from utils.im2col import im2col, col2im
+from utils.im2col import (
+    im2col,
+    col2im,
+    maxpool_forward,
+    maxpool_backward,
+    fuse_dout_transpose_and_bias
+)
+
 
 class Conv2D:
-    """
-    2D Convolutional Layer using im2col vectorization.
-    Stores weights with shape (out_channels, in_channels, k_h, k_w) and biases with shape (1, out_channels).
-    """
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1, pad: int = 0):
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -15,124 +18,147 @@ class Conv2D:
         self.stride = stride
         self.pad = pad
 
-        # He / Kaiming Uniform Initialization
         fan_in = in_channels * self.k_h * self.k_w
         limit = np.sqrt(6.0 / fan_in)
-        self.W = np.random.uniform(-limit, limit, (out_channels, in_channels, self.k_h, self.k_w))
-        self.b = np.zeros((1, out_channels))
+        self.W = np.random.uniform(-limit, limit, (out_channels, in_channels, self.k_h, self.k_w)).astype(np.float32)
+        self.b = np.zeros((1, out_channels), dtype=np.float32)
 
-        # Gradient placeholders
         self.dW = np.zeros_like(self.W)
         self.db = np.zeros_like(self.b)
-        
-        # Forward cache
-        self.x = None
+
+        self.x_shape = None
         self.col = None
         self.out_h = 0
         self.out_w = 0
 
+        self._col_cap = 0
+        self._col_buffer = None
+        self._dx_buffer = None
+        self._dout_trans_buffer = None
+        self._dcol_buffer = None
+        self._cached_dtype = None
+
+    def _ensure_buffers(self, N: int, C: int, H: int, W: int, out_h: int, out_w: int, dtype):
+        total_rows = N * out_h * out_w
+        if self._cached_dtype == dtype and total_rows <= self._col_cap and self._dx_buffer is not None:
+            return
+
+        total_cols = C * self.k_h * self.k_w
+        self._col_cap = total_rows
+        self._cached_dtype = dtype
+        self._col_buffer = np.empty((total_rows, total_cols), dtype=dtype)
+        self._dcol_buffer = np.empty((total_rows, total_cols), dtype=dtype)
+        self._dout_trans_buffer = np.empty((total_rows, self.out_channels), dtype=dtype)
+
+        pad_h = H + 2 * self.pad
+        pad_w = W + 2 * self.pad
+        self._dx_buffer = np.zeros((N, C, pad_h, pad_w), dtype=dtype)
+
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """
-        Input:  (N, C, H, W)
-        Output: (N, out_channels, out_h, out_w)
-        """
-        self.x = x
-        N, C, H, W = x.shape
+        if not x.flags['C_CONTIGUOUS']:
+            x = np.ascontiguousarray(x)
+
+        if self.W.dtype != x.dtype:
+            self.W = self.W.astype(x.dtype)
+            self.b = self.b.astype(x.dtype)
+
+        self.x_shape = x.shape
+        N, C, H, W = self.x_shape
         self.out_h = (H + 2 * self.pad - self.k_h) // self.stride + 1
         self.out_w = (W + 2 * self.pad - self.k_w) // self.stride + 1
 
-        # Flatten patches into 2D matrix
-        self.col = im2col(x, self.k_h, self.k_w, self.stride, self.pad)
-        
-        # Reshape weights: (out_channels, in_channels * k_h * k_w) -> transpose for dot product
-        w_row = self.W.reshape(self.out_channels, -1).T
+        self._ensure_buffers(N, C, H, W, self.out_h, self.out_w, x.dtype)
 
-        # Dot product + bias broadcast
-        out = np.dot(self.col, w_row) + self.b
-        
-        # Reshape back to 4D tensor: (N, out_channels, out_h, out_w)
-        out = out.reshape(N, self.out_h, self.out_w, self.out_channels).transpose(0, 3, 1, 2)
-        return out
+        total_rows = N * self.out_h * self.out_w
+        active_col = self._col_buffer[:total_rows]
+        self.col = im2col(x, self.k_h, self.k_w, self.stride, self.pad, out_buf=active_col)
+
+        W_2d = self.W.reshape(self.out_channels, -1)
+        out = np.dot(self.col, W_2d.T) + self.b
+
+        return np.ascontiguousarray(
+            out.reshape(N, self.out_h, self.out_w, self.out_channels).transpose(0, 3, 1, 2)
+        )
 
     def backward(self, dout: np.ndarray) -> np.ndarray:
-        """
-        dout: (N, out_channels, out_h, out_w)
-        Returns: dx (N, in_channels, H, W)
-        """
-        m = self.x.shape[0]
-        # Reshape incoming error: (N * out_h * out_w, out_channels)
-        dout_reshaped = dout.transpose(0, 2, 3, 1).reshape(-1, self.out_channels)
+        if not dout.flags['C_CONTIGUOUS']:
+            dout = np.ascontiguousarray(dout)
 
-        # Gradients normalized by batch size m
-        self.db = np.sum(dout_reshaped, axis=0, keepdims=True) / m
-        self.dW = (np.dot(self.col.T, dout_reshaped).T).reshape(self.W.shape) / m
+        m = self.x_shape[0]
+        inv_m = 1.0 / float(m)
+        N, C, H, W = self.x_shape
+        total_rows = N * self.out_h * self.out_w
 
-        # Propagate error back through patches
-        w_row = self.W.reshape(self.out_channels, -1).T
-        dcol = np.dot(dout_reshaped, w_row.T)
-        
-        # Reconstruct 4D tensor gradient
-        dx = col2im(dcol, self.x.shape, self.k_h, self.k_w, self.stride, self.pad)
-        return dx
+        self._ensure_buffers(N, C, H, W, self.out_h, self.out_w, dout.dtype)
+
+        if self.dW.shape != self.W.shape or self.dW.dtype != dout.dtype:
+            self.dW = np.zeros_like(self.W, dtype=dout.dtype)
+        if self.db.shape != self.b.shape or self.db.dtype != dout.dtype:
+            self.db = np.zeros_like(self.b, dtype=dout.dtype)
+        if self.W.dtype != dout.dtype:
+            self.W = self.W.astype(dout.dtype)
+
+        active_dout_trans = self._dout_trans_buffer[:total_rows]
+        fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
+
+        # 1. Parameter gradient Level-3 GEMM
+        dW_flat = self.dW.reshape(self.out_channels, -1)
+        np.dot(active_dout_trans.T, self.col, out=dW_flat)
+        dW_flat *= inv_m
+
+        # 2. Input gradient Level-3 GEMM
+        W_2d = self.W.reshape(self.out_channels, -1)
+        active_dcol = self._dcol_buffer[:total_rows]
+        np.dot(active_dout_trans, W_2d, out=active_dcol)
+
+        return col2im(active_dcol, self.x_shape, self.k_h, self.k_w, self.stride, self.pad, out_buf=self._dx_buffer)
 
 
 class MaxPool2D:
-    """
-    2D Max-Pooling Layer.
-    Downsamples spatial dimensions by tracking local maximum indices during forward
-    and routing gradients exclusively to winning indices during backward.
-    """
     def __init__(self, pool_size: int = 2, stride: int = 2):
         self.pool_size = pool_size
         self.stride = stride
-        self.x = None
-        self.max_idx = None
-        self.out_h = 0
-        self.out_w = 0
+        self.x_shape = None
+        self._cache = None
+        self._out_buf = None
+        self._dx_buf = None
+        self._argmax_buf = None
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        """
-        Input:  (N, C, H, W)
-        Output: (N, C, out_h, out_w)
-        """
-        self.x = x
-        N, C, H, W = x.shape
-        self.out_h = (H - self.pool_size) // self.stride + 1
-        self.out_w = (W - self.pool_size) // self.stride + 1
+        if not x.flags['C_CONTIGUOUS']:
+            x = np.ascontiguousarray(x)
 
-        # Flatten into pooling windows
-        col = im2col(x, self.pool_size, self.pool_size, self.stride, pad=0)
-        col = col.reshape(-1, self.pool_size * self.pool_size)
+        self.x_shape = x.shape
+        N, C, H, W = self.x_shape
+        out_h = (H - self.pool_size) // self.stride + 1
+        out_w = (W - self.pool_size) // self.stride + 1
 
-        # Cache winning indices and compute max values
-        self.max_idx = np.argmax(col, axis=1)
-        out = np.max(col, axis=1)
+        if self._out_buf is None or self._out_buf.shape != (N, C, out_h, out_w) or self._out_buf.dtype != x.dtype:
+            self._out_buf = np.empty((N, C, out_h, out_w), dtype=x.dtype)
+            self._argmax_buf = np.empty((N, C, out_h, out_w, 2), dtype=np.int64)
 
-        # Reshape to (N, C, out_h, out_w)
-        out = out.reshape(N, self.out_h, self.out_w, C).transpose(0, 3, 1, 2)
+        out, self._cache = maxpool_forward(
+            x, self.pool_size, self.stride,
+            out_buf=self._out_buf,
+            argmax_buf=self._argmax_buf
+        )
         return out
 
     def backward(self, dout: np.ndarray) -> np.ndarray:
-        """
-        dout: (N, C, out_h, out_w)
-        Returns: dx (N, C, H, W)
-        """
-        N, C, H, W = self.x.shape
-        dout_reshaped = dout.transpose(0, 2, 3, 1).ravel()
+        if not dout.flags['C_CONTIGUOUS']:
+            dout = np.ascontiguousarray(dout)
 
-        # Route error signal strictly to winning coordinates
-        dcol = np.zeros((dout_reshaped.size, self.pool_size * self.pool_size), dtype=dout.dtype)
-        dcol[np.arange(self.max_idx.size), self.max_idx] = dout_reshaped
+        if self._dx_buf is None or self._dx_buf.shape != self.x_shape or self._dx_buf.dtype != dout.dtype:
+            self._dx_buf = np.zeros(self.x_shape, dtype=dout.dtype)
 
-        dcol = dcol.reshape(-1, C * self.pool_size * self.pool_size)
-        dx = col2im(dcol, self.x.shape, self.pool_size, self.pool_size, self.stride, pad=0)
-        return dx
+        return maxpool_backward(
+            dout, self._cache, self.x_shape,
+            self.pool_size, self.stride,
+            dx_buf=self._dx_buf
+        )
 
 
 class Flatten:
-    """
-    Bridges 4D spatial tensors (N, C, H, W) to 2D feature matrices (N, C * H * W).
-    """
     def __init__(self):
         self.orig_shape = None
 

@@ -7,17 +7,17 @@ class Optimizer(ABC):
     """Abstract base class defining the required interface for optimization algorithms."""
     @abstractmethod
     def setup(self, weights, biases, gammas=None, betas=None):
-        """Initializes internal hyperparameter state tracking arrays[cite: 5]."""
+        """Initializes internal hyperparameter state tracking arrays."""
         pass
 
     @abstractmethod
     def update(self, weights, biases, grad_weights, grad_biases, m_samples, lam_l2, active_lr, 
                gammas=None, betas=None, grad_gammas=None, grad_betas=None):
-        """Mutates parameter matrices in-place using the current epoch's learning rate[cite: 5]."""
+        """Mutates parameter matrices in-place using the current epoch's learning rate."""
         pass
 
 class AdamOptimizer(Optimizer):
-    """Adam (Adaptive Moment Estimation) optimizer implementation with support for weight decay and batch normalization parameters[cite: 5]."""
+    """Adam (Adaptive Moment Estimation) optimizer implementation with support for weight decay and batch normalization parameters."""
     def __init__(self, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
         self.initial_lr = lr  
         self.beta1 = beta1
@@ -27,7 +27,7 @@ class AdamOptimizer(Optimizer):
         self._setup_done = False
 
     def setup(self, weights, biases, gammas=None, betas=None):
-        """Allocates moment tracking arrays for weights, biases, and optional batch normalization parameters[cite: 5]."""
+        """Allocates moment tracking arrays for weights, biases, and optional batch normalization parameters."""
         logging.info(f"[OPTIMIZER TRACE] Running Adam setup allocation pass...")
         logging.info(f"[OPTIMIZER TRACE] Gammas parameter passed to setup: {type(gammas)} | Betas: {type(betas)}")
         
@@ -49,7 +49,7 @@ class AdamOptimizer(Optimizer):
 
     def update(self, weights, biases, grad_weights, grad_biases, m_samples, lam_l2, active_lr, 
                gammas=None, betas=None, grad_gammas=None, grad_betas=None):
-        """Performs an Adam optimization step, updating weights, biases, and optional batch normalization parameters[cite: 5]."""
+        """Performs an Adam optimization step, updating weights, biases, and optional batch normalization parameters."""
         if not self._setup_done:
             self.setup(weights, biases, gammas, betas)
             
@@ -64,7 +64,7 @@ class AdamOptimizer(Optimizer):
             logging.info(f"[OPTIMIZER TRACE] Incoming Gammas: {type(gammas)} | Grad Gammas: {type(grad_gammas)}")
             logging.info(f"[OPTIMIZER TRACE] Incoming Betas: {type(betas)} | Grad Betas: {type(grad_betas)}")
         
-        # 1. Update Core Weights and Biases[cite: 5]
+        # 1. Update Core Weights and Biases
         for i in range(len(weights)):
             self.ms_w[i] = self.beta1 * self.ms_w[i] + (1 - self.beta1) * grad_weights[i]
             self.ms_b[i] = self.beta1 * self.ms_b[i] + (1 - self.beta1) * grad_biases[i]
@@ -88,7 +88,7 @@ class AdamOptimizer(Optimizer):
             weights[i] -= w_step
             biases[i] -= b_step
 
-        # 2. Update Batch Normalization Scaling Parameters via Adam[cite: 5]
+        # 2. Update Batch Normalization Scaling Parameters via Adam
         if gammas is not None and grad_gammas is not None:
             if self.t == 1:
                 logging.info(f"[OPTIMIZER TRACE] Gamma block hit. Processing updates across {len(gammas)} vectors.")
@@ -128,14 +128,14 @@ class AdamOptimizer(Optimizer):
 
 
 class SGDOptimizer(Optimizer):
-    """Stochastic Gradient Descent optimizer with momentum and weight decay support[cite: 5]."""
+    """Stochastic Gradient Descent optimizer with momentum and weight decay support."""
     def __init__(self, lr=0.05, momentum=0.9):
         self.initial_lr = lr
         self.momentum = momentum
         self._setup_done = False
 
     def setup(self, weights, biases, gammas=None, betas=None):
-        """Allocates velocity tracking buffers for SGD with momentum[cite: 5]."""
+        """Allocates velocity tracking buffers for SGD with momentum."""
         self.vs_w = [np.zeros_like(w) for w in weights]
         self.vs_b = [np.zeros_like(b) for b in biases]
         
@@ -148,11 +148,11 @@ class SGDOptimizer(Optimizer):
 
     def update(self, weights, biases, grad_weights, grad_biases, m_samples, lam_l2, active_lr, 
                gammas=None, betas=None, grad_gammas=None, grad_betas=None):
-        """Performs an SGD update step using momentum[cite: 5]."""
+        """Performs an SGD update step using momentum."""
         if not self._setup_done:
             self.setup(weights, biases, gammas, betas)
             
-        # 1. Update Weights and Biases[cite: 5]
+        # 1. Update Weights and Biases
         for i in range(len(weights)):
             self.vs_w[i] = (self.momentum * self.vs_w[i]) + active_lr * (grad_weights[i] + (lam_l2 / m_samples) * weights[i])
             self.vs_b[i] = (self.momentum * self.vs_b[i]) + active_lr * grad_biases[i]
@@ -160,7 +160,7 @@ class SGDOptimizer(Optimizer):
             weights[i] -= self.vs_w[i]
             biases[i] -= self.vs_b[i]
 
-        # 2. Update Batch Normalization Tracking vectors via classical momentum[cite: 5]
+        # 2. Update Batch Normalization Tracking vectors via classical momentum
         if gammas is not None and grad_gammas is not None:
             for i in range(len(gammas)):
                 if grad_gammas[i] is not None:
