@@ -1,5 +1,10 @@
 # testing/test_spatial_layers.py
+import sys
+import os
 import numpy as np
+# Ensure project root is discoverable
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten
 
 def test_conv2d_forward_shape():

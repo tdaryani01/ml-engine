@@ -1,3 +1,4 @@
+# testing/test_pipeline_integration.py
 import unittest
 import os
 import sys
@@ -8,10 +9,10 @@ import pandas as pd
 # Ensure project root is discoverable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from data.data_loader import load_pipeline_splits
-from data.csv_provider import CSVDataProvider
+from data.base_loader import BaseDataLoader
+from data.in_memory_provider import InMemoryDataProvider
 from src.controller import ModelController
-from config.constants import ModelType, IngestionMode, LRHierarchy
+from config.constants import ModelType, IngestionMode, LRHierarchy, DataKeys
 from config.schema import (
     PipelineConfig, MetaConfig, IngestionConfig, ArchitectureConfig,
     OptimizationConfig, RegularizationConfig, TransformationsConfig,
@@ -54,7 +55,7 @@ class TestPipelineIntegration(unittest.TestCase):
         """Cleans up the temporary directory to leave zero untracked files."""
         cls.temp_dir.cleanup()
 
-    def get_base_test_config(self, task_type: ModelType, num_classes: int = 1) -> PipelineConfig:
+    def get_base_test_config(self, task_type: ModelType, data_file_path: str, num_classes: int = 1) -> PipelineConfig:
         """Hydrates a clean baseline strongly-typed PipelineConfig instance matching schema parameters."""
         return PipelineConfig(
             meta=MetaConfig(
@@ -66,7 +67,7 @@ class TestPipelineIntegration(unittest.TestCase):
             ),
             ingestion=IngestionConfig(
                 source_mode=IngestionMode.CSV,
-                data_file_path="",  
+                data_file_path=data_file_path,  
                 feature_names=self.features,
                 splits=SplitConfig(train=0.70, val=0.30),
                 drain_on_empty=False,
@@ -119,19 +120,24 @@ class TestPipelineIntegration(unittest.TestCase):
         )
 
     def test_regression_class_pipeline(self):
-        """Validates continuous target mapping pipelines using CSVDataProvider and ModelController."""
-        cfg = self.get_base_test_config(ModelType.REGRESSION, num_classes=1)
-        
-        splits = load_pipeline_splits(
-            data_file_path=self.regression_data_path,
-            feature_names=cfg.ingestion.feature_names
+        """Validates continuous target mapping pipelines using InMemoryDataProvider and ModelController."""
+        cfg = self.get_base_test_config(ModelType.REGRESSION, data_file_path=self.regression_data_path, num_classes=1)
+
+        loader = BaseDataLoader.create_loader(cfg)
+        data_provider = InMemoryDataProvider(
+            loader=loader,
+            batch_size=cfg.optimization.batch_size,
+            epochs=cfg.optimization.epochs_full_dataset,
+            normalize_features=True
         )
-        self.assertIn("X_train", splits)
-        self.assertEqual(splits["X_train"].shape[1], 3)
+
+        self.assertIn(DataKeys.X_TRAIN, data_provider.splits)
+        self.assertEqual(data_provider.splits[DataKeys.X_TRAIN].shape[1], 3)
 
         controller = ModelController(
             learning_rate=cfg.optimization.learning_rate,
-            lr_scheduler_type=cfg.optimization.lr_scheduler
+            lr_scheduler_type=cfg.optimization.lr_scheduler,
+            data_provider=data_provider
         )
         controller.initialize_network_from_dimensions(
             input_dim=len(cfg.ingestion.feature_names),
@@ -147,16 +153,7 @@ class TestPipelineIntegration(unittest.TestCase):
             max_norm=cfg.optimization.gradient_clipping_max_norm
         )
 
-        data_provider = CSVDataProvider(
-            data_file_path=self.regression_data_path,
-            feature_names=cfg.ingestion.feature_names,
-            batch_size=cfg.optimization.batch_size,
-            epochs=cfg.optimization.epochs_full_dataset,
-            model_instance=controller.model
-        )
-
         train_hist, val_hist = controller.fit(
-            data_provider=data_provider,
             steps=cfg.optimization.steps_streaming,
             source_mode=cfg.ingestion.source_mode,
             model_type=cfg.architecture.model_type,
@@ -174,11 +171,20 @@ class TestPipelineIntegration(unittest.TestCase):
 
     def test_binary_class_pipeline(self):
         """Validates logistic sigmoidal classification routes across binary datasets."""
-        cfg = self.get_base_test_config(ModelType.BINARY_CLASSIFICATION, num_classes=1)
-        
+        cfg = self.get_base_test_config(ModelType.BINARY_CLASSIFICATION, data_file_path=self.binary_data_path, num_classes=1)
+
+        loader = BaseDataLoader.create_loader(cfg)
+        data_provider = InMemoryDataProvider(
+            loader=loader,
+            batch_size=cfg.optimization.batch_size,
+            epochs=cfg.optimization.epochs_full_dataset,
+            normalize_features=True
+        )
+
         controller = ModelController(
             learning_rate=cfg.optimization.learning_rate,
-            lr_scheduler_type=cfg.optimization.lr_scheduler
+            lr_scheduler_type=cfg.optimization.lr_scheduler,
+            data_provider=data_provider
         )
         controller.initialize_network_from_dimensions(
             input_dim=len(cfg.ingestion.feature_names),
@@ -194,16 +200,7 @@ class TestPipelineIntegration(unittest.TestCase):
             max_norm=cfg.optimization.gradient_clipping_max_norm
         )
 
-        data_provider = CSVDataProvider(
-            data_file_path=self.binary_data_path,
-            feature_names=cfg.ingestion.feature_names,
-            batch_size=cfg.optimization.batch_size,
-            epochs=cfg.optimization.epochs_full_dataset,
-            model_instance=controller.model
-        )
-
         controller.fit(
-            data_provider=data_provider,
             steps=cfg.optimization.steps_streaming,
             source_mode=cfg.ingestion.source_mode,
             model_type=cfg.architecture.model_type,
@@ -220,11 +217,20 @@ class TestPipelineIntegration(unittest.TestCase):
 
     def test_multiclass_class_pipeline(self):
         """Validates categorical softmax logit paths across multi-class configurations."""
-        cfg = self.get_base_test_config(ModelType.MULTI_CLASS, num_classes=3)
-        
+        cfg = self.get_base_test_config(ModelType.MULTI_CLASS, data_file_path=self.multiclass_data_path, num_classes=3)
+
+        loader = BaseDataLoader.create_loader(cfg)
+        data_provider = InMemoryDataProvider(
+            loader=loader,
+            batch_size=cfg.optimization.batch_size,
+            epochs=cfg.optimization.epochs_full_dataset,
+            normalize_features=True
+        )
+
         controller = ModelController(
             learning_rate=cfg.optimization.learning_rate,
-            lr_scheduler_type=cfg.optimization.lr_scheduler
+            lr_scheduler_type=cfg.optimization.lr_scheduler,
+            data_provider=data_provider
         )
         controller.initialize_network_from_dimensions(
             input_dim=len(cfg.ingestion.feature_names),
@@ -240,16 +246,7 @@ class TestPipelineIntegration(unittest.TestCase):
             max_norm=cfg.optimization.gradient_clipping_max_norm
         )
 
-        data_provider = CSVDataProvider(
-            data_file_path=self.multiclass_data_path,
-            feature_names=cfg.ingestion.feature_names,
-            batch_size=cfg.optimization.batch_size,
-            epochs=cfg.optimization.epochs_full_dataset,
-            model_instance=controller.model
-        )
-
         controller.fit(
-            data_provider=data_provider,
             steps=cfg.optimization.steps_streaming,
             source_mode=cfg.ingestion.source_mode,
             model_type=cfg.architecture.model_type,

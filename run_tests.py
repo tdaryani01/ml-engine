@@ -32,17 +32,19 @@ class DualWriter:
             self.log.close()
 
 
-def run_test_module(name: str, script_path: str) -> bool:
+def run_test_module(name: str, script_path: str, backend: str) -> bool:
+    backend_label = f"BACKEND={backend.upper()}"
     print(f"\n{'='*70}")
-    print(f" [RUNNING] {name} ({script_path})")
+    print(f" [RUNNING] [{backend_label}] {name} ({script_path})")
     print(f"{'='*70}")
     
-    # Configure child process environment with root in PYTHONPATH and UTF-8 encoding
+    # Inject backend environment variable and PYTHONPATH
     env = os.environ.copy()
     project_root = os.path.dirname(os.path.abspath(__file__))
     existing_pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{project_root}{os.pathsep}{existing_pythonpath}" if existing_pythonpath else project_root
     env["PYTHONIOENCODING"] = "utf-8"
+    env["ENGINE_BACKEND"] = backend
     
     start_time = time.time()
     result = subprocess.run(
@@ -57,15 +59,14 @@ def run_test_module(name: str, script_path: str) -> bool:
     )
     elapsed = time.time() - start_time
     
-    # Stream child process stdout and tracebacks
     if result.stdout:
         print(result.stdout, end="")
     
     if result.returncode == 0:
-        print(f"--> {name}: PASSED ({elapsed:.2f}s)")
+        print(f"--> [{backend.upper()}] {name}: PASSED ({elapsed:.2f}s)")
         return True
     else:
-        print(f"--> {name}: FAILED ({elapsed:.2f}s)")
+        print(f"--> [{backend.upper()}] {name}: FAILED ({elapsed:.2f}s)")
         return False
 
 
@@ -93,41 +94,47 @@ def main():
         ("Tier 3: CNN Integration Pipeline", "testing/test_cnn_pipeline.py"),
     ]
 
+    target_backends = ["fast", "numpy"]
     exit_code = 0
+
     try:
         print("\n" + "#" * 70)
-        print("      ML-ENGINE LOCAL PRE-COMMIT TEST HARNESS")
+        print("      ML-ENGINE LOCAL DUAL-BACKEND PRE-COMMIT TEST HARNESS")
         print("#" * 70)
 
         total_start = time.time()
         all_passed = True
         summary = []
 
-        for name, path in test_suite:
-            passed = run_test_module(name, path)
-            summary.append((name, passed))
-            if not passed:
-                all_passed = False
+        for backend in target_backends:
+            print(f"\n{'#'*70}")
+            print(f" >>> EXECUTING SUITE MATRIX: ENGINE_BACKEND = '{backend}' <<<")
+            print(f"{'#'*70}")
+            
+            for name, path in test_suite:
+                passed = run_test_module(name, path, backend)
+                summary.append((f"[{backend.upper()}] {name}", passed))
+                if not passed:
+                    all_passed = False
 
         total_elapsed = time.time() - total_start
         print("\n" + "=" * 70)
-        print("                    TEST SUITE SUMMARY")
+        print("                    DUAL-BACKEND TEST SUITE SUMMARY")
         print("=" * 70)
         for name, passed in summary:
             status = "PASSED [OK]" if passed else "FAILED [ERR]"
-            print(f" - {name:<40} : {status}")
+            print(f" - {name:<46} : {status}")
 
         print("-" * 70)
-        print(f"Total Duration: {total_elapsed:.2f}s")
+        print(f"Total Combined Duration: {total_elapsed:.2f}s")
         if all_passed:
-            print(f"\n[READY TO COMMIT] All tests passed! Log saved to: {os.path.abspath(LOG_FILE)}\n")
+            print(f"\n[READY TO COMMIT] All dual-matrix tests passed! Log saved to: {os.path.abspath(LOG_FILE)}\n")
             exit_code = 0
         else:
             print(f"\n[COMMIT BLOCKED] One or more tests failed. Full log: {os.path.abspath(LOG_FILE)}\n")
             exit_code = 1
 
     finally:
-        # Restore native stdout/stderr handles before closing writer to avoid unraisable hook exceptions
         sys.stdout = original_stdout
         sys.stderr = original_stderr
         writer.close()
