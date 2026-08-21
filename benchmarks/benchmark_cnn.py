@@ -261,14 +261,19 @@ def run_cnn_benchmark():
     torch_patience_counter = 0
     torch_early_stopped = False
 
+    torch_forward_counts = 0
+    torch_backward_counts = 0
+
     for ep in range(epochs):
         torch_model.train()
         running_loss = 0.0
         for bx, by in train_dl:
             optimizer.zero_grad()
             out = torch_model(bx)
+            torch_forward_counts += 1
             loss = criterion(out, by)
             loss.backward()
+            torch_backward_counts += 1
             optimizer.step()
             running_loss += loss.item() * len(bx)
         
@@ -279,6 +284,7 @@ def run_cnn_benchmark():
         torch_model.eval()
         with torch.no_grad():
             val_out = torch_model(val_tensors_x)
+            torch_forward_counts += 1 # Validation pass forward count
             current_val_loss = criterion(val_out, val_tensors_y).item()
             final_torch_val_loss = current_val_loss
             preds = torch.argmax(val_out, dim=1).numpy()
@@ -294,7 +300,7 @@ def run_cnn_benchmark():
                 best_torch_val_loss = current_val_loss
                 best_torch_epoch = ep + 1
             
-            if early_stopping_enabled and torch_patience_counter >= patience:
+            if early_stopped := (early_stopping_enabled and torch_patience_counter >= patience):
                 torch_early_stopped = True
                 break
 
@@ -327,7 +333,6 @@ def run_cnn_benchmark():
     print("[2/2] Executing Custom NumPy Engine benchmark run...")
     data_provider.reset_epoch()
     
-    # 4. Instantiate Controller exactly matching run_pipeline.py[cite: 6]
     controller = ModelController(
         data_provider=data_provider,
         learning_rate=lr_init,
@@ -337,7 +342,6 @@ def run_cnn_benchmark():
         scheduler_epochs_per_drop=10
     )
     
-    # 5. Build Network Topology[cite: 6]
     input_dim = int(np.prod(cnn_dict["input_shape"])) if cnn_dict else X_train.shape[1]
     controller.initialize_network_from_dimensions(
         input_dim=input_dim,
@@ -354,9 +358,33 @@ def run_cnn_benchmark():
         cnn_config=cnn_dict
     )
 
+    # Wrap custom engine methods to count forward & backward invocations
+    model = controller.model
+    orig_forward = model._forward
+    orig_backward = model.backward
+    orig_predict = model.predict
+
+    forward_counter = [0]
+    backward_counter = [0]
+
+    def counted_forward(X, training=True):
+        forward_counter[0] += 1
+        return orig_forward(X, training=training)
+
+    def counted_backward(*args, **kwargs):
+        backward_counter[0] += 1
+        return orig_backward(*args, **kwargs)
+
+    def counted_predict(processed_data, *args, **kwargs):
+        forward_counter[0] += 1
+        return orig_predict(processed_data, *args, **kwargs)
+
+    model._forward = counted_forward
+    model.backward = counted_backward
+    model.predict = counted_predict
+
     custom_total_params = extract_custom_engine_param_count(controller)
 
-    # 8. Train Model passing early_stopping_enabled, patience, and min_delta[cite: 6]
     t0_train = time.perf_counter()
     train_history, val_history = controller.fit(
         steps=data_provider.recomment_steps(),
@@ -381,7 +409,6 @@ def run_cnn_benchmark():
     custom_raw_train_preds = controller.predict(X_train)
     final_custom_train_loss = compute_cross_entropy_loss(custom_raw_train_preds, y_train)
 
-    # Resolve completed epochs and best epoch from returned history[cite: 6]
     if val_history and len(val_history) > 0:
         custom_epochs_completed = len(val_history)
         custom_best_epoch = int(np.argmin(val_history) + 1)
@@ -411,6 +438,8 @@ def run_cnn_benchmark():
     print(f"{'Epochs Completed':<32} | {torch_epochs_completed:<20d} | {custom_epochs_completed:<20d}")
     print(f"{'Best Validation Epoch':<32} | {best_torch_epoch:<20d} | {custom_best_epoch:<20d}")
     print(f"{'Early Stopping Triggered':<32} | {str(torch_early_stopped):<20} | {str(custom_early_stopped):<20}")
+    print(f"{'Forward Pass Count':<32} | {torch_forward_counts:<20,d} | {forward_counter[0]:<20,d}")
+    print(f"{'Backward Pass Count':<32} | {torch_backward_counts:<20,d} | {backward_counter[0]:<20,d}")
     print(f"{'Final Training Loss':<32} | {final_torch_train_loss:<20.6f} | {final_custom_train_loss:<20.6f}")
     print(f"{'Final Validation Loss':<32} | {final_torch_val_loss:<20.6f} | {final_custom_val_loss:<20.6f}")
     print(f"{'Final Validation Accuracy':<32} | {final_torch_val_acc * 100:>19.2f}% | {final_custom_val_acc * 100:>19.2f}%")
