@@ -193,10 +193,10 @@ class ModelController:
 
             self.val_history.append(current_val_loss)
 
-            # self._evaluate_epoch_performance(
-            #     epoch, epoch_train_loss, val_preds, y_val_target,
-            #     current_val_loss, active_lr, is_classification
-            # )
+            self._evaluate_epoch_performance(
+                epoch, epoch_train_loss, val_preds, y_val_target,
+                current_val_loss, active_lr, is_classification
+            )
 
             if early_stopping_enabled:
                 if self._handle_early_stopping(epoch, current_val_raw_cost, min_delta, patience, es_state):
@@ -281,6 +281,10 @@ class ModelController:
         is_classification: bool
     ) -> None:
         """Logs evaluation metrics at epoch intervals."""
+        is_info_enabled = logging.getLogger().isEnabledFor(logging.INFO)
+        if not is_info_enabled:
+            return
+
         if epoch % 10 == 0 or not self.data_provider.has_more_batches():
             metric_name = "Acc" if is_classification else "R²"
 
