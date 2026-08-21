@@ -1,7 +1,12 @@
 # src/cnn_network.py
+import builtins
 import logging
 import numpy as np
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten
+from utils.im2col import relu_spatial_forward, relu_spatial_backward
+
+if 'profile' not in builtins.__dict__:
+    builtins.__dict__['profile'] = lambda x: x
 
 
 class CNNNetwork:
@@ -89,6 +94,7 @@ class CNNNetwork:
             self.biases.append(b)
             self.param_layers.append("dense")
 
+    @profile
     def _forward(self, X: np.ndarray, training: bool = True) -> np.ndarray:
         self.spatial_inputs.clear()
         self.dense_inputs.clear()
@@ -110,7 +116,7 @@ class CNNNetwork:
             if training:
                 self.spatial_inputs.append(current_act)
             if layer == "relu":
-                current_act = np.maximum(0, current_act)
+                current_act = relu_spatial_forward(current_act.copy() if training else current_act)
             else:
                 current_act = layer.forward(current_act)
             self.activations.append(current_act)
@@ -171,6 +177,7 @@ class CNNNetwork:
         l1_penalty = (self.lam_l1 / m) * sum(np.sum(np.abs(w)) for w in self.weights)
         return raw_cost + l2_penalty + l1_penalty
 
+    @profile
     def backward(self, X: np.ndarray, y: np.ndarray, active_lr: float) -> float:
         m = X.shape[0]
         output = self._forward(X, training=True)
@@ -205,13 +212,13 @@ class CNNNetwork:
             in_act = self.spatial_inputs[i]
 
             if layer == "relu":
-                spatial_grad *= (in_act > 0)
+                spatial_grad = relu_spatial_backward(spatial_grad, in_act)
             else:
                 spatial_grad = layer.backward(spatial_grad)
                 if isinstance(layer, Conv2D):
                     c_idx = self.param_layers.index(layer)
-                    grad_weights[c_idx] = layer.dW.copy()
-                    grad_biases[c_idx] = layer.db.copy()
+                    grad_weights[c_idx] = layer.dW
+                    grad_biases[c_idx] = layer.db
 
         # 3. L1 Penalty
         if self.lam_l1 > 0.0:

@@ -7,6 +7,7 @@ from utils.im2col import (
     maxpool_forward,
     maxpool_backward,
     fuse_dout_transpose_and_bias,
+    fuse_forward_transpose_and_bias,
     gemm_param_grad
 )
 
@@ -45,7 +46,6 @@ class Conv2D:
 
     def _ensure_buffers(self, N: int, C: int, H: int, W: int, out_h: int, out_w: int, dtype):
         total_rows = N * out_h * out_w
-
         if self.W.dtype != dtype:
             self.W = self.W.astype(dtype)
             self.b = self.b.astype(dtype)
@@ -61,11 +61,14 @@ class Conv2D:
         self._col_buffer = np.empty((total_rows, total_cols), dtype=dtype)
         self._dcol_buffer = np.empty((total_rows, total_cols), dtype=dtype)
         self._dout_trans_buffer = np.empty((total_rows, self.out_channels), dtype=dtype)
+        self._fwd_gemm_buffer = np.empty((total_rows, self.out_channels), dtype=dtype)
+        self._fwd_out_buffer = np.empty((N, self.out_channels, out_h, out_w), dtype=dtype)
 
         pad_h = H + 2 * self.pad
         pad_w = W + 2 * self.pad
         self._dx_buffer = np.zeros((N, C, pad_h, pad_w), dtype=dtype)
-
+    
+    @profile
     def forward(self, x: np.ndarray) -> np.ndarray:
         if not x.flags['C_CONTIGUOUS']:
             x = np.ascontiguousarray(x)
@@ -82,11 +85,12 @@ class Conv2D:
         self.col = im2col(x, self.k_h, self.k_w, self.stride, self.pad, out_buf=active_col)
 
         W_2d = self.W.reshape(self.out_channels, -1)
-        out = np.dot(self.col, W_2d.T) + self.b
+        active_gemm = self._fwd_gemm_buffer[:total_rows]
+        np.dot(self.col, W_2d.T, out=active_gemm)
 
-        return np.ascontiguousarray(
-            out.reshape(N, self.out_h, self.out_w, self.out_channels).transpose(0, 3, 1, 2)
-        )
+        active_out = self._fwd_out_buffer[:N]
+        fuse_forward_transpose_and_bias(active_gemm, self.b, active_out)
+        return active_out
 
     @profile
     def backward(self, dout: np.ndarray) -> np.ndarray:

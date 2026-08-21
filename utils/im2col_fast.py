@@ -162,6 +162,11 @@ _fuse_dout_sig = [
     void(float64[:, :, :, :], float64[:, :], float64[:, :]),
 ]
 
+_fwd_trans_sig = [
+    void(float32[:, :], float32[:, :], float32[:, :, :, :]),
+    void(float64[:, :], float64[:, :], float64[:, :, :, :]),
+]
+
 
 @njit(_im2col_sig, parallel=True, fastmath=True, nogil=True, cache=True)
 def _im2col_numba_kernel(x, k_h, k_w, stride, pad, out_buf):
@@ -350,3 +355,47 @@ def fuse_dout_transpose_bias_fast(dout: np.ndarray, dout_trans_buf: np.ndarray, 
     if not dout.flags['C_CONTIGUOUS']:
         dout = np.ascontiguousarray(dout)
     _fuse_dout_transpose_and_bias(dout, dout_trans_buf, db_buf)
+
+@njit(_fwd_trans_sig, parallel=True, fastmath=True, nogil=True, cache=True)
+def _fuse_forward_transpose_and_bias(gemm_out, bias, out_nchw):
+    N, OutC, H_out, W_out = out_nchw.shape
+    spatial_size = H_out * W_out
+
+    for n in prange(N):
+        row_n_base = n * spatial_size
+        for h in range(H_out):
+            row_h_base = row_n_base + h * W_out
+            for w in range(W_out):
+                row_idx = row_h_base + w
+                for c in range(OutC):
+                    out_nchw[n, c, h, w] = gemm_out[row_idx, c] + bias[0, c]
+
+_relu_fwd_sig = [
+    void(float32[:, :, :, :]),
+    void(float64[:, :, :, :]),
+]
+
+_relu_bwd_sig = [
+    void(float32[:, :, :, :], float32[:, :, :, :]),
+    void(float64[:, :, :, :], float64[:, :, :, :]),
+]
+
+@njit(_relu_fwd_sig, parallel=True, fastmath=True, nogil=True, cache=True)
+def _relu_fwd_inplace_kernel(x):
+    N, C, H, W = x.shape
+    for n in prange(N):
+        for c in range(C):
+            for h in range(H):
+                for w in range(W):
+                    if x[n, c, h, w] < 0.0:
+                        x[n, c, h, w] = 0.0
+
+@njit(_relu_bwd_sig, parallel=True, fastmath=True, nogil=True, cache=True)
+def _relu_bwd_inplace_kernel(dout, in_act):
+    N, C, H, W = dout.shape
+    for n in prange(N):
+        for c in range(C):
+            for h in range(H):
+                for w in range(W):
+                    if in_act[n, c, h, w] <= 0.0:
+                        dout[n, c, h, w] = 0.0
