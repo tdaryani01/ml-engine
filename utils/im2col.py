@@ -12,7 +12,8 @@ try:
             col2im_fast as _col2im_impl,
             _maxpool_forward_kernel,
             _maxpool_backward_kernel,
-            fuse_dout_transpose_bias_fast as _fuse_dout_impl
+            fuse_dout_transpose_bias_fast as _fuse_dout_impl,
+            gemm_param_grad_fast as _gemm_param_grad_impl
         )
         _USE_FAST = True
         print("[Engine Backend] Initialized with Numba JIT C-Kernels.")
@@ -115,3 +116,12 @@ def fuse_dout_transpose_and_bias(dout: np.ndarray, dout_trans_buf: np.ndarray, d
     m = dout.shape[0]
     dout_trans_buf[:] = dout.transpose(0, 2, 3, 1).reshape(-1, dout.shape[1])
     db_buf[:] = np.sum(dout_trans_buf, axis=0, keepdims=True) / m
+
+
+def gemm_param_grad(dout_trans: np.ndarray, col: np.ndarray, dW_flat: np.ndarray, inv_m: float):
+    if _USE_FAST:
+        _gemm_param_grad_impl(dout_trans, col, dW_flat, inv_m)
+        return
+
+    np.copyto(dW_flat, np.dot(col.T, dout_trans).T)
+    dW_flat *= inv_m

@@ -1,12 +1,17 @@
 # src/spatial_layers.py
+import builtins
 import numpy as np
 from utils.im2col import (
     im2col,
     col2im,
     maxpool_forward,
     maxpool_backward,
-    fuse_dout_transpose_and_bias
+    fuse_dout_transpose_and_bias,
+    gemm_param_grad
 )
+
+if 'profile' not in builtins.__dict__:
+    builtins.__dict__['profile'] = lambda x: x
 
 
 class Conv2D:
@@ -40,6 +45,13 @@ class Conv2D:
 
     def _ensure_buffers(self, N: int, C: int, H: int, W: int, out_h: int, out_w: int, dtype):
         total_rows = N * out_h * out_w
+
+        if self.W.dtype != dtype:
+            self.W = self.W.astype(dtype)
+            self.b = self.b.astype(dtype)
+            self.dW = np.zeros_like(self.W)
+            self.db = np.zeros_like(self.b)
+
         if self._cached_dtype == dtype and total_rows <= self._col_cap and self._dx_buffer is not None:
             return
 
@@ -57,10 +69,6 @@ class Conv2D:
     def forward(self, x: np.ndarray) -> np.ndarray:
         if not x.flags['C_CONTIGUOUS']:
             x = np.ascontiguousarray(x)
-
-        if self.W.dtype != x.dtype:
-            self.W = self.W.astype(x.dtype)
-            self.b = self.b.astype(x.dtype)
 
         self.x_shape = x.shape
         N, C, H, W = self.x_shape
@@ -80,33 +88,32 @@ class Conv2D:
             out.reshape(N, self.out_h, self.out_w, self.out_channels).transpose(0, 3, 1, 2)
         )
 
+    @profile
     def backward(self, dout: np.ndarray) -> np.ndarray:
         if not dout.flags['C_CONTIGUOUS']:
             dout = np.ascontiguousarray(dout)
 
-        m = self.x_shape[0]
-        inv_m = 1.0 / float(m)
         N, C, H, W = self.x_shape
+        inv_m = 1.0 / float(N)
         total_rows = N * self.out_h * self.out_w
 
         self._ensure_buffers(N, C, H, W, self.out_h, self.out_w, dout.dtype)
 
-        if self.dW.shape != self.W.shape or self.dW.dtype != dout.dtype:
+        if self.db.dtype != dout.dtype or self.db.shape != (1, self.out_channels):
+            self.db = np.zeros((1, self.out_channels), dtype=dout.dtype)
+        if self.dW.dtype != dout.dtype or self.dW.shape != self.W.shape:
             self.dW = np.zeros_like(self.W, dtype=dout.dtype)
-        if self.db.shape != self.b.shape or self.db.dtype != dout.dtype:
-            self.db = np.zeros_like(self.b, dtype=dout.dtype)
-        if self.W.dtype != dout.dtype:
-            self.W = self.W.astype(dout.dtype)
 
         active_dout_trans = self._dout_trans_buffer[:total_rows]
+
+        # 1. Bias gradient accumulation
         fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
 
-        # 1. Parameter gradient Level-3 GEMM
+        # 2. Parameter gradient Level-3 GEMM with inv_m scaling
         dW_flat = self.dW.reshape(self.out_channels, -1)
-        np.dot(active_dout_trans.T, self.col, out=dW_flat)
-        dW_flat *= inv_m
+        gemm_param_grad(active_dout_trans, self.col, dW_flat, inv_m)
 
-        # 2. Input gradient Level-3 GEMM
+        # 3. Input gradient Level-3 GEMM
         W_2d = self.W.reshape(self.out_channels, -1)
         active_dcol = self._dcol_buffer[:total_rows]
         np.dot(active_dout_trans, W_2d, out=active_dcol)

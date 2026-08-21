@@ -1,4 +1,5 @@
 # benchmarks/benchmark_cnn.py
+import gc
 import os
 import sys
 import time
@@ -110,13 +111,36 @@ def run_cnn_benchmark():
     lr_init = float(cfg_dict["optimization"]["learning_rate"])
     epochs = int(cfg_dict["optimization"]["epochs_full_dataset"])
     lam_l2 = float(cfg_dict["regularization"].get("lam_l2", 0.0))
+    lam_l1 = float(cfg_dict["regularization"].get("lam_l1", 0.0))
     cnn_dict = cfg_dict["architecture"].get("cnn", None)
+
+    # Early Stopping Configurations
+    early_stopping_enabled = bool(cfg_dict["optimization"].get("early_stopping_enabled", False))
+    patience = int(cfg_dict["optimization"].get("patience", 10))
+    min_delta = float(cfg_dict["optimization"].get("min_delta", 1e-4))
+    lr_scheduler_type = cfg_dict["optimization"].get("lr_scheduler", "none")
+
+    # Hardware diagnostics
+    cpu_cores = os.cpu_count()
+    torch_threads = torch.get_num_threads()
+    try:
+        import numba
+        numba_threads = numba.get_num_threads()
+    except Exception:
+        numba_threads = 1
 
     print("=" * 80)
     print("      CONVERGENCE BENCHMARK: CUSTOM NUMPY ENGINE vs PYTORCH CNN")
     print("=" * 80)
-    print(f"Dataset Path    : {data_path}")
-    print(f"Epochs / Batch  : {epochs} / {batch_size} | LR: {lr_init} | L2 Reg: {lam_l2}")
+    print(f"Dataset Path        : {data_path}")
+    print(f"Epochs / Batch Size : {epochs} / {batch_size}")
+    print(f"Learning Rate / L2  : {lr_init} / {lam_l2} (L1: {lam_l1})")
+    print(f"LR Scheduler Type   : {lr_scheduler_type}")
+    print(f"Early Stopping      : Enabled={early_stopping_enabled} (Patience={patience}, Min Delta={min_delta})")
+    print("-" * 80)
+    print(f"Logical CPU Cores   : {cpu_cores}")
+    print(f"PyTorch Thread Pool : {torch_threads} Active Threads")
+    print(f"Numba Thread Pool   : {numba_threads} Active Threads")
     print("=" * 80)
 
     typed_cfg = PipelineConfig(
@@ -157,13 +181,13 @@ def run_cnn_benchmark():
             scheduler_drop_ratio=0.5,
             scheduler_epochs_per_drop=10,
             scheduler_decay_rate=0.98,
-            early_stopping_enabled=False,
-            patience=10,
-            min_delta=1e-4,
+            early_stopping_enabled=early_stopping_enabled,
+            patience=patience,
+            min_delta=min_delta,
             gradient_clipping_max_norm=5.0
         ),
         regularization=RegularizationConfig(
-            lam_l1=0.0,
+            lam_l1=lam_l1,
             lam_l2=lam_l2,
             sparsity_tolerance=1e-5
         ),
@@ -200,7 +224,7 @@ def run_cnn_benchmark():
     y_train_classes = np.argmax(y_train, axis=1) if y_train.ndim > 1 else y_train.ravel()
     y_val_classes = np.argmax(y_val, axis=1) if y_val.ndim > 1 else y_val.ravel()
 
-    # Scale inputs for PyTorch
+    # Scale inputs for PyTorch[cite: 5]
     X_train_torch = X_train.copy()
     X_val_torch = X_val.copy()
     max_val = np.max(X_train_torch)
@@ -232,6 +256,11 @@ def run_cnn_benchmark():
     final_torch_val_loss = 0.0
     final_torch_val_acc = 0.0
 
+    best_torch_val_loss = float("inf")
+    best_torch_epoch = 1
+    torch_patience_counter = 0
+    torch_early_stopped = False
+
     for ep in range(epochs):
         torch_model.train()
         running_loss = 0.0
@@ -250,13 +279,28 @@ def run_cnn_benchmark():
         torch_model.eval()
         with torch.no_grad():
             val_out = torch_model(val_tensors_x)
-            final_torch_val_loss = criterion(val_out, val_tensors_y).item()
+            current_val_loss = criterion(val_out, val_tensors_y).item()
+            final_torch_val_loss = current_val_loss
             preds = torch.argmax(val_out, dim=1).numpy()
             final_torch_val_acc = np.mean(preds == y_val_classes)
 
+        if best_torch_val_loss - current_val_loss > min_delta:
+            best_torch_val_loss = current_val_loss
+            best_torch_epoch = ep + 1
+            torch_patience_counter = 0
+        else:
+            torch_patience_counter += 1
+            if current_val_loss < best_torch_val_loss:
+                best_torch_val_loss = current_val_loss
+                best_torch_epoch = ep + 1
+            
+            if early_stopping_enabled and torch_patience_counter >= patience:
+                torch_early_stopped = True
+                break
+
     torch_train_time = time.perf_counter() - t0_train
 
-    # PyTorch Inference Latency Benchmark (100 passes over validation set)
+    # PyTorch Inference Latency Benchmark[cite: 5]
     torch_model.eval()
     t0_inf = time.perf_counter()
     with torch.no_grad():
@@ -264,44 +308,67 @@ def run_cnn_benchmark():
             _ = torch_model(val_tensors_x)
     torch_inf_time = (time.perf_counter() - t0_inf) / 100.0
 
+    # Teardown PyTorch Resources[cite: 5]
+    del torch_model
+    del optimizer
+    del scheduler
+    del criterion
+    del train_dl
+    del train_ds
+    del val_tensors_x
+    del val_tensors_y
+    del X_train_torch
+    del X_val_torch
+    gc.collect()
+
     # =========================================================================
     # PHASE 2: CUSTOM NUMPY ENGINE EXECUTION
     # =========================================================================
     print("[2/2] Executing Custom NumPy Engine benchmark run...")
     data_provider.reset_epoch()
+    
+    # 4. Instantiate Controller exactly matching run_pipeline.py[cite: 6]
     controller = ModelController(
+        data_provider=data_provider,
         learning_rate=lr_init,
         lr_scheduler_type=LRHierarchy.EXPONENTIAL,
-        data_provider=data_provider
+        scheduler_decay_rate=0.98,
+        scheduler_drop_ratio=0.5,
+        scheduler_epochs_per_drop=10
     )
     
-    input_dim = cnn_dict["input_shape"] if cnn_dict else X_train.shape[1:]
+    # 5. Build Network Topology[cite: 6]
+    input_dim = int(np.prod(cnn_dict["input_shape"])) if cnn_dict else X_train.shape[1]
     controller.initialize_network_from_dimensions(
         input_dim=input_dim,
         output_dim=num_classes,
         model_type=task_type,
-        hidden_layers=hidden_layers,
+        hidden_layers=[],
         optimizer_name="adam",
-        lam_l1=0.0,
+        lam_l1=lam_l1,
         lam_l2=lam_l2,
         p_dropout=0.0,
         use_batch_norm=False,
         bn_momentum=0.9,
+        max_norm=5.0,
         cnn_config=cnn_dict
     )
 
     custom_total_params = extract_custom_engine_param_count(controller)
 
+    # 8. Train Model passing early_stopping_enabled, patience, and min_delta[cite: 6]
     t0_train = time.perf_counter()
-    controller.fit(
+    train_history, val_history = controller.fit(
         steps=data_provider.recomment_steps(),
         source_mode=IngestionMode.CSV,
         model_type=task_type,
-        early_stopping_enabled=False
+        early_stopping_enabled=early_stopping_enabled,
+        patience=patience,
+        min_delta=min_delta
     )
     custom_train_time = time.perf_counter() - t0_train
 
-    # Custom Engine Inference Latency Benchmark (100 passes over validation set)
+    # Custom Engine Inference Latency Benchmark[cite: 5]
     t0_inf = time.perf_counter()
     for _ in range(100):
         custom_raw_val_preds = controller.predict(X_val)
@@ -314,12 +381,25 @@ def run_cnn_benchmark():
     custom_raw_train_preds = controller.predict(X_train)
     final_custom_train_loss = compute_cross_entropy_loss(custom_raw_train_preds, y_train)
 
+    # Resolve completed epochs and best epoch from returned history[cite: 6]
+    if val_history and len(val_history) > 0:
+        custom_epochs_completed = len(val_history)
+        custom_best_epoch = int(np.argmin(val_history) + 1)
+    elif hasattr(controller, "val_loss_history") and len(controller.val_loss_history) > 0:
+        custom_epochs_completed = len(controller.val_loss_history)
+        custom_best_epoch = int(np.argmin(controller.val_loss_history) + 1)
+    else:
+        custom_epochs_completed = getattr(controller, "epochs_completed", epochs)
+        custom_best_epoch = getattr(controller, "best_epoch", custom_epochs_completed)
+
+    custom_early_stopped = custom_epochs_completed < epochs
+
     # =========================================================================
     # SUMMARY REPORT
     # =========================================================================
     n_val_samples = len(X_val)
     torch_throughput = (len(X_train) * torch_epochs_completed) / torch_train_time
-    custom_throughput = (len(X_train) * epochs) / custom_train_time
+    custom_throughput = (len(X_train) * custom_epochs_completed) / custom_train_time
 
     print("\n" + "=" * 80)
     print("                    HEAD-TO-HEAD BENCHMARK REPORT")
@@ -327,14 +407,17 @@ def run_cnn_benchmark():
     print(f"{'Performance Metric':<32} | {'PyTorch CNN':<20} | {'Custom NumPy CNN':<20}")
     print("-" * 80)
     print(f"{'Total Trainable Parameters':<32} | {torch_total_params:<20,d} | {custom_total_params:<20,d}")
-    print(f"{'Total Epochs Executed':<32} | {torch_epochs_completed:<20d} | {epochs:<20d}")
+    print(f"{'Target Epochs':<32} | {epochs:<20d} | {epochs:<20d}")
+    print(f"{'Epochs Completed':<32} | {torch_epochs_completed:<20d} | {custom_epochs_completed:<20d}")
+    print(f"{'Best Validation Epoch':<32} | {best_torch_epoch:<20d} | {custom_best_epoch:<20d}")
+    print(f"{'Early Stopping Triggered':<32} | {str(torch_early_stopped):<20} | {str(custom_early_stopped):<20}")
     print(f"{'Final Training Loss':<32} | {final_torch_train_loss:<20.6f} | {final_custom_train_loss:<20.6f}")
     print(f"{'Final Validation Loss':<32} | {final_torch_val_loss:<20.6f} | {final_custom_val_loss:<20.6f}")
     print(f"{'Final Validation Accuracy':<32} | {final_torch_val_acc * 100:>19.2f}% | {final_custom_val_acc * 100:>19.2f}%")
     print("-" * 80)
     print(f"{'Total Training Time':<32} | {torch_train_time:>18.3f} s | {custom_train_time:>18.3f} s")
     print(f"{'Training Throughput':<32} | {torch_throughput:>14.1f} smp/s | {custom_throughput:>14.1f} smp/s")
-    print(f"{'Time per Epoch':<32} | {(torch_train_time / torch_epochs_completed) * 1000:>16.2f} ms | {(custom_train_time / epochs) * 1000:>16.2f} ms")
+    print(f"{'Time per Epoch':<32} | {(torch_train_time / torch_epochs_completed) * 1000:>16.2f} ms | {(custom_train_time / custom_epochs_completed) * 1000:>16.2f} ms")
     print(f"{'Val Inference Latency (Batch)':<32} | {torch_inf_time * 1000:>16.3f} ms | {custom_inf_time * 1000:>16.3f} ms")
     print(f"{'Per-Sample Inference Latency':<32} | {(torch_inf_time / n_val_samples) * 1000:>16.4f} ms | {(custom_inf_time / n_val_samples) * 1000:>16.4f} ms")
     print("=" * 80)
