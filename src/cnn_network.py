@@ -113,11 +113,14 @@ class CNNNetwork:
 
         # 1. Spatial Forward Pass
         for layer in self.layers:
-            if training:
-                self.spatial_inputs.append(current_act)
             if layer == "relu":
-                current_act = relu_spatial_forward(current_act.copy() if training else current_act)
+                # Always safely isolate the pre-activation state for backprop if training
+                if training:
+                    self.spatial_inputs.append(current_act.copy())
+                current_act = relu_spatial_forward(current_act)
             else:
+                if training:
+                    self.spatial_inputs.append(current_act)
                 current_act = layer.forward(current_act)
             self.activations.append(current_act)
 
