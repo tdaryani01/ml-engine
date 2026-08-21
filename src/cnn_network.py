@@ -83,8 +83,8 @@ class CNNNetwork:
         for i in range(len(dense_sizes) - 1):
             fan_in, fan_out = dense_sizes[i], dense_sizes[i + 1]
             limit = np.sqrt(6.0 / (fan_in + fan_out))
-            W = np.random.uniform(-limit, limit, (fan_in, fan_out))
-            b = np.zeros((1, fan_out))
+            W = np.random.uniform(-limit, limit, (fan_in, fan_out)).astype(np.float32)
+            b = np.zeros((1, fan_out), dtype=np.float32)
             self.weights.append(W)
             self.biases.append(b)
             self.param_layers.append("dense")
@@ -131,7 +131,7 @@ class CNNNetwork:
             else:
                 current_act = np.maximum(0, z)
                 if training and self.p_dropout > 0.0:
-                    mask = (np.random.rand(*current_act.shape) >= self.p_dropout) / (1.0 - self.p_dropout)
+                    mask = (np.random.rand(*current_act.shape) >= self.p_dropout).astype(current_act.dtype) / (1.0 - self.p_dropout)
                     current_act = current_act * mask
                     self.masks.append(mask)
                 elif training:

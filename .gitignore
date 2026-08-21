@@ -16,6 +16,8 @@ __pycache__/
 venv/
 .env
 .cursor/
-*.log
 
+# Diagnostics and monitoring 
 /diagnostics_output/
+*.log
+*.prof
