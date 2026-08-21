@@ -1,17 +1,16 @@
 # data/in_memory_provider.py
-from typing import Tuple, Optional
+from typing import Tuple
 import numpy as np
 
 from data.base_provider import BaseDataProvider
 from data.base_loader import BaseDataLoader
-from data.iterator import DatasetIterator
 from config.constants import DataKeys
 
 
 class InMemoryDataProvider(BaseDataProvider):
     """
-    Universal in-memory data provider for tabular matrices and spatial image tensors.
-    Consumes a BaseDataLoader instance, manages batch iteration, shuffling, and normalization.
+    Universal zero-overhead in-memory data provider for tabular matrices and image tensors.
+    Maintains clean contiguous index slicing with zero thread/queue overhead.
     """
 
     def __init__(
@@ -26,27 +25,33 @@ class InMemoryDataProvider(BaseDataProvider):
         self.epochs = epochs
         self.normalize_features = normalize_features
         self._epochs_completed = 0
+        self._batch_idx = 0
         self._has_more = True
-        self.batch_generator = None
 
-        # Execute loader to extract standard split arrays
+        # Extract standard split arrays
         X_train, y_train, X_val, y_val = self.loader.load_splits()
 
-        self.y_train_processed = y_train
-        self.y_val_processed = y_val
+        self.X_train = np.ascontiguousarray(X_train)
+        self.y_train_processed = np.ascontiguousarray(y_train)
+        self.X_val = np.ascontiguousarray(X_val)
+        self.y_val_processed = np.ascontiguousarray(y_val)
 
         # Setup feature normalization statistics
-        if self.normalize_features and X_train.ndim == 2:
-            self.mean = np.mean(X_train, axis=0)
-            self.std = np.std(X_train, axis=0) + 1e-24
+        if self.normalize_features and self.X_train.ndim == 2:
+            self.mean = np.mean(self.X_train, axis=0)
+            self.std = np.std(self.X_train, axis=0) + 1e-24
         else:
-            self.mean = np.zeros(X_train.shape[1:], dtype=np.float32)
-            self.std = np.ones(X_train.shape[1:], dtype=np.float32)
+            self.mean = np.zeros(self.X_train.shape[1:], dtype=np.float32)
+            self.std = np.ones(self.X_train.shape[1:], dtype=np.float32)
+
+        self.n_samples = self.X_train.shape[0]
+        self.num_batches = int(np.ceil(self.n_samples / self.batch_size))
+        self.indices = np.arange(self.n_samples)
 
         self.splits = {
-            DataKeys.X_TRAIN: X_train,
+            DataKeys.X_TRAIN: self.X_train,
             DataKeys.Y_TRAIN: self.y_train_processed,
-            DataKeys.X_VAL: X_val,
+            DataKeys.X_VAL: self.X_val,
             DataKeys.Y_VAL: self.y_val_processed
         }
 
@@ -59,48 +64,40 @@ class InMemoryDataProvider(BaseDataProvider):
         return data_matrix
 
     def reset_epoch(self) -> None:
-        if self.batch_generator is not None:
+        if self._batch_idx > 0:
             self._epochs_completed += 1
 
         if self._epochs_completed >= self.epochs:
             self._has_more = False
             return
 
-        num_samples = self.splits[DataKeys.X_TRAIN].shape[0]
-        indices = np.arange(num_samples)
-        np.random.shuffle(indices)
-
-        self.splits[DataKeys.X_TRAIN] = self.splits[DataKeys.X_TRAIN][indices]
-        self.y_train_processed = self.y_train_processed[indices]
-        self.splits[DataKeys.Y_TRAIN] = self.y_train_processed  # <-- Synchronize dictionary key
-
-        iterator = DatasetIterator(
-            self.splits[DataKeys.X_TRAIN],
-            self.y_train_processed,
-            batch_size=self.batch_size,
-            shuffle=False
-        )
-        self.batch_generator = iter(iterator)
+        np.random.shuffle(self.indices)
+        self._batch_idx = 0
         self._has_more = True
 
     def has_more_batches(self) -> bool:
-        """Determines if additional batches remain in the current epoch."""
-        return self._has_more
+        return self._has_more and (self._batch_idx < self.num_batches)
 
     def next_batch(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Retrieves the next feature and target batch from the generator."""
         if not self.has_more_batches():
-            return np.array([]), np.array([])
-        try:
-            return next(self.batch_generator)
-        except StopIteration:
             self._has_more = False
             return np.array([]), np.array([])
 
+        start_idx = self._batch_idx * self.batch_size
+        end_idx = min(start_idx + self.batch_size, self.n_samples)
+        batch_slice = self.indices[start_idx:end_idx]
+
+        self._batch_idx += 1
+        if self._batch_idx >= self.num_batches:
+            self._has_more = False
+
+        return self.X_train[batch_slice], self.y_train_processed[batch_slice]
+
     def get_validation_set(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Retrieves the full validation features and targets."""
-        return self.splits[DataKeys.X_VAL], self.y_val_processed
+        val_x = self.splits[DataKeys.X_VAL]
+        if self.normalize_features and val_x.ndim == 2:
+            val_x = self.normalize(val_x)
+        return val_x, self.y_val_processed
 
     def recomment_steps(self) -> int:
-        """Calculates and recommends the number of steps per epoch."""
-        return int(np.ceil(len(self.splits[DataKeys.X_TRAIN]) / self.batch_size))
+        return self.num_batches

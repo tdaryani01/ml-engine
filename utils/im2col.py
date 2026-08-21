@@ -10,10 +10,14 @@ try:
         from utils.im2col_fast import (
             im2col_fast as _im2col_impl,
             col2im_fast as _col2im_impl,
+            gemm_forward_fast as _gemm_forward_impl,
+            gemm_param_grad_fast as _gemm_param_grad_impl,
             _maxpool_forward_kernel,
             _maxpool_backward_kernel,
             fuse_dout_transpose_bias_fast as _fuse_dout_impl,
-            gemm_param_grad_fast as _gemm_param_grad_impl
+            _fuse_forward_transpose_and_bias as fuse_forward_impl,
+            _relu_fwd_inplace_kernel,
+            _relu_bwd_inplace_kernel
         )
         _USE_FAST = True
         print("[Engine Backend] Initialized with Numba JIT C-Kernels.")
@@ -23,6 +27,13 @@ except Exception as e:
     BACKEND = "numpy"
     _USE_FAST = False
     print(f"[Engine Backend] Using Pure NumPy backend. (Reason: {e})")
+
+
+def gemm_forward(col: np.ndarray, W_2d: np.ndarray, out_gemm: np.ndarray):
+    if _USE_FAST:
+        _gemm_forward_impl(col, W_2d, out_gemm)
+    else:
+        np.dot(col, W_2d.T, out=out_gemm)
 
 
 def im2col(x: np.ndarray, k_h: int, k_w: int, stride: int = 1, pad: int = 0, out_buf: np.ndarray = None) -> np.ndarray:
@@ -125,3 +136,27 @@ def gemm_param_grad(dout_trans: np.ndarray, col: np.ndarray, dW_flat: np.ndarray
 
     np.copyto(dW_flat, np.dot(col.T, dout_trans).T)
     dW_flat *= inv_m
+
+
+def fuse_forward_transpose_and_bias(gemm_out, bias, out_nchw):
+    if _USE_FAST:
+        fuse_forward_impl(gemm_out, bias, out_nchw)
+        return 
+
+    N, OutC, H_out, W_out = out_nchw.shape
+    out_nchw[:] = (gemm_out + bias).reshape(N, H_out, W_out, OutC).transpose(0, 3, 1, 2)
+
+
+def relu_spatial_forward(x: np.ndarray) -> np.ndarray:
+    if _USE_FAST:
+        _relu_fwd_inplace_kernel(x)
+        return x
+    return np.maximum(0, x)
+
+
+def relu_spatial_backward(dout: np.ndarray, in_act: np.ndarray) -> np.ndarray:
+    if _USE_FAST:
+        _relu_bwd_inplace_kernel(dout, in_act)
+        return dout
+    dout *= (in_act > 0)
+    return dout

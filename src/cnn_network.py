@@ -1,7 +1,12 @@
 # src/cnn_network.py
+import builtins
 import logging
 import numpy as np
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten
+from utils.im2col import relu_spatial_forward, relu_spatial_backward
+
+if 'profile' not in builtins.__dict__:
+    builtins.__dict__['profile'] = lambda x: x
 
 
 class CNNNetwork:
@@ -33,6 +38,14 @@ class CNNNetwork:
         self.dense_inputs = []
         self.masks = []
         self.activations = []
+
+        # Zero-allocation buffer caches for dense head
+        self._dense_z_bufs = []
+        self._dense_delta_bufs = []
+        self._grad_weights_bufs = []
+        self._grad_biases_bufs = []
+        self._cached_batch_size = 0
+        self._cached_dtype = None
 
     @property
     def layer_sizes(self) -> list:
@@ -89,6 +102,27 @@ class CNNNetwork:
             self.biases.append(b)
             self.param_layers.append("dense")
 
+    def _ensure_dense_buffers(self, m: int, dtype):
+        if self._cached_batch_size == m and self._cached_dtype == dtype and self._dense_z_bufs:
+            return
+
+        self._cached_batch_size = m
+        self._cached_dtype = dtype
+        self._dense_z_bufs = []
+        self._dense_delta_bufs = []
+        self._grad_weights_bufs = []
+        self._grad_biases_bufs = []
+
+        dense_w_indices = [i for i, l in enumerate(self.param_layers) if l == "dense"]
+        for w_idx in dense_w_indices:
+            W = self.weights[w_idx]
+            fan_in, fan_out = W.shape
+            self._dense_z_bufs.append(np.empty((m, fan_out), dtype=dtype))
+            self._dense_delta_bufs.append(np.empty((m, fan_in), dtype=dtype))
+            self._grad_weights_bufs.append(np.empty((fan_in, fan_out), dtype=dtype))
+            self._grad_biases_bufs.append(np.empty((1, fan_out), dtype=dtype))
+
+    @profile
     def _forward(self, X: np.ndarray, training: bool = True) -> np.ndarray:
         self.spatial_inputs.clear()
         self.dense_inputs.clear()
@@ -105,34 +139,41 @@ class CNNNetwork:
 
         current_act = X
 
-        # 1. Spatial Forward Pass
+        # 1. Spatial Forward Pass (zero activation copies)
         for layer in self.layers:
-            if training:
-                self.spatial_inputs.append(current_act)
             if layer == "relu":
-                current_act = np.maximum(0, current_act)
+                if training:
+                    self.spatial_inputs.append(current_act)
+                current_act = relu_spatial_forward(current_act)
             else:
+                if training:
+                    self.spatial_inputs.append(current_act)
                 current_act = layer.forward(current_act)
             self.activations.append(current_act)
 
         # 2. Dense Forward Pass
+        m = current_act.shape[0]
+        self._ensure_dense_buffers(m, current_act.dtype)
         dense_w_indices = [i for i, l in enumerate(self.param_layers) if l == "dense"]
         num_dense = len(dense_w_indices)
 
         for idx, w_idx in enumerate(dense_w_indices):
             if training:
                 self.dense_inputs.append(current_act)
-            z = np.dot(current_act, self.weights[w_idx]) + self.biases[w_idx]
+            
+            z_buf = self._dense_z_bufs[idx]
+            np.dot(current_act, self.weights[w_idx], out=z_buf)
+            z_buf += self.biases[w_idx]
 
             if idx == num_dense - 1:
-                current_act = self.apply_output_activation(z)
+                current_act = self.apply_output_activation(z_buf)
                 if training:
                     self.masks.append(None)
             else:
-                current_act = np.maximum(0, z)
+                current_act = np.maximum(0.0, z_buf)
                 if training and self.p_dropout > 0.0:
                     mask = (np.random.rand(*current_act.shape) >= self.p_dropout).astype(current_act.dtype) / (1.0 - self.p_dropout)
-                    current_act = current_act * mask
+                    current_act *= mask
                     self.masks.append(mask)
                 elif training:
                     self.masks.append(None)
@@ -157,22 +198,30 @@ class CNNNetwork:
         m = y.shape[0]
         eps = 1e-15
         if self.task_type == "multiclass":
-            output = np.clip(output, eps, 1.0 - eps)
-            return float(-np.sum(y * np.log(output)) / m)
+            clipped = np.clip(output, eps, 1.0 - eps)
+            return float(-np.sum(y * np.log(clipped)) / m)
         elif self.task_type == "binary":
-            output = np.clip(output, eps, 1.0 - eps)
-            return float(-np.sum(y * np.log(output) + (1.0 - y) * np.log(1.0 - output)) / m)
-        return float(np.sum((output - y) ** 2) / (2 * m))
+            clipped = np.clip(output, eps, 1.0 - eps)
+            return float(-np.sum(y * np.log(clipped) + (1.0 - y) * np.log(1.0 - clipped)) / m)
+        return float(np.sum((output - y) ** 2) / (2.0 * m))
 
     def compute_total_loss(self, output: np.ndarray, y: np.ndarray) -> float:
         raw_cost = self.calculate_raw_cost(output, y)
         m = y.shape[0]
-        l2_penalty = (self.lam_l2 / (2 * m)) * sum(np.sum(w**2) for w in self.weights)
-        l1_penalty = (self.lam_l1 / m) * sum(np.sum(np.abs(w)) for w in self.weights)
-        return raw_cost + l2_penalty + l1_penalty
+        l2_sum = 0.0
+        l1_sum = 0.0
+        if self.lam_l2 > 0.0:
+            for w in self.weights:
+                l2_sum += float(np.sum(w * w))
+        if self.lam_l1 > 0.0:
+            for w in self.weights:
+                l1_sum += float(np.sum(np.abs(w)))
+        return raw_cost + (self.lam_l2 / (2.0 * m)) * l2_sum + (self.lam_l1 / m) * l1_sum
 
+    @profile
     def backward(self, X: np.ndarray, y: np.ndarray, active_lr: float) -> float:
         m = X.shape[0]
+        inv_m = 1.0 / float(m)
         output = self._forward(X, training=True)
         delta = self.compute_output_delta(output, y)
 
@@ -188,15 +237,27 @@ class CNNNetwork:
             w_idx = dense_w_indices[local_idx]
             act_in = self.dense_inputs[local_idx]
 
-            grad_weights[w_idx] = np.dot(act_in.T, delta) / m
-            grad_biases[w_idx] = np.sum(delta, axis=0, keepdims=True) / m
+            # In-place parameter gradients
+            gw_buf = self._grad_weights_bufs[local_idx]
+            gb_buf = self._grad_biases_bufs[local_idx]
 
-            delta = np.dot(delta, self.weights[w_idx].T)
+            np.dot(act_in.T, delta, out=gw_buf)
+            gw_buf *= inv_m
+            grad_weights[w_idx] = gw_buf
+
+            np.sum(delta, axis=0, keepdims=True, out=gb_buf)
+            gb_buf *= inv_m
+            grad_biases[w_idx] = gb_buf
+
+            # Backprop delta to previous layer
+            next_delta_buf = self._dense_delta_bufs[local_idx]
+            np.dot(delta, self.weights[w_idx].T, out=next_delta_buf)
+            delta = next_delta_buf
 
             if local_idx > 0:
                 if self.masks[local_idx - 1] is not None:
                     delta *= self.masks[local_idx - 1]
-                delta *= (act_in > 0)
+                delta *= (act_in > 0.0)
 
         # 2. Backprop Spatial Pipeline
         spatial_grad = delta
@@ -205,22 +266,26 @@ class CNNNetwork:
             in_act = self.spatial_inputs[i]
 
             if layer == "relu":
-                spatial_grad *= (in_act > 0)
+                spatial_grad = relu_spatial_backward(spatial_grad, in_act)
             else:
                 spatial_grad = layer.backward(spatial_grad)
                 if isinstance(layer, Conv2D):
                     c_idx = self.param_layers.index(layer)
-                    grad_weights[c_idx] = layer.dW.copy()
-                    grad_biases[c_idx] = layer.db.copy()
+                    grad_weights[c_idx] = layer.dW
+                    grad_biases[c_idx] = layer.db
 
         # 3. L1 Penalty
         if self.lam_l1 > 0.0:
-            scale = self.lam_l1 / m
+            scale = self.lam_l1 * inv_m
             for i in range(num_params):
                 grad_weights[i] += scale * np.sign(self.weights[i])
 
-        # 4. Gradient Clipping
-        total_norm = np.sqrt(sum(np.sum(gw**2) for gw in grad_weights))
+        # 4. Fast Gradient Clipping
+        total_sq = 0.0
+        for gw in grad_weights:
+            total_sq += float(np.sum(gw * gw))
+        total_norm = np.sqrt(total_sq)
+
         if total_norm > self.max_norm:
             scaling_factor = self.max_norm / (total_norm + 1e-15)
             for i in range(num_params):

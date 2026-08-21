@@ -28,22 +28,24 @@ class AdamOptimizer(Optimizer):
 
     def setup(self, weights, biases, gammas=None, betas=None):
         """Allocates moment tracking arrays for weights, biases, and optional batch normalization parameters."""
-        logging.info(f"[OPTIMIZER TRACE] Running Adam setup allocation pass...")
-        logging.info(f"[OPTIMIZER TRACE] Gammas parameter passed to setup: {type(gammas)} | Betas: {type(betas)}")
-        
         self.ms_w = [np.zeros_like(w) for w in weights]
         self.vs_w = [np.zeros_like(w) for w in weights]
         self.ms_b = [np.zeros_like(b) for b in biases]
         self.vs_b = [np.zeros_like(b) for b in biases]
         
         if gammas is not None:
-            logging.info(f"[OPTIMIZER TRACE] Allocating Adam Batch Normalization Gamma tracking vectors (Count: {len(gammas)})")
             self.ms_g = [np.zeros_like(g) for g in gammas]
             self.vs_g = [np.zeros_like(g) for g in gammas]
+        else:
+            self.ms_g = None
+            self.vs_g = None
+
         if betas is not None:
-            logging.info(f"[OPTIMIZER TRACE] Allocating Adam Batch Normalization Beta tracking vectors (Count: {len(betas)})")
             self.ms_beta = [np.zeros_like(b) for b in betas]
             self.vs_beta = [np.zeros_like(b) for b in betas]
+        else:
+            self.ms_beta = None
+            self.vs_beta = None
             
         self._setup_done = True
 
@@ -54,77 +56,53 @@ class AdamOptimizer(Optimizer):
             self.setup(weights, biases, gammas, betas)
             
         self.t += 1
-        
-        if self.t == 1:
-            logging.info("=" * 60)
-            logging.info("   OPTIMIZER STEP 1 CONSOLE TELEMETRY")
-            logging.info("=" * 60)
-            logging.info(f"[OPTIMIZER TRACE] Active Learning Rate: {active_lr:.6f} | L2 Regularization Parameter: {lam_l2}")
-            logging.info(f"[OPTIMIZER TRACE] Incoming Core Weights Layers Count: {len(weights)}")
-            logging.info(f"[OPTIMIZER TRACE] Incoming Gammas: {type(gammas)} | Grad Gammas: {type(grad_gammas)}")
-            logging.info(f"[OPTIMIZER TRACE] Incoming Betas: {type(betas)} | Grad Betas: {type(grad_betas)}")
+
+        # Precompute scalar step multipliers once per step instead of per tensor
+        bias_correction1 = 1.0 - (self.beta1 ** self.t)
+        bias_correction2 = 1.0 - (self.beta2 ** self.t)
+        step_scale = active_lr * (np.sqrt(bias_correction2) / bias_correction1)
+        eps_corrected = self.eps * np.sqrt(bias_correction2)
+        decay_factor = active_lr * (lam_l2 / float(m_samples)) if lam_l2 > 0.0 else 0.0
+
+        one_minus_beta1 = 1.0 - self.beta1
+        one_minus_beta2 = 1.0 - self.beta2
         
         # 1. Update Core Weights and Biases
         for i in range(len(weights)):
-            self.ms_w[i] = self.beta1 * self.ms_w[i] + (1 - self.beta1) * grad_weights[i]
-            self.ms_b[i] = self.beta1 * self.ms_b[i] + (1 - self.beta1) * grad_biases[i]
+            gw = grad_weights[i]
+            gb = grad_biases[i]
+
+            # First moment updates
+            self.ms_w[i] = self.beta1 * self.ms_w[i] + one_minus_beta1 * gw
+            self.ms_b[i] = self.beta1 * self.ms_b[i] + one_minus_beta1 * gb
             
-            self.vs_w[i] = self.beta2 * self.vs_w[i] + (1 - self.beta2) * (grad_weights[i] ** 2)
-            self.vs_b[i] = self.beta2 * self.vs_b[i] + (1 - self.beta2) * (grad_biases[i] ** 2)
+            # Second moment updates
+            self.vs_w[i] = self.beta2 * self.vs_w[i] + one_minus_beta2 * (gw * gw)
+            self.vs_b[i] = self.beta2 * self.vs_b[i] + one_minus_beta2 * (gb * gb)
             
-            m_w_hat = self.ms_w[i] / (1 - self.beta1 ** self.t)
-            m_b_hat = self.ms_b[i] / (1 - self.beta1 ** self.t)
-            
-            v_w_hat = self.vs_w[i] / (1 - self.beta2 ** self.t)
-            v_b_hat = self.vs_b[i] / (1 - self.beta2 ** self.t)
-            
-            w_step = ((active_lr * m_w_hat) / (np.sqrt(v_w_hat) + self.eps)) + active_lr * ((lam_l2 / m_samples) * weights[i])
-            b_step = (active_lr * m_b_hat) / (np.sqrt(v_b_hat) + self.eps)
-            
-            if self.t == 1:
-                logging.info(f"[OPTIMIZER TRACE] Layer {i} Input Grad Weights Norm: {np.linalg.norm(grad_weights[i]):.6f} | Grad Biases Norm: {np.linalg.norm(grad_biases[i]):.6f}")
-                logging.info(f"[OPTIMIZER TRACE] Layer {i} Computed Adam Step Weight Norm: {np.linalg.norm(w_step):.6f} | Step Bias Norm: {np.linalg.norm(b_step):.6f}")
-            
-            weights[i] -= w_step
-            biases[i] -= b_step
+            # In-place step application
+            if decay_factor > 0.0:
+                weights[i] -= decay_factor * weights[i]
+
+            weights[i] -= step_scale * (self.ms_w[i] / (np.sqrt(self.vs_w[i]) + eps_corrected))
+            biases[i] -= step_scale * (self.ms_b[i] / (np.sqrt(self.vs_b[i]) + eps_corrected))
 
         # 2. Update Batch Normalization Scaling Parameters via Adam
         if gammas is not None and grad_gammas is not None:
-            if self.t == 1:
-                logging.info(f"[OPTIMIZER TRACE] Gamma block hit. Processing updates across {len(gammas)} vectors.")
             for i in range(len(gammas)):
-                if grad_gammas[i] is not None:
-                    self.ms_g[i] = self.beta1 * self.ms_g[i] + (1 - self.beta1) * grad_gammas[i]
-                    self.vs_g[i] = self.beta2 * self.vs_g[i] + (1 - self.beta2) * (grad_gammas[i] ** 2)
-                    
-                    mg_hat = self.ms_g[i] / (1 - self.beta1 ** self.t)
-                    vg_hat = self.vs_g[i] / (1 - self.beta2 ** self.t)
-                    
-                    g_step = (active_lr * mg_hat) / (np.sqrt(vg_hat) + self.eps)
-                    if self.t == 1:
-                        logging.info(f"[OPTIMIZER TRACE] Gamma Vector {i} Adam Step Norm: {np.linalg.norm(g_step):.6f}")
-                    gammas[i] -= g_step
-        elif self.t == 1:
-            logging.info("[OPTIMIZER TRACE] Gamma block skipped. (Either gammas or grad_gammas is None)")
+                gg = grad_gammas[i]
+                if gg is not None:
+                    self.ms_g[i] = self.beta1 * self.ms_g[i] + one_minus_beta1 * gg
+                    self.vs_g[i] = self.beta2 * self.vs_g[i] + one_minus_beta2 * (gg * gg)
+                    gammas[i] -= step_scale * (self.ms_g[i] / (np.sqrt(self.vs_g[i]) + eps_corrected))
 
         if betas is not None and grad_betas is not None:
-            if self.t == 1:
-                logging.info(f"[OPTIMIZER TRACE] Beta block hit. Processing updates across {len(betas)} vectors.")
             for i in range(len(betas)):
-                if grad_betas[i] is not None:
-                    self.ms_beta[i] = self.beta1 * self.ms_beta[i] + (1 - self.beta1) * grad_betas[i]
-                    self.vs_beta[i] = self.beta2 * self.vs_beta[i] + (1 - self.beta2) * (grad_betas[i] ** 2)
-                    
-                    mbeta_hat = self.ms_beta[i] / (1 - self.beta1 ** self.t)
-                    vbeta_hat = self.vs_beta[i] / (1 - self.beta2 ** self.t)
-                    
-                    beta_step = (active_lr * mbeta_hat) / (np.sqrt(vbeta_hat) + self.eps)
-                    if self.t == 1:
-                        logging.info(f"[OPTIMIZER TRACE] Beta Vector {i} Adam Step Norm: {np.linalg.norm(beta_step):.6f}")
-                    betas[i] -= beta_step
-        elif self.t == 1:
-            logging.info("[OPTIMIZER TRACE] Beta block skipped. (Either betas or grad_betas is None)")
-            logging.info("=" * 60)
+                gb_val = grad_betas[i]
+                if gb_val is not None:
+                    self.ms_beta[i] = self.beta1 * self.ms_beta[i] + one_minus_beta1 * gb_val
+                    self.vs_beta[i] = self.beta2 * self.vs_beta[i] + one_minus_beta2 * (gb_val * gb_val)
+                    betas[i] -= step_scale * (self.ms_beta[i] / (np.sqrt(self.vs_beta[i]) + eps_corrected))
 
 
 class SGDOptimizer(Optimizer):
@@ -141,8 +119,13 @@ class SGDOptimizer(Optimizer):
         
         if gammas is not None:
             self.vs_g = [np.zeros_like(g) for g in gammas]
+        else:
+            self.vs_g = None
+
         if betas is not None:
             self.vs_beta = [np.zeros_like(b) for b in betas]
+        else:
+            self.vs_beta = None
             
         self._setup_done = True
 
@@ -152,9 +135,15 @@ class SGDOptimizer(Optimizer):
         if not self._setup_done:
             self.setup(weights, biases, gammas, betas)
             
+        decay_term = (lam_l2 / float(m_samples)) if lam_l2 > 0.0 else 0.0
+
         # 1. Update Weights and Biases
         for i in range(len(weights)):
-            self.vs_w[i] = (self.momentum * self.vs_w[i]) + active_lr * (grad_weights[i] + (lam_l2 / m_samples) * weights[i])
+            gw = grad_weights[i]
+            if decay_term > 0.0:
+                gw = gw + decay_term * weights[i]
+
+            self.vs_w[i] = (self.momentum * self.vs_w[i]) + active_lr * gw
             self.vs_b[i] = (self.momentum * self.vs_b[i]) + active_lr * grad_biases[i]
             
             weights[i] -= self.vs_w[i]
