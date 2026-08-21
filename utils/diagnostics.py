@@ -281,3 +281,12 @@ class NeuralNetworkDiagnostics:
         plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f"Figure_5.{diag_cfg.output_format.lower()}"))
         plt.close()
+
+    @staticmethod
+    def run_diagnostics(controller, data_provider, cfg: PipelineConfig) -> None:
+        diag_cfg = cfg.diagnostics
+        if not diag_cfg.enabled:
+            return  # Respect the config flag and exit early if diagnostics are disabled
+            
+        meta_cfg = cfg.meta
+        # ... rest of the method ...
