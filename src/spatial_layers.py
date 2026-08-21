@@ -8,7 +8,8 @@ from utils.im2col import (
     maxpool_backward,
     fuse_dout_transpose_and_bias,
     fuse_forward_transpose_and_bias,
-    gemm_param_grad
+    gemm_param_grad,
+    gemm_forward
 )
 
 if 'profile' not in builtins.__dict__:
@@ -42,6 +43,8 @@ class Conv2D:
         self._dx_buffer = None
         self._dout_trans_buffer = None
         self._dcol_buffer = None
+        self._fwd_gemm_buffer = None
+        self._fwd_out_buffer = None
         self._cached_dtype = None
 
     def _ensure_buffers(self, N: int, C: int, H: int, W: int, out_h: int, out_w: int, dtype):
@@ -63,10 +66,7 @@ class Conv2D:
         self._dout_trans_buffer = np.empty((total_rows, self.out_channels), dtype=dtype)
         self._fwd_gemm_buffer = np.empty((total_rows, self.out_channels), dtype=dtype)
         self._fwd_out_buffer = np.empty((N, self.out_channels, out_h, out_w), dtype=dtype)
-
-        pad_h = H + 2 * self.pad
-        pad_w = W + 2 * self.pad
-        self._dx_buffer = np.zeros((N, C, pad_h, pad_w), dtype=dtype)
+        self._dx_buffer = np.zeros((N, C, H, W), dtype=dtype)
     
     @profile
     def forward(self, x: np.ndarray) -> np.ndarray:
@@ -86,7 +86,9 @@ class Conv2D:
 
         W_2d = self.W.reshape(self.out_channels, -1)
         active_gemm = self._fwd_gemm_buffer[:total_rows]
-        np.dot(self.col, W_2d.T, out=active_gemm)
+        
+        # Direct C-BLAS GEMM dispatch without Python intermediate views
+        gemm_forward(self.col, W_2d, active_gemm)
 
         active_out = self._fwd_out_buffer[:N]
         fuse_forward_transpose_and_bias(active_gemm, self.b, active_out)
@@ -122,7 +124,8 @@ class Conv2D:
         active_dcol = self._dcol_buffer[:total_rows]
         np.dot(active_dout_trans, W_2d, out=active_dcol)
 
-        return col2im(active_dcol, self.x_shape, self.k_h, self.k_w, self.stride, self.pad, out_buf=self._dx_buffer)
+        active_dx = self._dx_buffer[:N]
+        return col2im(active_dcol, self.x_shape, self.k_h, self.k_w, self.stride, self.pad, out_buf=active_dx)
 
 
 class MaxPool2D:

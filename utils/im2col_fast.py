@@ -98,6 +98,48 @@ _REF_ALPHA_F = ctypes.byref(_C_ALPHA_F)
 _REF_ALPHA_D = ctypes.byref(_C_ALPHA_D)
 
 
+def gemm_forward_fast(col: np.ndarray, W_2d: np.ndarray, out_gemm: np.ndarray):
+    """
+    Computes out_gemm = col @ W_2d.T
+    col shape: (M, K)
+    W_2d shape: (N, K) -> W_2d.T is (K, N)
+    out_gemm shape: (M, N)
+    """
+    m_dim = col.shape[0]
+    n_dim = W_2d.shape[0]
+    k_dim = col.shape[1]
+
+    _C_INT_M.value = n_dim
+    _C_INT_N.value = m_dim
+    _C_INT_K.value = k_dim
+    _C_INT_LDA.value = k_dim
+    _C_INT_LDB.value = k_dim
+    _C_INT_LDC.value = n_dim
+
+    if col.dtype == np.float32:
+        _C_ALPHA_F.value = 1.0
+        _raw_sgemm(
+            _REF_TRANS_T, _REF_TRANS_N,
+            _REF_M, _REF_N, _REF_K,
+            _REF_ALPHA_F,
+            W_2d.ctypes.data, _REF_LDA,
+            col.ctypes.data, _REF_LDB,
+            _REF_BETA_F,
+            out_gemm.ctypes.data, _REF_LDC
+        )
+    else:
+        _C_ALPHA_D.value = 1.0
+        _raw_dgemm(
+            _REF_TRANS_T, _REF_TRANS_N,
+            _REF_M, _REF_N, _REF_K,
+            _REF_ALPHA_D,
+            W_2d.ctypes.data, _REF_LDA,
+            col.ctypes.data, _REF_LDB,
+            _REF_BETA_D,
+            out_gemm.ctypes.data, _REF_LDC
+        )
+
+
 def gemm_param_grad_fast(dout_trans: np.ndarray, col: np.ndarray, dW_flat: np.ndarray, inv_m: float = 1.0):
     n_cols = dW_flat.shape[1]
     n_rows = dW_flat.shape[0]
@@ -318,7 +360,6 @@ def _fuse_dout_transpose_and_bias(dout, dout_trans_out, db_out):
             for h in range(H_out):
                 for w in range(W_out):
                     sum_val += dout[n, c, h, w]
-        # In CNN networks, db is averaged over the batch (1/N)
         db_out[0, c] = sum_val * inv_m
 
 
@@ -356,6 +397,7 @@ def fuse_dout_transpose_bias_fast(dout: np.ndarray, dout_trans_buf: np.ndarray, 
         dout = np.ascontiguousarray(dout)
     _fuse_dout_transpose_and_bias(dout, dout_trans_buf, db_buf)
 
+
 @njit(_fwd_trans_sig, parallel=True, fastmath=True, nogil=True, cache=True)
 def _fuse_forward_transpose_and_bias(gemm_out, bias, out_nchw):
     N, OutC, H_out, W_out = out_nchw.shape
@@ -370,6 +412,7 @@ def _fuse_forward_transpose_and_bias(gemm_out, bias, out_nchw):
                 for c in range(OutC):
                     out_nchw[n, c, h, w] = gemm_out[row_idx, c] + bias[0, c]
 
+
 _relu_fwd_sig = [
     void(float32[:, :, :, :]),
     void(float64[:, :, :, :]),
@@ -380,6 +423,7 @@ _relu_bwd_sig = [
     void(float64[:, :, :, :], float64[:, :, :, :]),
 ]
 
+
 @njit(_relu_fwd_sig, parallel=True, fastmath=True, nogil=True, cache=True)
 def _relu_fwd_inplace_kernel(x):
     N, C, H, W = x.shape
@@ -389,6 +433,7 @@ def _relu_fwd_inplace_kernel(x):
                 for w in range(W):
                     if x[n, c, h, w] < 0.0:
                         x[n, c, h, w] = 0.0
+
 
 @njit(_relu_bwd_sig, parallel=True, fastmath=True, nogil=True, cache=True)
 def _relu_bwd_inplace_kernel(dout, in_act):
