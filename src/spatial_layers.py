@@ -2,14 +2,14 @@
 import builtins
 import numpy as np
 from utils.im2col import (
-    im2col,
+    conv2d_forward,
+    conv2d_backward_weight,
+    conv2d_backward_input,
     col2im,
     maxpool_forward,
     maxpool_backward,
     fuse_dout_transpose_and_bias,
-    fuse_forward_transpose_and_bias,
-    gemm_param_grad,
-    gemm_forward
+    gemm_param_grad
 )
 
 if 'profile' not in builtins.__dict__:
@@ -34,6 +34,7 @@ class Conv2D:
         self.db = np.zeros_like(self.b)
 
         self.x_shape = None
+        self.x_cached = None
         self.col = None
         self.out_h = 0
         self.out_w = 0
@@ -67,31 +68,29 @@ class Conv2D:
         self._fwd_gemm_buffer = np.empty((total_rows, self.out_channels), dtype=dtype)
         self._fwd_out_buffer = np.empty((N, self.out_channels, out_h, out_w), dtype=dtype)
         self._dx_buffer = np.zeros((N, C, H, W), dtype=dtype)
-    
+
     @profile
     def forward(self, x: np.ndarray) -> np.ndarray:
         if not x.flags['C_CONTIGUOUS']:
             x = np.ascontiguousarray(x)
 
         self.x_shape = x.shape
+        self.x_cached = x
         N, C, H, W = self.x_shape
         self.out_h = (H + 2 * self.pad - self.k_h) // self.stride + 1
         self.out_w = (W + 2 * self.pad - self.k_w) // self.stride + 1
 
         self._ensure_buffers(N, C, H, W, self.out_h, self.out_w, x.dtype)
-
-        total_rows = N * self.out_h * self.out_w
-        active_col = self._col_buffer[:total_rows]
-        self.col = im2col(x, self.k_h, self.k_w, self.stride, self.pad, out_buf=active_col)
-
-        W_2d = self.W.reshape(self.out_channels, -1)
-        active_gemm = self._fwd_gemm_buffer[:total_rows]
-        
-        # Direct C-BLAS GEMM dispatch without Python intermediate views
-        gemm_forward(self.col, W_2d, active_gemm)
-
         active_out = self._fwd_out_buffer[:N]
-        fuse_forward_transpose_and_bias(active_gemm, self.b, active_out)
+
+        # Single consolidated dispatch
+        active_out, self.col = conv2d_forward(
+            x=x, W=self.W, bias=self.b,
+            stride=self.stride, pad=self.pad,
+            out_buf=active_out,
+            col_buf=self._col_buffer,
+            gemm_buf=self._fwd_gemm_buffer,
+        )
         return active_out
 
     @profile
@@ -103,30 +102,39 @@ class Conv2D:
         inv_m = 1.0 / float(N)
         total_rows = N * self.out_h * self.out_w
 
+        # Ensure internal scratch buffers match current batch size & dtype (float32 vs float64)
         self._ensure_buffers(N, C, H, W, self.out_h, self.out_w, dout.dtype)
 
-        if self.db.dtype != dout.dtype or self.db.shape != (1, self.out_channels):
+        # Ensure gradients match dtype and shape
+        if self.db is None or self.db.dtype != dout.dtype or self.db.shape != (1, self.out_channels):
             self.db = np.zeros((1, self.out_channels), dtype=dout.dtype)
-        if self.dW.dtype != dout.dtype or self.dW.shape != self.W.shape:
+        else:
+            self.db.fill(0)
+
+        if self.dW is None or self.dW.dtype != dout.dtype or self.dW.shape != self.W.shape:
             self.dW = np.zeros_like(self.W, dtype=dout.dtype)
+        else:
+            self.dW.fill(0)
 
         active_dout_trans = self._dout_trans_buffer[:total_rows]
 
-        # 1. Bias gradient accumulation
+        # 1. Bias gradient accumulation (now guaranteed matching dtypes)
         fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
 
-        # 2. Parameter gradient Level-3 GEMM with inv_m scaling
-        dW_flat = self.dW.reshape(self.out_channels, -1)
-        gemm_param_grad(active_dout_trans, self.col, dW_flat, inv_m)
+        # 2. Weight gradient accumulation
+        conv2d_backward_weight(
+            dout=dout, x=self.x_cached, dW=self.dW,
+            col=self.col, dout_trans=active_dout_trans,
+            stride=self.stride, pad=self.pad, inv_m=inv_m
+        )
 
-        # 3. Input gradient Level-3 GEMM
-        W_2d = self.W.reshape(self.out_channels, -1)
-        active_dcol = self._dcol_buffer[:total_rows]
-        np.dot(active_dout_trans, W_2d, out=active_dcol)
-
+        # 3. Input gradient accumulation (dx)
         active_dx = self._dx_buffer[:N]
-        return col2im(active_dcol, self.x_shape, self.k_h, self.k_w, self.stride, self.pad, out_buf=active_dx)
-
+        return conv2d_backward_input(
+            dout=dout, W=self.W, dx_buf=active_dx,
+            stride=self.stride, pad=self.pad,
+            dout_trans=active_dout_trans, dcol_buf=self._dcol_buffer
+        )
 
 class MaxPool2D:
     def __init__(self, pool_size: int = 2, stride: int = 2):
