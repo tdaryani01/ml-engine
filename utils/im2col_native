@@ -3,6 +3,13 @@ import os
 import ctypes
 import numpy as np
 
+os.environ["NUMBA_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
+os.environ["NUMEXPR_NUM_THREADS"] = "4"
+
 BACKEND = os.getenv("ENGINE_BACKEND", "fast").lower()
 
 _USE_NATIVE = False

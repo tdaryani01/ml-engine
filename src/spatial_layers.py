@@ -1,4 +1,3 @@
-# src/spatial_layers.py
 import builtins
 import numpy as np
 from utils.im2col import (
@@ -9,7 +8,8 @@ from utils.im2col import (
     maxpool_forward,
     maxpool_backward,
     fuse_dout_transpose_and_bias,
-    gemm_param_grad
+    _USE_NATIVE,
+    _USE_FAST
 )
 
 if 'profile' not in builtins.__dict__:
@@ -50,6 +50,7 @@ class Conv2D:
 
     def _ensure_buffers(self, N: int, C: int, H: int, W: int, out_h: int, out_w: int, dtype):
         total_rows = N * out_h * out_w
+
         if self.W.dtype != dtype:
             self.W = self.W.astype(dtype)
             self.b = self.b.astype(dtype)
@@ -83,13 +84,13 @@ class Conv2D:
         self._ensure_buffers(N, C, H, W, self.out_h, self.out_w, x.dtype)
         active_out = self._fwd_out_buffer[:N]
 
-        # Single consolidated dispatch
         active_out, self.col = conv2d_forward(
             x=x, W=self.W, bias=self.b,
             stride=self.stride, pad=self.pad,
             out_buf=active_out,
             col_buf=self._col_buffer,
             gemm_buf=self._fwd_gemm_buffer,
+            fuse_relu=False
         )
         return active_out
 
@@ -102,23 +103,16 @@ class Conv2D:
         inv_m = 1.0 / float(N)
         total_rows = N * self.out_h * self.out_w
 
-        # Ensure internal scratch buffers match current batch size & dtype (float32 vs float64)
         self._ensure_buffers(N, C, H, W, self.out_h, self.out_w, dout.dtype)
 
-        # Ensure gradients match dtype and shape
         if self.db is None or self.db.dtype != dout.dtype or self.db.shape != (1, self.out_channels):
             self.db = np.zeros((1, self.out_channels), dtype=dout.dtype)
-        else:
-            self.db.fill(0)
-
         if self.dW is None or self.dW.dtype != dout.dtype or self.dW.shape != self.W.shape:
             self.dW = np.zeros_like(self.W, dtype=dout.dtype)
-        else:
-            self.dW.fill(0)
 
         active_dout_trans = self._dout_trans_buffer[:total_rows]
 
-        # 1. Bias gradient accumulation (now guaranteed matching dtypes)
+        # 1. Bias gradient accumulation
         fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
 
         # 2. Weight gradient accumulation
@@ -135,6 +129,7 @@ class Conv2D:
             stride=self.stride, pad=self.pad,
             dout_trans=active_dout_trans, dcol_buf=self._dcol_buffer
         )
+
 
 class MaxPool2D:
     def __init__(self, pool_size: int = 2, stride: int = 2):

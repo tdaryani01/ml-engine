@@ -1,13 +1,74 @@
-# utils/im2col.py
 import os
 import ctypes
+import time
 import numpy as np
 
-BACKEND = os.getenv("ENGINE_BACKEND", "fast").lower()
+# Enforce thread configuration before importing C runtimes
+os.environ["NUMBA_NUM_THREADS"] = "4"
+os.environ["OPENBLAS_NUM_THREADS"] = "4"
+os.environ["MKL_NUM_THREADS"] = "4"
+os.environ["OMP_NUM_THREADS"] = "4"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
+os.environ["NUMEXPR_NUM_THREADS"] = "4"
+
+BACKEND = os.getenv("ENGINE_BACKEND", "native").lower()
 
 _USE_NATIVE = False
 _USE_FAST = False
 _native_lib = None
+_diagnostics_logged = False
+
+# -----------------------------------------------------------------------------
+# Timing Diagnostic Collector
+# -----------------------------------------------------------------------------
+_stats = {
+    "fwd_count": 0, "fwd_l0": 0.0, "fwd_l1": 0.0,
+    "dx_count": 0,  "dx_l0": 0.0,  "dx_l1": 0.0,
+    "dw_count": 0,  "dw_l0": 0.0,  "dw_l1": 0.0,
+}
+
+def _log_timing(phase: str, Cin: int, dt: float):
+    count_key = f"{phase}_count"
+    l0_key = f"{phase}_l0"
+    l1_key = f"{phase}_l1"
+    
+    if _stats[count_key] < 100:
+        _stats[count_key] += 1
+        if Cin == 3:
+            _stats[l0_key] += dt
+        else:
+            _stats[l1_key] += dt
+
+        if _stats["fwd_count"] >= 100 and _stats["dx_count"] >= 100 and _stats["dw_count"] >= 100:
+            print("\n" + "=" * 65)
+            print("  EXACT ENGINE TIME BREAKDOWN (Average ms per call)")
+            print("=" * 65)
+            print(f" Layer 0 (3 -> 8, 32x32):")
+            print(f"   -> Forward : {_stats['fwd_l0'] / 50.0:.3f} ms")
+            print(f"   -> dx      : {_stats['dx_l0'] / 50.0:.3f} ms")
+            print(f"   -> dW      : {_stats['dw_l0'] / 50.0:.3f} ms")
+            print(f"   -> Total   : {(_stats['fwd_l0'] + _stats['dx_l0'] + _stats['dw_l0']) / 50.0:.3f} ms")
+            print("-" * 65)
+            print(f" Layer 3 (8 -> 16, 16x16):")
+            print(f"   -> Forward : {_stats['fwd_l1'] / 50.0:.3f} ms")
+            print(f"   -> dx      : {_stats['dx_l1'] / 50.0:.3f} ms")
+            print(f"   -> dW      : {_stats['dw_l1'] / 50.0:.3f} ms")
+            print(f"   -> Total   : {(_stats['fwd_l1'] + _stats['dx_l1'] + _stats['dw_l1']) / 50.0:.3f} ms")
+            print("=" * 65 + "\n")
+            _stats["fwd_count"] = 1000
+
+# -----------------------------------------------------------------------------
+# Memory Alignment Helpers
+# -----------------------------------------------------------------------------
+def as_aligned_array(arr: np.ndarray, alignment: int = 32) -> np.ndarray:
+    """Guarantees contiguous 32-byte aligned float32 array for AVX2 loads/stores."""
+    if arr.ctypes.data % alignment == 0 and arr.flags['C_CONTIGUOUS'] and arr.dtype == np.float32:
+        return arr
+    buf = np.empty(arr.size * 4 + alignment, dtype=np.uint8)
+    offset = (alignment - (buf.ctypes.data % alignment)) % alignment
+    aligned = np.frombuffer(buf.data, dtype=np.float32, offset=offset, count=arr.size).reshape(arr.shape)
+    np.copyto(aligned, arr.astype(np.float32, copy=False))
+    return aligned
 
 # -----------------------------------------------------------------------------
 # 1. Native C++ AVX2 Initialization
@@ -32,177 +93,112 @@ if BACKEND in ("native", "cpp", "c++"):
 
         _native_lib = ctypes.CDLL(lib_path)
 
-        # 0. Thread Diagnostic
         _native_lib.get_omp_threads.restype = ctypes.c_int
         _native_lib.get_omp_threads.argtypes = []
 
-        # 1. Forward signature (with optional ReLU fusion flag)
+        _native_lib.log_engine_runtime_diagnostics.restype = None
+        _native_lib.log_engine_runtime_diagnostics.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64
+        ]
+
         _native_lib.direct_conv2d_forward_avx2.restype = None
         _native_lib.direct_conv2d_forward_avx2.argtypes = [
-            ctypes.c_void_p,  # x
-            ctypes.c_void_p,  # W
-            ctypes.c_void_p,  # bias
-            ctypes.c_void_p,  # out
-            ctypes.c_int64,   # N
-            ctypes.c_int64,   # C_in
-            ctypes.c_int64,   # H
-            ctypes.c_int64,   # W_in
-            ctypes.c_int64,   # C_out
-            ctypes.c_int64,   # k_h
-            ctypes.c_int64,   # k_w
-            ctypes.c_int64,   # stride
-            ctypes.c_int64,   # pad
-            ctypes.c_int32    # fuse_relu (1 or 0)
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int32
         ]
 
-        # 2. Backward weight signature (dW)
         _native_lib.direct_conv2d_backward_weight_avx2.restype = None
         _native_lib.direct_conv2d_backward_weight_avx2.argtypes = [
-            ctypes.c_void_p,  # dout
-            ctypes.c_void_p,  # x
-            ctypes.c_void_p,  # dW
-            ctypes.c_int64,   # N
-            ctypes.c_int64,   # C_in
-            ctypes.c_int64,   # H
-            ctypes.c_int64,   # W_in
-            ctypes.c_int64,   # C_out
-            ctypes.c_int64,   # k_h
-            ctypes.c_int64,   # k_w
-            ctypes.c_int64,   # stride
-            ctypes.c_int64,   # pad
-            ctypes.c_float    # inv_m
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_float
         ]
 
-        # 3. Backward input signature (dx)
         _native_lib.direct_conv2d_backward_input_avx2.restype = None
         _native_lib.direct_conv2d_backward_input_avx2.argtypes = [
-            ctypes.c_void_p,  # dout
-            ctypes.c_void_p,  # W
-            ctypes.c_void_p,  # dx
-            ctypes.c_int64,   # N
-            ctypes.c_int64,   # C_in
-            ctypes.c_int64,   # H
-            ctypes.c_int64,   # W_in
-            ctypes.c_int64,   # C_out
-            ctypes.c_int64,   # k_h
-            ctypes.c_int64,   # k_w
-            ctypes.c_int64,   # stride
-            ctypes.c_int64    # pad
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64
         ]
 
-        # 4. Native Vector ReLU Primitives
         _native_lib.direct_relu_forward_avx2.restype = None
         _native_lib.direct_relu_forward_avx2.argtypes = [ctypes.c_void_p, ctypes.c_int64]
 
         _native_lib.direct_relu_backward_avx2.restype = None
         _native_lib.direct_relu_backward_avx2.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64]
 
-        # 5. Native MaxPool Forward & Backward
         _native_lib.direct_maxpool_forward_avx2.restype = None
         _native_lib.direct_maxpool_forward_avx2.argtypes = [
-            ctypes.c_void_p,  # x
-            ctypes.c_void_p,  # out
-            ctypes.c_void_p,  # argmax_buf
-            ctypes.c_int64,   # N
-            ctypes.c_int64,   # C
-            ctypes.c_int64,   # H
-            ctypes.c_int64,   # W
-            ctypes.c_int64,   # pool_size
-            ctypes.c_int64    # stride
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64
         ]
 
         _native_lib.direct_maxpool_backward_avx2.restype = None
         _native_lib.direct_maxpool_backward_avx2.argtypes = [
-            ctypes.c_void_p,  # dout
-            ctypes.c_void_p,  # argmax_indices
-            ctypes.c_void_p,  # dx
-            ctypes.c_int64,   # N
-            ctypes.c_int64,   # C
-            ctypes.c_int64,   # out_h
-            ctypes.c_int64,   # out_w
-            ctypes.c_int64,   # in_h
-            ctypes.c_int64    # in_w
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_int64, ctypes.c_int64
         ]
 
-        # 6. Native Direct Bias Backward
         _native_lib.direct_bias_backward_avx2.restype = None
         _native_lib.direct_bias_backward_avx2.argtypes = [
-            ctypes.c_void_p,  # dout
-            ctypes.c_void_p,  # db
-            ctypes.c_int64,   # N
-            ctypes.c_int64,   # C_out
-            ctypes.c_int64,   # out_h
-            ctypes.c_int64,   # out_w
-            ctypes.c_float    # inv_m
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
+            ctypes.c_float
         ]
 
         _USE_NATIVE = True
-        num_threads = _native_lib.get_omp_threads()
-        print(f"[Engine Backend] Initialized with Native C++ AVX2 Kernels. (Active OpenMP Threads: {num_threads})")
-    except Exception as e:
-        print(f"[Engine Backend] Failed to load Native C++ backend ({e}). Falling back to 'fast'.")
+    except Exception:
         BACKEND = "fast"
 
-# -----------------------------------------------------------------------------
-# 2. Fast Numba / OpenBLAS Initialization
-# -----------------------------------------------------------------------------
-if not _USE_NATIVE and BACKEND in ("fast", "numba"):
-    try:
-        from utils.im2col_fast import (
-            im2col_fast as _im2col_impl,
-            col2im_fast as _col2im_impl,
-            gemm_forward_fast as _gemm_forward_impl,
-            gemm_param_grad_fast as _gemm_param_grad_impl,
-            _maxpool_forward_kernel,
-            _maxpool_backward_kernel,
-            fuse_dout_transpose_bias_fast as _fuse_dout_impl,
-            _fuse_forward_transpose_and_bias as fuse_forward_impl,
-            _relu_fwd_inplace_kernel,
-            _relu_bwd_inplace_kernel
-        )
-        _USE_FAST = True
-        print("[Engine Backend] Initialized with Numba JIT C-Kernels.")
-    except Exception as e:
-        BACKEND = "numpy"
-        _USE_FAST = False
-        print(f"[Engine Backend] Using Pure NumPy backend. (Reason: {e})")
-
-# In Native mode, keep the fast backend primitives fully imported as fallbacks
-if _USE_NATIVE:
-    from utils.im2col_fast import (
-        im2col_fast as _im2col_impl,
-        col2im_fast as _col2im_impl,
-        gemm_forward_fast as _gemm_forward_impl,
-        gemm_param_grad_fast as _gemm_param_grad_impl,
-        _maxpool_forward_kernel,
-        _maxpool_backward_kernel,
-        fuse_dout_transpose_bias_fast as _fuse_dout_impl,
-        _fuse_forward_transpose_and_bias as fuse_forward_impl,
-        _relu_fwd_inplace_kernel,
-        _relu_bwd_inplace_kernel
-    )
-    _USE_FAST = True
+from utils.im2col_fast import (
+    im2col_fast as _im2col_impl,
+    col2im_fast as _col2im_impl,
+    gemm_forward_fast as _gemm_forward_impl,
+    gemm_param_grad_fast as _gemm_param_grad_impl,
+    _maxpool_forward_kernel,
+    _maxpool_backward_kernel,
+    fuse_dout_transpose_bias_fast as _fuse_dout_impl,
+    _fuse_forward_transpose_and_bias as fuse_forward_impl,
+    _relu_fwd_inplace_kernel,
+    _relu_bwd_inplace_kernel
+)
+_USE_FAST = True
 
 
 # -----------------------------------------------------------------------------
-# Consolidated Convolution Forward & Backward Routing
+# Convolution Routing with Strict float32 Guarantees
 # -----------------------------------------------------------------------------
 def conv2d_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
                    stride: int, pad: int, out_buf: np.ndarray,
                    col_buf: np.ndarray = None, gemm_buf: np.ndarray = None,
                    fuse_relu: bool = False) -> tuple:
-    """
-    Unified forward entry point.
-    Returns (out_buf, col_matrix_or_None).
-    """
-    N, C_in, H, W_in = x.shape
-    C_out, _, k_h, k_w = W.shape
-    out_h = (H + 2 * pad - k_h) // stride + 1
-    out_w = (W_in + 2 * pad - k_w) // stride + 1
-    total_rows = N * out_h * out_w
+    global _diagnostics_logged
 
-    # PATH A: Native C++ AVX2 microkernel (float32 optimized)
-    if _USE_NATIVE and x.dtype == np.float32:
+    if _USE_NATIVE and x.dtype == np.float32 and W.dtype == np.float32:
+        N, C_in, H, W_in = x.shape
+        C_out, _, k_h, k_w = W.shape
+
+        if not _diagnostics_logged:
+            print("\n--- Corrected Tensor Audit ---")
+            print(f"  x       contiguous: {x.flags['C_CONTIGUOUS']} | dtype: {x.dtype} | strides: {x.strides}")
+            print(f"  W       contiguous: {W.flags['C_CONTIGUOUS']} | dtype: {W.dtype} | strides: {W.strides}")
+            print(f"  out_buf contiguous: {out_buf.flags['C_CONTIGUOUS']} | dtype: {out_buf.dtype} | strides: {out_buf.strides}")
+            
+            _native_lib.log_engine_runtime_diagnostics(
+                x.ctypes.data, W.ctypes.data, out_buf.ctypes.data,
+                N, C_in, H, W_in, C_out, k_h, k_w
+            )
+            _diagnostics_logged = True
+
+        t0 = time.perf_counter()
         _native_lib.direct_conv2d_forward_avx2(
             x.ctypes.data,
             W.ctypes.data,
@@ -213,38 +209,35 @@ def conv2d_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
             stride, pad,
             1 if fuse_relu else 0
         )
+        dt = (time.perf_counter() - t0) * 1000.0
+        _log_timing("fwd", C_in, dt)
         return out_buf, None
 
-    # PATH B: Fast Numba im2col + OpenBLAS GEMM + Fused Bias
-    if _USE_FAST:
-        active_col = col_buf[:total_rows] if col_buf is not None else np.empty((total_rows, C_in * k_h * k_w), dtype=x.dtype)
-        active_gemm = gemm_buf[:total_rows] if gemm_buf is not None else np.empty((total_rows, C_out), dtype=x.dtype)
+    N, C_in, H, W_in = x.shape
+    C_out, _, k_h, k_w = W.shape
+    out_h = (H + 2 * pad - k_h) // stride + 1
+    out_w = (W_in + 2 * pad - k_w) // stride + 1
+    total_rows = N * out_h * out_w
 
-        _im2col_impl(x, k_h, k_w, stride, pad, out_buf=active_col)
-        _gemm_forward_impl(active_col, W.reshape(C_out, -1), active_gemm)
-        fuse_forward_impl(active_gemm, bias, out_buf)
-        if fuse_relu:
-            _relu_fwd_inplace_kernel(out_buf)
-        return out_buf, active_col
+    active_col = col_buf[:total_rows] if col_buf is not None else np.empty((total_rows, C_in * k_h * k_w), dtype=x.dtype)
+    active_gemm = gemm_buf[:total_rows] if gemm_buf is not None else np.empty((total_rows, C_out), dtype=x.dtype)
 
-    # PATH C: Pure NumPy Fallback
-    col = im2col(x, k_h, k_w, stride, pad, out_buf=col_buf[:total_rows] if col_buf is not None else None)
-    gemm_out = np.dot(col, W.reshape(C_out, -1).T)
-    out_buf[:] = (gemm_out + bias).reshape(N, out_h, out_w, C_out).transpose(0, 3, 1, 2)
+    _im2col_impl(x, k_h, k_w, stride, pad, out_buf=active_col)
+    _gemm_forward_impl(active_col, W.reshape(C_out, -1), active_gemm)
+    fuse_forward_impl(active_gemm, bias, out_buf)
     if fuse_relu:
-        np.maximum(0, out_buf, out=out_buf)
-    return out_buf, col
+        _relu_fwd_inplace_kernel(out_buf)
+    return out_buf, active_col
 
 
 def conv2d_backward_weight(dout: np.ndarray, x: np.ndarray, dW: np.ndarray,
                            col: np.ndarray, dout_trans: np.ndarray,
                            stride: int, pad: int, inv_m: float) -> np.ndarray:
-    """
-    Agnostically dispatches weight gradient accumulation (dW).
-    """
-    if _USE_NATIVE and dout.dtype == np.float32:
+    if _USE_NATIVE and dout.dtype == np.float32 and x.dtype == np.float32:
         N, C_in, H, W_in = x.shape
         C_out, _, k_h, k_w = dW.shape
+        
+        t0 = time.perf_counter()
         _native_lib.direct_conv2d_backward_weight_avx2(
             dout.ctypes.data,
             x.ctypes.data,
@@ -254,9 +247,10 @@ def conv2d_backward_weight(dout: np.ndarray, x: np.ndarray, dW: np.ndarray,
             stride, pad,
             inv_m
         )
+        dt = (time.perf_counter() - t0) * 1000.0
+        _log_timing("dw", C_in, dt)
         return dW
 
-    # BLAS / Fast path using GEMM
     dW_flat = dW.reshape(dW.shape[0], -1)
     gemm_param_grad(dout_trans, col, dW_flat, inv_m)
     return dW
@@ -265,13 +259,11 @@ def conv2d_backward_weight(dout: np.ndarray, x: np.ndarray, dW: np.ndarray,
 def conv2d_backward_input(dout: np.ndarray, W: np.ndarray, dx_buf: np.ndarray,
                           stride: int, pad: int,
                           dout_trans: np.ndarray = None, dcol_buf: np.ndarray = None) -> np.ndarray:
-    """
-    Agnostically dispatches input gradient computation (dx).
-    """
-    N, C_in, H, W_in = dx_buf.shape
-    C_out, _, k_h, k_w = W.shape
-
-    if _USE_NATIVE and dout.dtype == np.float32:
+    if _USE_NATIVE and dout.dtype == np.float32 and W.dtype == np.float32:
+        N, C_in, H, W_in = dx_buf.shape
+        C_out, _, k_h, k_w = W.shape
+        
+        t0 = time.perf_counter()
         _native_lib.direct_conv2d_backward_input_avx2(
             dout.ctypes.data,
             W.ctypes.data,
@@ -280,79 +272,32 @@ def conv2d_backward_input(dout: np.ndarray, W: np.ndarray, dx_buf: np.ndarray,
             C_out, k_h, k_w,
             stride, pad
         )
+        dt = (time.perf_counter() - t0) * 1000.0
+        _log_timing("dx", C_in, dt)
         return dx_buf
 
-    # Fast BLAS path
-    W_2d = W.reshape(C_out, -1)
+    W_2d = W.reshape(W.shape[0], -1)
     total_rows = dout_trans.shape[0]
     active_dcol = dcol_buf[:total_rows]
     np.dot(dout_trans, W_2d, out=active_dcol)
-    return col2im(active_dcol, dx_buf.shape, k_h, k_w, stride, pad, out_buf=dx_buf)
+    return col2im(active_dcol, dx_buf.shape, W.shape[2], W.shape[3], stride, pad, out_buf=dx_buf)
 
 
 # -----------------------------------------------------------------------------
-# Primitives, Activations, Pooling
+# Primitives & Activations
 # -----------------------------------------------------------------------------
 def im2col(x: np.ndarray, k_h: int, k_w: int, stride: int = 1, pad: int = 0, out_buf: np.ndarray = None) -> np.ndarray:
-    if _USE_FAST:
-        return _im2col_impl(x, k_h, k_w, stride, pad, out_buf=out_buf)
-
-    N, C, H, W = x.shape
-    out_h = (H + 2 * pad - k_h) // stride + 1
-    out_w = (W + 2 * pad - k_w) // stride + 1
-    img = np.pad(x, ((0, 0), (0, 0), (pad, pad), (pad, pad)), mode='constant') if pad > 0 else x
-
-    total_rows = N * out_h * out_w
-    total_cols = C * k_h * k_w
-    col = out_buf if (out_buf is not None and out_buf.shape == (total_rows, total_cols) and out_buf.dtype == x.dtype) else np.empty((total_rows, total_cols), dtype=x.dtype)
-
-    col_idx = 0
-    for c in range(C):
-        for ky in range(k_h):
-            for kx in range(k_w):
-                y_max = ky + stride * out_h
-                x_max = kx + stride * out_w
-                col[:, col_idx] = img[:, c, ky:y_max:stride, kx:x_max:stride].reshape(-1)
-                col_idx += 1
-    return col
+    return _im2col_impl(x, k_h, k_w, stride, pad, out_buf=out_buf)
 
 
 def col2im(col: np.ndarray, input_shape: tuple, k_h: int, k_w: int, stride: int = 1, pad: int = 0, out_buf: np.ndarray = None) -> np.ndarray:
-    if _USE_FAST:
-        return _col2im_impl(col, input_shape, k_h, k_w, stride, pad, out_buf=out_buf)
-
-    N, C, H, W = input_shape
-    out_h = (H + 2 * pad - k_h) // stride + 1
-    out_w = (W + 2 * pad - k_w) // stride + 1
-    pad_h, pad_w = H + 2 * pad, W + 2 * pad
-
-    if out_buf is not None and out_buf.shape == (N, C, pad_h, pad_w) and out_buf.dtype == col.dtype:
-        img = out_buf
-        img.fill(0)
-    else:
-        img = np.zeros((N, C, pad_h, pad_w), dtype=col.dtype)
-
-    col_idx = 0
-    for c in range(C):
-        for ky in range(k_h):
-            for kx in range(k_w):
-                y_max = ky + stride * out_h
-                x_max = kx + stride * out_w
-                img[:, c, ky:y_max:stride, kx:x_max:stride] += col[:, col_idx].reshape(N, out_h, out_w)
-                col_idx += 1
-
-    return img if pad == 0 else img[:, :, pad:-pad, pad:-pad]
+    return _col2im_impl(col, input_shape, k_h, k_w, stride, pad, out_buf=out_buf)
 
 
 def maxpool_forward(x: np.ndarray, pool_size: int, stride: int, out_buf: np.ndarray = None, argmax_buf: np.ndarray = None):
     N, C, H, W = x.shape
     out_h = (H - pool_size) // stride + 1
     out_w = (W - pool_size) // stride + 1
-
-    if out_buf is None or out_buf.shape != (N, C, out_h, out_w) or out_buf.dtype != x.dtype:
-        out_buf = np.empty((N, C, out_h, out_w), dtype=x.dtype)
-    if argmax_buf is None or argmax_buf.shape != (N, C, out_h, out_w, 2):
-        argmax_buf = np.empty((N, C, out_h, out_w, 2), dtype=np.int64)
 
     if _USE_NATIVE and x.dtype == np.float32:
         _native_lib.direct_maxpool_forward_avx2(
@@ -361,38 +306,22 @@ def maxpool_forward(x: np.ndarray, pool_size: int, stride: int, out_buf: np.ndar
         )
         return out_buf, argmax_buf
 
-    if _USE_FAST:
-        _maxpool_forward_kernel(x, pool_size, stride, out_buf, argmax_buf)
-        return out_buf, argmax_buf
-
-    # NumPy Fallback
-    x_reshaped = x[:, :, :out_h * stride, :out_w * stride].reshape(N, C, out_h, stride, out_w, stride)
-    out = x_reshaped.max(axis=(3, 5))
-    mask = (x_reshaped == out[:, :, :, None, :, None])
-    return out, mask
+    _maxpool_forward_kernel(x, pool_size, stride, out_buf, argmax_buf)
+    return out_buf, argmax_buf
 
 
 def maxpool_backward(dout: np.ndarray, cache, x_shape: tuple, pool_size: int, stride: int, dx_buf: np.ndarray = None):
-    if _USE_NATIVE and dout.dtype == np.float32 and isinstance(cache, np.ndarray) and cache.ndim == 5:
+    if _USE_NATIVE and dout.dtype == np.float32:
         N, C, in_h, in_w = x_shape
         out_h, out_w = dout.shape[2], dout.shape[3]
-        if dx_buf is None or dx_buf.shape != x_shape or dx_buf.dtype != dout.dtype:
-            dx_buf = np.empty(x_shape, dtype=np.float32)
         _native_lib.direct_maxpool_backward_avx2(
             dout.ctypes.data, cache.ctypes.data, dx_buf.ctypes.data,
             N, C, out_h, out_w, in_h, in_w
         )
         return dx_buf
 
-    if _USE_FAST:
-        if dx_buf is None or dx_buf.shape != x_shape or dx_buf.dtype != dout.dtype:
-            dx_buf = np.zeros(x_shape, dtype=dout.dtype)
-        _maxpool_backward_kernel(dout, cache, dx_buf)
-        return dx_buf
-
-    mask = cache
-    dx_reshaped = mask * dout[:, :, :, None, :, None]
-    return np.ascontiguousarray(dx_reshaped.reshape(x_shape))
+    _maxpool_backward_kernel(dout, cache, dx_buf)
+    return dx_buf
 
 
 def fuse_dout_transpose_and_bias(dout: np.ndarray, dout_trans_buf: np.ndarray, db_buf: np.ndarray):
@@ -405,40 +334,24 @@ def fuse_dout_transpose_and_bias(dout: np.ndarray, dout_trans_buf: np.ndarray, d
         )
         return
 
-    if _USE_FAST:
-        _fuse_dout_impl(dout, dout_trans_buf, db_buf)
-        return
-
-    m = dout.shape[0]
-    dout_trans_buf[:] = dout.transpose(0, 2, 3, 1).reshape(-1, dout.shape[1])
-    db_buf[:] = np.sum(dout_trans_buf, axis=0, keepdims=True) / m
+    _fuse_dout_impl(dout, dout_trans_buf, db_buf)
 
 
 def gemm_param_grad(dout_trans: np.ndarray, col: np.ndarray, dW_flat: np.ndarray, inv_m: float):
-    if _USE_FAST:
-        _gemm_param_grad_impl(dout_trans, col, dW_flat, inv_m)
-        return
-
-    np.copyto(dW_flat, np.dot(col.T, dout_trans).T)
-    dW_flat *= inv_m
+    _gemm_param_grad_impl(dout_trans, col, dW_flat, inv_m)
 
 
 def relu_spatial_forward(x: np.ndarray) -> np.ndarray:
     if _USE_NATIVE and x.dtype == np.float32:
         _native_lib.direct_relu_forward_avx2(x.ctypes.data, x.size)
         return x
-    if _USE_FAST:
-        _relu_fwd_inplace_kernel(x)
-        return x
-    return np.maximum(0, x)
+    _relu_fwd_inplace_kernel(x)
+    return x
 
 
 def relu_spatial_backward(dout: np.ndarray, in_act: np.ndarray) -> np.ndarray:
-    if _USE_NATIVE and dout.dtype == np.float32 and in_act.dtype == np.float32:
+    if _USE_NATIVE and dout.dtype == np.float32:
         _native_lib.direct_relu_backward_avx2(dout.ctypes.data, in_act.ctypes.data, dout.size)
         return dout
-    if _USE_FAST:
-        _relu_bwd_inplace_kernel(dout, in_act)
-        return dout
-    dout *= (in_act > 0)
+    _relu_bwd_inplace_kernel(dout, in_act)
     return dout

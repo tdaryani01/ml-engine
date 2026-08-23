@@ -34,6 +34,14 @@ class CNNNetwork:
         self._build_spatial_layers(conv_configs)
         self._build_dense_head(dense_sizes)
 
+        print("\n--- CONV LAYER SHAPES ---")
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, Conv2D):
+                print(f"Layer {i} (Conv2D): W={layer.W.shape}, stride={layer.stride}, pad={layer.pad}")
+            elif isinstance(layer, MaxPool2D):
+                print(f"Layer {i} (MaxPool2D): pool_size={layer.pool_size}, stride={layer.stride}")
+        print("-------------------------\n")
+
         self.spatial_inputs = []
         self.dense_inputs = []
         self.masks = []
