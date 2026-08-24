@@ -1,6 +1,6 @@
+# utils/im2col.py
 import os
 import ctypes
-import time
 import numpy as np
 
 os.environ["NUMBA_NUM_THREADS"] = "4"
@@ -15,7 +15,6 @@ BACKEND = os.getenv("ENGINE_BACKEND", "native").lower()
 _USE_NATIVE = False
 _USE_FAST = False
 _native_lib = None
-_diagnostics_logged = True
 
 # -----------------------------------------------------------------------------
 # 1. Native C++ AVX2 Initialization
@@ -50,24 +49,59 @@ if BACKEND in ("native", "cpp", "c++"):
             ctypes.c_int64, ctypes.c_int64, ctypes.c_int64
         ]
 
+        # 1. Direct Composite Forward (Conv + ReLU + Pool)
+        _native_lib.direct_conv_block_forward_avx2.restype = None
+        _native_lib.direct_conv_block_forward_avx2.argtypes = [
+            ctypes.c_void_p,  # x
+            ctypes.c_void_p,  # W
+            ctypes.c_void_p,  # bias
+            ctypes.c_void_p,  # out_conv_buf
+            ctypes.c_void_p,  # out_pool_buf
+            ctypes.c_void_p,  # argmax_buf (uint8_t)
+            ctypes.c_int64,   # N
+            ctypes.c_int64,   # C_in
+            ctypes.c_int64,   # H
+            ctypes.c_int64,   # W_in
+            ctypes.c_int64,   # C_out
+            ctypes.c_int64,   # k_h
+            ctypes.c_int64,   # k_w
+            ctypes.c_int64,   # conv_stride
+            ctypes.c_int64,   # conv_pad
+            ctypes.c_int64,   # pool_size
+            ctypes.c_int64    # pool_stride
+        ]
+
+        # 2. Direct Composite Backward (Unpool + ReLU Gate + Bias Acc + dx + dW)
+        _native_lib.direct_conv_block_backward_avx2.restype = None
+        _native_lib.direct_conv_block_backward_avx2.argtypes = [
+            ctypes.c_void_p,  # dout_pool
+            ctypes.c_void_p,  # argmax_buf (uint8_t)
+            ctypes.c_void_p,  # x
+            ctypes.c_void_p,  # W
+            ctypes.c_void_p,  # conv_act
+            ctypes.c_void_p,  # d_conv_buf
+            ctypes.c_void_p,  # dx_buf
+            ctypes.c_void_p,  # dW_buf
+            ctypes.c_void_p,  # db_buf
+            ctypes.c_int64,   # N
+            ctypes.c_int64,   # C_in
+            ctypes.c_int64,   # H
+            ctypes.c_int64,   # W_in
+            ctypes.c_int64,   # C_out
+            ctypes.c_int64,   # k_h
+            ctypes.c_int64,   # k_w
+            ctypes.c_int64,   # conv_stride
+            ctypes.c_int64,   # conv_pad
+            ctypes.c_int64,   # pool_size
+            ctypes.c_int64,   # pool_stride
+            ctypes.c_int64,   # pool_out_h
+            ctypes.c_int64,   # pool_out_w
+            ctypes.c_float    # inv_m
+        ]
+
+        # 3. Direct Conv2D Standalone Primitives
         _native_lib.direct_conv2d_forward_avx2.restype = None
         _native_lib.direct_conv2d_forward_avx2.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_int32
-        ]
-
-        _native_lib.direct_conv2d_backward_weight_avx2.restype = None
-        _native_lib.direct_conv2d_backward_weight_avx2.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_int64, ctypes.c_int64, ctypes.c_float
-        ]
-
-        _native_lib.direct_conv2d_backward_input_avx2.restype = None
-        _native_lib.direct_conv2d_backward_input_avx2.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
             ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
@@ -85,27 +119,20 @@ if BACKEND in ("native", "cpp", "c++"):
             ctypes.c_int32
         ]
 
-        _native_lib.direct_conv_block_forward_avx2.restype = None
-        _native_lib.direct_conv_block_forward_avx2.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        _native_lib.direct_conv2d_backward_weight_avx2.restype = None
+        _native_lib.direct_conv2d_backward_weight_avx2.argtypes = [
             ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
             ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_int64, ctypes.c_int64
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_float
         ]
 
-        _native_lib.direct_conv_block_backward_avx2.restype = None
-        _native_lib.direct_conv_block_backward_avx2.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        _native_lib.direct_conv2d_backward_input_avx2.restype = None
+        _native_lib.direct_conv2d_backward_input_avx2.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
             ctypes.c_int64, ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
             ctypes.c_int64, ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_int64, ctypes.c_int64,
-            ctypes.c_float
+            ctypes.c_int64, ctypes.c_int64, ctypes.c_int32
         ]
 
         _native_lib.direct_relu_forward_avx2.restype = None
@@ -153,26 +180,15 @@ from utils.im2col_fast import (
 _USE_FAST = True
 
 
-def _verify_native_args(func_name: str, **arrays):
-    if not _USE_NATIVE or _native_lib is None:
-        raise RuntimeError(f"[{func_name}] Native backend requested, but _USE_NATIVE is False or library is not loaded.")
-    for name, arr in arrays.items():
-        if arr is not None:
-            if not isinstance(arr, np.ndarray):
-                raise TypeError(f"[{func_name}] Expected numpy.ndarray for '{name}', got {type(arr)}")
-            if arr.dtype != np.float32:
-                raise TypeError(f"[{func_name}] Array '{name}' must be float32, but got {arr.dtype}")
-            if not arr.flags['C_CONTIGUOUS']:
-                raise ValueError(f"[{func_name}] Array '{name}' must be C-contiguous for native memory pointers.")
-
-
+# -----------------------------------------------------------------------------
+# Fast Composite Block Wrappers
+# -----------------------------------------------------------------------------
 def conv_block_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
                        out_conv_buf: np.ndarray, out_pool_buf: np.ndarray, argmax_buf: np.ndarray,
                        conv_stride: int = 1, conv_pad: int = 1,
                        pool_size: int = 2, pool_stride: int = 2,
                        col_buf: np.ndarray = None, gemm_buf: np.ndarray = None) -> tuple:
     if _USE_NATIVE:
-        _verify_native_args("conv_block_forward", x=x, W=W, bias=bias, out_conv_buf=out_conv_buf, out_pool_buf=out_pool_buf)
         N, C_in, H, W_in = x.shape
         C_out, _, k_h, k_w = W.shape
         
@@ -208,8 +224,6 @@ def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
                         inv_m: float = 1.0,
                         col: np.ndarray = None, dout_trans: np.ndarray = None, dcol_buf: np.ndarray = None) -> tuple:
     if _USE_NATIVE:
-        _verify_native_args("conv_block_backward", dout_pool=dout_pool, x=x, W=W, conv_act=conv_act,
-                            d_conv_buf=d_conv_buf, dx_buf=dx_buf, dW_buf=dW_buf, db_buf=db_buf)
         N, C_in, H, W_in = x.shape
         C_out, _, k_h, k_w = W.shape
         pool_out_h, pool_out_w = dout_pool.shape[2], dout_pool.shape[3]
@@ -247,15 +261,17 @@ def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
     return dx, dW, db_buf
 
 
+# -----------------------------------------------------------------------------
+# Standalone Layer Routing
+# -----------------------------------------------------------------------------
 def conv2d_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
                    stride: int, pad: int, out_buf: np.ndarray,
                    col_buf: np.ndarray = None, gemm_buf: np.ndarray = None,
                    fuse_relu: bool = False) -> tuple:
-    if _USE_NATIVE:
-        _verify_native_args("conv2d_forward", x=x, W=W, bias=bias, out_buf=out_buf)
-        N, C_in, H, W_in = x.shape
-        C_out, _, k_h, k_w = W.shape
+    N, C_in, H, W_in = x.shape
+    C_out, _, k_h, k_w = W.shape
 
+    if _USE_NATIVE:
         _native_lib.direct_conv2d_forward_avx2(
             x.ctypes.data,
             W.ctypes.data,
@@ -268,8 +284,6 @@ def conv2d_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
         )
         return out_buf, None
 
-    N, C_in, H, W_in = x.shape
-    C_out, _, k_h, k_w = W.shape
     out_h = (H + 2 * pad - k_h) // stride + 1
     out_w = (W_in + 2 * pad - k_w) // stride + 1
     total_rows = N * out_h * out_w
@@ -292,7 +306,6 @@ def conv2d_backward_fused(dout: np.ndarray, x: np.ndarray, W: np.ndarray,
                           col: np.ndarray = None, dout_trans: np.ndarray = None,
                           dcol_buf: np.ndarray = None) -> tuple:
     if _USE_NATIVE:
-        _verify_native_args("conv2d_backward_fused", dout=dout, x=x, W=W, dx_buf=dx_buf, dW_buf=dW_buf, in_act=in_act)
         N, C_in, H, W_in = x.shape
         C_out, _, k_h, k_w = W.shape
 
@@ -320,7 +333,6 @@ def conv2d_backward_weight(dout: np.ndarray, x: np.ndarray, dW: np.ndarray,
                            col: np.ndarray, dout_trans: np.ndarray,
                            stride: int, pad: int, inv_m: float) -> np.ndarray:
     if _USE_NATIVE:
-        _verify_native_args("conv2d_backward_weight", dout=dout, x=x, dW=dW)
         N, C_in, H, W_in = x.shape
         C_out, _, k_h, k_w = dW.shape
         _native_lib.direct_conv2d_backward_weight_avx2(
@@ -341,7 +353,6 @@ def conv2d_backward_input(dout: np.ndarray, W: np.ndarray, dx_buf: np.ndarray,
                           dout_trans: np.ndarray = None, dcol_buf: np.ndarray = None,
                           in_act: np.ndarray = None, fuse_relu: bool = False) -> np.ndarray:
     if _USE_NATIVE:
-        _verify_native_args("conv2d_backward_input", dout=dout, W=W, dx_buf=dx_buf, in_act=in_act)
         N, C_in, H, W_in = dx_buf.shape
         C_out, _, k_h, k_w = W.shape
         _native_lib.direct_conv2d_backward_input_avx2(
@@ -374,7 +385,6 @@ def maxpool_forward(x: np.ndarray, pool_size: int, stride: int, out_buf: np.ndar
         argmax_buf = np.empty((N, C, out_h, out_w), dtype=np.uint8)
 
     if _USE_NATIVE:
-        _verify_native_args("maxpool_forward", x=x, out_buf=out_buf)
         _native_lib.direct_maxpool_forward_avx2(
             x.ctypes.data, out_buf.ctypes.data, argmax_buf.ctypes.data,
             N, C, H, W, pool_size, stride
@@ -402,7 +412,6 @@ def maxpool_backward(dout: np.ndarray, cache: np.ndarray, x_shape: tuple, pool_s
     out_h, out_w = dout.shape[2], dout.shape[3]
 
     if _USE_NATIVE:
-        _verify_native_args("maxpool_backward", dout=dout, dx_buf=dx_buf)
         _native_lib.direct_maxpool_backward_avx2(
             dout.ctypes.data, cache.ctypes.data, dx_buf.ctypes.data,
             N, C, out_h, out_w, in_h, in_w, pool_size, stride
@@ -423,7 +432,6 @@ def maxpool_backward(dout: np.ndarray, cache: np.ndarray, x_shape: tuple, pool_s
 
 def fuse_dout_transpose_and_bias(dout: np.ndarray, dout_trans_buf: np.ndarray, db_buf: np.ndarray):
     if _USE_NATIVE:
-        _verify_native_args("fuse_dout_transpose_and_bias", dout=dout, db_buf=db_buf)
         N, C_out, out_h, out_w = dout.shape
         inv_m = 1.0 / float(N)
         _native_lib.direct_bias_backward_avx2(
@@ -441,7 +449,6 @@ def gemm_param_grad(dout_trans: np.ndarray, col: np.ndarray, dW_flat: np.ndarray
 
 def relu_spatial_forward(x: np.ndarray) -> np.ndarray:
     if _USE_NATIVE:
-        _verify_native_args("relu_spatial_forward", x=x)
         _native_lib.direct_relu_forward_avx2(x.ctypes.data, x.size)
         return x
     _relu_fwd_inplace_kernel(x)
@@ -450,7 +457,6 @@ def relu_spatial_forward(x: np.ndarray) -> np.ndarray:
 
 def relu_spatial_backward(dout: np.ndarray, in_act: np.ndarray) -> np.ndarray:
     if _USE_NATIVE:
-        _verify_native_args("relu_spatial_backward", dout=dout, in_act=in_act)
         _native_lib.direct_relu_backward_avx2(dout.ctypes.data, in_act.ctypes.data, dout.size)
         return dout
     _relu_bwd_inplace_kernel(dout, in_act)
