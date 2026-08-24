@@ -21,7 +21,7 @@ class ModelFactory:
         Runs a dry forward pass on dummy spatial tensors to infer
         the exact flattened feature dimension feeding into the dense head.
         """
-        dummy_x = np.zeros((1, *input_shape))
+        dummy_x = np.zeros((1, *input_shape), dtype=np.float32)
         temp_x = dummy_x
 
         for layer_cfg in spatial_pipeline:
