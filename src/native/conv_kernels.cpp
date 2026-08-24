@@ -25,7 +25,7 @@ EXPORT_API void log_engine_runtime_diagnostics(
 }
 
 // -----------------------------------------------------------------------------
-// 1. COMPLETELY UNROLLED 9-TAP DIRECT FORWARD (ZERO INNER LOOPS)
+// 1. HARDCODED 9-TAP ZERO-LOOP DIRECT FORWARD
 // -----------------------------------------------------------------------------
 EXPORT_API void direct_conv2d_forward_avx2(
     const float* __restrict x,
@@ -102,7 +102,6 @@ EXPORT_API void direct_conv2d_forward_avx2(
                             } \
                         }
 
-                        // 9 Straight-line FMA Executions (Zero Loops)
                         TAP_FWD(r0, 0, 0); TAP_FWD(r0, 1, 1); TAP_FWD(r0, 2, 2);
                         TAP_FWD(r1, 0, 3); TAP_FWD(r1, 1, 4); TAP_FWD(r1, 2, 5);
                         TAP_FWD(r2, 0, 6); TAP_FWD(r2, 1, 7); TAP_FWD(r2, 2, 8);
@@ -174,7 +173,7 @@ EXPORT_API void direct_conv2d_forward_avx2(
 }
 
 // -----------------------------------------------------------------------------
-// 2. COMPLETELY UNROLLED 9-TAP DIRECT BACKWARD (ZERO INNER LOOPS)
+// 2. HARDCODED 9-TAP ZERO-LOOP DIRECT BACKWARD (dx + dW)
 // -----------------------------------------------------------------------------
 EXPORT_API void direct_conv2d_backward_fused_avx2(
     const float* __restrict dout,
@@ -196,7 +195,7 @@ EXPORT_API void direct_conv2d_backward_fused_avx2(
     const int64_t spatial_in  = H * W_in;
     const __m256 v_zero = _mm256_setzero_ps();
 
-    // 1. Direct Spatial dx Accumulation (Hardcoded 9-way Transpose)
+    // 1. Direct Spatial dx Accumulation
     #pragma omp parallel for collapse(2) num_threads(4) schedule(static)
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t cin = 0; cin < C_in; ++cin) {
@@ -252,7 +251,6 @@ EXPORT_API void direct_conv2d_backward_fused_avx2(
                                 } \
                             } \
                         }
-                        // Hardcoded Transposed 9-Tap FMA Block
                         TAP_DX4(oh0, 0, 0); TAP_DX4(oh0, 1, 1); TAP_DX4(oh0, 2, 2);
                         TAP_DX4(oh1, 0, 3); TAP_DX4(oh1, 1, 4); TAP_DX4(oh1, 2, 5);
                         TAP_DX4(oh2, 0, 6); TAP_DX4(oh2, 1, 7); TAP_DX4(oh2, 2, 8);
@@ -318,7 +316,7 @@ EXPORT_API void direct_conv2d_backward_fused_avx2(
         }
     }
 
-    // 2. Direct 9-Way SIMD dW Stream (Single Loop Iteration)
+    // 2. Direct 9-Way SIMD dW Stream
     #pragma omp parallel for collapse(2) num_threads(4) schedule(static)
     for (int64_t cout = 0; cout < C_out; ++cout) {
         for (int64_t cin = 0; cin < C_in; ++cin) {
@@ -424,7 +422,7 @@ EXPORT_API void direct_conv2d_backward_fused_avx2(
 }
 
 // -----------------------------------------------------------------------------
-// 3. FUSED COMPOSITE CONV BLOCK (ZERO-BUFFER REUSE)
+// 3. FULLY FUSED COMPOSITE CONV BLOCK
 // -----------------------------------------------------------------------------
 EXPORT_API void direct_conv_block_forward_avx2(
     const float* __restrict x,
@@ -503,6 +501,7 @@ EXPORT_API void direct_conv_block_backward_avx2(
     int64_t pool_out_h, int64_t pool_out_w,
     float inv_m
 ) {
+    (void)pool_size; (void)pool_stride;
     const int64_t conv_out_h = (H + 2 * conv_pad - 3) / conv_stride + 1;
     const int64_t conv_out_w = (W_in + 2 * conv_pad - 3) / conv_stride + 1;
     const int64_t conv_spatial = conv_out_h * conv_out_w;
@@ -522,13 +521,13 @@ EXPORT_API void direct_conv_block_backward_avx2(
             std::memset(d_plane, 0, conv_spatial * sizeof(float));
 
             for (int64_t ph = 0; ph < pool_out_h; ++ph) {
-                const int64_t ih_base = ph * pool_stride;
+                const int64_t ih_base = ph * 2;
                 for (int64_t pw = 0; pw < pool_out_w; ++pw) {
                     const int64_t p_idx = ph * pool_out_w + pw;
                     const uint8_t idx = mask_plane[p_idx];
                     const int64_t r_off = idx >> 1;
                     const int64_t c_off = idx & 1;
-                    const int64_t c_idx = (ih_base + r_off) * conv_out_w + (pw * pool_stride + c_off);
+                    const int64_t c_idx = (ih_base + r_off) * conv_out_w + (pw * 2 + c_off);
 
                     float grad = dp_plane[p_idx];
                     if (act_plane && act_plane[c_idx] <= 0.0f) {
