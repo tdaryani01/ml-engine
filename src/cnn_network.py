@@ -1,8 +1,7 @@
-# src/cnn_network.py
 import builtins
 import logging
 import numpy as np
-from src.spatial_layers import Conv2D, MaxPool2D, Flatten
+from src.spatial_layers import Conv2D, MaxPool2D, Flatten, ConvBlock
 from utils.im2col import relu_spatial_forward, relu_spatial_backward
 
 if 'profile' not in builtins.__dict__:
@@ -12,8 +11,8 @@ if 'profile' not in builtins.__dict__:
 class CNNNetwork:
     """
     Modular Convolutional Neural Network engine.
-    Composes spatial layers with a dense classification/regression head while
-    exposing standard interfaces for ModelController, Optimizers, and Diagnostics.
+    Automatically identifies and constructs fused ConvBlocks (Conv2D -> ReLU -> MaxPool2D)
+    to minimize Python-to-C++ FFI dispatch transitions.
     """
     def __init__(self, conv_configs: list, dense_sizes: list, optimizer_instance,
                  lam_l1: float = 0.01, lam_l2: float = 0.01, p_dropout: float = 0.0,
@@ -33,6 +32,16 @@ class CNNNetwork:
 
         self._build_spatial_layers(conv_configs)
         self._build_dense_head(dense_sizes)
+
+        print("\n--- CONV LAYER SHAPES ---")
+        for i, layer in enumerate(self.layers):
+            if isinstance(layer, ConvBlock):
+                print(f"Layer {i} (ConvBlock): W={layer.W.shape}, conv_stride={layer.conv_stride}, pool_size={layer.pool_size}")
+            elif isinstance(layer, Conv2D):
+                print(f"Layer {i} (Conv2D): W={layer.W.shape}, stride={layer.stride}, pad={layer.pad}")
+            elif isinstance(layer, MaxPool2D):
+                print(f"Layer {i} (MaxPool2D): pool_size={layer.pool_size}, stride={layer.stride}")
+        print("-------------------------\n")
 
         self.spatial_inputs = []
         self.dense_inputs = []
@@ -68,8 +77,34 @@ class CNNNetwork:
         return self.num_classes
 
     def _build_spatial_layers(self, conv_configs: list):
-        for cfg in conv_configs:
+        i = 0
+        n = len(conv_configs)
+        while i < n:
+            cfg = conv_configs[i]
             l_type = cfg["type"].lower()
+
+            # Pattern Match: [Conv2D -> ReLU -> MaxPool2D] -> Fuse into ConvBlock
+            if (l_type == "conv" and i + 2 < n and
+                conv_configs[i + 1]["type"].lower() == "relu" and
+                conv_configs[i + 2]["type"].lower() == "pool"):
+                
+                pool_cfg = conv_configs[i + 2]
+                block = ConvBlock(
+                    in_channels=cfg["in_channels"],
+                    out_channels=cfg["out_channels"],
+                    kernel_size=cfg.get("kernel_size", 3),
+                    conv_stride=cfg.get("stride", 1),
+                    conv_pad=cfg.get("pad", 0),
+                    pool_size=pool_cfg.get("pool_size", 2),
+                    pool_stride=pool_cfg.get("stride", 2)
+                )
+                self.layers.append(block)
+                self.param_layers.append(block)
+                self.weights.append(block.W)
+                self.biases.append(block.b)
+                i += 3
+                continue
+
             if l_type == "conv":
                 layer = Conv2D(
                     in_channels=cfg["in_channels"],
@@ -91,6 +126,7 @@ class CNNNetwork:
                 self.layers.append(Flatten())
             elif l_type == "relu":
                 self.layers.append("relu")
+            i += 1
 
     def _build_dense_head(self, dense_sizes: list):
         for i in range(len(dense_sizes) - 1):
@@ -129,9 +165,9 @@ class CNNNetwork:
         self.masks.clear()
         self.activations = [X]
 
-        # Sync spatial parameter pointers if model.weights/model.biases were re-assigned externally
+        # Sync spatial parameter pointers
         for i, layer in enumerate(self.param_layers):
-            if isinstance(layer, Conv2D):
+            if isinstance(layer, (Conv2D, ConvBlock)):
                 if layer.W is not self.weights[i]:
                     layer.W = self.weights[i]
                 if layer.b is not self.biases[i]:
@@ -139,7 +175,7 @@ class CNNNetwork:
 
         current_act = X
 
-        # 1. Spatial Forward Pass (zero activation copies)
+        # 1. Spatial Forward Pass
         for layer in self.layers:
             if layer == "relu":
                 if training:
@@ -162,8 +198,15 @@ class CNNNetwork:
                 self.dense_inputs.append(current_act)
             
             z_buf = self._dense_z_bufs[idx]
-            np.dot(current_act, self.weights[w_idx], out=z_buf)
-            z_buf += self.biases[w_idx]
+            W_mat = self.weights[w_idx]
+            if W_mat.dtype != current_act.dtype:
+                W_mat = W_mat.astype(current_act.dtype)
+            b_vec = self.biases[w_idx]
+            if b_vec.dtype != current_act.dtype:
+                b_vec = b_vec.astype(current_act.dtype)
+
+            np.dot(current_act, W_mat, out=z_buf)
+            z_buf += b_vec
 
             if idx == num_dense - 1:
                 current_act = self.apply_output_activation(z_buf)
@@ -237,9 +280,12 @@ class CNNNetwork:
             w_idx = dense_w_indices[local_idx]
             act_in = self.dense_inputs[local_idx]
 
-            # In-place parameter gradients
             gw_buf = self._grad_weights_bufs[local_idx]
             gb_buf = self._grad_biases_bufs[local_idx]
+
+            W_mat = self.weights[w_idx]
+            if W_mat.dtype != delta.dtype:
+                W_mat = W_mat.astype(delta.dtype)
 
             np.dot(act_in.T, delta, out=gw_buf)
             gw_buf *= inv_m
@@ -249,9 +295,8 @@ class CNNNetwork:
             gb_buf *= inv_m
             grad_biases[w_idx] = gb_buf
 
-            # Backprop delta to previous layer
             next_delta_buf = self._dense_delta_bufs[local_idx]
-            np.dot(delta, self.weights[w_idx].T, out=next_delta_buf)
+            np.dot(delta, W_mat.T, out=next_delta_buf)
             delta = next_delta_buf
 
             if local_idx > 0:
@@ -269,7 +314,7 @@ class CNNNetwork:
                 spatial_grad = relu_spatial_backward(spatial_grad, in_act)
             else:
                 spatial_grad = layer.backward(spatial_grad)
-                if isinstance(layer, Conv2D):
+                if isinstance(layer, (Conv2D, ConvBlock)):
                     c_idx = self.param_layers.index(layer)
                     grad_weights[c_idx] = layer.dW
                     grad_biases[c_idx] = layer.db

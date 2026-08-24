@@ -17,6 +17,11 @@ venv/
 .env
 .cursor/
 
+*.dll
+*.lib
+*.exp
+*.obj
+
 # Diagnostics and monitoring 
 /diagnostics_output/
 *.log
