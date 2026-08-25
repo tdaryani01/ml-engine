@@ -40,7 +40,8 @@ def load_native_telemetry_lib():
     """Defensively loads conv_kernels.dll to access OpenMP telemetry counters."""
     possible_paths = [
         os.path.join(project_root, "src", "native", "conv_kernels.dll"),
-        os.path.join(project_root, "conv_kernels.dll")
+        os.path.join(project_root, "conv_kernels.dll"),
+        os.path.join(project_root, "native", "conv_kernels.dll")
     ]
     for p in possible_paths:
         if os.path.exists(p):
@@ -116,7 +117,6 @@ def compute_cross_entropy_loss(probabilities: np.ndarray, one_hot_targets: np.nd
 
 
 def extract_custom_engine_param_count(controller: ModelController) -> int:
-    """Defensively extracts trainable parameter counts across controller representations."""
     if hasattr(controller, "weights") and hasattr(controller, "biases"):
         return sum(w.size for w in controller.weights if w is not None) + \
                sum(b.size for b in controller.biases if b is not None)
@@ -149,7 +149,6 @@ def run_pytorch_benchmark(
     min_delta: float,
     num_threads: int = 4
 ) -> dict:
-    """Configures PyTorch with the configured threads, executes training/inference, and tears down memory."""
     print(f"\n[1/2] Setting up and executing PyTorch benchmark run ({num_threads} Threads)...")
     
     torch.set_num_threads(num_threads)
@@ -240,7 +239,6 @@ def run_pytorch_benchmark(
 
         torch_train_time = time.perf_counter() - t0_train
 
-        # Inference Latency Benchmark
         torch_model.eval()
         t0_inf = time.perf_counter()
         with torch.no_grad():
@@ -287,7 +285,6 @@ def run_custom_engine_benchmark(
     backend: EngineBackend = EngineBackend.NATIVE,
     num_threads: int = 4
 ) -> dict:
-    """Initializes Custom ModelController with explicit backend routing and tracks telemetry."""
     print(f"[2/2] Setting up and executing Custom Engine [{backend.value}] benchmark run ({num_threads} Threads)...")
     
     init_engine_backend(backend)
@@ -350,6 +347,7 @@ def run_custom_engine_benchmark(
 
     custom_total_params = extract_custom_engine_param_count(controller)
 
+    # Keep training, latency benchmark, and evaluation inside thread-limit scope
     with threadpool_limits(limits=num_threads):
         t0_train = time.perf_counter()
         train_history, val_history = controller.fit(
@@ -362,18 +360,17 @@ def run_custom_engine_benchmark(
         )
         custom_train_time = time.perf_counter() - t0_train
 
-        # Inference Latency Benchmark
         t0_inf = time.perf_counter()
         for _ in range(100):
             custom_raw_val_preds = controller.predict(X_val)
         custom_inf_time = (time.perf_counter() - t0_inf) / 100.0
 
-    custom_val_preds = np.argmax(custom_raw_val_preds, axis=1)
-    final_custom_val_acc = np.mean(custom_val_preds == y_val_classes)
-    final_custom_val_loss = compute_cross_entropy_loss(custom_raw_val_preds, y_val)
+        custom_val_preds = np.argmax(custom_raw_val_preds, axis=1)
+        final_custom_val_acc = np.mean(custom_val_preds == y_val_classes)
+        final_custom_val_loss = compute_cross_entropy_loss(custom_raw_val_preds, y_val)
 
-    custom_raw_train_preds = controller.predict(X_train)
-    final_custom_train_loss = compute_cross_entropy_loss(custom_raw_train_preds, y_train)
+        custom_raw_train_preds = controller.predict(X_train)
+        final_custom_train_loss = compute_cross_entropy_loss(custom_raw_train_preds, y_train)
 
     if val_history and len(val_history) > 0:
         custom_epochs_completed = len(val_history)

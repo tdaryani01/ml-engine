@@ -3,6 +3,9 @@
 #include <cstring>
 #include <cmath>
 #include <omp.h>
+#include <atomic>
+#include <iostream>
+#include <vector>
 
 #if defined(_MSC_VER)
     #define EXPORT_API extern "C" __declspec(dllexport)
@@ -10,8 +13,39 @@
     #define EXPORT_API extern "C" __attribute__((visibility("default")))
 #endif
 
+// -----------------------------------------------------------------------------
+// THREAD TELEMETRY & HARDWARE PROFILING
+// -----------------------------------------------------------------------------
+constexpr int MAX_TELEMETRY_THREADS = 128;
+static std::atomic<int64_t> thread_call_count[MAX_TELEMETRY_THREADS];
+
+EXPORT_API void log_thread_execution_stats() {
+    int active_threads = omp_get_max_threads();
+    if (active_threads > MAX_TELEMETRY_THREADS) {
+        active_threads = MAX_TELEMETRY_THREADS;
+    }
+    std::cout << "\n================ OPENMP WORKER THREAD PROFILE ================\n";
+    for (int i = 0; i < active_threads; ++i) {
+        std::cout << " Worker Thread [" << i << "]: " 
+                  << thread_call_count[i].load() << " parallel tasks executed\n";
+    }
+    std::cout << "=============================================================\n\n";
+}
+
+EXPORT_API void reset_thread_execution_stats() {
+    for (int i = 0; i < MAX_TELEMETRY_THREADS; ++i) {
+        thread_call_count[i].store(0);
+    }
+}
+
+EXPORT_API void set_omp_threads(int num_threads) {
+    if (num_threads > 0) {
+        omp_set_num_threads(num_threads);
+    }
+}
+
 EXPORT_API int get_omp_threads() {
-    return 4;
+    return omp_get_max_threads();
 }
 
 EXPORT_API void log_engine_runtime_diagnostics(
@@ -44,9 +78,14 @@ EXPORT_API void direct_conv2d_forward_avx2(
     const int64_t spatial_in  = H * W_in;
     const __m256 v_zero = _mm256_setzero_ps();
 
-    #pragma omp parallel for collapse(2) num_threads(4) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t cout_blk = 0; cout_blk < (C_out + 3) / 4; ++cout_blk) {
+            int tid = omp_get_thread_num();
+            if (tid >= 0 && tid < MAX_TELEMETRY_THREADS) {
+                thread_call_count[tid].fetch_add(1, std::memory_order_relaxed);
+            }
+
             const int64_t cout0 = cout_blk * 4;
             const int64_t c_rem = (C_out - cout0 >= 4) ? 4 : (C_out - cout0);
 
@@ -200,9 +239,14 @@ EXPORT_API void direct_conv_block_forward_avx2(
     const int64_t pool_out_h = (conv_out_h - pool_size) / pool_stride + 1;
     const int64_t pool_out_w = (conv_out_w - pool_size) / pool_stride + 1;
 
-    #pragma omp parallel for collapse(2) num_threads(4) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t cout = 0; cout < C_out; ++cout) {
+            int tid = omp_get_thread_num();
+            if (tid >= 0 && tid < MAX_TELEMETRY_THREADS) {
+                thread_call_count[tid].fetch_add(1, std::memory_order_relaxed);
+            }
+
             const float* __restrict cr_plane = &out_conv_relu[(n * C_out + cout) * conv_out_h * conv_out_w];
             float* __restrict p_plane        = &out_pool[(n * C_out + cout) * pool_out_h * pool_out_w];
             uint8_t* __restrict m_plane      = &argmax_buf[(n * C_out + cout) * pool_out_h * pool_out_w];
@@ -263,8 +307,13 @@ EXPORT_API void direct_conv_block_backward_avx2(
     const int64_t spatial_in  = H * W_in;
 
     // 1. Thread-Parallel Sparse Unpooling
-    #pragma omp parallel for num_threads(4) schedule(static)
+    #pragma omp parallel for schedule(static)
     for (int64_t cout = 0; cout < C_out; ++cout) {
+        int tid = omp_get_thread_num();
+        if (tid >= 0 && tid < MAX_TELEMETRY_THREADS) {
+            thread_call_count[tid].fetch_add(1, std::memory_order_relaxed);
+        }
+
         float bias_sum = 0.0f;
         for (int64_t n = 0; n < N; ++n) {
             const int64_t plane_idx = n * C_out + cout;
@@ -297,9 +346,14 @@ EXPORT_API void direct_conv_block_backward_avx2(
     }
 
     // 2. Unbranched 2-Way Cin / 2-Way Cout Tiled dx Backprop
-    #pragma omp parallel for collapse(2) num_threads(4) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t cin_blk = 0; cin_blk < (C_in + 1) / 2; ++cin_blk) {
+            int tid = omp_get_thread_num();
+            if (tid >= 0 && tid < MAX_TELEMETRY_THREADS) {
+                thread_call_count[tid].fetch_add(1, std::memory_order_relaxed);
+            }
+
             const int64_t cin0 = cin_blk * 2;
             const int64_t cin_rem = (C_in - cin0 >= 2) ? 2 : 1;
 
@@ -431,9 +485,14 @@ EXPORT_API void direct_conv_block_backward_avx2(
     }
 
     // 3. Unbranched Vectorized dW Accumulation
-    #pragma omp parallel for collapse(2) num_threads(4) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(static)
     for (int64_t cout = 0; cout < C_out; ++cout) {
         for (int64_t cin = 0; cin < C_in; ++cin) {
+            int tid = omp_get_thread_num();
+            if (tid >= 0 && tid < MAX_TELEMETRY_THREADS) {
+                thread_call_count[tid].fetch_add(1, std::memory_order_relaxed);
+            }
+
             float* __restrict dw_target = &dW[(cout * C_in + cin) * 9];
 
             __m256 v_dw00 = _mm256_setzero_ps(), v_dw01 = _mm256_setzero_ps(), v_dw02 = _mm256_setzero_ps();
@@ -588,8 +647,12 @@ EXPORT_API void direct_maxpool_backward_avx2(
 EXPORT_API void direct_relu_forward_avx2(float* data, int64_t size) {
     const __m256 v_zero = _mm256_setzero_ps();
     int64_t i = 0;
-    #pragma omp parallel for num_threads(4) schedule(static)
+    #pragma omp parallel for schedule(static)
     for (i = 0; i <= size - 8; i += 8) {
+        int tid = omp_get_thread_num();
+        if (tid >= 0 && tid < MAX_TELEMETRY_THREADS) {
+            thread_call_count[tid].fetch_add(1, std::memory_order_relaxed);
+        }
         __m256 v = _mm256_loadu_ps(&data[i]);
         _mm256_storeu_ps(&data[i], _mm256_max_ps(v, v_zero));
     }
@@ -601,8 +664,12 @@ EXPORT_API void direct_relu_forward_avx2(float* data, int64_t size) {
 EXPORT_API void direct_relu_backward_avx2(float* dout, const float* in_act, int64_t size) {
     const __m256 v_zero = _mm256_setzero_ps();
     int64_t i = 0;
-    #pragma omp parallel for num_threads(4) schedule(static)
+    #pragma omp parallel for schedule(static)
     for (i = 0; i <= size - 8; i += 8) {
+        int tid = omp_get_thread_num();
+        if (tid >= 0 && tid < MAX_TELEMETRY_THREADS) {
+            thread_call_count[tid].fetch_add(1, std::memory_order_relaxed);
+        }
         __m256 v_dout = _mm256_loadu_ps(&dout[i]);
         __m256 v_act  = _mm256_loadu_ps(&in_act[i]);
         __m256 mask   = _mm256_cmp_ps(v_act, v_zero, _CMP_GT_OQ);
@@ -618,8 +685,12 @@ EXPORT_API void direct_bias_backward_avx2(
     int64_t N, int64_t C_out, int64_t out_h, int64_t out_w, float inv_m
 ) {
     const int64_t spatial = out_h * out_w;
-    #pragma omp parallel for num_threads(4) schedule(static)
+    #pragma omp parallel for schedule(static)
     for (int64_t c = 0; c < C_out; ++c) {
+        int tid = omp_get_thread_num();
+        if (tid >= 0 && tid < MAX_TELEMETRY_THREADS) {
+            thread_call_count[tid].fetch_add(1, std::memory_order_relaxed);
+        }
         float sum = 0.0f;
         for (int64_t n = 0; n < N; ++n) {
             const float* plane = &dout[(n * C_out + c) * spatial];
