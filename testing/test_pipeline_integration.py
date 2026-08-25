@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from data.base_loader import BaseDataLoader
 from data.in_memory_provider import InMemoryDataProvider
 from src.controller import ModelController
-from config.constants import ModelType, IngestionMode, LRHierarchy, DataKeys
+from config.constants import ModelType, IngestionMode, LRHierarchy, DataKeys, EngineBackend
 from config.schema import (
     PipelineConfig, MetaConfig, IngestionConfig, ArchitectureConfig,
     OptimizationConfig, RegularizationConfig, TransformationsConfig,
@@ -55,7 +55,7 @@ class TestPipelineIntegration(unittest.TestCase):
         """Cleans up the temporary directory to leave zero untracked files."""
         cls.temp_dir.cleanup()
 
-    def get_base_test_config(self, task_type: ModelType, data_file_path: str, num_classes: int = 1) -> PipelineConfig:
+    def get_base_test_config(self, task_type: ModelType, data_file_path: str, num_classes: int = 1, backend: EngineBackend = EngineBackend.NATIVE) -> PipelineConfig:
         """Hydrates a clean baseline strongly-typed PipelineConfig instance matching schema parameters."""
         return PipelineConfig(
             meta=MetaConfig(
@@ -77,6 +77,7 @@ class TestPipelineIntegration(unittest.TestCase):
                 model_type=task_type,
                 num_classes=num_classes,
                 hidden_layers=[16, 8],
+                backend=backend,
                 p_dropout=0.0,
                 use_batch_norm=False,
                 bn_momentum=0.9
@@ -94,7 +95,8 @@ class TestPipelineIntegration(unittest.TestCase):
                 early_stopping_enabled=False,
                 patience=5,
                 min_delta=1e-5,
-                gradient_clipping_max_norm=5.0
+                gradient_clipping_max_norm=5.0,
+                num_threads=4
             ),
             regularization=RegularizationConfig(
                 lam_l1=0.0,
@@ -120,148 +122,157 @@ class TestPipelineIntegration(unittest.TestCase):
         )
 
     def test_regression_class_pipeline(self):
-        """Validates continuous target mapping pipelines using InMemoryDataProvider and ModelController."""
-        cfg = self.get_base_test_config(ModelType.REGRESSION, data_file_path=self.regression_data_path, num_classes=1)
+        """Validates continuous target mapping pipelines across all compute backends."""
+        for backend in [EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM, EngineBackend.NUMPY]:
+            with self.subTest(backend=backend.value):
+                cfg = self.get_base_test_config(ModelType.REGRESSION, data_file_path=self.regression_data_path, num_classes=1, backend=backend)
 
-        loader = BaseDataLoader.create_loader(cfg)
-        data_provider = InMemoryDataProvider(
-            loader=loader,
-            batch_size=cfg.optimization.batch_size,
-            epochs=cfg.optimization.epochs_full_dataset,
-            normalize_features=True
-        )
+                loader = BaseDataLoader.create_loader(cfg)
+                data_provider = InMemoryDataProvider(
+                    loader=loader,
+                    batch_size=cfg.optimization.batch_size,
+                    epochs=cfg.optimization.epochs_full_dataset,
+                    normalize_features=True
+                )
 
-        self.assertIn(DataKeys.X_TRAIN, data_provider.splits)
-        self.assertEqual(data_provider.splits[DataKeys.X_TRAIN].shape[1], 3)
+                self.assertIn(DataKeys.X_TRAIN, data_provider.splits)
+                self.assertEqual(data_provider.splits[DataKeys.X_TRAIN].shape[1], 3)
 
-        controller = ModelController(
-            learning_rate=cfg.optimization.learning_rate,
-            lr_scheduler_type=cfg.optimization.lr_scheduler,
-            data_provider=data_provider
-        )
-        controller.initialize_network_from_dimensions(
-            input_dim=len(cfg.ingestion.feature_names),
-            output_dim=1,  
-            model_type=cfg.architecture.model_type,
-            hidden_layers=cfg.architecture.hidden_layers,
-            optimizer_name=cfg.optimization.optimizer,
-            lam_l1=cfg.regularization.lam_l1,
-            lam_l2=cfg.regularization.lam_l2,
-            p_dropout=cfg.architecture.p_dropout,
-            use_batch_norm=cfg.architecture.use_batch_norm,
-            bn_momentum=cfg.architecture.bn_momentum,
-            max_norm=cfg.optimization.gradient_clipping_max_norm
-        )
+                controller = ModelController(
+                    learning_rate=cfg.optimization.learning_rate,
+                    lr_scheduler_type=cfg.optimization.lr_scheduler,
+                    data_provider=data_provider
+                )
+                controller.initialize_network_from_dimensions(
+                    input_dim=len(cfg.ingestion.feature_names),
+                    output_dim=1,  
+                    model_type=cfg.architecture.model_type,
+                    hidden_layers=cfg.architecture.hidden_layers,
+                    optimizer_name=cfg.optimization.optimizer,
+                    lam_l1=cfg.regularization.lam_l1,
+                    lam_l2=cfg.regularization.lam_l2,
+                    p_dropout=cfg.architecture.p_dropout,
+                    use_batch_norm=cfg.architecture.use_batch_norm,
+                    bn_momentum=cfg.architecture.bn_momentum,
+                    max_norm=cfg.optimization.gradient_clipping_max_norm,
+                    backend=cfg.architecture.backend
+                )
 
-        train_hist, val_hist = controller.fit(
-            steps=cfg.optimization.steps_streaming,
-            source_mode=cfg.ingestion.source_mode,
-            model_type=cfg.architecture.model_type,
-            early_stopping_enabled=cfg.optimization.early_stopping_enabled,
-            patience=cfg.optimization.patience,
-            min_delta=cfg.optimization.min_delta
-        )
+                train_hist, val_hist = controller.fit(
+                    steps=cfg.optimization.steps_streaming,
+                    source_mode=cfg.ingestion.source_mode,
+                    model_type=cfg.architecture.model_type,
+                    early_stopping_enabled=cfg.optimization.early_stopping_enabled,
+                    patience=cfg.optimization.patience,
+                    min_delta=cfg.optimization.min_delta
+                )
 
-        self.assertGreater(len(train_hist), 0)
-        self.assertTrue(np.isfinite(train_hist[-1]), "Loss encountered non-finite NaN/Inf bounds.")
-        
-        X_val, y_val = data_provider.get_validation_set()
-        val_preds = controller.predict(X_val)
-        self.assertEqual(val_preds.shape, y_val.shape, "Prediction matrix shape mismatch.")
+                self.assertGreater(len(train_hist), 0)
+                self.assertTrue(np.isfinite(train_hist[-1]), f"[{backend.value}] Loss encountered non-finite NaN/Inf bounds.")
+                
+                X_val, y_val = data_provider.get_validation_set()
+                val_preds = controller.predict(X_val)
+                self.assertEqual(val_preds.shape, y_val.shape, f"[{backend.value}] Prediction matrix shape mismatch.")
 
     def test_binary_class_pipeline(self):
-        """Validates logistic sigmoidal classification routes across binary datasets."""
-        cfg = self.get_base_test_config(ModelType.BINARY_CLASSIFICATION, data_file_path=self.binary_data_path, num_classes=1)
+        """Validates logistic sigmoidal classification routes across all compute backends."""
+        for backend in [EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM, EngineBackend.NUMPY]:
+            with self.subTest(backend=backend.value):
+                cfg = self.get_base_test_config(ModelType.BINARY_CLASSIFICATION, data_file_path=self.binary_data_path, num_classes=1, backend=backend)
 
-        loader = BaseDataLoader.create_loader(cfg)
-        data_provider = InMemoryDataProvider(
-            loader=loader,
-            batch_size=cfg.optimization.batch_size,
-            epochs=cfg.optimization.epochs_full_dataset,
-            normalize_features=True
-        )
+                loader = BaseDataLoader.create_loader(cfg)
+                data_provider = InMemoryDataProvider(
+                    loader=loader,
+                    batch_size=cfg.optimization.batch_size,
+                    epochs=cfg.optimization.epochs_full_dataset,
+                    normalize_features=True
+                )
 
-        controller = ModelController(
-            learning_rate=cfg.optimization.learning_rate,
-            lr_scheduler_type=cfg.optimization.lr_scheduler,
-            data_provider=data_provider
-        )
-        controller.initialize_network_from_dimensions(
-            input_dim=len(cfg.ingestion.feature_names),
-            output_dim=1,  
-            model_type=cfg.architecture.model_type,
-            hidden_layers=cfg.architecture.hidden_layers,
-            optimizer_name=cfg.optimization.optimizer,
-            lam_l1=cfg.regularization.lam_l1,
-            lam_l2=cfg.regularization.lam_l2,
-            p_dropout=cfg.architecture.p_dropout,
-            use_batch_norm=cfg.architecture.use_batch_norm,
-            bn_momentum=cfg.architecture.bn_momentum,
-            max_norm=cfg.optimization.gradient_clipping_max_norm
-        )
+                controller = ModelController(
+                    learning_rate=cfg.optimization.learning_rate,
+                    lr_scheduler_type=cfg.optimization.lr_scheduler,
+                    data_provider=data_provider
+                )
+                controller.initialize_network_from_dimensions(
+                    input_dim=len(cfg.ingestion.feature_names),
+                    output_dim=1,  
+                    model_type=cfg.architecture.model_type,
+                    hidden_layers=cfg.architecture.hidden_layers,
+                    optimizer_name=cfg.optimization.optimizer,
+                    lam_l1=cfg.regularization.lam_l1,
+                    lam_l2=cfg.regularization.lam_l2,
+                    p_dropout=cfg.architecture.p_dropout,
+                    use_batch_norm=cfg.architecture.use_batch_norm,
+                    bn_momentum=cfg.architecture.bn_momentum,
+                    max_norm=cfg.optimization.gradient_clipping_max_norm,
+                    backend=cfg.architecture.backend
+                )
 
-        controller.fit(
-            steps=cfg.optimization.steps_streaming,
-            source_mode=cfg.ingestion.source_mode,
-            model_type=cfg.architecture.model_type,
-            early_stopping_enabled=cfg.optimization.early_stopping_enabled,
-            patience=cfg.optimization.patience,
-            min_delta=cfg.optimization.min_delta
-        )
+                controller.fit(
+                    steps=cfg.optimization.steps_streaming,
+                    source_mode=cfg.ingestion.source_mode,
+                    model_type=cfg.architecture.model_type,
+                    early_stopping_enabled=cfg.optimization.early_stopping_enabled,
+                    patience=cfg.optimization.patience,
+                    min_delta=cfg.optimization.min_delta
+                )
 
-        X_val, _ = data_provider.get_validation_set()
-        val_preds = controller.predict(X_val)
-        
-        self.assertTrue(np.all(val_preds >= 0.0) and np.all(val_preds <= 1.0), 
-                        "Binary activations breached sigmoid boundaries.")
+                X_val, _ = data_provider.get_validation_set()
+                val_preds = controller.predict(X_val)
+                
+                self.assertTrue(np.all(val_preds >= 0.0) and np.all(val_preds <= 1.0), 
+                                f"[{backend.value}] Binary activations breached sigmoid boundaries.")
 
     def test_multiclass_class_pipeline(self):
-        """Validates categorical softmax logit paths across multi-class configurations."""
-        cfg = self.get_base_test_config(ModelType.MULTI_CLASS, data_file_path=self.multiclass_data_path, num_classes=3)
+        """Validates categorical softmax logit paths across all compute backends."""
+        for backend in [EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM, EngineBackend.NUMPY]:
+            with self.subTest(backend=backend.value):
+                cfg = self.get_base_test_config(ModelType.MULTI_CLASS, data_file_path=self.multiclass_data_path, num_classes=3, backend=backend)
 
-        loader = BaseDataLoader.create_loader(cfg)
-        data_provider = InMemoryDataProvider(
-            loader=loader,
-            batch_size=cfg.optimization.batch_size,
-            epochs=cfg.optimization.epochs_full_dataset,
-            normalize_features=True
-        )
+                loader = BaseDataLoader.create_loader(cfg)
+                data_provider = InMemoryDataProvider(
+                    loader=loader,
+                    batch_size=cfg.optimization.batch_size,
+                    epochs=cfg.optimization.epochs_full_dataset,
+                    normalize_features=True
+                )
 
-        controller = ModelController(
-            learning_rate=cfg.optimization.learning_rate,
-            lr_scheduler_type=cfg.optimization.lr_scheduler,
-            data_provider=data_provider
-        )
-        controller.initialize_network_from_dimensions(
-            input_dim=len(cfg.ingestion.feature_names),
-            output_dim=3,  
-            model_type=cfg.architecture.model_type,
-            hidden_layers=cfg.architecture.hidden_layers,
-            optimizer_name=cfg.optimization.optimizer,
-            lam_l1=cfg.regularization.lam_l1,
-            lam_l2=cfg.regularization.lam_l2,
-            p_dropout=cfg.architecture.p_dropout,
-            use_batch_norm=cfg.architecture.use_batch_norm,
-            bn_momentum=cfg.architecture.bn_momentum,
-            max_norm=cfg.optimization.gradient_clipping_max_norm
-        )
+                controller = ModelController(
+                    learning_rate=cfg.optimization.learning_rate,
+                    lr_scheduler_type=cfg.optimization.lr_scheduler,
+                    data_provider=data_provider
+                )
+                controller.initialize_network_from_dimensions(
+                    input_dim=len(cfg.ingestion.feature_names),
+                    output_dim=3,  
+                    model_type=cfg.architecture.model_type,
+                    hidden_layers=cfg.architecture.hidden_layers,
+                    optimizer_name=cfg.optimization.optimizer,
+                    lam_l1=cfg.regularization.lam_l1,
+                    lam_l2=cfg.regularization.lam_l2,
+                    p_dropout=cfg.architecture.p_dropout,
+                    use_batch_norm=cfg.architecture.use_batch_norm,
+                    bn_momentum=cfg.architecture.bn_momentum,
+                    max_norm=cfg.optimization.gradient_clipping_max_norm,
+                    backend=cfg.architecture.backend
+                )
 
-        controller.fit(
-            steps=cfg.optimization.steps_streaming,
-            source_mode=cfg.ingestion.source_mode,
-            model_type=cfg.architecture.model_type,
-            early_stopping_enabled=cfg.optimization.early_stopping_enabled,
-            patience=cfg.optimization.patience,
-            min_delta=cfg.optimization.min_delta
-        )
+                controller.fit(
+                    steps=cfg.optimization.steps_streaming,
+                    source_mode=cfg.ingestion.source_mode,
+                    model_type=cfg.architecture.model_type,
+                    early_stopping_enabled=cfg.optimization.early_stopping_enabled,
+                    patience=cfg.optimization.patience,
+                    min_delta=cfg.optimization.min_delta
+                )
 
-        X_val, _ = data_provider.get_validation_set()
-        val_preds = controller.predict(X_val)
-        
-        self.assertEqual(len(val_preds.shape), 2, "Multiclass predictions must yield a 2D matrix profile.")
-        row_sums = np.sum(val_preds, axis=1)
-        np.testing.assert_allclose(row_sums, 1.0, rtol=1e-5, 
-                                   err_msg="Softmax probability distribution failed unity checks.")
+                X_val, _ = data_provider.get_validation_set()
+                val_preds = controller.predict(X_val)
+                
+                self.assertEqual(len(val_preds.shape), 2, f"[{backend.value}] Multiclass predictions must yield a 2D matrix profile.")
+                row_sums = np.sum(val_preds, axis=1)
+                np.testing.assert_allclose(row_sums, 1.0, rtol=1e-5, 
+                                           err_msg=f"[{backend.value}] Softmax probability distribution failed unity checks.")
 
 
 if __name__ == "__main__":

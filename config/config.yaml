@@ -7,7 +7,7 @@ meta:
   pipeline_name: "synthetic_spatial_cnn_run"
   stage: "development"
   suppress_logging: false
-  logging_level: "info"
+  logging_level: "error"
   output_dir: "diagnostics_output"
 
 # =====================================================================
@@ -30,6 +30,7 @@ ingestion:
 # =====================================================================
 architecture:
   model_type: "cnn"                  # Options: "multi_class", "binary_classification", "regression", "cnn"
+  backend: "native"                  # Options: "native" | "im2col+gemm" | "numpy"
   num_classes: 4                     # 4 Synthetic Classes: Circle, Square, Cross, Diamond
   hidden_layers: []                  # Dense MLP hidden layers (bypassed for CNN)
   p_dropout: 0.1                     # Regularization dropout rate
@@ -69,6 +70,7 @@ architecture:
 # OPTIMIZATION LOOP CONTROLS
 # =====================================================================
 optimization:
+  num_threads: 4
   optimizer: "adam"
   epochs_full_dataset: 100
   steps_streaming: 31

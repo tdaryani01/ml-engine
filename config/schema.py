@@ -1,7 +1,7 @@
 # config/schema.py
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
-from config.constants import ModelType, IngestionMode, LRHierarchy
+from config.constants import ModelType, IngestionMode, LRHierarchy, EngineBackend
 
 @dataclass(frozen=True)
 class MetaConfig:
@@ -43,6 +43,7 @@ class ArchitectureConfig:
     model_type: ModelType                      # Enforced Enum Type!
     num_classes: int
     hidden_layers: List[int]
+    backend: EngineBackend = EngineBackend.NATIVE  # Enforced Enum Type!
     p_dropout: float = 0.0
     use_batch_norm: bool = True
     bn_momentum: float = 0.9
@@ -64,6 +65,8 @@ class OptimizationConfig:
     patience: int
     min_delta: float
     gradient_clipping_max_norm: float
+    num_threads: int
+
 
 @dataclass(frozen=True)
 class RegularizationConfig:

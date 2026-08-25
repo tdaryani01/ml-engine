@@ -1,6 +1,7 @@
 # src/model_factory.py
 import logging
 import numpy as np
+from config.constants import EngineBackend
 from src.models import BinaryClassificationNetwork, RegressionNetwork, MultiClassNetwork
 from src.cnn_network import CNNNetwork
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten
@@ -16,7 +17,7 @@ class ModelFactory:
     }
 
     @classmethod
-    def _compute_flattened_dim(cls, input_shape: list, spatial_pipeline: list) -> int:
+    def _compute_flattened_dim(cls, input_shape: list, spatial_pipeline: list, backend: EngineBackend = EngineBackend.NATIVE) -> int:
         """
         Runs a dry forward pass on dummy spatial tensors to infer
         the exact flattened feature dimension feeding into the dense head.
@@ -26,18 +27,20 @@ class ModelFactory:
 
         for layer_cfg in spatial_pipeline:
             l_type = layer_cfg["type"].lower()
-            if l_type == "conv":
+            if l_type in ("conv", "conv_block"):
                 temp_x = Conv2D(
                     in_channels=layer_cfg["in_channels"],
                     out_channels=layer_cfg["out_channels"],
                     kernel_size=layer_cfg.get("kernel_size", 3),
                     stride=layer_cfg.get("stride", 1),
-                    pad=layer_cfg.get("pad", 0)
+                    pad=layer_cfg.get("pad", 0),
+                    backend=backend
                 ).forward(temp_x)
             elif l_type == "pool":
                 temp_x = MaxPool2D(
                     pool_size=layer_cfg.get("pool_size", 2),
-                    stride=layer_cfg.get("stride", 2)
+                    stride=layer_cfg.get("stride", 2),
+                    backend=backend
                 ).forward(temp_x)
             elif l_type == "flatten":
                 temp_x = Flatten().forward(temp_x)
@@ -45,9 +48,9 @@ class ModelFactory:
         return temp_x.shape[1]
 
     @classmethod
-    def create_model(cls, model_type, layer_sizes, **kwargs):
+    def create_model(cls, model_type, layer_sizes, backend: EngineBackend = EngineBackend.NATIVE, **kwargs):
         """Instantiates and returns the requested neural network model with resolved optimizers and arguments."""
-        normalized_type = str(model_type).strip().lower()
+        normalized_type = str(model_type.value if hasattr(model_type, "value") else model_type).strip().lower()
         
         if normalized_type not in cls._registry:
             raise KeyError(
@@ -61,6 +64,18 @@ class ModelFactory:
         # Extract the learning rate to isolate it from network initialization kwargs
         lr_val = factory_kwargs.pop("lr", 0.001) 
         
+        # Resolve backend enum injection
+        backend_val = backend
+        if isinstance(backend_val, str):
+            backend_lookup = {
+                "native": EngineBackend.NATIVE,
+                "im2col+gemm": EngineBackend.IM2COL_GEMM,
+                "im2col_gemm": EngineBackend.IM2COL_GEMM,
+                "gemm": EngineBackend.IM2COL_GEMM,
+                "numpy": EngineBackend.NUMPY
+            }
+            backend_val = backend_lookup.get(backend_val.strip().lower(), EngineBackend.NATIVE)
+
         # Resolve decoupled optimizer injection
         if "optimizer" in factory_kwargs and "optimizer_instance" not in factory_kwargs:
             opt_name = str(factory_kwargs.pop("optimizer")).strip().lower()
@@ -77,7 +92,7 @@ class ModelFactory:
             factory_kwargs["p_dropout"] = 0.0
 
         model_class = cls._registry[normalized_type]
-        logging.info(f"[Factory] Initializing model block structure '{normalized_type}' via dynamic registry pass.")
+        logging.info(f"[Factory] Initializing model block structure '{normalized_type}' (Backend: {backend_val.value}) via dynamic registry pass.")
 
         # --- CNN INSTANTIATION ROUTE ---
         if normalized_type == "cnn":
@@ -96,7 +111,7 @@ class ModelFactory:
                 dense_head = cnn_config.get("dense_head", [])
 
             # Compute input size for Dense head based on spatial transformations
-            flattened_dim = cls._compute_flattened_dim(input_shape, spatial_pipeline)
+            flattened_dim = cls._compute_flattened_dim(input_shape, spatial_pipeline, backend=backend_val)
             output_dim = layer_sizes[-1]
             resolved_dense_sizes = [flattened_dim] + list(dense_head) + [output_dim]
 
@@ -107,10 +122,10 @@ class ModelFactory:
             return model_class(
                 conv_configs=spatial_pipeline,
                 dense_sizes=resolved_dense_sizes,
+                backend=backend_val,
                 **factory_kwargs
             )
 
         # --- MLP/STANDARD INSTANTIATION ROUTE ---
-        # Remove cnn_config if passed to standard MLP networks
         factory_kwargs.pop("cnn_config", None)
         return model_class(layer_sizes=layer_sizes, **factory_kwargs)

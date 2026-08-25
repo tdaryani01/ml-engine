@@ -1,6 +1,9 @@
+# src/spatial_layers.py
 import builtins
 import numpy as np
+from config.constants import EngineBackend
 from utils.im2col import (
+    init_engine_backend,
     conv2d_forward,
     conv2d_backward_fused,
     conv_block_forward,
@@ -8,9 +11,7 @@ from utils.im2col import (
     col2im,
     maxpool_forward,
     maxpool_backward,
-    fuse_dout_transpose_and_bias,
-    _USE_NATIVE,
-    _USE_FAST
+    fuse_dout_transpose_and_bias
 )
 
 if 'profile' not in builtins.__dict__:
@@ -20,7 +21,9 @@ if 'profile' not in builtins.__dict__:
 class ConvBlock:
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3,
                  conv_stride: int = 1, conv_pad: int = 0,
-                 pool_size: int = 2, pool_stride: int = 2):
+                 pool_size: int = 2, pool_stride: int = 2,
+                 backend: EngineBackend = EngineBackend.NATIVE):
+        init_engine_backend(backend)
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.k_h = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
@@ -64,8 +67,13 @@ class ConvBlock:
         if self.W.dtype != dtype:
             self.W = self.W.astype(dtype)
             self.b = self.b.astype(dtype)
-            self.dW = np.zeros_like(self.W)
-            self.db = np.zeros_like(self.b)
+            self.dW = np.zeros_like(self.W, dtype=dtype)
+            self.db = np.zeros_like(self.b, dtype=dtype)
+
+        if self.db is None or self.db.dtype != dtype:
+            self.db = np.zeros_like(self.b, dtype=dtype)
+        if self.dW is None or self.dW.dtype != dtype:
+            self.dW = np.zeros_like(self.W, dtype=dtype)
 
         if self._cached_batch_size == N and self._cached_dtype == dtype and self._dx_buffer is not None:
             return
@@ -140,7 +148,10 @@ class ConvBlock:
 
 
 class Conv2D:
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, stride: int = 1, pad: int = 0):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3,
+                 stride: int = 1, pad: int = 0,
+                 backend: EngineBackend = EngineBackend.NATIVE):
+        init_engine_backend(backend)
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.k_h = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
@@ -177,8 +188,13 @@ class Conv2D:
         if self.W.dtype != dtype:
             self.W = self.W.astype(dtype)
             self.b = self.b.astype(dtype)
-            self.dW = np.zeros_like(self.W)
-            self.db = np.zeros_like(self.b)
+            self.dW = np.zeros_like(self.W, dtype=dtype)
+            self.db = np.zeros_like(self.b, dtype=dtype)
+
+        if self.db is None or self.db.dtype != dtype:
+            self.db = np.zeros_like(self.b, dtype=dtype)
+        if self.dW is None or self.dW.dtype != dtype:
+            self.dW = np.zeros_like(self.W, dtype=dtype)
 
         if self._cached_dtype == dtype and total_rows <= self._col_cap and self._dx_buffer is not None:
             return
@@ -228,11 +244,6 @@ class Conv2D:
 
         self._ensure_buffers(N, C, H, W, self.out_h, self.out_w, dout.dtype)
 
-        if self.db is None or self.db.dtype != dout.dtype or self.db.shape != (1, self.out_channels):
-            self.db = np.zeros((1, self.out_channels), dtype=dout.dtype)
-        if self.dW is None or self.dW.dtype != dout.dtype or self.dW.shape != self.W.shape:
-            self.dW = np.zeros_like(self.W, dtype=dout.dtype)
-
         active_dout_trans = self._dout_trans_buffer[:total_rows]
 
         fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
@@ -258,7 +269,8 @@ class Conv2D:
 
 
 class MaxPool2D:
-    def __init__(self, pool_size: int = 2, stride: int = 2):
+    def __init__(self, pool_size: int = 2, stride: int = 2, backend: EngineBackend = EngineBackend.NATIVE):
+        init_engine_backend(backend)
         self.pool_size = pool_size
         self.stride = stride
         self.x_shape = None

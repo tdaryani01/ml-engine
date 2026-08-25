@@ -1,21 +1,8 @@
 # utils/im2col_fast.py
-import os
-
-os.environ["NUMBA_NUM_THREADS"] = "4"
-os.environ["OPENBLAS_NUM_THREADS"] = "4"
-os.environ["MKL_NUM_THREADS"] = "4"
-os.environ["OMP_NUM_THREADS"] = "4"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "4"
-os.environ["NUMEXPR_NUM_THREADS"] = "4"
-
 import ctypes
 import numpy as np
-import numba
 from numba import njit, prange, float32, float64, int64, void
 from scipy.linalg import cython_blas
-
-_DEFAULT_THREADS = min(4, os.cpu_count() or 4)
-numba.set_num_threads(_DEFAULT_THREADS)
 
 # -----------------------------------------------------------------------------
 # Direct Native BLAS C-Function Pointers via Scipy Cython Interface
@@ -102,12 +89,7 @@ _REF_ALPHA_D = ctypes.byref(_C_ALPHA_D)
 
 
 def gemm_forward_fast(col: np.ndarray, W_2d: np.ndarray, out_gemm: np.ndarray):
-    """
-    Computes out_gemm = col @ W_2d.T
-    col shape: (M, K)
-    W_2d shape: (N, K) -> W_2d.T is (K, N)
-    out_gemm shape: (M, N)
-    """
+    """Computes out_gemm = col @ W_2d.T"""
     m_dim = col.shape[0]
     n_dim = W_2d.shape[0]
     k_dim = col.shape[1]
@@ -144,6 +126,7 @@ def gemm_forward_fast(col: np.ndarray, W_2d: np.ndarray, out_gemm: np.ndarray):
 
 
 def gemm_param_grad_fast(dout_trans: np.ndarray, col: np.ndarray, dW_flat: np.ndarray, inv_m: float = 1.0):
+    """Computes dW_flat = inv_m * (dout_trans.T @ col)"""
     n_cols = dW_flat.shape[1]
     n_rows = dW_flat.shape[0]
     k_dim = dout_trans.shape[0]

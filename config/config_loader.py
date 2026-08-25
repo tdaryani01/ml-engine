@@ -1,7 +1,8 @@
 # config/config_loader.py
+import os
 import yaml
 from config.schema import *
-from config.constants import ModelType, IngestionMode, LRHierarchy
+from config.constants import ModelType, IngestionMode, LRHierarchy, EngineBackend
 
 def load_production_config(file_path="config/config.yaml") -> PipelineConfig:
     """Loads and parses production configuration from a structured YAML file, mapping raw strings to their respective Enums and data classes."""
@@ -24,16 +25,36 @@ def load_production_config(file_path="config/config.yaml") -> PipelineConfig:
         **ingestion_raw
     )
     
-    # 2. Parse Architecture Blocks & Convert String to ModelType Enum
+    # 2. Parse Architecture Blocks & Convert String to ModelType and EngineBackend Enums
     architecture_raw = raw["architecture"].copy()
     raw_model_str = architecture_raw.pop("model_type", "multi_class").strip().upper()
     try:
         model_type_enum = ModelType[raw_model_str]
     except KeyError:
         raise ValueError(f"[Config Error] Unknown model_type string in YAML: '{raw_model_str}'")
+
+    raw_backend_str = architecture_raw.pop(
+        "backend", 
+        os.getenv("ENGINE_BACKEND", "native")
+    ).strip().lower()
+
+    # Map possible backend string variants to EngineBackend
+    backend_lookup = {
+        "native": EngineBackend.NATIVE,
+        "im2col+gemm": EngineBackend.IM2COL_GEMM,
+        "im2col_gemm": EngineBackend.IM2COL_GEMM,
+        "gemm": EngineBackend.IM2COL_GEMM,
+        "numpy": EngineBackend.NUMPY
+    }
+
+    try:
+        backend_enum = backend_lookup[raw_backend_str]
+    except KeyError:
+        raise ValueError(f"[Config Error] Unknown backend string in YAML/Environment: '{raw_backend_str}'")
         
     architecture_obj = ArchitectureConfig(
         model_type=model_type_enum,
+        backend=backend_enum,
         **architecture_raw
     )
     
@@ -62,5 +83,5 @@ def load_production_config(file_path="config/config.yaml") -> PipelineConfig:
         regularization=RegularizationConfig(**raw["regularization"]),
         transformations=transform_obj,
         persistence=PersistenceConfig(**raw["persistence"]),
-        diagnostics=DiagnosticsConfig(**raw["diagnostics"])  # Explicit unpacking of new parameters
+        diagnostics=DiagnosticsConfig(**raw["diagnostics"])
     )

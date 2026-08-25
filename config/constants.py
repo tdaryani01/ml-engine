@@ -1,6 +1,11 @@
 # config/constants.py
 from enum import Enum, auto
 
+class EngineBackend(str, Enum):
+    NUMPY = "numpy"
+    IM2COL_GEMM = "im2col+gemm"
+    NATIVE = "native"
+
 class ModelType(Enum):
     """Defines the supported machine learning task types for the model architecture."""
     BINARY_CLASSIFICATION = auto()

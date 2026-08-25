@@ -3,6 +3,7 @@ import sys
 import subprocess
 import time
 import os
+import re
 
 LOG_FILE = "test_run.log"
 
@@ -32,13 +33,39 @@ class DualWriter:
             self.log.close()
 
 
-def run_test_module(name: str, script_path: str, backend: str) -> bool:
+def parse_sub_backend_results(stdout_text: str) -> list:
+    """Extracts explicit sub-backend execution statuses from test output."""
+    sub_results = []
+    
+    # 1. Match standard backend sections: --- Backend: <name> --- or --- Testing Backend: <name> ---
+    backend_blocks = re.split(r"--- (?:Testing )?Backend: ([a-zA-Z0-9_\+\-]+) ---", stdout_text)
+    if len(backend_blocks) > 1:
+        for i in range(1, len(backend_blocks), 2):
+            b_name = backend_blocks[i].strip()
+            block_content = backend_blocks[i+1] if i+1 < len(backend_blocks) else ""
+            b_passed = not ("FAILED" in block_content or "ERROR" in block_content or "Traceback" in block_content)
+            sub_results.append((b_name, b_passed))
+        return sub_results
+
+    # 2. Match Task & Backend lines (test_gradient_check style)
+    grad_matches = re.findall(r"RUNNING CHECK: Task='([^']+)'(?:\s*\|\s*Backend='([^']+)')?", stdout_text)
+    if grad_matches:
+        for task, b_name in grad_matches:
+            label = f"{task} ({b_name})" if b_name else task
+            # Check if this section had a failure
+            passed = f"Discrepancy detected in {task}" not in stdout_text and "Traceback" not in stdout_text
+            sub_results.append((label, passed))
+        return sub_results
+
+    return sub_results
+
+
+def run_test_module(name: str, script_path: str, backend: str) -> tuple:
     backend_label = f"BACKEND={backend.upper()}"
     print(f"\n{'='*70}")
     print(f" [RUNNING] [{backend_label}] {name} ({script_path})")
     print(f"{'='*70}")
     
-    # Inject backend environment variable and PYTHONPATH
     env = os.environ.copy()
     project_root = os.path.dirname(os.path.abspath(__file__))
     existing_pythonpath = env.get("PYTHONPATH", "")
@@ -62,12 +89,15 @@ def run_test_module(name: str, script_path: str, backend: str) -> bool:
     if result.stdout:
         print(result.stdout, end="")
     
-    if result.returncode == 0:
+    sub_backends = parse_sub_backend_results(result.stdout or "")
+    passed = (result.returncode == 0)
+    
+    if passed:
         print(f"--> [{backend.upper()}] {name}: PASSED ({elapsed:.2f}s)")
-        return True
     else:
         print(f"--> [{backend.upper()}] {name}: FAILED ({elapsed:.2f}s)")
-        return False
+        
+    return passed, sub_backends
 
 
 def main():
@@ -112,8 +142,8 @@ def main():
             print(f"{'#'*70}")
             
             for name, path in test_suite:
-                passed = run_test_module(name, path, backend)
-                summary.append((f"[{backend.upper()}] {name}", passed))
+                passed, sub_backends = run_test_module(name, path, backend)
+                summary.append((backend.upper(), name, passed, sub_backends))
                 if not passed:
                     all_passed = False
 
@@ -121,11 +151,24 @@ def main():
         print("\n" + "=" * 70)
         print("                    DUAL-BACKEND TEST SUITE SUMMARY")
         print("=" * 70)
-        for name, passed in summary:
+
+        current_backend_header = None
+        for backend_tag, name, passed, sub_backends in summary:
+            if current_backend_header != backend_tag:
+                current_backend_header = backend_tag
+                print(f"\n[ENGINE MATRIX: {current_backend_header}]")
+
             status = "PASSED [OK]" if passed else "FAILED [ERR]"
             print(f" - {name:<46} : {status}")
+            
+            if sub_backends:
+                for idx, (sub_name, sub_passed) in enumerate(sub_backends):
+                    is_last = (idx == len(sub_backends) - 1)
+                    branch = "└──" if is_last else "├──"
+                    sub_status = "PASSED [OK]" if sub_passed else "FAILED [ERR]"
+                    print(f"     {branch} {sub_name:<42} : {sub_status}")
 
-        print("-" * 70)
+        print("\n" + "-" * 70)
         print(f"Total Combined Duration: {total_elapsed:.2f}s")
         if all_passed:
             print(f"\n[READY TO COMMIT] All dual-matrix tests passed! Log saved to: {os.path.abspath(LOG_FILE)}\n")

@@ -1,9 +1,7 @@
 # run_pipeline.py
 import logging
 import numpy as np
-
-# import os
-# os.environ['NUMBA_PARALLEL_DIAGNOSTICS'] = '4'                
+from threadpoolctl import threadpool_limits
 
 from config.config_loader import load_production_config
 from data.base_loader import BaseDataLoader
@@ -23,11 +21,15 @@ def execute_training_pipeline():
     # 2. Initialize enterprise dual-destination logging
     initialize_global_logging(cfg)
 
+    # 3. Resolve Thread Limit from Config
+    num_threads = getattr(cfg.optimization, "num_threads", 4)
+    logging.info(f"[Runtime] Scoping OpenMP/BLAS thread pools to {num_threads} threads via threadpoolctl.")
+
     is_cnn = (cfg.architecture.model_type == ModelType.CNN)
     source_mode = cfg.ingestion.source_mode
     cnn_cfg = getattr(cfg.architecture, "cnn", None) if is_cnn else None
 
-    # 3. Resolve Data Provider via Factory Loader or Stream Provider
+    # 4. Resolve Data Provider via Factory Loader or Stream Provider
     if source_mode == IngestionMode.STREAM:
         if not cfg.ingestion.amqp_url or not cfg.ingestion.queue_name:
             raise ValueError("[Ingestion Error] AMQP properties must be defined in config when source_mode='stream'")
@@ -47,7 +49,6 @@ def execute_training_pipeline():
         input_dim = len(cfg.ingestion.feature_names)
 
     else:
-        # Resolve loader polymorphically via BaseDataLoader factory
         loader = BaseDataLoader.create_loader(cfg)
 
         data_provider = InMemoryDataProvider(
@@ -67,9 +68,9 @@ def execute_training_pipeline():
                 else data_provider.splits[DataKeys.X_TRAIN].shape[1]
             )
 
-    # 4. Instantiate Controller
+    # 5. Instantiate Controller
     controller = ModelController(
-        data_provider = data_provider,
+        data_provider=data_provider,
         learning_rate=cfg.optimization.learning_rate,
         lr_scheduler_type=cfg.optimization.lr_scheduler,
         scheduler_decay_rate=cfg.optimization.scheduler_decay_rate,
@@ -77,7 +78,7 @@ def execute_training_pipeline():
         scheduler_epochs_per_drop=cfg.optimization.scheduler_epochs_per_drop
     )
 
-    # 5. Build Network Topology
+    # 6. Build Network Topology
     logging.info(f"[Pipeline Root] Initializing network topology (Type: {cfg.architecture.model_type})...")
     controller.initialize_network_from_dimensions(
         input_dim=input_dim,
@@ -91,14 +92,15 @@ def execute_training_pipeline():
         use_batch_norm=cfg.architecture.use_batch_norm,
         bn_momentum=cfg.architecture.bn_momentum,
         max_norm=cfg.optimization.gradient_clipping_max_norm,
-        cnn_config=cnn_cfg if is_cnn else None
+        cnn_config=cnn_cfg if is_cnn else None,
+        backend=cfg.architecture.backend
     )
 
-    # 6. Pretrained Model Hydration
+    # 7. Pretrained Model Hydration
     if cfg.persistence.load_saved_model:
         controller.hydrate_from_asset(cfg.persistence.model_asset_path)
 
-    # 7. Print Class Distribution
+    # 8. Print Class Distribution
     if hasattr(data_provider, "y_train_processed"):
         unique, counts = np.unique(data_provider.y_train_processed, axis=0, return_counts=True)
         logging.info("\n=== Training Class Balance ===")
@@ -106,22 +108,22 @@ def execute_training_pipeline():
             logging.info(f"Target Vector: {u} | Count: {c}")
         logging.info("=============================\n")
 
-    # 8. Train Model
-    train_history, val_history = controller.fit(
-        steps=steps,
-        source_mode=source_mode,
-        model_type=cfg.architecture.model_type,
-        early_stopping_enabled=cfg.optimization.early_stopping_enabled,
-        patience=cfg.optimization.patience,
-        min_delta=cfg.optimization.min_delta
-    )
-    
-    # 9. Diagnostics & Reporting
-    NeuralNetworkDiagnostics.run_diagnostics(
-        controller=controller,
-        data_provider=data_provider,
-        cfg=cfg
-    )
+    # 9. Train Model & Execute Diagnostics Inside Thread-Clamped Context
+    with threadpool_limits(limits=num_threads):
+        train_history, val_history = controller.fit(
+            steps=steps,
+            source_mode=source_mode,
+            model_type=cfg.architecture.model_type,
+            early_stopping_enabled=cfg.optimization.early_stopping_enabled,
+            patience=cfg.optimization.patience,
+            min_delta=cfg.optimization.min_delta
+        )
+        
+        NeuralNetworkDiagnostics.run_diagnostics(
+            controller=controller,
+            data_provider=data_provider,
+            cfg=cfg
+        )
 
     # 10. Post-Training Inference Diagnostics
     # if is_cnn:

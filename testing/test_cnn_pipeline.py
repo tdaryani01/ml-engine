@@ -7,7 +7,7 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.controller import ModelController
-from config.constants import ModelType, LRHierarchy, IngestionMode
+from config.constants import ModelType, LRHierarchy, IngestionMode, EngineBackend
 
 
 class DummyImageProvider:
@@ -43,11 +43,12 @@ class DummyImageProvider:
         return x
 
 
-def test_full_cnn_training_cycle():
+def test_full_cnn_training_cycle(backend: EngineBackend):
+    print(f"\n--- Testing Backend: {backend.value} ---")
     cnn_cfg = {
         "input_shape": [3, 14, 14],
         "spatial_pipeline": [
-            {"type": "conv", "in_channels": 3, "out_channels": 4, "kernel_size": 3, "stride": 1, "pad": 0},
+            {"type": "conv", "in_channels": 3, "out_channels": 4, "kernel_size": 3, "stride": 1, "pad": 1},
             {"type": "relu"},
             {"type": "pool", "pool_size": 2, "stride": 2},
             {"type": "flatten"}
@@ -73,30 +74,32 @@ def test_full_cnn_training_cycle():
         lam_l2=1e-4,
         p_dropout=0.0,
         use_batch_norm=False,
-        cnn_config=cnn_cfg
+        cnn_config=cnn_cfg,
+        backend=backend
     )
 
     train_hist, val_hist = controller.fit(
         steps=10,
         source_mode=IngestionMode.CSV,
         model_type=ModelType.CNN,
-        early_stopping_enabled=True,  # Active early stopping
-        patience=3,                   # Terminate quickly after 3 stagnant validation checks
+        early_stopping_enabled=True,
+        patience=3,
         min_delta=1e-4
     )
 
-    assert len(train_hist) > 0, "Train loss history empty"
-    assert len(val_hist) > 0, "Val loss history empty"
-    assert not np.isnan(train_hist[-1]), "NaN detected in training loss"
-    assert not np.isnan(val_hist[-1]), "NaN detected in validation loss"
-    print(f"[PASSED] Full CNN Training Cycle verified (Final Val Loss: {val_hist[-1]:.4f}).")
+    assert len(train_hist) > 0, f"[{backend.value}] Train loss history empty"
+    assert len(val_hist) > 0, f"[{backend.value}] Val loss history empty"
+    assert not np.isnan(train_hist[-1]), f"[{backend.value}] NaN detected in training loss"
+    assert not np.isnan(val_hist[-1]), f"[{backend.value}] NaN detected in validation loss"
+    print(f"[PASSED] Backend '{backend.value}' verified (Final Val Loss: {val_hist[-1]:.4f}).")
 
 
 if __name__ == "__main__":
     print("=" * 60)
     print(" RUNNING CNN END-TO-END PIPELINE INTEGRATION TEST ")
     print("=" * 60)
-    test_full_cnn_training_cycle()
-    print("=" * 60)
-    print("[SUCCESS] CNN Pipeline integration test passed cleanly!")
+    for backend in [EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM, EngineBackend.NUMPY]:
+        test_full_cnn_training_cycle(backend)
+    print("\n" + "=" * 60)
+    print("[SUCCESS] All CNN Pipeline backend suites passed cleanly!")
     print("=" * 60)

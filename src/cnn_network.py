@@ -1,6 +1,8 @@
+# src/cnn_network.py
 import builtins
 import logging
 import numpy as np
+from config.constants import EngineBackend
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten, ConvBlock
 from utils.im2col import relu_spatial_forward, relu_spatial_backward
 
@@ -15,8 +17,10 @@ class CNNNetwork:
     to minimize Python-to-C++ FFI dispatch transitions.
     """
     def __init__(self, conv_configs: list, dense_sizes: list, optimizer_instance,
+                 backend: EngineBackend = EngineBackend.NATIVE,
                  lam_l1: float = 0.01, lam_l2: float = 0.01, p_dropout: float = 0.0,
-                 max_norm: float = 5.0, task_type: str = "multiclass"):
+                 max_norm: float = 5.0, task_type: str = "multiclass", **kwargs):
+        self.backend = backend
         self.optimizer = optimizer_instance
         self.lam_l1 = lam_l1
         self.lam_l2 = lam_l2
@@ -33,15 +37,15 @@ class CNNNetwork:
         self._build_spatial_layers(conv_configs)
         self._build_dense_head(dense_sizes)
 
-        print("\n--- CONV LAYER SHAPES ---")
+        logging.info("\n--- CONV LAYER SHAPES ---")
         for i, layer in enumerate(self.layers):
             if isinstance(layer, ConvBlock):
-                print(f"Layer {i} (ConvBlock): W={layer.W.shape}, conv_stride={layer.conv_stride}, pool_size={layer.pool_size}")
+                 logging.info(f"Layer {i} (ConvBlock): W={layer.W.shape}, conv_stride={layer.conv_stride}, pool_size={layer.pool_size}")
             elif isinstance(layer, Conv2D):
-                print(f"Layer {i} (Conv2D): W={layer.W.shape}, stride={layer.stride}, pad={layer.pad}")
+                 logging.info(f"Layer {i} (Conv2D): W={layer.W.shape}, stride={layer.stride}, pad={layer.pad}")
             elif isinstance(layer, MaxPool2D):
-                print(f"Layer {i} (MaxPool2D): pool_size={layer.pool_size}, stride={layer.stride}")
-        print("-------------------------\n")
+                 logging.info(f"Layer {i} (MaxPool2D): pool_size={layer.pool_size}, stride={layer.stride}")
+        logging.info("-------------------------\n")
 
         self.spatial_inputs = []
         self.dense_inputs = []
@@ -96,7 +100,8 @@ class CNNNetwork:
                     conv_stride=cfg.get("stride", 1),
                     conv_pad=cfg.get("pad", 0),
                     pool_size=pool_cfg.get("pool_size", 2),
-                    pool_stride=pool_cfg.get("stride", 2)
+                    pool_stride=pool_cfg.get("stride", 2),
+                    backend=self.backend
                 )
                 self.layers.append(block)
                 self.param_layers.append(block)
@@ -111,7 +116,8 @@ class CNNNetwork:
                     out_channels=cfg["out_channels"],
                     kernel_size=cfg.get("kernel_size", 3),
                     stride=cfg.get("stride", 1),
-                    pad=cfg.get("pad", 0)
+                    pad=cfg.get("pad", 0),
+                    backend=self.backend
                 )
                 self.layers.append(layer)
                 self.param_layers.append(layer)
@@ -120,7 +126,8 @@ class CNNNetwork:
             elif l_type == "pool":
                 self.layers.append(MaxPool2D(
                     pool_size=cfg.get("pool_size", 2),
-                    stride=cfg.get("stride", 2)
+                    stride=cfg.get("stride", 2),
+                    backend=self.backend
                 ))
             elif l_type == "flatten":
                 self.layers.append(Flatten())

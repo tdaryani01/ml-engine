@@ -1,15 +1,60 @@
-# ==========================================
-# FILE 1: data/tabular_loader.py
-# ==========================================
 import logging
 import pandas as pd
 import numpy as np
 from typing import Tuple, List
-from sklearn.model_selection import train_test_split
 from data.base_loader import BaseDataLoader
 from config.constants import ModelType
 
 logger = logging.getLogger(__name__)
+
+
+def numpy_train_test_split(
+    *arrays,
+    train_size: float = 0.7,
+    stratify: pd.Series = None,
+    random_state: int = 42
+):
+    """
+    Pure NumPy implementation of train_test_split supporting optional stratification.
+    """
+    if not arrays:
+        return []
+
+    n_samples = len(arrays[0])
+    rng = np.random.default_rng(random_state)
+
+    if stratify is not None:
+        labels = np.asarray(stratify)
+        unique_classes = np.unique(labels)
+        train_indices, test_indices = [], []
+
+        for cls in unique_classes:
+            cls_idx = np.where(labels == cls)[0]
+            rng.shuffle(cls_idx)
+            n_train_cls = int(round(len(cls_idx) * train_size))
+            train_indices.extend(cls_idx[:n_train_cls])
+            test_indices.extend(cls_idx[n_train_cls:])
+
+        train_idx = np.array(train_indices)
+        test_idx = np.array(test_indices)
+        rng.shuffle(train_idx)
+        rng.shuffle(test_idx)
+    else:
+        indices = np.arange(n_samples)
+        rng.shuffle(indices)
+        n_train = int(round(n_samples * train_size))
+        train_idx, test_idx = indices[:n_train], indices[n_train:]
+
+    result = []
+    for arr in arrays:
+        if isinstance(arr, (pd.Series, pd.DataFrame)):
+            result.append(arr.iloc[train_idx])
+            result.append(arr.iloc[test_idx])
+        else:
+            result.append(arr[train_idx])
+            result.append(arr[test_idx])
+
+    return result
 
 
 class TabularCSVLoader(BaseDataLoader):
@@ -60,7 +105,7 @@ class TabularCSVLoader(BaseDataLoader):
             can_stratify = seed_classes.value_counts().min() >= 2
             stratify_labels = seed_classes if can_stratify else None
 
-            train_seeds, temp_seeds = train_test_split(
+            train_seeds, temp_seeds = numpy_train_test_split(
                 unique_seeds,
                 train_size=self.train_split,
                 stratify=stratify_labels,
@@ -71,7 +116,7 @@ class TabularCSVLoader(BaseDataLoader):
             can_stratify_temp = temp_classes.value_counts().min() >= 2 if can_stratify else False
             stratify_temp = temp_classes if can_stratify_temp else None
 
-            val_seeds, _ = train_test_split(
+            val_seeds, _ = numpy_train_test_split(
                 temp_seeds,
                 train_size=val_ratio,
                 stratify=stratify_temp,
@@ -89,10 +134,10 @@ class TabularCSVLoader(BaseDataLoader):
             X_val, y_val = X[val_idx], y_raw[val_idx]
         else:
             logger.info("[Tabular Loader] Performing standard train/validation split...")
-            X_train, X_temp, y_train, y_temp = train_test_split(
+            X_train, X_temp, y_train, y_temp = numpy_train_test_split(
                 X, y_raw, train_size=self.train_split, random_state=self.random_state
             )
-            X_val, _, y_val, _ = train_test_split(
+            X_val, _, y_val, _ = numpy_train_test_split(
                 X_temp, y_temp, train_size=val_ratio, random_state=self.random_state
             )
 
@@ -111,5 +156,3 @@ class TabularCSVLoader(BaseDataLoader):
             return y_encoded
 
         return y.reshape(-1, 1).astype(np.float32)
-
-

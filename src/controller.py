@@ -8,7 +8,7 @@ import numpy as np
 from src.model_factory import ModelFactory
 from src.serializer import ModelSerializer
 from src.schedulers import StepDecay, ExponentialDecay
-from config.constants import DataKeys, ModelType, LRHierarchy
+from config.constants import DataKeys, ModelType, LRHierarchy, EngineBackend
 
 
 class ModelController:
@@ -60,12 +60,14 @@ class ModelController:
         use_batch_norm: bool = False,
         bn_momentum: float = 0.9,
         max_norm: float = 5.0,
-        cnn_config: Optional[Dict[str, Any]] = None
+        cnn_config: Optional[Dict[str, Any]] = None,
+        backend: EngineBackend = EngineBackend.NATIVE
     ) -> None:
         """
         Builds and initializes network topology. 
         If input_dim or output_dim are omitted, infers them automatically from the bound data_provider.
         """
+        self.backend = backend
         hidden_layers = hidden_layers or []
 
         # Auto-infer dimensions from data_provider if not explicitly passed
@@ -103,6 +105,7 @@ class ModelController:
             use_batch_norm=use_batch_norm,
             bn_momentum=bn_momentum,
             max_norm=max_norm,
+            backend=self.backend,
             cnn_config=cnn_config
         )
 
