@@ -23,7 +23,14 @@ def init_engine_backend(backend: EngineBackend = EngineBackend.NATIVE):
 
     if _active_backend == EngineBackend.NATIVE:
         lib_name = "conv_kernels.dll" if os.name == "nt" else "conv_kernels.so"
+        
+        # Root directory calculation assuming this file is under src/ or tests/
+        root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        
         possible_paths = [
+            os.path.join(root_dir, "bin", lib_name),
+            os.path.join(os.path.dirname(__file__), "bin", lib_name),
+            os.path.join(os.path.dirname(__file__), "..", "bin", lib_name),
             os.path.join(os.path.dirname(__file__), "..", "native", lib_name),
             os.path.join(os.path.dirname(__file__), "..", "src", "native", lib_name),
             os.path.join(os.path.dirname(__file__), "native", lib_name),
@@ -36,7 +43,7 @@ def init_engine_backend(backend: EngineBackend = EngineBackend.NATIVE):
                 break
 
         if lib_path is None:
-            raise FileNotFoundError(f"Could not locate {lib_name}")
+            raise FileNotFoundError(f"Could not locate {lib_name}. Checked: {[os.path.abspath(p) for p in possible_paths]}")
 
         lib = ctypes.CDLL(lib_path)
 
