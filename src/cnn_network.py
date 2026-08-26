@@ -182,12 +182,27 @@ class CNNNetwork:
 
         current_act = X
 
-        # 1. Spatial Forward Pass
+        # 1. Spatial Forward Pass (Tracking logical width across layers)
+        current_logical_w = getattr(self, "input_logical_w", None)
+        if current_logical_w is None:
+            # If input is (N, C, H, W_stride), derive logical width
+            # Standard MNIST/benchmark logical width is 28 if stride-padded to 32
+            current_logical_w = 28 if (X.ndim == 4 and X.shape[3] == 32) else (X.shape[3] if X.ndim == 4 else None)
+
         for layer in self.layers:
             if layer == "relu":
                 if training:
                     self.spatial_inputs.append(current_act)
                 current_act = relu_spatial_forward(current_act)
+            elif isinstance(layer, Flatten):
+                if training:
+                    self.spatial_inputs.append(current_act)
+                current_act = layer.forward(current_act, logical_w=current_logical_w)
+            elif isinstance(layer, (Conv2D, ConvBlock, MaxPool2D)):
+                if training:
+                    self.spatial_inputs.append(current_act)
+                current_act = layer.forward(current_act, W_logical=current_logical_w)
+                current_logical_w = layer.out_w
             else:
                 if training:
                     self.spatial_inputs.append(current_act)

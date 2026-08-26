@@ -19,33 +19,38 @@ class ModelFactory:
     @classmethod
     def _compute_flattened_dim(cls, input_shape: list, spatial_pipeline: list, backend: EngineBackend = EngineBackend.NATIVE) -> int:
         """
-        Runs a dry forward pass on dummy spatial tensors to infer
-        the exact flattened feature dimension feeding into the dense head.
+        Calculates the exact flattened logical feature dimension feeding into the dense head
+        without executing buffer allocations or kernel passes.
         """
-        dummy_x = np.zeros((1, *input_shape), dtype=np.float32)
-        temp_x = dummy_x
+        c, h, w = input_shape[0], input_shape[1], input_shape[2]
 
         for layer_cfg in spatial_pipeline:
             l_type = layer_cfg["type"].lower()
             if l_type in ("conv", "conv_block"):
-                temp_x = Conv2D(
-                    in_channels=layer_cfg["in_channels"],
-                    out_channels=layer_cfg["out_channels"],
-                    kernel_size=layer_cfg.get("kernel_size", 3),
-                    stride=layer_cfg.get("stride", 1),
-                    pad=layer_cfg.get("pad", 0),
-                    backend=backend
-                ).forward(temp_x)
-            elif l_type == "pool":
-                temp_x = MaxPool2D(
-                    pool_size=layer_cfg.get("pool_size", 2),
-                    stride=layer_cfg.get("stride", 2),
-                    backend=backend
-                ).forward(temp_x)
-            elif l_type == "flatten":
-                temp_x = Flatten().forward(temp_x)
+                k_size = layer_cfg.get("kernel_size", 3)
+                k_h = k_size if isinstance(k_size, int) else k_size[0]
+                k_w = k_size if isinstance(k_size, int) else k_size[1]
+                stride = layer_cfg.get("stride", 1)
+                pad = layer_cfg.get("pad", 0)
+                out_channels = layer_cfg["out_channels"]
 
-        return temp_x.shape[1]
+                h = (h + 2 * pad - k_h) // stride + 1
+                w = (w + 2 * pad - k_w) // stride + 1
+                c = out_channels
+
+                if l_type == "conv_block":
+                    p_size = layer_cfg.get("pool_size", 2)
+                    p_stride = layer_cfg.get("pool_stride", 2)
+                    h = (h - p_size) // p_stride + 1
+                    w = (w - p_size) // p_stride + 1
+
+            elif l_type == "pool":
+                p_size = layer_cfg.get("pool_size", 2)
+                p_stride = layer_cfg.get("stride", 2)
+                h = (h - p_size) // p_stride + 1
+                w = (w - p_size) // p_stride + 1
+
+        return int(c * h * w)
 
     @classmethod
     def create_model(cls, model_type, layer_sizes, backend: EngineBackend = EngineBackend.NATIVE, **kwargs):
