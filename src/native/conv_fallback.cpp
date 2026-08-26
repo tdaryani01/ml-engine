@@ -3,6 +3,16 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdint>
+#include <vector>
+
+static inline float hsum256_ps(__m256 v) {
+    __m128 vlow  = _mm256_castps256_ps128(v);
+    __m128 vhigh = _mm256_extractf128_ps(v, 1);
+    __m128 vsum  = _mm_add_ps(vlow, vhigh);
+    vsum = _mm_hadd_ps(vsum, vsum);
+    vsum = _mm_hadd_ps(vsum, vsum);
+    return _mm_cvtss_f32(vsum);
+}
 
 void conv2d_forward_fallback_avx2(
     const float* x, const float* W, const float* bias, float* out,
@@ -16,122 +26,84 @@ void conv2d_forward_fallback_avx2(
     const int64_t spatial_out = out_h * out_w;
     const int64_t spatial_in  = H * W_in;
     const int64_t k_spatial   = k_h * k_w;
-    const int64_t cout_blocks = (C_out + 3) / 4;
+    
+    // Native 30x30 padded dimensions (treating padding as part of the image)
+    const int64_t H_pad = H + 2 * pad;
+    const int64_t W_pad = W_in + 2 * pad;
+    const int64_t spatial_pad = H_pad * W_pad;
     const __m256 v_zero = _mm256_setzero_ps();
 
-    #pragma omp parallel for collapse(3) schedule(static)
-    for (int64_t n = 0; n < N; ++n) {
-        for (int64_t cout_blk = 0; cout_blk < cout_blocks; ++cout_blk) {
-            for (int64_t oh = 0; oh < out_h; ++oh) {
-                const int64_t cout0 = cout_blk * 4;
-                const int64_t c_rem = (C_out - cout0 >= 4) ? 4 : (C_out - cout0);
-                const int64_t ih_base = oh * stride - pad;
+    #pragma omp parallel
+    {
+        // Thread-local pre-padded tensor: 30x30 layout initialized to 0.0f ONCE
+        std::vector<float> x_padded_slice(spatial_pad, 0.0f);
 
-                float* __restrict out_r0 = &out[(n * C_out + cout0 + 0) * spatial_out + oh * out_w];
-                float* __restrict out_r1 = (c_rem > 1) ? &out[(n * C_out + cout0 + 1) * spatial_out + oh * out_w] : nullptr;
-                float* __restrict out_r2 = (c_rem > 2) ? &out[(n * C_out + cout0 + 2) * spatial_out + oh * out_w] : nullptr;
-                float* __restrict out_r3 = (c_rem > 3) ? &out[(n * C_out + cout0 + 3) * spatial_out + oh * out_w] : nullptr;
+        #pragma omp for collapse(2) schedule(static)
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t cout = 0; cout < C_out; ++cout) {
+                float* __restrict out_ptr = &out[(n * C_out + cout) * spatial_out];
+                const __m256 vb = bias ? _mm256_set1_ps(bias[cout]) : v_zero;
+                const float s_bias = bias ? bias[cout] : 0.0f;
 
-                const __m256 vb0 = bias ? _mm256_set1_ps(bias[cout0 + 0]) : _mm256_setzero_ps();
-                const __m256 vb1 = (bias && c_rem > 1) ? _mm256_set1_ps(bias[cout0 + 1]) : _mm256_setzero_ps();
-                const __m256 vb2 = (bias && c_rem > 2) ? _mm256_set1_ps(bias[cout0 + 2]) : _mm256_setzero_ps();
-                const __m256 vb3 = (bias && c_rem > 3) ? _mm256_set1_ps(bias[cout0 + 3]) : _mm256_setzero_ps();
-
-                int64_t ow = 0;
-                for (; ow + 8 <= out_w; ow += 8) {
-                    __m256 acc0 = vb0, acc1 = vb1, acc2 = vb2, acc3 = vb3;
-                    const int64_t iw0 = ow * stride - pad;
-
-                    for (int64_t cin = 0; cin < C_in; ++cin) {
-                        const float* __restrict xp  = &x[(n * C_in + cin) * spatial_in];
-                        const float* __restrict wp0 = &W[((cout0 + 0) * C_in + cin) * k_spatial];
-                        const float* __restrict wp1 = (c_rem > 1) ? &W[((cout0 + 1) * C_in + cin) * k_spatial] : nullptr;
-                        const float* __restrict wp2 = (c_rem > 2) ? &W[((cout0 + 2) * C_in + cin) * k_spatial] : nullptr;
-                        const float* __restrict wp3 = (c_rem > 3) ? &W[((cout0 + 3) * C_in + cin) * k_spatial] : nullptr;
-
-                        for (int64_t kh = 0; kh < k_h; ++kh) {
-                            const int64_t cur_ih = ih_base + kh;
-                            if (cur_ih < 0 || cur_ih >= H) continue;
-                            const float* __restrict in_row = &xp[cur_ih * W_in];
-
-                            for (int64_t kw = 0; kw < k_w; ++kw) {
-                                const int64_t cur_iw = iw0 + kw;
-                                __m256 vx;
-                                if (stride == 1 && cur_iw >= 0 && (cur_iw + 8) <= W_in) {
-                                    vx = _mm256_loadu_ps(&in_row[cur_iw]);
-                                } else {
-                                    alignas(32) float tmp[8] = {0};
-                                    for (int s = 0; s < 8; ++s) {
-                                        int64_t s_iw = (ow + s) * stride - pad + kw;
-                                        if (s_iw >= 0 && s_iw < W_in) tmp[s] = in_row[s_iw];
-                                    }
-                                    vx = _mm256_load_ps(tmp);
-                                }
-
-                                const int64_t w_idx = kh * k_w + kw;
-                                acc0 = _mm256_fmadd_ps(vx, _mm256_set1_ps(wp0[w_idx]), acc0);
-                                if (c_rem > 1) acc1 = _mm256_fmadd_ps(vx, _mm256_set1_ps(wp1[w_idx]), acc1);
-                                if (c_rem > 2) acc2 = _mm256_fmadd_ps(vx, _mm256_set1_ps(wp2[w_idx]), acc2);
-                                if (c_rem > 3) acc3 = _mm256_fmadd_ps(vx, _mm256_set1_ps(wp3[w_idx]), acc3);
-                            }
-                        }
-                    }
-
-                    if (fuse_relu) {
-                        acc0 = _mm256_max_ps(acc0, v_zero);
-                        if (c_rem > 1) acc1 = _mm256_max_ps(acc1, v_zero);
-                        if (c_rem > 2) acc2 = _mm256_max_ps(acc2, v_zero);
-                        if (c_rem > 3) acc3 = _mm256_max_ps(acc3, v_zero);
-                    }
-
-                    _mm256_storeu_ps(&out_r0[ow], acc0);
-                    if (c_rem > 1) _mm256_storeu_ps(&out_r1[ow], acc1);
-                    if (c_rem > 2) _mm256_storeu_ps(&out_r2[ow], acc2);
-                    if (c_rem > 3) _mm256_storeu_ps(&out_r3[ow], acc3);
+                // Initialize output grid
+                int64_t i = 0;
+                for (; i + 8 <= spatial_out; i += 8) {
+                    _mm256_storeu_ps(&out_ptr[i], vb);
+                }
+                for (; i < spatial_out; ++i) {
+                    out_ptr[i] = s_bias;
                 }
 
-                for (; ow < out_w; ++ow) {
-                    float s0 = bias ? bias[cout0 + 0] : 0.0f;
-                    float s1 = (bias && c_rem > 1) ? bias[cout0 + 1] : 0.0f;
-                    float s2 = (bias && c_rem > 2) ? bias[cout0 + 2] : 0.0f;
-                    float s3 = (bias && c_rem > 3) ? bias[cout0 + 3] : 0.0f;
+                for (int64_t cin = 0; cin < C_in; ++cin) {
+                    const float* __restrict xp = &x[(n * C_in + cin) * spatial_in];
+                    const float* __restrict wp = &W[(cout * C_in + cin) * k_spatial];
 
-                    for (int64_t cin = 0; cin < C_in; ++cin) {
-                        const float* __restrict xp  = &x[(n * C_in + cin) * spatial_in];
-                        const float* __restrict wp0 = &W[((cout0 + 0) * C_in + cin) * k_spatial];
-                        const float* __restrict wp1 = (c_rem > 1) ? &W[((cout0 + 1) * C_in + cin) * k_spatial] : nullptr;
-                        const float* __restrict wp2 = (c_rem > 2) ? &W[((cout0 + 2) * C_in + cin) * k_spatial] : nullptr;
-                        const float* __restrict wp3 = (c_rem > 3) ? &W[((cout0 + 3) * C_in + cin) * k_spatial] : nullptr;
+                    // --- PRE-PAD THE TENSOR ONCE (Treating it as a 30x30 unpadded image) ---
+                    std::fill(x_padded_slice.begin(), x_padded_slice.end(), 0.0f);
+                    float* __restrict dest_row_ptr = &x_padded_slice[pad * W_pad + pad];
+                    for (int64_t h = 0; h < H; ++h) {
+                        std::memcpy(dest_row_ptr + h * W_pad, xp + h * W_in, W_in * sizeof(float));
+                    }
+                    // ---------------------------------------------------------------------
+
+                    for (int64_t oh = 0; oh < out_h; ++oh) {
+                        const int64_t ih_base = oh * stride;
+                        float* __restrict out_row = &out_ptr[oh * out_w];
 
                         for (int64_t kh = 0; kh < k_h; ++kh) {
-                            const int64_t cur_ih = ih_base + kh;
-                            if (cur_ih < 0 || cur_ih >= H) continue;
-                            const float* __restrict in_row = &xp[cur_ih * W_in];
-
+                            // Now we read directly from the 30x30 padded grid with ZERO conditional checks
+                            const float* __restrict in_row = &x_padded_slice[(ih_base + kh) * W_pad];
                             for (int64_t kw = 0; kw < k_w; ++kw) {
-                                const int64_t cur_iw = ow * stride - pad + kw;
-                                if (cur_iw >= 0 && cur_iw < W_in) {
-                                    const float val = in_row[cur_iw];
-                                    const int64_t w_idx = kh * k_w + kw;
-                                    s0 += val * wp0[w_idx];
-                                    if (c_rem > 1) s1 += val * wp1[w_idx];
-                                    if (c_rem > 2) s2 += val * wp2[w_idx];
-                                    if (c_rem > 3) s3 += val * wp3[w_idx];
+                                const float w_val = wp[kh * k_w + kw];
+                                const __m256 vw = _mm256_set1_ps(w_val);
+                                const float* __restrict in_ptr = &in_row[kw];
+
+                                int64_t ow = 0;
+                                if (stride == 1) {
+                                    for (; ow + 8 <= out_w; ow += 8) {
+                                        __m256 v_out = _mm256_loadu_ps(&out_row[ow]);
+                                        __m256 v_in  = _mm256_loadu_ps(&in_ptr[ow]);
+                                        v_out = _mm256_fmadd_ps(v_in, vw, v_out);
+                                        _mm256_storeu_ps(&out_row[ow], v_out);
+                                    }
+                                }
+                                for (; ow < out_w; ++ow) {
+                                    out_row[ow] += in_ptr[ow * stride] * w_val;
                                 }
                             }
                         }
                     }
+                }
 
-                    if (fuse_relu) {
-                        s0 = s0 > 0.0f ? s0 : 0.0f;
-                        s1 = s1 > 0.0f ? s1 : 0.0f;
-                        s2 = s2 > 0.0f ? s2 : 0.0f;
-                        s3 = s3 > 0.0f ? s3 : 0.0f;
+                if (fuse_relu) {
+                    int64_t i = 0;
+                    for (; i + 8 <= spatial_out; i += 8) {
+                        __m256 v = _mm256_loadu_ps(&out_ptr[i]);
+                        _mm256_storeu_ps(&out_ptr[i], _mm256_max_ps(v, v_zero));
                     }
-                    out_r0[ow] = s0;
-                    if (c_rem > 1) out_r1[ow] = s1;
-                    if (c_rem > 2) out_r2[ow] = s2;
-                    if (c_rem > 3) out_r3[ow] = s3;
+                    for (; i < spatial_out; ++i) {
+                        out_ptr[i] = std::max(0.0f, out_ptr[i]);
+                    }
                 }
             }
         }
@@ -151,162 +123,60 @@ void conv2d_backward_fallback_avx2(
     const int64_t conv_spatial = conv_out_h * conv_out_w;
     const int64_t spatial_in   = H * W_in;
     const int64_t k_spatial    = k_h * k_w;
-    const int64_t cin_blocks   = (C_in + 1) / 2;
+    const int64_t pad_h_bwd    = (k_h - 1) - pad;
+    const int64_t pad_w_bwd    = (k_w - 1) - pad;
+    const int64_t H_pad_dr     = conv_out_h + 2 * std::max<int64_t>(0, pad_h_bwd);
+    const int64_t W_pad_dr     = conv_out_w + 2 * std::max<int64_t>(0, pad_w_bwd);
+    const int64_t spatial_pad_dr = H_pad_dr * W_pad_dr;
 
-    // 1. dX Input Gradient Pass
+    // 1. dX Pass with pre-padded gradient tensor
     if (dx && W) {
         std::memset(dx, 0, N * C_in * spatial_in * sizeof(float));
 
-        #pragma omp parallel for collapse(3) schedule(static)
-        for (int64_t n = 0; n < N; ++n) {
-            for (int64_t cin_blk = 0; cin_blk < cin_blocks; ++cin_blk) {
-                for (int64_t ih = 0; ih < H; ++ih) {
-                    const int64_t cin0 = cin_blk * 2;
-                    const int64_t cin_rem = (C_in - cin0 >= 2) ? 2 : 1;
+        #pragma omp parallel
+        {
+            std::vector<float> dr_padded_slice(spatial_pad_dr, 0.0f);
 
-                    float* __restrict dx_p0 = &dx[(n * C_in + cin0 + 0) * spatial_in + ih * W_in];
-                    float* __restrict dx_p1 = (cin_rem == 2) ? &dx[(n * C_in + cin0 + 1) * spatial_in + ih * W_in] : nullptr;
+            #pragma omp for collapse(2) schedule(static)
+            for (int64_t n = 0; n < N; ++n) {
+                for (int64_t cin = 0; cin < C_in; ++cin) {
+                    float* __restrict dx_p = &dx[(n * C_in + cin) * spatial_in];
 
-                    if (cin_rem == 2) {
-                        int64_t iw = 0;
-                        if (stride == 1) {
-                            for (; iw + 8 <= W_in; iw += 8) {
-                                __m256 acc0 = _mm256_setzero_ps();
-                                __m256 acc1 = _mm256_setzero_ps();
+                    for (int64_t cout = 0; cout < C_out; ++cout) {
+                        const float* __restrict dp = &d_conv_buf[(n * C_out + cout) * conv_spatial];
+                        const float* __restrict wp = &W[(cout * C_in + cin) * k_spatial];
 
-                                for (int64_t cout = 0; cout < C_out; ++cout) {
-                                    const float* __restrict dp = &d_conv_buf[(n * C_out + cout) * conv_spatial];
-                                    const float* __restrict wp0 = &W[((cout * C_in + cin0 + 0) * k_spatial)];
-                                    const float* __restrict wp1 = &W[((cout * C_in + cin0 + 1) * k_spatial)];
-
-                                    for (int64_t kh = 0; kh < k_h; ++kh) {
-                                        const int64_t oh = ih + pad - kh;
-                                        if (oh < 0 || oh >= conv_out_h) continue;
-
-                                        const float* __restrict dr = &dp[oh * conv_out_w];
-                                        for (int64_t kw = 0; kw < k_w; ++kw) {
-                                            const int64_t ow_offset = iw + pad - kw;
-                                            const int64_t w_idx = kh * k_w + kw;
-                                            const __m256 w0 = _mm256_set1_ps(wp0[w_idx]);
-                                            const __m256 w1 = _mm256_set1_ps(wp1[w_idx]);
-
-                                            __m256 v;
-                                            if (ow_offset >= 0 && (ow_offset + 8) <= conv_out_w) {
-                                                v = _mm256_loadu_ps(&dr[ow_offset]);
-                                            } else {
-                                                alignas(32) float tmp[8] = {0};
-                                                for (int s = 0; s < 8; ++s) {
-                                                    int64_t cur_ow = ow_offset + s;
-                                                    if (cur_ow >= 0 && cur_ow < conv_out_w) tmp[s] = dr[cur_ow];
-                                                }
-                                                v = _mm256_load_ps(tmp);
-                                            }
-
-                                            acc0 = _mm256_fmadd_ps(v, w0, acc0);
-                                            acc1 = _mm256_fmadd_ps(v, w1, acc1);
-                                        }
-                                    }
-                                }
-                                _mm256_storeu_ps(&dx_p0[iw], acc0);
-                                _mm256_storeu_ps(&dx_p1[iw], acc1);
-                            }
+                        // Pre-pad gradient tensor once
+                        std::fill(dr_padded_slice.begin(), dr_padded_slice.end(), 0.0f);
+                        float* __restrict dest_dr_ptr = &dr_padded_slice[pad_h_bwd * W_pad_dr + pad_w_bwd];
+                        for (int64_t h = 0; h < conv_out_h; ++h) {
+                            std::memcpy(dest_dr_ptr + h * W_pad_dr, dp + h * conv_out_w, conv_out_w * sizeof(float));
                         }
 
-                        for (; iw < W_in; ++iw) {
-                            float sum0 = 0.0f, sum1 = 0.0f;
-                            for (int64_t cout = 0; cout < C_out; ++cout) {
-                                const float* __restrict dp = &d_conv_buf[(n * C_out + cout) * conv_spatial];
-                                const float* __restrict wp0 = &W[((cout * C_in + cin0 + 0) * k_spatial)];
-                                const float* __restrict wp1 = &W[((cout * C_in + cin0 + 1) * k_spatial)];
+                        for (int64_t ih = 0; ih < H; ++ih) {
+                            float* __restrict dx_row = &dx_p[ih * W_in];
 
-                                for (int64_t kh = 0; kh < k_h; ++kh) {
-                                    const int64_t oh_raw = ih + pad - kh;
-                                    if (oh_raw < 0 || (stride == 1 ? false : (oh_raw % stride != 0))) continue;
-                                    const int64_t oh = (stride == 1) ? oh_raw : (oh_raw / stride);
-                                    if (oh >= conv_out_h) continue;
+                            for (int64_t kh = 0; kh < k_h; ++kh) {
+                                const float* __restrict dr_row = &dr_padded_slice[(ih + (k_h - 1 - kh)) * W_pad_dr];
+                                for (int64_t kw = 0; kw < k_w; ++kw) {
+                                    const float w_val = wp[kh * k_w + kw];
+                                    const __m256 vw = _mm256_set1_ps(w_val);
+                                    const float* __restrict in_dr = &dr_row[k_w - 1 - kw];
 
-                                    const float* __restrict dp_row = &dp[oh * conv_out_w];
-                                    for (int64_t kw = 0; kw < k_w; ++kw) {
-                                        const int64_t ow_raw = iw + pad - kw;
-                                        if (ow_raw >= 0 && (stride == 1 ? true : (ow_raw % stride == 0))) {
-                                            const int64_t ow = (stride == 1) ? ow_raw : (ow_raw / stride);
-                                            if (ow < conv_out_w) {
-                                                const float val = dp_row[ow];
-                                                const int64_t w_idx = kh * k_w + kw;
-                                                sum0 += val * wp0[w_idx];
-                                                sum1 += val * wp1[w_idx];
-                                            }
+                                    int64_t iw = 0;
+                                    if (stride == 1) {
+                                        for (; iw + 8 <= W_in; iw += 8) {
+                                            __m256 v_dx = _mm256_loadu_ps(&dx_row[iw]);
+                                            __m256 v_dr = _mm256_loadu_ps(&in_dr[iw]);
+                                            v_dx = _mm256_fmadd_ps(v_dr, vw, v_dx);
+                                            _mm256_storeu_ps(&dx_row[iw], v_dx);
                                         }
+                                    }
+                                    for (; iw < W_in; ++iw) {
+                                        dx_row[iw] += in_dr[iw] * w_val;
                                     }
                                 }
                             }
-                            dx_p0[iw] = sum0;
-                            dx_p1[iw] = sum1;
-                        }
-                    } else {
-                        int64_t iw = 0;
-                        if (stride == 1) {
-                            for (; iw + 8 <= W_in; iw += 8) {
-                                __m256 acc0 = _mm256_setzero_ps();
-
-                                for (int64_t cout = 0; cout < C_out; ++cout) {
-                                    const float* __restrict dp = &d_conv_buf[(n * C_out + cout) * conv_spatial];
-                                    const float* __restrict wp0 = &W[((cout * C_in + cin0 + 0) * k_spatial)];
-
-                                    for (int64_t kh = 0; kh < k_h; ++kh) {
-                                        const int64_t oh = ih + pad - kh;
-                                        if (oh < 0 || oh >= conv_out_h) continue;
-
-                                        const float* __restrict dr = &dp[oh * conv_out_w];
-                                        for (int64_t kw = 0; kw < k_w; ++kw) {
-                                            const int64_t ow_offset = iw + pad - kw;
-                                            const int64_t w_idx = kh * k_w + kw;
-                                            const __m256 w0 = _mm256_set1_ps(wp0[w_idx]);
-
-                                            __m256 v;
-                                            if (ow_offset >= 0 && (ow_offset + 8) <= conv_out_w) {
-                                                v = _mm256_loadu_ps(&dr[ow_offset]);
-                                            } else {
-                                                alignas(32) float tmp[8] = {0};
-                                                for (int s = 0; s < 8; ++s) {
-                                                    int64_t cur_ow = ow_offset + s;
-                                                    if (cur_ow >= 0 && cur_ow < conv_out_w) tmp[s] = dr[cur_ow];
-                                                }
-                                                v = _mm256_load_ps(tmp);
-                                            }
-                                            acc0 = _mm256_fmadd_ps(v, w0, acc0);
-                                        }
-                                    }
-                                }
-                                _mm256_storeu_ps(&dx_p0[iw], acc0);
-                            }
-                        }
-
-                        for (; iw < W_in; ++iw) {
-                            float sum0 = 0.0f;
-                            for (int64_t cout = 0; cout < C_out; ++cout) {
-                                const float* __restrict dp = &d_conv_buf[(n * C_out + cout) * conv_spatial];
-                                const float* __restrict wp0 = &W[((cout * C_in + cin0 + 0) * k_spatial)];
-
-                                for (int64_t kh = 0; kh < k_h; ++kh) {
-                                    const int64_t oh_raw = ih + pad - kh;
-                                    if (oh_raw < 0 || (stride == 1 ? false : (oh_raw % stride != 0))) continue;
-                                    const int64_t oh = (stride == 1) ? oh_raw : (oh_raw / stride);
-                                    if (oh >= conv_out_h) continue;
-
-                                    const float* __restrict dp_row = &dp[oh * conv_out_w];
-                                    for (int64_t kw = 0; kw < k_w; ++kw) {
-                                        const int64_t ow_raw = iw + pad - kw;
-                                        if (ow_raw >= 0 && (stride == 1 ? true : (ow_raw % stride == 0))) {
-                                            const int64_t ow = (stride == 1) ? ow_raw : (ow_raw / stride);
-                                            if (ow < conv_out_w) {
-                                                sum0 += dp_row[ow] * wp0[kh * k_w + kw];
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            dx_p0[iw] = sum0;
                         }
                     }
                 }
@@ -314,55 +184,63 @@ void conv2d_backward_fallback_avx2(
         }
     }
 
-    // 2. dW Weight Gradient Pass (Persistent Accumulator per Tap)
+    // 2. dW Pass with pre-padded input tensor
     if (dW && x) {
-        #pragma omp parallel for collapse(2) schedule(static)
-        for (int64_t cout = 0; cout < C_out; ++cout) {
-            for (int64_t cin = 0; cin < C_in; ++cin) {
-                float* __restrict dw_target = &dW[(cout * C_in + cin) * k_spatial];
+        std::memset(dW, 0, C_out * C_in * k_spatial * sizeof(float));
+        const int64_t H_pad_x = H + 2 * pad;
+        const int64_t W_pad_x = W_in + 2 * pad;
+        const int64_t spatial_pad_x = H_pad_x * W_pad_x;
 
-                for (int64_t k = 0; k < k_spatial; ++k) {
-                    const int64_t kh = k / k_w;
-                    const int64_t kw = k % k_w;
-                    __m256 v_acc = _mm256_setzero_ps();
-                    float s_acc = 0.0f;
+        #pragma omp parallel
+        {
+            std::vector<float> x_padded_slice(spatial_pad_x, 0.0f);
+            std::vector<float> dw_local(k_spatial, 0.0f);
+
+            #pragma omp for collapse(2) schedule(static)
+            for (int64_t cout = 0; cout < C_out; ++cout) {
+                for (int64_t cin = 0; cin < C_in; ++cin) {
+                    std::fill(dw_local.begin(), dw_local.end(), 0.0f);
 
                     for (int64_t n = 0; n < N; ++n) {
                         const float* __restrict dp = &d_conv_buf[(n * C_out + cout) * conv_spatial];
                         const float* __restrict xp = &x[(n * C_in + cin) * spatial_in];
 
-                        for (int64_t oh = 0; oh < conv_out_h; ++oh) {
-                            const int64_t ih = oh * stride - pad + kh;
-                            if (ih < 0 || ih >= H) continue;
+                        // Pre-pad input tensor once
+                        std::fill(x_padded_slice.begin(), x_padded_slice.end(), 0.0f);
+                        float* __restrict dest_xp_ptr = &x_padded_slice[pad * W_pad_x + pad];
+                        for (int64_t h = 0; h < H; ++h) {
+                            std::memcpy(dest_xp_ptr + h * W_pad_x, xp + h * W_in, W_in * sizeof(float));
+                        }
 
-                            const float* __restrict dr = &dp[oh * conv_out_w];
-                            const float* __restrict xr = &xp[ih * W_in];
+                        for (int64_t kh = 0; kh < k_h; ++kh) {
+                            for (int64_t kw = 0; kw < k_w; ++kw) {
+                                const int64_t tap_idx = kh * k_w + kw;
+                                __m256 v_acc = _mm256_setzero_ps();
+                                float s_acc = 0.0f;
 
-                            int64_t ow = 0;
-                            if (stride == 1) {
-                                for (; ow + 8 <= conv_out_w; ow += 8) {
-                                    const int64_t iw0 = ow - pad + kw;
-                                    if (iw0 >= 0 && (iw0 + 8) <= W_in) {
-                                        v_acc = _mm256_fmadd_ps(_mm256_loadu_ps(&dr[ow]), _mm256_loadu_ps(&xr[iw0]), v_acc);
-                                    } else {
-                                        for (int s = 0; s < 8; ++s) {
-                                            const int64_t cur_iw = iw0 + s;
-                                            if (cur_iw >= 0 && cur_iw < W_in) s_acc += dr[ow + s] * xr[cur_iw];
+                                for (int64_t oh = 0; oh < conv_out_h; ++oh) {
+                                    const float* __restrict dr_row = &dp[oh * conv_out_w];
+                                    const float* __restrict xr_row = &x_padded_slice[(oh * stride + kh) * W_pad_x + kw];
+
+                                    int64_t ow = 0;
+                                    if (stride == 1) {
+                                        for (; ow + 8 <= conv_out_w; ow += 8) {
+                                            v_acc = _mm256_fmadd_ps(_mm256_loadu_ps(&dr_row[ow]), _mm256_loadu_ps(&xr_row[ow]), v_acc);
                                         }
                                     }
+                                    for (; ow < conv_out_w; ++ow) {
+                                        s_acc += dr_row[ow] * xr_row[ow * stride];
+                                    }
                                 }
-                            }
-
-                            for (; ow < conv_out_w; ++ow) {
-                                const int64_t iw = ow * stride - pad + kw;
-                                if (iw >= 0 && iw < W_in) s_acc += dr[ow] * xr[iw];
+                                dw_local[tap_idx] += hsum256_ps(v_acc) + s_acc;
                             }
                         }
                     }
 
-                    alignas(32) float b[8];
-                    _mm256_store_ps(b, v_acc);
-                    dw_target[k] = ((b[0]+b[1]+b[2]+b[3]) + (b[4]+b[5]+b[6]+b[7]) + s_acc) * inv_m;
+                    float* __restrict dw_target = &dW[(cout * C_in + cin) * k_spatial];
+                    for (int64_t k = 0; k < k_spatial; ++k) {
+                        dw_target[k] = dw_local[k] * inv_m;
+                    }
                 }
             }
         }
