@@ -39,7 +39,6 @@ void conv2d_forward_fallback_avx2(
             float* __restrict out_ptr = &out[(n * C_out + cout) * spatial_out];
             const __m256 vb = bias ? _mm256_set1_ps(bias[cout]) : v_zero;
 
-            // Initialize entire output slice (including padding stride)
             int64_t sp = 0;
             for (; sp + 7 < spatial_out; sp += 8) {
                 _mm256_storeu_ps(&out_ptr[sp], vb);
@@ -53,12 +52,133 @@ void conv2d_forward_fallback_avx2(
                 const int64_t ih_base = oh * stride - pad;
 
                 if (stride == 1) {
-                    // LOOP PEELING: Mathematically isolate the safe interior
                     const int64_t ow_safe_start = std::min(out_w, pad);
                     const int64_t ow_safe_end   = std::max(ow_safe_start, out_w - pad);
 
-                    // 1. Left Edge (Padding overlap)
-                    for (int64_t ow = 0; ow < ow_safe_start; ++ow) {
+                    // 1. Left Edge (100% Vectorized with Masks)
+                    for (int64_t ow = 0; ow < ow_safe_start; ow += 8) {
+                        int64_t count = std::min((int64_t)8, ow_safe_start - ow);
+                        __m256i out_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(count), v_idx);
+                        __m256 vo0 = _mm256_maskload_ps(&out_row[ow], out_mask);
+                        
+                        const float* xp_ptr = &x[n * C_in * spatial_in];
+                        const float* wp_ptr = &W[cout * C_in * k_spatial];
+                        for (int64_t cin = 0; cin < C_in; ++cin) {
+                            for (int64_t kh = 0; kh < k_h; ++kh) {
+                                const int64_t ih = ih_base + kh;
+                                if (ih < 0 || ih >= H) continue;
+                                const float* in_row = xp_ptr + ih * W_in_stride;
+                                const float* w_row  = wp_ptr + kh * k_w;
+                                for (int64_t kw = 0; kw < k_w; ++kw) {
+                                    const int64_t iw_base_k = ow - pad + kw;
+                                    __m256i viw = _mm256_add_epi32(_mm256_set1_epi32(iw_base_k), v_idx);
+                                    __m256i m1 = _mm256_cmpgt_epi32(viw, _mm256_set1_epi32(-1));
+                                    __m256i m2 = _mm256_cmpgt_epi32(_mm256_set1_epi32(W_in), viw);
+                                    __m256i in_mask = _mm256_and_si256(_mm256_and_si256(m1, m2), out_mask);
+                                    
+                                    __m256 vw = _mm256_set1_ps(w_row[kw]);
+                                    __m256 vi0 = _mm256_maskload_ps(&in_row[iw_base_k], in_mask);
+                                    vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
+                                }
+                            }
+                            xp_ptr += spatial_in;
+                            wp_ptr += k_spatial;
+                        }
+                        _mm256_maskstore_ps(&out_row[ow], out_mask, vo0);
+                    }
+
+                    // 2. Safe Middle (Zero Bounds Checks, Fast Unaligned Loads)
+                    int64_t ow = ow_safe_start;
+                    for (; ow + 15 < ow_safe_end; ow += 16) {
+                        __m256 vo0 = _mm256_loadu_ps(&out_row[ow]);
+                        __m256 vo1 = _mm256_loadu_ps(&out_row[ow + 8]);
+
+                        const float* xp_ptr = &x[n * C_in * spatial_in];
+                        const float* wp_ptr = &W[cout * C_in * k_spatial];
+                        for (int64_t cin = 0; cin < C_in; ++cin) {
+                            for (int64_t kh = 0; kh < k_h; ++kh) {
+                                const int64_t ih = ih_base + kh;
+                                if (ih < 0 || ih >= H) continue;
+
+                                const float* in_row = xp_ptr + ih * W_in_stride;
+                                const float* w_row  = wp_ptr + kh * k_w;
+                                for (int64_t kw = 0; kw < k_w; ++kw) {
+                                    const __m256 vw = _mm256_set1_ps(w_row[kw]);
+                                    const int64_t iw = ow - pad + kw;
+                                    
+                                    __m256 vi0 = _mm256_loadu_ps(&in_row[iw]);
+                                    __m256 vi1 = _mm256_loadu_ps(&in_row[iw + 8]);
+                                    vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
+                                    vo1 = _mm256_fmadd_ps(vi1, vw, vo1);
+                                }
+                            }
+                            xp_ptr += spatial_in;
+                            wp_ptr += k_spatial;
+                        }
+                        _mm256_storeu_ps(&out_row[ow], vo0);
+                        _mm256_storeu_ps(&out_row[ow + 8], vo1);
+                    }
+                    
+                    for (; ow + 7 < ow_safe_end; ow += 8) {
+                        __m256 vo0 = _mm256_loadu_ps(&out_row[ow]);
+                        const float* xp_ptr = &x[n * C_in * spatial_in];
+                        const float* wp_ptr = &W[cout * C_in * k_spatial];
+
+                        for (int64_t cin = 0; cin < C_in; ++cin) {
+                            for (int64_t kh = 0; kh < k_h; ++kh) {
+                                const int64_t ih = ih_base + kh;
+                                if (ih < 0 || ih >= H) continue;
+
+                                const float* in_row = xp_ptr + ih * W_in_stride;
+                                const float* w_row  = wp_ptr + kh * k_w;
+                                for (int64_t kw = 0; kw < k_w; ++kw) {
+                                    const __m256 vw = _mm256_set1_ps(w_row[kw]);
+                                    const int64_t iw = ow - pad + kw;
+                                    
+                                    __m256 vi0 = _mm256_loadu_ps(&in_row[iw]);
+                                    vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
+                                }
+                            }
+                            xp_ptr += spatial_in;
+                            wp_ptr += k_spatial;
+                        }
+                        _mm256_storeu_ps(&out_row[ow], vo0);
+                    }
+
+                    // 3. Right Edge + Tails (100% Vectorized with Masks)
+                    for (; ow < out_w; ow += 8) {
+                        int64_t count = std::min((int64_t)8, out_w - ow);
+                        __m256i out_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(count), v_idx);
+                        __m256 vo0 = _mm256_maskload_ps(&out_row[ow], out_mask);
+                        
+                        const float* xp_ptr = &x[n * C_in * spatial_in];
+                        const float* wp_ptr = &W[cout * C_in * k_spatial];
+                        for (int64_t cin = 0; cin < C_in; ++cin) {
+                            for (int64_t kh = 0; kh < k_h; ++kh) {
+                                const int64_t ih = ih_base + kh;
+                                if (ih < 0 || ih >= H) continue;
+                                const float* in_row = xp_ptr + ih * W_in_stride;
+                                const float* w_row  = wp_ptr + kh * k_w;
+                                for (int64_t kw = 0; kw < k_w; ++kw) {
+                                    const int64_t iw_base_k = ow - pad + kw;
+                                    __m256i viw = _mm256_add_epi32(_mm256_set1_epi32(iw_base_k), v_idx);
+                                    __m256i m1 = _mm256_cmpgt_epi32(viw, _mm256_set1_epi32(-1));
+                                    __m256i m2 = _mm256_cmpgt_epi32(_mm256_set1_epi32(W_in), viw);
+                                    __m256i in_mask = _mm256_and_si256(_mm256_and_si256(m1, m2), out_mask);
+                                    
+                                    __m256 vw = _mm256_set1_ps(w_row[kw]);
+                                    __m256 vi0 = _mm256_maskload_ps(&in_row[iw_base_k], in_mask);
+                                    vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
+                                }
+                            }
+                            xp_ptr += spatial_in;
+                            wp_ptr += k_spatial;
+                        }
+                        _mm256_maskstore_ps(&out_row[ow], out_mask, vo0);
+                    }
+                } else {
+                    // Stride > 1 Fallback
+                    for (int64_t ow = 0; ow < out_w; ++ow) {
                         float val = out_row[ow];
                         const float* xp_ptr = &x[n * C_in * spatial_in];
                         const float* wp_ptr = &W[cout * C_in * k_spatial];
@@ -70,131 +190,6 @@ void conv2d_forward_fallback_avx2(
                                     const float* in_row = xp_ptr + ih * W_in_stride;
                                     const float* w_row  = wp_ptr + kh * k_w;
                                     for (int64_t kw = 0; kw < k_w; ++kw) {
-                                        const int64_t iw = ow - pad + kw;
-                                        if (iw >= 0 && iw < W_in) {
-                                            val += in_row[iw] * w_row[kw];
-                                        }
-                                    }
-                                }
-                            }
-                            xp_ptr += spatial_in;
-                            wp_ptr += k_spatial;
-                        }
-                        out_row[ow] = val;
-                    }
-
-                    // 2. Safe Middle (100% Vectorized, ZERO bounds checks)
-                    int64_t ow = ow_safe_start;
-                    for (; ow + 15 < ow_safe_end; ow += 16) {
-                        __m256 vo0 = _mm256_loadu_ps(&out_row[ow]);
-                        __m256 vo1 = _mm256_loadu_ps(&out_row[ow + 8]);
-
-                        // Pure Pointer Initialization
-                        const float* xp_ptr = &x[n * C_in * spatial_in];
-                        const float* wp_ptr = &W[cout * C_in * k_spatial];
-
-                        for (int64_t cin = 0; cin < C_in; ++cin) {
-                            for (int64_t kh = 0; kh < k_h; ++kh) {
-                                const int64_t ih = ih_base + kh;
-                                if (ih < 0 || ih >= H) continue;
-
-                                const float* in_row = xp_ptr + ih * W_in_stride;
-                                const float* w_row  = wp_ptr + kh * k_w;
-
-                                for (int64_t kw = 0; kw < k_w; ++kw) {
-                                    const __m256 vw = _mm256_set1_ps(w_row[kw]);
-                                    const int64_t iw = ow - pad + kw;
-                                    
-                                    __m256 vi0 = _mm256_loadu_ps(&in_row[iw]);
-                                    __m256 vi1 = _mm256_loadu_ps(&in_row[iw + 8]);
-                                    
-                                    vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
-                                    vo1 = _mm256_fmadd_ps(vi1, vw, vo1);
-                                }
-                            }
-                            // Pointer Arithmetic (Zero `imul`)
-                            xp_ptr += spatial_in;
-                            wp_ptr += k_spatial;
-                        }
-                        _mm256_storeu_ps(&out_row[ow], vo0);
-                        _mm256_storeu_ps(&out_row[ow + 8], vo1);
-                    }
-                    
-                    for (; ow + 7 < ow_safe_end; ow += 8) {
-                        __m256 vo0 = _mm256_loadu_ps(&out_row[ow]);
-
-                        const float* xp_ptr = &x[n * C_in * spatial_in];
-                        const float* wp_ptr = &W[cout * C_in * k_spatial];
-
-                        for (int64_t cin = 0; cin < C_in; ++cin) {
-                            for (int64_t kh = 0; kh < k_h; ++kh) {
-                                const int64_t ih = ih_base + kh;
-                                if (ih < 0 || ih >= H) continue;
-
-                                const float* in_row = xp_ptr + ih * W_in_stride;
-                                const float* w_row  = wp_ptr + kh * k_w;
-
-                                for (int64_t kw = 0; kw < k_w; ++kw) {
-                                    const __m256 vw = _mm256_set1_ps(w_row[kw]);
-                                    const int64_t iw = ow - pad + kw;
-                                    
-                                    __m256 vi0 = _mm256_loadu_ps(&in_row[iw]);
-                                    vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
-                                }
-                            }
-                            xp_ptr += spatial_in;
-                            wp_ptr += k_spatial;
-                        }
-                        _mm256_storeu_ps(&out_row[ow], vo0);
-                    }
-
-                    // Masked Tail handling
-                    int64_t rem = out_w - ow;
-                    if (rem > 0) {
-                        __m256i mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(rem), v_idx);
-                        __m256 vo0 = _mm256_maskload_ps(&out_row[ow], mask);
-
-                        const float* xp_ptr = &x[n * C_in * spatial_in];
-                        const float* wp_ptr = &W[cout * C_in * k_spatial];
-
-                        for (int64_t cin = 0; cin < C_in; ++cin) {
-                            for (int64_t kh = 0; kh < k_h; ++kh) {
-                                const int64_t ih = ih_base + kh;
-                                if (ih < 0 || ih >= H) continue;
-
-                                const float* in_row = xp_ptr + ih * W_in_stride;
-                                const float* w_row  = wp_ptr + kh * k_w;
-
-                                for (int64_t kw = 0; kw < k_w; ++kw) {
-                                    const __m256 vw = _mm256_set1_ps(w_row[kw]);
-                                    const int64_t iw = ow - pad + kw;
-                                    
-                                    __m256 vi0 = _mm256_maskload_ps(&in_row[iw], mask);
-                                    vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
-                                }
-                            }
-                            xp_ptr += spatial_in;
-                            wp_ptr += k_spatial;
-                        }
-                        _mm256_maskstore_ps(&out_row[ow], mask, vo0);
-                    }
-                } else {
-                    // Stride > 1 Fallback
-                    const float* xp_ptr = &x[n * C_in * spatial_in];
-                    const float* wp_ptr = &W[cout * C_in * k_spatial];
-
-                    for (int64_t ow = 0; ow < out_w; ++ow) {
-                        float val = out_row[ow];
-                        const float* xp_local = xp_ptr;
-                        const float* wp_local = wp_ptr;
-                        
-                        for (int64_t cin = 0; cin < C_in; ++cin) {
-                            for (int64_t kh = 0; kh < k_h; ++kh) {
-                                const int64_t ih = ih_base + kh;
-                                if (ih >= 0 && ih < H) {
-                                    const float* in_row = xp_local + ih * W_in_stride;
-                                    const float* w_row  = wp_local + kh * k_w;
-                                    for (int64_t kw = 0; kw < k_w; ++kw) {
                                         const int64_t iw = ow * stride - pad + kw;
                                         if (iw >= 0 && iw < W_in) {
                                             val += in_row[iw] * w_row[kw];
@@ -202,15 +197,14 @@ void conv2d_forward_fallback_avx2(
                                     }
                                 }
                             }
-                            xp_local += spatial_in;
-                            wp_local += k_spatial;
+                            xp_ptr += spatial_in;
+                            wp_ptr += k_spatial;
                         }
                         out_row[ow] = val;
                     }
                 }
             }
 
-            // Fuse ReLU inline
             if (fuse_relu) {
                 int64_t i = 0;
                 for (; i + 7 < spatial_out; i += 8) {
@@ -244,7 +238,7 @@ void conv2d_backward_fallback_avx2(
     const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
 
     // ------------------------------------------------------------------------
-    // dX Backward
+    // 1. dX Backward
     // ------------------------------------------------------------------------
     if (dx && W) {
         std::memset(dx, 0, N * C_in * spatial_in * sizeof(float));
@@ -312,7 +306,6 @@ void conv2d_backward_fallback_avx2(
                                         dp_ptr += conv_spatial;
                                         wp_ptr += C_in * k_spatial;
                                     }
-                                    
                                     _mm256_storeu_ps(&dx_row[iw_start + i], v_dx0);
                                 }
                                 
@@ -332,7 +325,6 @@ void conv2d_backward_fallback_avx2(
                                         dp_ptr += conv_spatial;
                                         wp_ptr += C_in * k_spatial;
                                     }
-                                    
                                     _mm256_maskstore_ps(&dx_row[iw_start + i], mask, v_dx0);
                                 }
                             } else {
@@ -363,55 +355,47 @@ void conv2d_backward_fallback_avx2(
     }
 
     // ------------------------------------------------------------------------
-    // dW Backward: Multi-Accumulator Setup
+    // 2. dW Backward: Register Accumulators (Zero Stack Spilling)
     // ------------------------------------------------------------------------
     if (dW && x) {
-        std::memset(dW, 0, C_out * C_in * k_spatial * sizeof(float));
-
         #pragma omp parallel for collapse(2) schedule(static)
         for (int64_t cout = 0; cout < C_out; ++cout) {
             for (int64_t cin = 0; cin < C_in; ++cin) {
                 float* __restrict dw_target = &dW[(cout * C_in + cin) * k_spatial];
                 
-                __m256 tap_sums_main[64];
-                __m256 tap_sums_tail[64];
-                float tap_scalars[64]; 
-                
-                for(int i = 0; i < 64; ++i) {
-                    tap_sums_main[i] = _mm256_setzero_ps();
-                    tap_sums_tail[i] = _mm256_setzero_ps();
-                    tap_scalars[i]   = 0.0f;
-                }
+                for (int64_t kh = 0; kh < k_h; ++kh) {
+                    for (int64_t kw = 0; kw < k_w; ++kw) {
+                        const int64_t tap_idx = kh * k_w + kw;
+                        
+                        if (stride == 1) {
+                            const int64_t iw_base = -pad + kw;
+                            const int64_t ow_start = std::max((int64_t)0, -iw_base);
+                            const int64_t ow_end   = std::min(conv_out_w, W_in - iw_base);
+                            const int64_t count    = ow_end - ow_start;
+                            
+                            if (count <= 0) {
+                                dw_target[tap_idx] = 0.0f;
+                                continue;
+                            }
+                            
+                            const int64_t iw_start = ow_start + iw_base;
 
-                for (int64_t n = 0; n < N; ++n) {
-                    const float* __restrict dp = &d_conv_buf[(n * C_out + cout) * conv_spatial];
-                    const float* __restrict xp = &x[(n * C_in + cin) * spatial_in];
+                            __m256 v_acc0 = _mm256_setzero_ps();
+                            __m256 v_acc1 = _mm256_setzero_ps();
+                            __m256 v_tail = _mm256_setzero_ps();
 
-                    for (int64_t oh = 0; oh < conv_out_h; ++oh) {
-                        const float* __restrict dr_row = &dp[oh * conv_out_w_stride];
+                            for (int64_t n = 0; n < N; ++n) {
+                                const float* dp_n = &d_conv_buf[(n * C_out + cout) * conv_spatial];
+                                const float* xp_n = &x[(n * C_in + cin) * spatial_in];
 
-                        for (int64_t kh = 0; kh < k_h; ++kh) {
-                            const int64_t ih = oh * stride - pad + kh;
-                            if (ih < 0 || ih >= H) continue;
+                                for (int64_t oh = 0; oh < conv_out_h; ++oh) {
+                                    const int64_t ih = oh * stride - pad + kh;
+                                    if (ih < 0 || ih >= H) continue;
 
-                            const float* __restrict xr_row = &xp[ih * W_in_stride];
-
-                            for (int64_t kw = 0; kw < k_w; ++kw) {
-                                const int64_t tap_idx = kh * k_w + kw;
-
-                                if (stride == 1) {
-                                    const int64_t iw_start = std::max((int64_t)0, -pad + kw);
-                                    const int64_t ow_start = iw_start + pad - kw;
-                                    const int64_t count = std::min(conv_out_w - ow_start, W_in - iw_start);
-
-                                    if (count <= 0) continue;
+                                    const float* dr_row = &dp_n[oh * conv_out_w_stride];
+                                    const float* xr_row = &xp_n[ih * W_in_stride];
 
                                     int64_t i = 0;
-                                    
-                                    // Dual accumulators break the FMA latency chain (Shaves the final 300us)
-                                    __m256 v_acc0 = tap_sums_main[tap_idx];
-                                    __m256 v_acc1 = _mm256_setzero_ps();
-                                    
                                     for (; i + 15 < count; i += 16) {
                                         __m256 r0 = _mm256_loadu_ps(&dr_row[ow_start + i]);
                                         __m256 x0 = _mm256_loadu_ps(&xr_row[iw_start + i]);
@@ -427,34 +411,45 @@ void conv2d_backward_fallback_avx2(
                                         v_acc0 = _mm256_fmadd_ps(r0, x0, v_acc0);
                                     }
                                     
-                                    tap_sums_main[tap_idx] = _mm256_add_ps(v_acc0, v_acc1);
-
                                     int64_t rem = count - i;
                                     if (rem > 0) {
                                         __m256i mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(rem), v_idx);
                                         __m256 r0 = _mm256_maskload_ps(&dr_row[ow_start + i], mask);
                                         __m256 x0 = _mm256_maskload_ps(&xr_row[iw_start + i], mask);
-                                        tap_sums_tail[tap_idx] = _mm256_fmadd_ps(r0, x0, tap_sums_tail[tap_idx]);
+                                        v_tail = _mm256_fmadd_ps(r0, x0, v_tail);
                                     }
-                                } else {
-                                    float row_acc = 0.0f;
-                                    for (int64_t ow = 0; ow < conv_out_w; ++ow) {
-                                        const int64_t iw = ow * stride - pad + kw;
-                                        if (iw >= 0 && iw < W_in) {
-                                            row_acc += dr_row[ow] * xr_row[iw];
-                                        }
-                                    }
-                                    tap_scalars[tap_idx] += row_acc;
                                 }
                             }
+                            
+                            __m256 v_total = _mm256_add_ps(v_acc0, _mm256_add_ps(v_acc1, v_tail));
+                            dw_target[tap_idx] = _mm256_reduce_add_ps(v_total) * inv_m;
+
+                        } else {
+                            float tap_sum = 0.0f;
+                            const int64_t iw_base = -pad + kw;
+
+                            for (int64_t n = 0; n < N; ++n) {
+                                const float* dp_n = &d_conv_buf[(n * C_out + cout) * conv_spatial];
+                                const float* xp_n = &x[(n * C_in + cin) * spatial_in];
+
+                                for (int64_t oh = 0; oh < conv_out_h; ++oh) {
+                                    const int64_t ih = oh * stride - pad + kh;
+                                    if (ih < 0 || ih >= H) continue;
+
+                                    const float* dr_row = &dp_n[oh * conv_out_w_stride];
+                                    const float* xr_row = &xp_n[ih * W_in_stride];
+
+                                    for (int64_t ow = 0; ow < conv_out_w; ++ow) {
+                                        const int64_t iw = ow * stride + iw_base;
+                                        if (iw >= 0 && iw < W_in) {
+                                            tap_sum += dr_row[ow] * xr_row[iw];
+                                        }
+                                    }
+                                }
+                            }
+                            dw_target[tap_idx] = tap_sum * inv_m;
                         }
                     }
-                }
-
-                for (int64_t k = 0; k < k_spatial; ++k) {
-                    __m256 v_total = _mm256_add_ps(tap_sums_main[k], tap_sums_tail[k]);
-                    float tap_sum = _mm256_reduce_add_ps(v_total) + tap_scalars[k];
-                    dw_target[k] = tap_sum * inv_m;
                 }
             }
         }
