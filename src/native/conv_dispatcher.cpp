@@ -230,40 +230,75 @@ __declspec(dllexport) int32_t direct_conv_block_forward_avx2(
             const int64_t conv_out_w = (W_in + 2 * conv_pad - k_w) / conv_stride + 1;
             const int64_t pool_out_h = (conv_out_h - pool_size) / pool_stride + 1;
             const int64_t pool_out_w = (conv_out_w - pool_size) / pool_stride + 1;
-            const int64_t conv_spatial = conv_out_h * conv_out_w_stride;
-            const int64_t pool_spatial = pool_out_h * pool_out_w;
+    const int64_t conv_spatial = conv_out_h * conv_out_w_stride;
+    const int64_t pool_spatial = pool_out_h * pool_out_w;
 
-            #pragma omp parallel for collapse(2) schedule(static)
-            for (int64_t n = 0; n < N; ++n) {
-                for (int64_t c = 0; c < C_out; ++c) {
-                    const float* __restrict cp = &out_conv[(n * C_out + c) * conv_spatial];
-                    float* __restrict pp = &out_pool[(n * C_out + c) * pool_spatial];
-                    uint8_t* __restrict ap = &argmax_buf[(n * C_out + c) * pool_spatial];
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t c = 0; c < C_out; ++c) {
+            const float* __restrict cp = &out_conv[(n * C_out + c) * conv_spatial];
+            float* __restrict pp = &out_pool[(n * C_out + c) * pool_spatial];
+            uint8_t* __restrict ap = &argmax_buf[(n * C_out + c) * pool_spatial];
 
-                    for (int64_t ph = 0; ph < pool_out_h; ++ph) {
-                        for (int64_t pw = 0; pw < pool_out_w; ++pw) {
-                            float max_val = -1e30f;
-                            uint8_t max_idx = 0;
+            if (pool_size == 2 && pool_stride == 2) {
+                // 2x2 Fast Path - Perfectly Unrolled, Zero Index Math, Register Bound
+                for (int64_t ph = 0; ph < pool_out_h; ++ph) {
+                    const float* __restrict r0 = cp + (ph * 2) * conv_out_w_stride;
+                    const float* __restrict r1 = r0 + conv_out_w_stride;
+                    
+                    float* __restrict p_row = pp + ph * pool_out_w;
+                    uint8_t* __restrict a_row = ap + ph * pool_out_w;
 
-                            for (int64_t kh = 0; kh < pool_size; ++kh) {
-                                for (int64_t kw = 0; kw < pool_size; ++kw) {
-                                    const int64_t ih = ph * pool_stride + kh;
-                                    const int64_t iw = pw * pool_stride + kw;
-                                    const float val = cp[ih * conv_out_w_stride + iw];
-                                    if (val > max_val) {
-                                        max_val = val;
-                                        max_idx = (uint8_t)(kh * pool_size + kw);
-                                    }
+                    for (int64_t pw = 0; pw < pool_out_w; ++pw) {
+                        const int64_t iw = pw * 2;
+                        
+                        // Force compiler to keep these in XMM registers
+                        const float v0 = r0[iw];
+                        const float v1 = r0[iw + 1];
+                        const float v2 = r1[iw];
+                        const float v3 = r1[iw + 1];
+
+                        float max_val = v0;
+                        uint8_t max_idx = 0;
+
+                        if (v1 > max_val) { max_val = v1; max_idx = 1; }
+                        if (v2 > max_val) { max_val = v2; max_idx = 2; }
+                        if (v3 > max_val) { max_val = v3; max_idx = 3; }
+
+                        p_row[pw] = max_val;
+                        a_row[pw] = max_idx;
+                    }
+                }
+            } else {
+                // Generic Pointer-Stepped Fallback (Zero nested imul)
+                for (int64_t ph = 0; ph < pool_out_h; ++ph) {
+                    const float* __restrict in_row_base = cp + (ph * pool_stride) * conv_out_w_stride;
+                    float* __restrict p_row = pp + ph * pool_out_w;
+                    uint8_t* __restrict a_row = ap + ph * pool_out_w;
+
+                    for (int64_t pw = 0; pw < pool_out_w; ++pw) {
+                        const float* __restrict in_ptr = in_row_base + (pw * pool_stride);
+                        
+                        float max_val = -1e30f;
+                        uint8_t max_idx = 0;
+
+                        for (int64_t kh = 0; kh < pool_size; ++kh) {
+                            const float* __restrict k_row = in_ptr + kh * conv_out_w_stride;
+                            for (int64_t kw = 0; kw < pool_size; ++kw) {
+                                const float val = k_row[kw];
+                                if (val > max_val) {
+                                    max_val = val;
+                                    max_idx = (uint8_t)(kh * pool_size + kw);
                                 }
                             }
-
-                            const int64_t p_idx = ph * pool_out_w + pw;
-                            pp[p_idx] = max_val;
-                            ap[p_idx] = max_idx;
                         }
+                        p_row[pw] = max_val;
+                        a_row[pw] = max_idx;
                     }
                 }
             }
+        }
+    }
         }
         return 0;
     } catch (const std::exception& e) {

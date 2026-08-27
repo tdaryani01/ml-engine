@@ -24,9 +24,6 @@ void conv2d_forward_fallback_avx2(
     int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride, int64_t pad,
     int64_t out_w_stride, int32_t fuse_relu
 ) {
-    // DIAG_INC(fwd_fallback);
-    // TIME_SCOPE(time_fwd_fallback_ns);
-
     const int64_t out_h = (H + 2 * pad - k_h) / stride + 1;
     const int64_t out_w = (W_in + 2 * pad - k_w) / stride + 1;
     const int64_t spatial_out = out_h * out_w_stride;
@@ -51,107 +48,164 @@ void conv2d_forward_fallback_avx2(
                 out_ptr[sp] = bias ? bias[cout] : 0.0f;
             }
 
-            for (int64_t kh = 0; kh < k_h; ++kh) {
-                for (int64_t kw = 0; kw < k_w; ++kw) {
-                    const int64_t iw_base = -pad + kw;
-                    
-                    // Safely bounds-check the row so we never need a scalar fallback!
-                    const int64_t ow_start = (stride == 1) ? std::max((int64_t)0, -iw_base) : 0;
-                    const int64_t ow_end   = (stride == 1) ? std::min(out_w, W_in - iw_base) : out_w;
-                    const int64_t count    = ow_end - ow_start;
-                    
-                    if (stride == 1 && count <= 0) continue;
-                    const int64_t iw_start = ow_start + iw_base;
+            for (int64_t oh = 0; oh < out_h; ++oh) {
+                float* __restrict out_row = &out_ptr[oh * out_w_stride];
+                const int64_t ih_base = oh * stride - pad;
 
-                    for (int64_t oh = 0; oh < out_h; ++oh) {
-                        const int64_t ih = oh * stride - pad + kh;
-                        if (ih < 0 || ih >= H) continue;
+                if (stride == 1) {
+                    // LOOP PEELING: Mathematically isolate the safe interior
+                    const int64_t ow_safe_start = std::min(out_w, pad);
+                    const int64_t ow_safe_end   = std::max(ow_safe_start, out_w - pad);
 
-                        float* __restrict out_row = &out_ptr[oh * out_w_stride];
+                    // 1. Left Edge (Padding overlap)
+                    for (int64_t ow = 0; ow < ow_safe_start; ++ow) {
+                        float val = out_row[ow];
+                        const float* xp_ptr = &x[n * C_in * spatial_in];
+                        const float* wp_ptr = &W[cout * C_in * k_spatial];
                         
-                        if (stride == 1) {
-                            const float* xp_base_ih = &x[n * C_in * spatial_in + ih * W_in_stride + iw_start];
-                            const float* wp_base_k  = &W[cout * C_in * k_spatial + kh * k_w + kw];
+                        for (int64_t cin = 0; cin < C_in; ++cin) {
+                            for (int64_t kh = 0; kh < k_h; ++kh) {
+                                const int64_t ih = ih_base + kh;
+                                if (ih >= 0 && ih < H) {
+                                    const float* in_row = xp_ptr + ih * W_in_stride;
+                                    const float* w_row  = wp_ptr + kh * k_w;
+                                    for (int64_t kw = 0; kw < k_w; ++kw) {
+                                        const int64_t iw = ow - pad + kw;
+                                        if (iw >= 0 && iw < W_in) {
+                                            val += in_row[iw] * w_row[kw];
+                                        }
+                                    }
+                                }
+                            }
+                            xp_ptr += spatial_in;
+                            wp_ptr += k_spatial;
+                        }
+                        out_row[ow] = val;
+                    }
 
-                            int64_t i = 0;
-                            for (; i + 15 < count; i += 16) {
-                                __m256 vo0 = _mm256_loadu_ps(&out_row[ow_start + i]);
-                                __m256 vo1 = _mm256_loadu_ps(&out_row[ow_start + i + 8]);
+                    // 2. Safe Middle (100% Vectorized, ZERO bounds checks)
+                    int64_t ow = ow_safe_start;
+                    for (; ow + 15 < ow_safe_end; ow += 16) {
+                        __m256 vo0 = _mm256_loadu_ps(&out_row[ow]);
+                        __m256 vo1 = _mm256_loadu_ps(&out_row[ow + 8]);
 
-                                const float* in_ptr = xp_base_ih + i;
-                                const float* wp_ptr = wp_base_k;
+                        // Pure Pointer Initialization
+                        const float* xp_ptr = &x[n * C_in * spatial_in];
+                        const float* wp_ptr = &W[cout * C_in * k_spatial];
 
-                                for (int64_t cin = 0; cin < C_in; ++cin) {
-                                    const __m256 vw = _mm256_set1_ps(*wp_ptr);
-                                    __m256 vi0 = _mm256_loadu_ps(in_ptr);
-                                    __m256 vi1 = _mm256_loadu_ps(in_ptr + 8);
+                        for (int64_t cin = 0; cin < C_in; ++cin) {
+                            for (int64_t kh = 0; kh < k_h; ++kh) {
+                                const int64_t ih = ih_base + kh;
+                                if (ih < 0 || ih >= H) continue;
 
+                                const float* in_row = xp_ptr + ih * W_in_stride;
+                                const float* w_row  = wp_ptr + kh * k_w;
+
+                                for (int64_t kw = 0; kw < k_w; ++kw) {
+                                    const __m256 vw = _mm256_set1_ps(w_row[kw]);
+                                    const int64_t iw = ow - pad + kw;
+                                    
+                                    __m256 vi0 = _mm256_loadu_ps(&in_row[iw]);
+                                    __m256 vi1 = _mm256_loadu_ps(&in_row[iw + 8]);
+                                    
                                     vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
                                     vo1 = _mm256_fmadd_ps(vi1, vw, vo1);
-
-                                    in_ptr += spatial_in;
-                                    wp_ptr += k_spatial;
-                                }
-                                _mm256_storeu_ps(&out_row[ow_start + i], vo0);
-                                _mm256_storeu_ps(&out_row[ow_start + i + 8], vo1);
-                            }
-                            
-                            for (; i + 7 < count; i += 8) {
-                                __m256 vo0 = _mm256_loadu_ps(&out_row[ow_start + i]);
-                                const float* in_ptr = xp_base_ih + i;
-                                const float* wp_ptr = wp_base_k;
-
-                                for (int64_t cin = 0; cin < C_in; ++cin) {
-                                    const __m256 vw = _mm256_set1_ps(*wp_ptr);
-                                    __m256 vi0 = _mm256_loadu_ps(in_ptr);
-                                    vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
-                                    
-                                    in_ptr += spatial_in;
-                                    wp_ptr += k_spatial;
-                                }
-                                _mm256_storeu_ps(&out_row[ow_start + i], vo0);
-                            }
-                            
-                            // Masked Tail handling - No scalar loop needed!
-                            int64_t rem = count - i;
-                            if (rem > 0) {
-                                __m256i mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(rem), v_idx);
-                                __m256 vo0 = _mm256_maskload_ps(&out_row[ow_start + i], mask);
-                                
-                                const float* in_ptr = xp_base_ih + i;
-                                const float* wp_ptr = wp_base_k;
-
-                                for (int64_t cin = 0; cin < C_in; ++cin) {
-                                    const __m256 vw = _mm256_set1_ps(*wp_ptr);
-                                    __m256 vi0 = _mm256_maskload_ps(in_ptr, mask);
-                                    vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
-                                    
-                                    in_ptr += spatial_in;
-                                    wp_ptr += k_spatial;
-                                }
-                                _mm256_maskstore_ps(&out_row[ow_start + i], mask, vo0);
-                            }
-                        } else {
-                            // Stride > 1 Fallback
-                            const float* xp_base_ih = &x[n * C_in * spatial_in + ih * W_in_stride];
-                            const float* wp_base_k  = &W[cout * C_in * k_spatial + kh * k_w + kw];
-
-                            for (int64_t ow = 0; ow < out_w; ++ow) {
-                                const int64_t iw = ow * stride + iw_base;
-                                if (iw >= 0 && iw < W_in) {
-                                    float out_val = out_row[ow];
-                                    const float* in_ptr = xp_base_ih + iw;
-                                    const float* wp_ptr = wp_base_k;
-
-                                    for (int64_t cin = 0; cin < C_in; ++cin) {
-                                        out_val += (*in_ptr) * (*wp_ptr);
-                                        in_ptr += spatial_in;
-                                        wp_ptr += k_spatial;
-                                    }
-                                    out_row[ow] = out_val;
                                 }
                             }
+                            // Pointer Arithmetic (Zero `imul`)
+                            xp_ptr += spatial_in;
+                            wp_ptr += k_spatial;
                         }
+                        _mm256_storeu_ps(&out_row[ow], vo0);
+                        _mm256_storeu_ps(&out_row[ow + 8], vo1);
+                    }
+                    
+                    for (; ow + 7 < ow_safe_end; ow += 8) {
+                        __m256 vo0 = _mm256_loadu_ps(&out_row[ow]);
+
+                        const float* xp_ptr = &x[n * C_in * spatial_in];
+                        const float* wp_ptr = &W[cout * C_in * k_spatial];
+
+                        for (int64_t cin = 0; cin < C_in; ++cin) {
+                            for (int64_t kh = 0; kh < k_h; ++kh) {
+                                const int64_t ih = ih_base + kh;
+                                if (ih < 0 || ih >= H) continue;
+
+                                const float* in_row = xp_ptr + ih * W_in_stride;
+                                const float* w_row  = wp_ptr + kh * k_w;
+
+                                for (int64_t kw = 0; kw < k_w; ++kw) {
+                                    const __m256 vw = _mm256_set1_ps(w_row[kw]);
+                                    const int64_t iw = ow - pad + kw;
+                                    
+                                    __m256 vi0 = _mm256_loadu_ps(&in_row[iw]);
+                                    vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
+                                }
+                            }
+                            xp_ptr += spatial_in;
+                            wp_ptr += k_spatial;
+                        }
+                        _mm256_storeu_ps(&out_row[ow], vo0);
+                    }
+
+                    // Masked Tail handling
+                    int64_t rem = out_w - ow;
+                    if (rem > 0) {
+                        __m256i mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(rem), v_idx);
+                        __m256 vo0 = _mm256_maskload_ps(&out_row[ow], mask);
+
+                        const float* xp_ptr = &x[n * C_in * spatial_in];
+                        const float* wp_ptr = &W[cout * C_in * k_spatial];
+
+                        for (int64_t cin = 0; cin < C_in; ++cin) {
+                            for (int64_t kh = 0; kh < k_h; ++kh) {
+                                const int64_t ih = ih_base + kh;
+                                if (ih < 0 || ih >= H) continue;
+
+                                const float* in_row = xp_ptr + ih * W_in_stride;
+                                const float* w_row  = wp_ptr + kh * k_w;
+
+                                for (int64_t kw = 0; kw < k_w; ++kw) {
+                                    const __m256 vw = _mm256_set1_ps(w_row[kw]);
+                                    const int64_t iw = ow - pad + kw;
+                                    
+                                    __m256 vi0 = _mm256_maskload_ps(&in_row[iw], mask);
+                                    vo0 = _mm256_fmadd_ps(vi0, vw, vo0);
+                                }
+                            }
+                            xp_ptr += spatial_in;
+                            wp_ptr += k_spatial;
+                        }
+                        _mm256_maskstore_ps(&out_row[ow], mask, vo0);
+                    }
+                } else {
+                    // Stride > 1 Fallback
+                    const float* xp_ptr = &x[n * C_in * spatial_in];
+                    const float* wp_ptr = &W[cout * C_in * k_spatial];
+
+                    for (int64_t ow = 0; ow < out_w; ++ow) {
+                        float val = out_row[ow];
+                        const float* xp_local = xp_ptr;
+                        const float* wp_local = wp_ptr;
+                        
+                        for (int64_t cin = 0; cin < C_in; ++cin) {
+                            for (int64_t kh = 0; kh < k_h; ++kh) {
+                                const int64_t ih = ih_base + kh;
+                                if (ih >= 0 && ih < H) {
+                                    const float* in_row = xp_local + ih * W_in_stride;
+                                    const float* w_row  = wp_local + kh * k_w;
+                                    for (int64_t kw = 0; kw < k_w; ++kw) {
+                                        const int64_t iw = ow * stride - pad + kw;
+                                        if (iw >= 0 && iw < W_in) {
+                                            val += in_row[iw] * w_row[kw];
+                                        }
+                                    }
+                                }
+                            }
+                            xp_local += spatial_in;
+                            wp_local += k_spatial;
+                        }
+                        out_row[ow] = val;
                     }
                 }
             }
@@ -309,7 +363,7 @@ void conv2d_backward_fallback_avx2(
     }
 
     // ------------------------------------------------------------------------
-    // dW Backward
+    // dW Backward: Multi-Accumulator Setup
     // ------------------------------------------------------------------------
     if (dW && x) {
         std::memset(dW, 0, C_out * C_in * k_spatial * sizeof(float));
@@ -353,24 +407,27 @@ void conv2d_backward_fallback_avx2(
                                     if (count <= 0) continue;
 
                                     int64_t i = 0;
-                                    __m256 v_acc = tap_sums_main[tap_idx];
+                                    
+                                    // Dual accumulators break the FMA latency chain (Shaves the final 300us)
+                                    __m256 v_acc0 = tap_sums_main[tap_idx];
+                                    __m256 v_acc1 = _mm256_setzero_ps();
                                     
                                     for (; i + 15 < count; i += 16) {
                                         __m256 r0 = _mm256_loadu_ps(&dr_row[ow_start + i]);
                                         __m256 x0 = _mm256_loadu_ps(&xr_row[iw_start + i]);
-                                        v_acc = _mm256_fmadd_ps(r0, x0, v_acc);
+                                        v_acc0 = _mm256_fmadd_ps(r0, x0, v_acc0);
                                         
                                         __m256 r1 = _mm256_loadu_ps(&dr_row[ow_start + i + 8]);
                                         __m256 x1 = _mm256_loadu_ps(&xr_row[iw_start + i + 8]);
-                                        v_acc = _mm256_fmadd_ps(r1, x1, v_acc);
+                                        v_acc1 = _mm256_fmadd_ps(r1, x1, v_acc1);
                                     }
                                     for (; i + 7 < count; i += 8) {
                                         __m256 r0 = _mm256_loadu_ps(&dr_row[ow_start + i]);
                                         __m256 x0 = _mm256_loadu_ps(&xr_row[iw_start + i]);
-                                        v_acc = _mm256_fmadd_ps(r0, x0, v_acc);
+                                        v_acc0 = _mm256_fmadd_ps(r0, x0, v_acc0);
                                     }
                                     
-                                    tap_sums_main[tap_idx] = v_acc;
+                                    tap_sums_main[tap_idx] = _mm256_add_ps(v_acc0, v_acc1);
 
                                     int64_t rem = count - i;
                                     if (rem > 0) {
