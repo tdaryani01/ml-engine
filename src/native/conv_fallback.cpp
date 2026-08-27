@@ -355,16 +355,99 @@ void conv2d_backward_fallback_avx2(
     }
 
     // ------------------------------------------------------------------------
-    // 2. dW Backward: Register Accumulators (Zero Stack Spilling)
+    // 2. dW Backward: Register Tiled Accumulators (4x kernel unroll)
     // ------------------------------------------------------------------------
     if (dW && x) {
+        std::memset(dW, 0, C_out * C_in * k_spatial * sizeof(float));
+
         #pragma omp parallel for collapse(2) schedule(static)
         for (int64_t cout = 0; cout < C_out; ++cout) {
             for (int64_t cin = 0; cin < C_in; ++cin) {
                 float* __restrict dw_target = &dW[(cout * C_in + cin) * k_spatial];
                 
                 for (int64_t kh = 0; kh < k_h; ++kh) {
-                    for (int64_t kw = 0; kw < k_w; ++kw) {
+                    int64_t kw = 0;
+                    
+                    if (stride == 1) {
+                        // REGISTER TILING: Process 4 kernel width (kw) elements simultaneously
+                        for (; kw + 3 < k_w; kw += 4) {
+                            const int64_t iw_base_0 = -pad + kw;
+                            // Calculate safe bounds that apply to ALL 4 kw offsets
+                            const int64_t ow_start = std::max((int64_t)0, -iw_base_0);
+                            const int64_t ow_end   = std::min(conv_out_w, W_in - (-pad + kw + 3));
+                            const int64_t count    = ow_end - ow_start;
+                            
+                            if (count <= 0) break; // Drop to 1-wide fallback if padding is too extreme
+                            
+                            const int64_t iw_start_0 = ow_start + iw_base_0;
+
+                            __m256 v_acc0 = _mm256_setzero_ps();
+                            __m256 v_acc1 = _mm256_setzero_ps();
+                            __m256 v_acc2 = _mm256_setzero_ps();
+                            __m256 v_acc3 = _mm256_setzero_ps();
+                            
+                            __m256 v_t0 = _mm256_setzero_ps();
+                            __m256 v_t1 = _mm256_setzero_ps();
+                            __m256 v_t2 = _mm256_setzero_ps();
+                            __m256 v_t3 = _mm256_setzero_ps();
+
+                            for (int64_t n = 0; n < N; ++n) {
+                                const float* dp_n = &d_conv_buf[(n * C_out + cout) * conv_spatial];
+                                const float* xp_n = &x[(n * C_in + cin) * spatial_in];
+
+                                for (int64_t oh = 0; oh < conv_out_h; ++oh) {
+                                    const int64_t ih = oh * stride - pad + kh;
+                                    if (ih < 0 || ih >= H) continue;
+
+                                    const float* dr_row = &dp_n[oh * conv_out_w_stride];
+                                    const float* xr_row = &xp_n[ih * W_in_stride];
+
+                                    int64_t i = 0;
+                                    for (; i + 7 < count; i += 8) {
+                                        // Load upstream gradient ONCE
+                                        __m256 r0 = _mm256_loadu_ps(&dr_row[ow_start + i]);
+                                        
+                                        // Load 4 shifted input windows
+                                        __m256 x0 = _mm256_loadu_ps(&xr_row[iw_start_0 + i]);
+                                        __m256 x1 = _mm256_loadu_ps(&xr_row[iw_start_0 + i + 1]);
+                                        __m256 x2 = _mm256_loadu_ps(&xr_row[iw_start_0 + i + 2]);
+                                        __m256 x3 = _mm256_loadu_ps(&xr_row[iw_start_0 + i + 3]);
+                                        
+                                        // Accumulate 4 kernel gradients simultaneously!
+                                        v_acc0 = _mm256_fmadd_ps(r0, x0, v_acc0);
+                                        v_acc1 = _mm256_fmadd_ps(r0, x1, v_acc1);
+                                        v_acc2 = _mm256_fmadd_ps(r0, x2, v_acc2);
+                                        v_acc3 = _mm256_fmadd_ps(r0, x3, v_acc3);
+                                    }
+                                    
+                                    int64_t rem = count - i;
+                                    if (rem > 0) {
+                                        __m256i mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(rem), v_idx);
+                                        __m256 r0 = _mm256_maskload_ps(&dr_row[ow_start + i], mask);
+                                        
+                                        __m256 x0 = _mm256_maskload_ps(&xr_row[iw_start_0 + i], mask);
+                                        __m256 x1 = _mm256_maskload_ps(&xr_row[iw_start_0 + i + 1], mask);
+                                        __m256 x2 = _mm256_maskload_ps(&xr_row[iw_start_0 + i + 2], mask);
+                                        __m256 x3 = _mm256_maskload_ps(&xr_row[iw_start_0 + i + 3], mask);
+
+                                        v_t0 = _mm256_fmadd_ps(r0, x0, v_t0);
+                                        v_t1 = _mm256_fmadd_ps(r0, x1, v_t1);
+                                        v_t2 = _mm256_fmadd_ps(r0, x2, v_t2);
+                                        v_t3 = _mm256_fmadd_ps(r0, x3, v_t3);
+                                    }
+                                }
+                            }
+                            
+                            const int64_t base_idx = kh * k_w + kw;
+                            dw_target[base_idx + 0] = _mm256_reduce_add_ps(_mm256_add_ps(v_acc0, v_t0)) * inv_m;
+                            dw_target[base_idx + 1] = _mm256_reduce_add_ps(_mm256_add_ps(v_acc1, v_t1)) * inv_m;
+                            dw_target[base_idx + 2] = _mm256_reduce_add_ps(_mm256_add_ps(v_acc2, v_t2)) * inv_m;
+                            dw_target[base_idx + 3] = _mm256_reduce_add_ps(_mm256_add_ps(v_acc3, v_t3)) * inv_m;
+                        }
+                    }
+                    
+                    // 1-wide fallback for remaining kw (or all kw if stride > 1)
+                    for (; kw < k_w; ++kw) {
                         const int64_t tap_idx = kh * k_w + kw;
                         
                         if (stride == 1) {
@@ -373,15 +456,11 @@ void conv2d_backward_fallback_avx2(
                             const int64_t ow_end   = std::min(conv_out_w, W_in - iw_base);
                             const int64_t count    = ow_end - ow_start;
                             
-                            if (count <= 0) {
-                                dw_target[tap_idx] = 0.0f;
-                                continue;
-                            }
+                            if (count <= 0) continue;
                             
                             const int64_t iw_start = ow_start + iw_base;
 
                             __m256 v_acc0 = _mm256_setzero_ps();
-                            __m256 v_acc1 = _mm256_setzero_ps();
                             __m256 v_tail = _mm256_setzero_ps();
 
                             for (int64_t n = 0; n < N; ++n) {
@@ -396,15 +475,6 @@ void conv2d_backward_fallback_avx2(
                                     const float* xr_row = &xp_n[ih * W_in_stride];
 
                                     int64_t i = 0;
-                                    for (; i + 15 < count; i += 16) {
-                                        __m256 r0 = _mm256_loadu_ps(&dr_row[ow_start + i]);
-                                        __m256 x0 = _mm256_loadu_ps(&xr_row[iw_start + i]);
-                                        v_acc0 = _mm256_fmadd_ps(r0, x0, v_acc0);
-                                        
-                                        __m256 r1 = _mm256_loadu_ps(&dr_row[ow_start + i + 8]);
-                                        __m256 x1 = _mm256_loadu_ps(&xr_row[iw_start + i + 8]);
-                                        v_acc1 = _mm256_fmadd_ps(r1, x1, v_acc1);
-                                    }
                                     for (; i + 7 < count; i += 8) {
                                         __m256 r0 = _mm256_loadu_ps(&dr_row[ow_start + i]);
                                         __m256 x0 = _mm256_loadu_ps(&xr_row[iw_start + i]);
@@ -420,9 +490,7 @@ void conv2d_backward_fallback_avx2(
                                     }
                                 }
                             }
-                            
-                            __m256 v_total = _mm256_add_ps(v_acc0, _mm256_add_ps(v_acc1, v_tail));
-                            dw_target[tap_idx] = _mm256_reduce_add_ps(v_total) * inv_m;
+                            dw_target[tap_idx] = _mm256_reduce_add_ps(_mm256_add_ps(v_acc0, v_tail)) * inv_m;
 
                         } else {
                             float tap_sum = 0.0f;
