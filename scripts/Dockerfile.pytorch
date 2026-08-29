@@ -1,0 +1,31 @@
+FROM python:3.13-slim
+
+WORKDIR /workspace
+
+# Runtime OpenMP library for PyTorch CPU BLAS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bake PyTorch CPU scheduling & affinity overrides into container environment
+# (Prevents Intel OpenMP from fighting Docker/WSL2 cgroup core masks)
+ENV KMP_AFFINITY=none
+ENV OMP_PROC_BIND=false
+ENV KMP_BLOCKTIME=0
+ENV OMP_WAIT_POLICY=PASSIVE
+
+# Inline PyTorch and pipeline data ingestion stack
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+    torch \
+    numpy \
+    scipy \
+    numba \
+    pandas \
+    joblib \
+    "pyyaml>=6.0" \
+    "threadpoolctl>=3.4.0"
+
+COPY . .
+
+ENTRYPOINT ["python", "benchmarks/run_benchmarks_docker.py", "--target=pytorch"]

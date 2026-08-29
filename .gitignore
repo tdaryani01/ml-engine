@@ -21,6 +21,7 @@ venv/
 *.lib
 *.exp
 *.obj
+*.pdb
 
 # Diagnostics and monitoring 
 /diagnostics_output/

@@ -12,7 +12,7 @@ from config.constants import IngestionMode, ModelType, DataKeys
 from utils.logger import initialize_global_logging
 from utils.diagnostics import NeuralNetworkDiagnostics
 
-
+@profile
 def execute_training_pipeline():
     """Hydrates configuration, initializes logging, sets up data providers, builds network topology, and executes training."""
     # 1. Hydrate the immutable, typed configuration object from YAML

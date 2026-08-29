@@ -8,21 +8,37 @@ import getpass
 import platform
 import yaml
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
 import warnings
-from torch.utils.data import TensorDataset, DataLoader
 from threadpoolctl import threadpool_limits
 
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="threadpoolctl")
 
+# -----------------------------------------------------------------------------
+# 1. Enforce Thread Environment Variables BEFORE Torch/BLAS Imports
+# -----------------------------------------------------------------------------
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "config.yaml")
+_NUM_THREADS = 4
+if os.path.exists(_CONFIG_PATH):
+    try:
+        with open(_CONFIG_PATH, "r") as _f:
+            _raw_cfg = yaml.safe_load(_f)
+            _NUM_THREADS = int(_raw_cfg.get("optimization", {}).get("num_threads", 4))
+    except Exception:
+        pass
+
+os.environ["OMP_NUM_THREADS"] = str(_NUM_THREADS)
+os.environ["MKL_NUM_THREADS"] = str(_NUM_THREADS)
+os.environ["OPENBLAS_NUM_THREADS"] = str(_NUM_THREADS)
+os.environ["VECLIB_MAXIMUM_THREADS"] = str(_NUM_THREADS)
+os.environ["NUMEXPR_NUM_THREADS"] = str(_NUM_THREADS)
+os.environ["KMP_ALL_THREADS"] = str(_NUM_THREADS)
+os.environ["$env:OMP_THREAD_LIMIT"] = str(_NUM_THREADS)
+os.environ["$env:KMP_DEVICE_THREAD_LIMIT"] = str(_NUM_THREADS)
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-
-# Ensure OpenMP conflict handling and project discovery
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 from config.constants import ModelType, IngestionMode, LRHierarchy, DataKeys, EngineBackend
 from src.controller import ModelController
@@ -37,10 +53,13 @@ from config.schema import (
 
 
 def load_native_telemetry_lib():
-    """Defensively loads conv_kernels.dll to access OpenMP telemetry counters."""
     possible_paths = [
+        os.path.join(project_root, "src", "native", "conv_kernels.so"),
+        os.path.join(project_root, "bin", "conv_kernels.so"),
+        os.path.join(project_root, "conv_kernels.so"),
         os.path.join(project_root, "src", "native", "conv_kernels.dll"),
         os.path.join(project_root, "conv_kernels.dll"),
+        os.path.join(project_root, "bin", "conv_kernels.dll"),
         os.path.join(project_root, "native", "conv_kernels.dll")
     ]
     for p in possible_paths:
@@ -78,36 +97,143 @@ def resolve_backend(raw_val: str) -> EngineBackend:
     return EngineBackend.NATIVE
 
 
-class ConfigMappedTorchCNN(nn.Module):
-    def __init__(self, in_channels: int, num_classes: int):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, 8, kernel_size=3, stride=1, padding=1)
-        self.relu1 = nn.ReLU()
-        self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        self.conv2 = nn.Conv2d(8, 16, kernel_size=3, stride=1, padding=1)
-        self.relu2 = nn.ReLU()
-        self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
-        
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(16 * 7 * 7, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_classes)
-        )
-        self._init_weights()
+def extract_layer_specs(cnn_config: dict) -> list:
+    if not cnn_config:
+        return []
+    
+    spatial_pipe = cnn_config.get("spatial_pipeline", [])
+    specs = []
+    
+    for item in spatial_pipe:
+        if isinstance(item, dict) and item.get("type") == "conv":
+            out_c = int(item.get("out_channels", 8))
+            specs.append({
+                "out_channels": out_c,
+                "kernel_size": int(item.get("kernel_size", 3)),
+                "stride": int(item.get("stride", 1)),
+                "padding": int(item.get("pad", item.get("padding", 0))),
+                "pool_size": 0,
+                "pool_stride": 0
+            })
+        elif isinstance(item, dict) and item.get("type") == "pool" and specs:
+            specs[-1]["pool_size"] = int(item.get("pool_size", 2))
+            specs[-1]["pool_stride"] = int(item.get("stride", 2))
+            
+    if specs:
+        return specs
 
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+    raw_layers = cnn_config.get("conv_layers") or cnn_config.get("layers") or []
+    if raw_layers:
+        for l in raw_layers:
+            specs.append({
+                "out_channels": int(l.get("out_channels", l.get("filters", 8))),
+                "kernel_size": int(l.get("kernel_size", l.get("filter_size", 3))),
+                "stride": int(l.get("stride", 1)),
+                "padding": int(l.get("padding", l.get("pad", 0))),
+                "pool_size": int(l.get("pool_size", l.get("pool", 2))),
+                "pool_stride": int(l.get("pool_stride", l.get("pool_s", 2)))
+            })
+        return specs
 
-    def forward(self, x):
-        x = self.pool1(self.relu1(self.conv1(x)))
-        x = self.pool2(self.relu2(self.conv2(x)))
-        return self.classifier(x)
+    return []
+
+
+def ensure_nchw_format(data: np.ndarray, target_shape: tuple) -> np.ndarray:
+    if len(target_shape) == 3:
+        c, h, w = target_shape
+    elif len(target_shape) == 2:
+        c, h, w = 1, target_shape[0], target_shape[1]
+    else:
+        raise ValueError(f"Unsupported input shape configuration: {target_shape}")
+
+    if data.ndim == 4:
+        if data.shape[1] == c and data.shape[2] == h and data.shape[3] == w:
+            return data
+        if data.shape[3] == c and data.shape[1] == h and data.shape[2] == w:
+            return np.transpose(data, (0, 3, 1, 2))
+        if data.shape[2] == h and data.shape[3] >= w:
+            return np.ascontiguousarray(data[:, :c, :h, :w])
+        return data.reshape(data.shape[0], c, h, w)
+
+    if data.ndim == 3:
+        if data.shape[1] == h and data.shape[2] >= w:
+            return np.ascontiguousarray(data[:, :h, :w]).reshape(data.shape[0], 1, h, w)
+        return data.reshape(data.shape[0], 1, h, w)
+
+    if data.ndim == 2:
+        num_samples, num_features = data.shape
+        if num_features == c * h * w:
+            return data.reshape(num_samples, c, h, w)
+            
+        w_stride = num_features // (c * h)
+        if num_features % (c * h) == 0 and w_stride >= w:
+            reshaped = data.reshape(num_samples, c, h, w_stride)
+            return np.ascontiguousarray(reshaped[:, :, :, :w])
+            
+        if num_features % (h * w) == 0:
+            actual_c = num_features // (h * w)
+            return data.reshape(num_samples, actual_c, h, w)
+            
+        side = int(np.sqrt(num_features // c))
+        return data.reshape(num_samples, c, side, side)
+
+    return data.reshape(-1, c, h, w)
+
+
+def create_torch_model_class():
+    import torch
+    import torch.nn as nn
+
+    class DynamicConfigTorchCNN(nn.Module):
+        def __init__(self, in_channels: int, num_classes: int, cnn_config: dict, input_shape: tuple):
+            super().__init__()
+            specs = extract_layer_specs(cnn_config)
+            
+            feature_modules = []
+            c_in = in_channels
+
+            for sp in specs:
+                feature_modules.append(
+                    nn.Conv2d(c_in, sp["out_channels"], kernel_size=sp["kernel_size"], stride=sp["stride"], padding=sp["padding"])
+                )
+                feature_modules.append(nn.ReLU())
+                if sp["pool_size"] > 0:
+                    feature_modules.append(nn.MaxPool2d(kernel_size=sp["pool_size"], stride=sp["pool_stride"]))
+                c_in = sp["out_channels"]
+
+            self.features = nn.Sequential(*feature_modules)
+
+            dummy = torch.zeros(1, in_channels, input_shape[1], input_shape[2])
+            with torch.no_grad():
+                feat_out = self.features(dummy)
+                flattened_dim = feat_out.numel()
+
+            dense_hidden = cnn_config.get("dense_hidden", [64]) if cnn_config else [64]
+            if isinstance(dense_hidden, int):
+                dense_hidden = [dense_hidden]
+
+            classifier_modules = [nn.Flatten()]
+            c_dense_in = flattened_dim
+            for dh in dense_hidden:
+                classifier_modules.append(nn.Linear(c_dense_in, dh))
+                classifier_modules.append(nn.ReLU())
+                c_dense_in = dh
+            classifier_modules.append(nn.Linear(c_dense_in, num_classes))
+
+            self.classifier = nn.Sequential(*classifier_modules)
+            self._init_weights()
+
+        def _init_weights(self):
+            for m in self.modules():
+                if isinstance(m, (nn.Conv2d, nn.Linear)):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+
+        def forward(self, x):
+            return self.classifier(self.features(x))
+
+    return DynamicConfigTorchCNN
 
 
 def compute_cross_entropy_loss(probabilities: np.ndarray, one_hot_targets: np.ndarray) -> float:
@@ -131,290 +257,20 @@ def extract_custom_engine_param_count(controller: ModelController) -> int:
             if hasattr(layer, "biases") and layer.biases is not None:
                 total += layer.biases.size
         return total
-    return 51800
+    return 0
 
 
-def run_pytorch_benchmark(
-    X_train: np.ndarray,
-    y_train_classes: np.ndarray,
-    X_val: np.ndarray,
-    y_val_classes: np.ndarray,
-    num_classes: int,
-    batch_size: int,
-    epochs: int,
-    lr_init: float,
-    lam_l2: float,
-    early_stopping_enabled: bool,
-    patience: int,
-    min_delta: float,
-    num_threads: int = 4
-) -> dict:
-    print(f"\n[1/2] Setting up and executing PyTorch benchmark run ({num_threads} Threads)...")
-    
-    torch.set_num_threads(num_threads)
-    try:
-        torch.set_num_interop_threads(num_threads)
-    except RuntimeError:
-        pass
-
-    torch.manual_seed(42)
-    
-    X_train_torch = X_train.copy()
-    X_val_torch = X_val.copy()
-    max_val = np.max(X_train_torch)
-    if max_val > 1.0:
-        X_train_torch = X_train_torch / max_val
-        X_val_torch = X_val_torch / max_val
-
-    in_channels = X_train.shape[1]
-    torch_model = ConfigMappedTorchCNN(in_channels=in_channels, num_classes=num_classes)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(torch_model.parameters(), lr=lr_init, weight_decay=lam_l2)
-    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.98)
-
-    train_ds = TensorDataset(
-        torch.tensor(X_train_torch, dtype=torch.float32), 
-        torch.tensor(y_train_classes, dtype=torch.long)
-    )
-    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_tensors_x = torch.tensor(X_val_torch, dtype=torch.float32)
-    val_tensors_y = torch.tensor(y_val_classes, dtype=torch.long)
-
-    torch_total_params = sum(p.numel() for p in torch_model.parameters() if p.requires_grad)
-
-    t0_train = time.perf_counter()
-    torch_epochs_completed = 0
-    final_torch_train_loss = 0.0
-    final_torch_val_loss = 0.0
-    final_torch_val_acc = 0.0
-
-    best_torch_val_loss = float("inf")
-    best_torch_epoch = 1
-    torch_patience_counter = 0
-    torch_early_stopped = False
-
-    torch_forward_counts = 0
-    torch_backward_counts = 0
-
-    with threadpool_limits(limits=num_threads):
-        for ep in range(epochs):
-            torch_model.train()
-            running_loss = 0.0
-            for bx, by in train_dl:
-                optimizer.zero_grad()
-                out = torch_model(bx)
-                torch_forward_counts += 1
-                loss = criterion(out, by)
-                loss.backward()
-                torch_backward_counts += 1
-                optimizer.step()
-                running_loss += loss.item() * len(bx)
-            
-            final_torch_train_loss = running_loss / len(train_ds)
-            scheduler.step()
-            torch_epochs_completed += 1
-            
-            torch_model.eval()
-            with torch.no_grad():
-                val_out = torch_model(val_tensors_x)
-                torch_forward_counts += 1
-                current_val_loss = criterion(val_out, val_tensors_y).item()
-                final_torch_val_loss = current_val_loss
-                preds = torch.argmax(val_out, dim=1).numpy()
-                final_torch_val_acc = np.mean(preds == y_val_classes)
-
-            if best_torch_val_loss - current_val_loss > min_delta:
-                best_torch_val_loss = current_val_loss
-                best_torch_epoch = ep + 1
-                torch_patience_counter = 0
-            else:
-                torch_patience_counter += 1
-                if current_val_loss < best_torch_val_loss:
-                    best_torch_val_loss = current_val_loss
-                    best_torch_epoch = ep + 1
-                
-                if early_stopping_enabled and torch_patience_counter >= patience:
-                    torch_early_stopped = True
-                    break
-
-        torch_train_time = time.perf_counter() - t0_train
-
-        torch_model.eval()
-        t0_inf = time.perf_counter()
-        with torch.no_grad():
-            for _ in range(100):
-                _ = torch_model(val_tensors_x)
-        torch_inf_time = (time.perf_counter() - t0_inf) / 100.0
-
-    del torch_model, optimizer, scheduler, criterion, train_dl, train_ds
-    del val_tensors_x, val_tensors_y, X_train_torch, X_val_torch
-    gc.collect()
-
-    return {
-        "params": torch_total_params,
-        "epochs_completed": torch_epochs_completed,
-        "best_epoch": best_torch_epoch,
-        "early_stopped": torch_early_stopped,
-        "forward_counts": torch_forward_counts,
-        "backward_counts": torch_backward_counts,
-        "train_loss": final_torch_train_loss,
-        "val_loss": final_torch_val_loss,
-        "val_acc": final_torch_val_acc,
-        "train_time": torch_train_time,
-        "inf_time": torch_inf_time
-    }
-
-
-def run_custom_engine_benchmark(
-    data_provider: InMemoryDataProvider,
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    y_val_classes: np.ndarray,
-    cnn_dict: dict,
-    num_classes: int,
-    task_type: ModelType,
-    epochs: int,
-    lr_init: float,
-    lam_l1: float,
-    lam_l2: float,
-    early_stopping_enabled: bool,
-    patience: int,
-    min_delta: float,
-    backend: EngineBackend = EngineBackend.NATIVE,
-    num_threads: int = 4
-) -> dict:
-    print(f"[2/2] Setting up and executing Custom Engine [{backend.value}] benchmark run ({num_threads} Threads)...")
-    
-    init_engine_backend(backend)
-
-    native_lib = load_native_telemetry_lib() if backend == EngineBackend.NATIVE else None
-    if native_lib and hasattr(native_lib, "reset_thread_execution_stats"):
-        native_lib.reset_thread_execution_stats()
-
-    data_provider.reset_epoch()
-    
-    controller = ModelController(
-        data_provider=data_provider,
-        learning_rate=lr_init,
-        lr_scheduler_type=LRHierarchy.EXPONENTIAL,
-        scheduler_decay_rate=0.98,
-        scheduler_drop_ratio=0.5,
-        scheduler_epochs_per_drop=10
-    )
-    
-    input_dim = int(np.prod(cnn_dict["input_shape"])) if cnn_dict else X_train.shape[1]
-    controller.initialize_network_from_dimensions(
-        input_dim=input_dim,
-        output_dim=num_classes,
-        model_type=task_type,
-        hidden_layers=[],
-        optimizer_name="adam",
-        lam_l1=lam_l1,
-        lam_l2=lam_l2,
-        p_dropout=0.0,
-        use_batch_norm=False,
-        bn_momentum=0.9,
-        max_norm=5.0,
-        cnn_config=cnn_dict,
-        backend=backend
-    )
-
-    model = controller.model
-    orig_forward = model._forward
-    orig_backward = model.backward
-    orig_predict = model.predict
-
-    forward_counter = [0]
-    backward_counter = [0]
-
-    def counted_forward(X, training=True):
-        forward_counter[0] += 1
-        return orig_forward(X, training=training)
-
-    def counted_backward(*args, **kwargs):
-        backward_counter[0] += 1
-        return orig_backward(*args, **kwargs)
-
-    def counted_predict(processed_data, *args, **kwargs):
-        forward_counter[0] += 1
-        return orig_predict(processed_data, *args, **kwargs)
-
-    model._forward = counted_forward
-    model.backward = counted_backward
-    model.predict = counted_predict
-
-    custom_total_params = extract_custom_engine_param_count(controller)
-
-    # Keep training, latency benchmark, and evaluation inside thread-limit scope
-    with threadpool_limits(limits=num_threads):
-        t0_train = time.perf_counter()
-        train_history, val_history = controller.fit(
-            steps=data_provider.recomment_steps(),
-            source_mode=IngestionMode.CSV,
-            model_type=task_type,
-            early_stopping_enabled=early_stopping_enabled,
-            patience=patience,
-            min_delta=min_delta
-        )
-        custom_train_time = time.perf_counter() - t0_train
-
-        t0_inf = time.perf_counter()
-        for _ in range(100):
-            custom_raw_val_preds = controller.predict(X_val)
-        custom_inf_time = (time.perf_counter() - t0_inf) / 100.0
-
-        custom_val_preds = np.argmax(custom_raw_val_preds, axis=1)
-        final_custom_val_acc = np.mean(custom_val_preds == y_val_classes)
-        final_custom_val_loss = compute_cross_entropy_loss(custom_raw_val_preds, y_val)
-
-        custom_raw_train_preds = controller.predict(X_train)
-        final_custom_train_loss = compute_cross_entropy_loss(custom_raw_train_preds, y_train)
-
-    if val_history and len(val_history) > 0:
-        custom_epochs_completed = len(val_history)
-        custom_best_epoch = int(np.argmin(val_history) + 1)
-    elif hasattr(controller, "val_loss_history") and len(controller.val_loss_history) > 0:
-        custom_epochs_completed = len(controller.val_loss_history)
-        custom_best_epoch = int(np.argmin(controller.val_loss_history) + 1)
-    else:
-        custom_epochs_completed = getattr(controller, "epochs_completed", epochs)
-        custom_best_epoch = getattr(controller, "best_epoch", custom_epochs_completed)
-
-    custom_early_stopped = custom_epochs_completed < epochs
-
-    if backend == EngineBackend.NATIVE and native_lib and hasattr(native_lib, "log_thread_execution_stats"):
-        native_lib.log_thread_execution_stats()
-
-    del controller, model
-    gc.collect()
-
-    return {
-        "params": custom_total_params,
-        "epochs_completed": custom_epochs_completed,
-        "best_epoch": custom_best_epoch,
-        "early_stopped": custom_early_stopped,
-        "forward_counts": forward_counter[0],
-        "backward_counts": backward_counter[0],
-        "train_loss": final_custom_train_loss,
-        "val_loss": final_custom_val_loss,
-        "val_acc": final_custom_val_acc,
-        "train_time": custom_train_time,
-        "inf_time": custom_inf_time
-    }
-
-
-def run_cnn_benchmark():
-    config_path = os.path.join("config", "config.yaml")
-    if not os.path.exists(config_path):
-        print(f"[ERROR] Config file not found at {config_path}")
-        return
+def load_benchmark_data(config_path: str = None):
+    if config_path is None:
+        config_path = os.path.join(project_root, "config", "config.yaml")
 
     with open(config_path, "r") as f:
         cfg_dict = yaml.safe_load(f)
 
     data_path = cfg_dict["ingestion"]["data_file_path"]
+    if not os.path.isabs(data_path):
+        data_path = os.path.join(project_root, data_path)
+
     features = cfg_dict["ingestion"].get("feature_names", [])
     raw_model_type = cfg_dict["architecture"]["model_type"]
     task_type = resolve_model_type(raw_model_type)
@@ -435,30 +291,6 @@ def run_cnn_benchmark():
     early_stopping_enabled = bool(cfg_dict["optimization"].get("early_stopping_enabled", False))
     patience = int(cfg_dict["optimization"].get("patience", 10))
     min_delta = float(cfg_dict["optimization"].get("min_delta", 1e-4))
-    lr_scheduler_type = cfg_dict["optimization"].get("lr_scheduler", "none")
-
-    user_name = getpass.getuser()
-    system_node = platform.node()
-    os_name = f"{platform.system()} {platform.release()} ({platform.machine()})"
-    cpu_model = platform.processor() or "AMD x86_64 Family"
-    logical_cores = os.cpu_count()
-
-    print("=" * 80)
-    print("      CONVERGENCE BENCHMARK: CUSTOM ENGINE vs PYTORCH CNN")
-    print("=" * 80)
-    print(f"User / Host         : {user_name}@{system_node}")
-    print(f"OS / Architecture   : {os_name}")
-    print(f"CPU Model           : {cpu_model}")
-    print(f"Logical CPU Cores   : {logical_cores}")
-    print(f"Dataset Path        : {data_path}")
-    print(f"Active Backend      : {backend.value}")
-    print(f"Epochs / Batch Size : {epochs} / {batch_size}")
-    print(f"Learning Rate / L2  : {lr_init} / {lam_l2} (L1: {lam_l1})")
-    print(f"LR Scheduler Type   : {lr_scheduler_type}")
-    print(f"Early Stopping      : Enabled={early_stopping_enabled} (Patience={patience}, Min Delta={min_delta})")
-    print("-" * 80)
-    print(f"Configured Threads  : {num_threads} Threads (Enforced via threadpoolctl)")
-    print("=" * 80)
 
     typed_cfg = PipelineConfig(
         meta=MetaConfig(
@@ -536,6 +368,372 @@ def run_cnn_benchmark():
         normalize_features=False
     )
 
+    return data_provider, cfg_dict
+
+def run_pytorch_benchmark(
+    X_train: np.ndarray,
+    y_train_classes: np.ndarray,
+    X_val: np.ndarray,
+    y_val_classes: np.ndarray,
+    num_classes: int,
+    batch_size: int,
+    epochs: int,
+    lr_init: float,
+    lam_l2: float,
+    early_stopping_enabled: bool,
+    patience: int,
+    min_delta: float,
+    cnn_dict: dict,
+    num_threads: int = 4
+) -> dict:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import TensorDataset, DataLoader
+
+    torch.set_num_threads(num_threads)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+
+    verified_threads = torch.get_num_threads()
+    print(f"\n[1/2] Setting up and executing PyTorch benchmark run ({verified_threads} Threads active)...")
+    
+    torch.manual_seed(42)
+
+    raw_shape = cnn_dict.get("input_shape", (1, 28, 28)) if cnn_dict else (1, 28, 28)
+    if len(raw_shape) == 2:
+        input_shape = (1, raw_shape[0], raw_shape[1])
+    else:
+        input_shape = tuple(raw_shape)
+
+    if X_train.ndim == 2:
+        num_features = X_train.shape[1]
+        c, h, w = input_shape
+        if num_features % (c * h * w) != 0:
+            if num_features % (h * w) == 0:
+                input_shape = (num_features // (h * w), h, w)
+            else:
+                side = int(np.sqrt(num_features))
+                input_shape = (1, side, side)
+
+    X_train_torch = ensure_nchw_format(X_train.copy(), input_shape)
+    X_val_torch = ensure_nchw_format(X_val.copy(), input_shape)
+
+    max_val = np.max(X_train_torch)
+    if max_val > 1.0:
+        X_train_torch = X_train_torch / max_val
+        X_val_torch = X_val_torch / max_val
+
+    TorchCNNClass = create_torch_model_class()
+    torch_model = TorchCNNClass(
+        in_channels=input_shape[0],
+        num_classes=num_classes,
+        cnn_config=cnn_dict or {},
+        input_shape=input_shape
+    )
+    
+    # 1. Align model weights to channels-last layout
+    torch_model = torch_model.to(memory_format=torch.channels_last)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(torch_model.parameters(), lr=lr_init, weight_decay=lam_l2)
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.98)
+
+    # 2. Convert training and validation tensors to contiguous channels-last format
+    train_x_tensor = torch.tensor(X_train_torch, dtype=torch.float32).to(memory_format=torch.channels_last).contiguous()
+    train_y_tensor = torch.tensor(y_train_classes, dtype=torch.long)
+    val_tensors_x = torch.tensor(X_val_torch, dtype=torch.float32).to(memory_format=torch.channels_last).contiguous()
+    val_tensors_y = torch.tensor(y_val_classes, dtype=torch.long)
+
+    train_ds = TensorDataset(train_x_tensor, train_y_tensor)
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+
+    torch_total_params = sum(p.numel() for p in torch_model.parameters() if p.requires_grad)
+
+    t0_train = time.perf_counter()
+    torch_epochs_completed = 0
+    final_torch_train_loss = 0.0
+    final_torch_val_loss = 0.0
+    final_torch_val_acc = 0.0
+
+    best_torch_val_loss = float("inf")
+    best_torch_epoch = 1
+    torch_patience_counter = 0
+    torch_early_stopped = False
+
+    torch_forward_counts = 0
+    torch_backward_counts = 0
+
+    with threadpool_limits(limits=num_threads):
+        for ep in range(epochs):
+            torch_model.train()
+            running_loss = torch.tensor(0.0)
+            
+            for bx, by in train_dl:
+                bx = bx.to(memory_format=torch.channels_last)
+                optimizer.zero_grad(set_to_none=True)
+                out = torch_model(bx)
+                torch_forward_counts += 1
+                loss = criterion(out, by)
+                loss.backward()
+                torch_backward_counts += 1
+                optimizer.step()
+                running_loss += loss.detach() * len(bx)
+            
+            final_torch_train_loss = (running_loss / len(train_ds)).item()
+            scheduler.step()
+            torch_epochs_completed += 1
+            
+            torch_model.eval()
+            with torch.no_grad():
+                val_out = torch_model(val_tensors_x)
+                torch_forward_counts += 1
+                current_val_loss = criterion(val_out, val_tensors_y).item()
+                final_torch_val_loss = current_val_loss
+                preds = torch.argmax(val_out, dim=1).cpu().numpy()
+                final_torch_val_acc = float(np.mean(preds == y_val_classes))
+
+            if best_torch_val_loss - current_val_loss > min_delta:
+                best_torch_val_loss = current_val_loss
+                best_torch_epoch = ep + 1
+                torch_patience_counter = 0
+            else:
+                torch_patience_counter += 1
+                if current_val_loss < best_torch_val_loss:
+                    best_torch_val_loss = current_val_loss
+                    best_torch_epoch = ep + 1
+                
+                if early_stopping_enabled and torch_patience_counter >= patience:
+                    torch_early_stopped = True
+                    break
+
+        torch_train_time = time.perf_counter() - t0_train
+
+        torch_model.eval()
+        t0_inf = time.perf_counter()
+        with torch.no_grad():
+            for _ in range(100):
+                _ = torch_model(val_tensors_x)
+        torch_inf_time = (time.perf_counter() - t0_inf) / 100.0
+
+    del torch_model, optimizer, scheduler, criterion, train_dl, train_ds
+    del val_tensors_x, val_tensors_y, X_train_torch, X_val_torch
+    gc.collect()
+
+    return {
+        "params": torch_total_params,
+        "threads_verified": verified_threads,
+        "epochs_completed": torch_epochs_completed,
+        "best_epoch": best_torch_epoch,
+        "early_stopped": torch_early_stopped,
+        "forward_counts": torch_forward_counts,
+        "backward_counts": torch_backward_counts,
+        "train_loss": float(final_torch_train_loss),
+        "val_loss": float(final_torch_val_loss),
+        "val_acc": float(final_torch_val_acc),
+        "train_time": float(torch_train_time),
+        "inf_time": float(torch_inf_time)
+    }
+
+def run_custom_engine_benchmark(
+    data_provider: InMemoryDataProvider,
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    y_val_classes: np.ndarray,
+    cnn_dict: dict,
+    num_classes: int,
+    task_type: ModelType,
+    epochs: int,
+    lr_init: float,
+    lam_l1: float,
+    lam_l2: float,
+    early_stopping_enabled: bool,
+    patience: int,
+    min_delta: float,
+    backend: EngineBackend = EngineBackend.NATIVE,
+    num_threads: int = 4
+) -> dict:
+    init_engine_backend(backend)
+
+    native_lib = load_native_telemetry_lib() if backend == EngineBackend.NATIVE else None
+    verified_threads = num_threads
+    if native_lib and hasattr(native_lib, "get_omp_threads"):
+        try:
+            verified_threads = native_lib.get_omp_threads()
+        except Exception:
+            pass
+
+    print(f"[2/2] Setting up and executing Custom Engine [{backend.value}] benchmark run ({verified_threads} Threads active)...")
+    
+    if native_lib and hasattr(native_lib, "reset_thread_execution_stats"):
+        native_lib.reset_thread_execution_stats()
+
+    data_provider.reset_epoch()
+    
+    controller = ModelController(
+        data_provider=data_provider,
+        learning_rate=lr_init,
+        lr_scheduler_type=LRHierarchy.EXPONENTIAL,
+        scheduler_decay_rate=0.98,
+        scheduler_drop_ratio=0.5,
+        scheduler_epochs_per_drop=10
+    )
+    
+    input_dim = int(np.prod(cnn_dict["input_shape"])) if cnn_dict else X_train.shape[1]
+    controller.initialize_network_from_dimensions(
+        input_dim=input_dim,
+        output_dim=num_classes,
+        model_type=task_type,
+        hidden_layers=[],
+        optimizer_name="adam",
+        lam_l1=lam_l1,
+        lam_l2=lam_l2,
+        p_dropout=0.0,
+        use_batch_norm=False,
+        bn_momentum=0.9,
+        max_norm=5.0,
+        cnn_config=cnn_dict,
+        backend=backend
+    )
+
+    model = controller.model
+    orig_forward = model._forward
+    orig_backward = model.backward
+    orig_predict = model.predict
+
+    forward_counter = [0]
+    backward_counter = [0]
+
+    def counted_forward(X, training=True):
+        forward_counter[0] += 1
+        return orig_forward(X, training=training)
+
+    def counted_backward(*args, **kwargs):
+        backward_counter[0] += 1
+        return orig_backward(*args, **kwargs)
+
+    def counted_predict(processed_data, *args, **kwargs):
+        forward_counter[0] += 1
+        return orig_predict(processed_data, *args, **kwargs)
+
+    model._forward = counted_forward
+    model.backward = counted_backward
+    model.predict = counted_predict
+
+    custom_total_params = extract_custom_engine_param_count(controller)
+
+    with threadpool_limits(limits=num_threads):
+        t0_train = time.perf_counter()
+        train_history, val_history = controller.fit(
+            steps=data_provider.recomment_steps(),
+            source_mode=IngestionMode.CSV,
+            model_type=task_type,
+            early_stopping_enabled=early_stopping_enabled,
+            patience=patience,
+            min_delta=min_delta
+        )
+        custom_train_time = time.perf_counter() - t0_train
+
+        t0_inf = time.perf_counter()
+        for _ in range(100):
+            custom_raw_val_preds = controller.predict(X_val)
+        custom_inf_time = (time.perf_counter() - t0_inf) / 100.0
+
+        custom_val_preds = np.argmax(custom_raw_val_preds, axis=1)
+        final_custom_val_acc = float(np.mean(custom_val_preds == y_val_classes))
+        final_custom_val_loss = float(compute_cross_entropy_loss(custom_raw_val_preds, y_val))
+
+        custom_raw_train_preds = controller.predict(X_train)
+        final_custom_train_loss = float(compute_cross_entropy_loss(custom_raw_train_preds, y_train))
+
+    if val_history and len(val_history) > 0:
+        custom_epochs_completed = len(val_history)
+        custom_best_epoch = int(np.argmin(val_history) + 1)
+    elif hasattr(controller, "val_loss_history") and len(controller.val_loss_history) > 0:
+        custom_epochs_completed = len(controller.val_loss_history)
+        custom_best_epoch = int(np.argmin(controller.val_loss_history) + 1)
+    else:
+        custom_epochs_completed = getattr(controller, "epochs_completed", epochs)
+        custom_best_epoch = getattr(controller, "best_epoch", custom_epochs_completed)
+
+    custom_early_stopped = custom_epochs_completed < epochs
+
+    if backend == EngineBackend.NATIVE and native_lib and hasattr(native_lib, "log_thread_execution_stats"):
+        native_lib.log_thread_execution_stats()
+
+    del controller, model
+    gc.collect()
+
+    return {
+        "params": custom_total_params,
+        "threads_verified": verified_threads,
+        "epochs_completed": custom_epochs_completed,
+        "best_epoch": custom_best_epoch,
+        "early_stopped": custom_early_stopped,
+        "forward_counts": forward_counter[0],
+        "backward_counts": backward_counter[0],
+        "train_loss": float(final_custom_train_loss),
+        "val_loss": float(final_custom_val_loss),
+        "val_acc": float(final_custom_val_acc),
+        "train_time": float(custom_train_time),
+        "inf_time": float(custom_inf_time)
+    }
+
+
+def run_cnn_benchmark():
+    data_provider, cfg_dict = load_benchmark_data()
+    
+    data_path = cfg_dict["ingestion"]["data_file_path"]
+    raw_model_type = cfg_dict["architecture"]["model_type"]
+    task_type = resolve_model_type(raw_model_type)
+
+    raw_backend = cfg_dict["architecture"].get("backend", "native")
+    backend = resolve_backend(raw_backend)
+
+    num_classes = int(cfg_dict["architecture"].get("num_classes", 1))
+    batch_size = int(cfg_dict["optimization"]["batch_size"])
+    lr_init = float(cfg_dict["optimization"]["learning_rate"])
+    epochs = int(cfg_dict["optimization"]["epochs_full_dataset"])
+    num_threads = int(cfg_dict["optimization"].get("num_threads", 4))
+    lam_l2 = float(cfg_dict["regularization"].get("lam_l2", 0.0))
+    lam_l1 = float(cfg_dict["regularization"].get("lam_l1", 0.0))
+    cnn_dict = cfg_dict["architecture"].get("cnn", None)
+
+    early_stopping_enabled = bool(cfg_dict["optimization"].get("early_stopping_enabled", False))
+    patience = int(cfg_dict["optimization"].get("patience", 10))
+    min_delta = float(cfg_dict["optimization"].get("min_delta", 1e-4))
+    lr_scheduler_type = cfg_dict["optimization"].get("lr_scheduler", "none")
+
+    user_name = getpass.getuser()
+    system_node = platform.node()
+    os_name = f"{platform.system()} {platform.release()} ({platform.machine()})"
+    cpu_model = platform.processor() or "AMD x86_64 Family"
+    logical_cores = os.cpu_count()
+
+    specs = extract_layer_specs(cnn_dict)
+
+    print("=" * 80)
+    print("      CONVERGENCE BENCHMARK: CUSTOM ENGINE vs PYTORCH CNN")
+    print("=" * 80)
+    print(f"User / Host         : {user_name}@{system_node}")
+    print(f"OS / Architecture   : {os_name}")
+    print(f"CPU Model           : {cpu_model}")
+    print(f"Logical CPU Cores   : {logical_cores}")
+    print(f"Dataset Path        : {data_path}")
+    print(f"Active Backend      : {backend.value}")
+    print(f"Epochs / Batch Size : {epochs} / {batch_size}")
+    print(f"Learning Rate / L2  : {lr_init} / {lam_l2} (L1: {lam_l1})")
+    print(f"LR Scheduler Type   : {lr_scheduler_type}")
+    print(f"Early Stopping      : Enabled={early_stopping_enabled} (Patience={patience}, Min Delta={min_delta})")
+    print("-" * 80)
+    print(f"Configured Threads  : {num_threads} Threads (Enforced via OMP/MKL/PyTorch)")
+    print(f"CNN Layer Specs     : {specs}")
+    print("=" * 80)
+
     X_train = data_provider.splits[DataKeys.X_TRAIN]
     y_train = data_provider.splits[DataKeys.Y_TRAIN]
     X_val, y_val = data_provider.get_validation_set()
@@ -556,6 +754,7 @@ def run_cnn_benchmark():
         early_stopping_enabled=early_stopping_enabled,
         patience=patience,
         min_delta=min_delta,
+        cnn_dict=cnn_dict,
         num_threads=num_threads
     )
 
@@ -584,13 +783,15 @@ def run_cnn_benchmark():
     torch_throughput = (len(X_train) * t_res["epochs_completed"]) / t_res["train_time"]
     custom_throughput = (len(X_train) * c_res["epochs_completed"]) / c_res["train_time"]
 
-    custom_col_header = f"Custom [{backend.value}] ({num_threads}T)"
+    torch_col_header = f"PyTorch CNN ({t_res['threads_verified']}T)"
+    custom_col_header = f"Custom [{backend.value}] ({c_res['threads_verified']}T)"
 
     print("\n" + "=" * 80)
     print("                    HEAD-TO-HEAD BENCHMARK REPORT")
     print("=" * 80)
-    print(f"{'Performance Metric':<32} | {f'PyTorch CNN ({num_threads}T)':<20} | {custom_col_header:<20}")
+    print(f"{'Performance Metric':<32} | {torch_col_header:<20} | {custom_col_header:<20}")
     print("-" * 80)
+    print(f"{'Active Hardware Threads':<32} | {t_res['threads_verified']:<20d} | {c_res['threads_verified']:<20d}")
     print(f"{'Total Trainable Parameters':<32} | {t_res['params']:<20,d} | {c_res['params']:<20,d}")
     print(f"{'Target Epochs':<32} | {epochs:<20d} | {epochs:<20d}")
     print(f"{'Epochs Completed':<32} | {t_res['epochs_completed']:<20d} | {c_res['epochs_completed']:<20d}")

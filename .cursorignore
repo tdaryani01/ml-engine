@@ -1,0 +1,18 @@
+# Profiler and benchmark outputs
+profiler_results/
+*.prof
+*.dat
+output/
+dist/
+build/
+
+# Standard log files and temp dumps
+*.log
+logs/
+tmp/
+__pycache__/
+benchmark_diagnostics/
+bin/
+data/
+diagnostics_output/
+uprof_reports/
