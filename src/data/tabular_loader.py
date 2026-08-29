@@ -2,7 +2,7 @@ import logging
 import pandas as pd
 import numpy as np
 from typing import Tuple, List
-from data.base_loader import BaseDataLoader
+from src.data.base_loader import BaseDataLoader
 from config.constants import ModelType
 
 logger = logging.getLogger(__name__)

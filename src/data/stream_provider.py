@@ -4,7 +4,7 @@ from typing import Tuple, List, Optional
 import numpy as np
 import pika
 import time
-from data.base_provider import BaseDataProvider
+from src.data.base_provider import BaseDataProvider
 from config.constants import DataKeys
 
 class StreamDataProvider(BaseDataProvider):

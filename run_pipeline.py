@@ -4,9 +4,9 @@ import numpy as np
 from threadpoolctl import threadpool_limits
 
 from config.config_loader import load_production_config
-from data.base_loader import BaseDataLoader
-from data.in_memory_provider import InMemoryDataProvider
-from data.stream_provider import StreamDataProvider
+from src.data.base_loader import BaseDataLoader
+from src.data.in_memory_provider import InMemoryDataProvider
+from src.data.stream_provider import StreamDataProvider
 from src.controller import ModelController
 from config.constants import IngestionMode, ModelType, DataKeys
 from utils.logger import initialize_global_logging

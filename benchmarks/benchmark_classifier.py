@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from config.constants import ModelType, IngestionMode, LRHierarchy
 from src.controller import ModelController
-from data.csv_provider import CSVDataProvider
+from src.data.csv_provider import CSVDataProvider
 
 
 def run_classification_benchmark():

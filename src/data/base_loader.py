@@ -26,8 +26,8 @@ class BaseDataLoader(ABC):
         Factory method to resolve and instantiate the correct BaseDataLoader 
         based on the provided pipeline configuration.
         """
-        from data.tabular_loader import TabularCSVLoader
-        from data.image_loader import ImageCSVLoader
+        from src.data.tabular_loader import TabularCSVLoader
+        from src.data.image_loader import ImageCSVLoader
 
         is_cnn = (cfg.architecture.model_type == ModelType.CNN)
 

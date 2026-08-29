@@ -6,7 +6,7 @@ import yaml
 import os
 from dataclasses import replace
 from config.config_loader import load_production_config
-from data.data_loader import load_pipeline_splits
+from src.data.data_loader import load_pipeline_splits
 from models.controller import ModelController
 from config.constants import ModelType, LRHierarchy
 

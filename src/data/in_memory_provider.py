@@ -2,8 +2,8 @@
 from typing import Tuple
 import numpy as np
 
-from data.base_provider import BaseDataProvider
-from data.base_loader import BaseDataLoader
+from src.data.base_provider import BaseDataProvider
+from src.data.base_loader import BaseDataLoader
 from config.constants import DataKeys
 
 

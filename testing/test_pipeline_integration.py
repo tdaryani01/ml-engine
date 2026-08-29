@@ -9,8 +9,8 @@ import pandas as pd
 # Ensure project root is discoverable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from data.base_loader import BaseDataLoader
-from data.in_memory_provider import InMemoryDataProvider
+from src.data.base_loader import BaseDataLoader
+from src.data.in_memory_provider import InMemoryDataProvider
 from src.controller import ModelController
 from config.constants import ModelType, IngestionMode, LRHierarchy, DataKeys, EngineBackend
 from config.schema import (

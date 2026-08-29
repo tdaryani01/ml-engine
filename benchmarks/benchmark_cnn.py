@@ -42,8 +42,8 @@ if project_root not in sys.path:
 
 from config.constants import ModelType, IngestionMode, LRHierarchy, DataKeys, EngineBackend
 from src.controller import ModelController
-from data.base_loader import BaseDataLoader
-from data.in_memory_provider import InMemoryDataProvider
+from src.data.base_loader import BaseDataLoader
+from src.data.in_memory_provider import InMemoryDataProvider
 from utils.im2col import init_engine_backend
 from config.schema import (
     PipelineConfig, MetaConfig, IngestionConfig, ArchitectureConfig, 

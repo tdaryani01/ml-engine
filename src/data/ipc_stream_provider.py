@@ -4,7 +4,7 @@ import time
 import numpy as np
 from typing import Tuple, List
 from multiprocessing.connection import Client
-from data.base_provider import BaseDataProvider
+from src.data.base_provider import BaseDataProvider
 from config.constants import DataKeys
 
 class IPCStreamDataProvider(BaseDataProvider):

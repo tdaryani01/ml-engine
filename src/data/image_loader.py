@@ -9,7 +9,7 @@ import logging
 from typing import Tuple, List, Optional
 import numpy as np
 
-from data.base_loader import BaseDataLoader
+from src.data.base_loader import BaseDataLoader
 
 logger = logging.getLogger(__name__)
 
