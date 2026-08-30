@@ -32,8 +32,8 @@ os.environ["OPENBLAS_NUM_THREADS"] = str(_NUM_THREADS)
 os.environ["VECLIB_MAXIMUM_THREADS"] = str(_NUM_THREADS)
 os.environ["NUMEXPR_NUM_THREADS"] = str(_NUM_THREADS)
 os.environ["KMP_ALL_THREADS"] = str(_NUM_THREADS)
-os.environ["$env:OMP_THREAD_LIMIT"] = str(_NUM_THREADS)
-os.environ["$env:KMP_DEVICE_THREAD_LIMIT"] = str(_NUM_THREADS)
+os.environ["OMP_THREAD_LIMIT"] = str(_NUM_THREADS)
+os.environ["KMP_DEVICE_THREAD_LIMIT"] = str(_NUM_THREADS)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

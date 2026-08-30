@@ -4,7 +4,7 @@
     [switch]$EnableCProfile,
     [string]$CProfileOutput = "train.prof",
 
-    [ValidateSet("Hotspots", "SourceDisasm", "Assess", "ConcurrencyBound", "Memory", "MemAlloc")]
+    [ValidateSet("Hotspots", "SourceDisasm", "Assess", "ConcurrencyBound", "Memory", "MemAlloc", "BackwardDiag")]
     [string]$AnalysisType = "Memory",
     
     [switch]$SystemWide,
@@ -167,11 +167,14 @@ if ($AnalysisType -eq "Memory") {
 $CollectPreset = switch ($AnalysisType) {
     "Hotspots"         { "hotspots" }
     "SourceDisasm"     { "hotspots" }
+    "BackwardDiag"     { "hotspots" }
     "Assess"           { "assess" }
     "ConcurrencyBound" { "hotspots" }
     "MemAlloc"         { "assess" }
     Default            { "assess" }
 }
+
+$UseSourceDisasm = ($AnalysisType -eq "SourceDisasm") -or ($AnalysisType -eq "BackwardDiag") -or $IncludeDisasm
 
 $CollectArgs = @("collect", "--config", $CollectPreset)
 if ($SystemWide) { $CollectArgs += "--system-wide" }
@@ -197,10 +200,9 @@ Write-Host "[2/4] Generating Profile Summary Reports from: $SessionDir" -Foregro
 $SummaryCsv = Join-Path $ReportDir "summary_report.csv"
 $DetailCsv  = Join-Path $ReportDir "detail_report.csv"
 
-if ($AnalysisType -eq "SourceDisasm" -or $IncludeDisasm) {
+& $UprofCli report -i "$SessionDir" --report-output "$SummaryCsv" --show-sample-count @PathArgs
+if ($UseSourceDisasm) {
     & $UprofCli report -i "$SessionDir" --report-output "$DetailCsv" --disasm --disasm-style intel --show-sample-count @PathArgs
-} else {
-    & $UprofCli report -i "$SessionDir" --report-output "$SummaryCsv" --show-sample-count @PathArgs
 }
 
 Write-Host "`n[3/4] SYSTEM & PIPELINE METRICS ($AnalysisType):" -ForegroundColor Green
@@ -283,7 +285,28 @@ if (Test-Path $SummaryCsv) {
         Write-Host "`nTOP HOTTEST FUNCTIONS & PIPELINE METRICS (uProf Native):" -ForegroundColor Green
         Write-Host "========================================================================================================"
         $FuncData | Select-Object -First 15 | Format-Table -AutoSize
+
+        $KernelFuncs = $FuncData | Where-Object {
+            $_.FUNCTION -match 'process_bwd_dx|process_dw_nci|process_fwd_tile|conv2d_.*fallback'
+        }
+        if ($KernelFuncs.Count -gt 0) {
+            Write-Host "`nCONV FALLBACK KERNEL HOTSPOTS (uProf Native):" -ForegroundColor Green
+            Write-Host "--------------------------------------------------------------------------------------------------------"
+            $KernelFuncs | Format-Table -AutoSize
+        }
     }
+}
+
+if ($AnalysisType -eq "BackwardDiag") {
+    Write-Host "`nBACKWARD DIAG CHECKLIST:" -ForegroundColor Yellow
+    Write-Host "  1. Sources tab -> conv_fallback.cpp: compare process_bwd_dx_tile vs process_dw_nci_task CPU_TIME"
+    Write-Host "  2. Re-run with -AnalysisType Memory for core L1/L2/DRAM (not per-function)"
+    Write-Host "  3. Re-run with -EnableCProfile for Python vs native split in im2col.py"
+    Write-Host "  Detail report: $DetailCsv" -ForegroundColor DarkGray
+}
+
+if ($AnalysisType -eq "Memory") {
+    Write-Host "`nNOTE: Memory mode reports core-level cache counters (PCM), not per-function L1 miss." -ForegroundColor DarkGray
 }
 
 # --- SECTION 2: PYTHON HEAP & DYNAMIC BUFFER TRACE (Runs automatically under MemAlloc) ---

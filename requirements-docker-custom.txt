@@ -1,0 +1,5 @@
+# Minimal deps for native-backend Docker benchmark (no numba/scipy/joblib)
+numpy>=2.0.0
+pandas>=2.1.0
+pyyaml>=6.0
+threadpoolctl>=3.4.0

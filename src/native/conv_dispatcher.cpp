@@ -122,7 +122,7 @@ static inline void dispatch_backward(
     if (k_h == 1 && k_w == 1 && pad == 0 && W_in == W_in_stride && stride == 1) {
         log_routing_decision("BWD", "1x1_SPECIALIZED", k_h, k_w, stride, pad);
         conv2d_backward_1x1_avx2(dout, x, W, dx, dW, N, C_in, H * W_in, C_out, stride, inv_m);
-    } else if (k_h == 3 && k_w == 3 && pad == 1 && W_in == W_in_stride && stride == 1) {
+    } else if (k_h == 3 && k_w == 3 && pad == 2 && W_in == W_in_stride && stride == 1) {
         log_routing_decision("BWD", "3x3_SPECIALIZED", k_h, k_w, stride, pad);
         conv2d_backward_3x3_avx2(dout, x, W, dx, dW, N, C_in, H, W_in, C_out, stride, pad, inv_m);
     } else if (k_h == 5 && k_w == 5 && pad == 2 && W_in == W_in_stride && stride == 1) {

@@ -2,16 +2,23 @@ FROM python:3.13-slim
 
 WORKDIR /workspace
 
+# libgomp tuning for native AVX2 kernels (cpuset-isolated Docker run)
+ENV OMP_PROC_BIND=false
+ENV OMP_DYNAMIC=false
+ENV OMP_WAIT_POLICY=ACTIVE
+ENV GOMP_SPINCOUNT=100000
+ENV PYTHONUNBUFFERED=1
+
 # Native build toolchain & OpenMP runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Explicitly pull and install from your root requirements.txt
-COPY requirements.txt .
+# Slim deps for native-backend benchmark (no numba/scipy/llvmlite)
+COPY requirements-docker-custom.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt
+    pip install -r requirements-docker-custom.txt
 
 # Copy source repository
 COPY . .
@@ -25,4 +32,4 @@ RUN mkdir -p bin && \
     -Isrc/native \
     -o bin/conv_kernels.so'
 
-ENTRYPOINT ["python", "benchmarks/run_benchmarks_docker.py", "--target=custom"]
+ENTRYPOINT ["python", "-u", "benchmarks/run_benchmarks_docker.py"]

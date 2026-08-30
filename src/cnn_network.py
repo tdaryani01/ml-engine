@@ -165,7 +165,7 @@ class CNNNetwork:
             self._grad_weights_bufs.append(np.empty((fan_in, fan_out), dtype=dtype))
             self._grad_biases_bufs.append(np.empty((1, fan_out), dtype=dtype))
 
-    @profile
+    
     def _forward(self, X: np.ndarray, training: bool = True) -> np.ndarray:
         self.spatial_inputs.clear()
         self.dense_inputs.clear()
@@ -283,7 +283,7 @@ class CNNNetwork:
                 l1_sum += float(np.sum(np.abs(w)))
         return raw_cost + (self.lam_l2 / (2.0 * m)) * l2_sum + (self.lam_l1 / m) * l1_sum
 
-    @profile
+    
     def backward(self, X: np.ndarray, y: np.ndarray, active_lr: float) -> float:
         m = X.shape[0]
         inv_m = 1.0 / float(m)

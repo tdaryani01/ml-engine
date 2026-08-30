@@ -7,7 +7,7 @@ meta:
   pipeline_name: "synthetic_spatial_cnn_run"
   stage: "development"
   suppress_logging: false
-  logging_level: "error"
+  logging_level: "warning"
   output_dir: "diagnostics_output"
 
 # =====================================================================
@@ -46,7 +46,7 @@ architecture:
       - type: "conv"
         in_channels: 3
         out_channels: 8
-        kernel_size: 3
+        kernel_size: 6
         stride: 1
         pad: 1
       - type: "relu"
@@ -56,7 +56,7 @@ architecture:
       - type: "conv"
         in_channels: 8
         out_channels: 16
-        kernel_size: 3
+        kernel_size: 6
         stride: 1
         pad: 1
       - type: "relu"

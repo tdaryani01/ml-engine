@@ -88,7 +88,7 @@ class ConvBlock:
         self._dcol_buffer     = np.empty((total_rows, total_cols), dtype=dtype)
         self._fwd_gemm_buffer = np.empty((total_rows, self.out_channels), dtype=dtype)
 
-    @profile
+    
     def forward(self, x: np.ndarray) -> np.ndarray:
         if not x.flags['C_CONTIGUOUS']:
             x = np.ascontiguousarray(x)
@@ -111,7 +111,7 @@ class ConvBlock:
         self.argmax_cached = argmax
         return out_pool
 
-    @profile
+    
     def backward(self, dout: np.ndarray) -> np.ndarray:
         if not dout.flags['C_CONTIGUOUS']:
             dout = np.ascontiguousarray(dout)
@@ -204,7 +204,7 @@ class Conv2D:
         self._fwd_out_buffer = np.empty((N, self.out_channels, out_h, out_w), dtype=dtype)
         self._dx_buffer = np.zeros((N, C, H, W), dtype=dtype)
 
-    @profile
+    
     def forward(self, x: np.ndarray) -> np.ndarray:
         if not x.flags['C_CONTIGUOUS']:
             x = np.ascontiguousarray(x)
@@ -228,7 +228,7 @@ class Conv2D:
         )
         return active_out
 
-    @profile
+    
     def backward(self, dout: np.ndarray, in_act: np.ndarray = None, fuse_relu: bool = False) -> np.ndarray:
         if not dout.flags['C_CONTIGUOUS']:
             dout = np.ascontiguousarray(dout)
