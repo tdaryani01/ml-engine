@@ -136,6 +136,15 @@ class ModelController:
 
         return self.model.predict(raw_data_matrix)
 
+    def _set_train_batch_caps(self, model_type: ModelType) -> None:
+        if model_type != ModelType.CNN:
+            return
+        if not hasattr(self.model, "set_train_batch_cap"):
+            return
+        cap = int(getattr(self.data_provider, "batch_size", 32))
+        self.model.set_train_batch_cap(cap)
+        logging.debug(f"[Model Controller] Train buffer cap set to N={cap}.")
+
     def fit(
         self,
         steps: int,
@@ -168,6 +177,8 @@ class ModelController:
         if steps <= 0:
             logging.info("[Model Controller] Steps count set to 0. Skipping training execution loops.")
             return self.train_history, self.val_history
+
+        self._set_train_batch_caps(model_type)
 
         if hasattr(self.model.optimizer, "_setup_done"):
             self.model.optimizer._setup_done = False

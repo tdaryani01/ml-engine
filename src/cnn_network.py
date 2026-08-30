@@ -59,6 +59,10 @@ class CNNNetwork:
         self._grad_biases_bufs = []
         self._cached_batch_size = 0
         self._cached_dtype = None
+        self._train_batch_cap = 0
+        self._eval_batch_size = 0
+        self._eval_cached_dtype = None
+        self._eval_dense_z_bufs = []
 
     @property
     def layer_sizes(self) -> list:
@@ -145,11 +149,40 @@ class CNNNetwork:
             self.biases.append(b)
             self.param_layers.append("dense")
 
-    def _ensure_dense_buffers(self, m: int, dtype):
-        if self._cached_batch_size == m and self._cached_dtype == dtype and self._dense_z_bufs:
+    def set_train_batch_cap(self, cap: int) -> None:
+        self._train_batch_cap = int(cap)
+        for layer in self.layers:
+            if isinstance(layer, ConvBlock) and hasattr(layer, "set_train_batch_cap"):
+                layer.set_train_batch_cap(cap)
+
+    def _ensure_dense_buffers(self, m: int, dtype, inference: bool = False):
+        if inference:
+            if self._eval_cached_dtype == dtype and m <= self._eval_batch_size and self._eval_dense_z_bufs:
+                return
+
+            self._eval_batch_size = max(self._eval_batch_size, m)
+            self._eval_cached_dtype = dtype
+            self._eval_dense_z_bufs = []
+
+            dense_w_indices = [i for i, l in enumerate(self.param_layers) if l == "dense"]
+            for w_idx in dense_w_indices:
+                W = self.weights[w_idx]
+                fan_in, fan_out = W.shape
+                cap = self._eval_batch_size
+                self._eval_dense_z_bufs.append(np.empty((cap, fan_out), dtype=dtype))
             return
 
-        self._cached_batch_size = m
+        target_m = max(self._cached_batch_size, m)
+        if self._train_batch_cap > 0:
+            if self._cached_batch_size > self._train_batch_cap:
+                target_m = self._train_batch_cap
+            else:
+                target_m = min(target_m, self._train_batch_cap)
+
+        if self._cached_dtype == dtype and m <= self._cached_batch_size and self._cached_batch_size == target_m and self._dense_z_bufs:
+            return
+
+        self._cached_batch_size = target_m
         self._cached_dtype = dtype
         self._dense_z_bufs = []
         self._dense_delta_bufs = []
@@ -160,8 +193,9 @@ class CNNNetwork:
         for w_idx in dense_w_indices:
             W = self.weights[w_idx]
             fan_in, fan_out = W.shape
-            self._dense_z_bufs.append(np.empty((m, fan_out), dtype=dtype))
-            self._dense_delta_bufs.append(np.empty((m, fan_in), dtype=dtype))
+            cap = self._cached_batch_size
+            self._dense_z_bufs.append(np.empty((cap, fan_out), dtype=dtype))
+            self._dense_delta_bufs.append(np.empty((cap, fan_in), dtype=dtype))
             self._grad_weights_bufs.append(np.empty((fan_in, fan_out), dtype=dtype))
             self._grad_biases_bufs.append(np.empty((1, fan_out), dtype=dtype))
 
@@ -201,7 +235,12 @@ class CNNNetwork:
             elif isinstance(layer, (Conv2D, ConvBlock, MaxPool2D)):
                 if training:
                     self.spatial_inputs.append(current_act)
-                current_act = layer.forward(current_act, W_logical=current_logical_w)
+                if isinstance(layer, ConvBlock):
+                    current_act = layer.forward(
+                        current_act, W_logical=current_logical_w, inference=not training
+                    )
+                else:
+                    current_act = layer.forward(current_act, W_logical=current_logical_w)
                 current_logical_w = layer.out_w
             else:
                 if training:
@@ -211,15 +250,16 @@ class CNNNetwork:
 
         # 2. Dense Forward Pass
         m = current_act.shape[0]
-        self._ensure_dense_buffers(m, current_act.dtype)
+        self._ensure_dense_buffers(m, current_act.dtype, inference=not training)
         dense_w_indices = [i for i, l in enumerate(self.param_layers) if l == "dense"]
         num_dense = len(dense_w_indices)
+        z_buf_source = self._eval_dense_z_bufs if not training else self._dense_z_bufs
 
         for idx, w_idx in enumerate(dense_w_indices):
             if training:
                 self.dense_inputs.append(current_act)
             
-            z_buf = self._dense_z_bufs[idx]
+            z_buf = z_buf_source[idx]
             W_mat = self.weights[w_idx]
             if W_mat.dtype != current_act.dtype:
                 W_mat = W_mat.astype(current_act.dtype)
@@ -227,15 +267,16 @@ class CNNNetwork:
             if b_vec.dtype != current_act.dtype:
                 b_vec = b_vec.astype(current_act.dtype)
 
-            np.dot(current_act, W_mat, out=z_buf)
-            z_buf += b_vec
+            active_z = z_buf[:m]
+            np.dot(current_act, W_mat, out=active_z)
+            active_z += b_vec
 
             if idx == num_dense - 1:
-                current_act = self.apply_output_activation(z_buf)
+                current_act = self.apply_output_activation(active_z)
                 if training:
                     self.masks.append(None)
             else:
-                current_act = np.maximum(0.0, z_buf)
+                current_act = np.maximum(0.0, active_z)
                 if training and self.p_dropout > 0.0:
                     mask = (np.random.rand(*current_act.shape) >= self.p_dropout).astype(current_act.dtype) / (1.0 - self.p_dropout)
                     current_act *= mask
@@ -317,7 +358,7 @@ class CNNNetwork:
             gb_buf *= inv_m
             grad_biases[w_idx] = gb_buf
 
-            next_delta_buf = self._dense_delta_bufs[local_idx]
+            next_delta_buf = self._dense_delta_bufs[local_idx][:m]
             np.dot(delta, W_mat.T, out=next_delta_buf)
             delta = next_delta_buf
 

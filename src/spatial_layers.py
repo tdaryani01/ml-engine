@@ -102,99 +102,173 @@ class ConvBlock:
         self.out_h = 0
         self.out_w = 0
 
-        # Replace exact batch size tracking with capacity trackers
+        # Train-buffer capacity (inference uses separate eval buffers)
+        self._train_N_cap = 0
         self._max_N = 0
         self._col_cap = 0
         self._cached_dtype = None
-        
+
         self._out_conv_buffer = None
         self._out_pool_buffer = None
         self._argmax_buffer = None
         self._d_conv_buffer = None
         self._dx_buffer = None
+
+        self._eval_max_N = 0
+        self._eval_cached_dtype = None
+        self._eval_out_conv_buffer = None
+        self._eval_out_pool_buffer = None
+        self._eval_argmax_buffer = None
+
         self._dout_trans_buffer = None
         self._col_buffer = None
         self._dcol_buffer = None
         self._fwd_gemm_buffer = None
 
-    def _ensure_buffers(self, N: int, C: int, H: int, W_stride: int, W_logical: int, dtype):
+    def set_train_batch_cap(self, cap: int) -> None:
+        self._train_N_cap = int(cap)
+
+    def _compute_geometry(self, C: int, H: int, W_stride: int, W_logical: int):
         conv_out_h = (H + 2 * self.conv_pad - self.k_h) // self.conv_stride + 1
         conv_out_w = (W_logical + 2 * self.conv_pad - self.k_w) // self.conv_stride + 1
         conv_out_w_stride = _round_up_simd(conv_out_w)
-
         pool_out_h = (conv_out_h - self.pool_size) // self.pool_stride + 1
         pool_out_w = (conv_out_w - self.pool_size) // self.pool_stride + 1
         self.out_h = pool_out_h
         self.out_w = pool_out_w
+        return conv_out_h, conv_out_w_stride, pool_out_h, pool_out_w
 
+    def _sync_param_dtypes(self, dtype):
         if self.W.dtype != dtype:
             self.W = self.W.astype(dtype)
             self.b = self.b.astype(dtype)
             self.dW = np.zeros_like(self.W, dtype=dtype)
             self.db = np.zeros_like(self.b, dtype=dtype)
-
         if self.db is None or self.db.dtype != dtype:
             self.db = np.zeros_like(self.b, dtype=dtype)
         if self.dW is None or self.dW.dtype != dtype:
             self.dW = np.zeros_like(self.W, dtype=dtype)
 
+    def _ensure_train_buffers(self, N: int, C: int, H: int, W_stride: int, W_logical: int, dtype):
+        conv_out_h, conv_out_w_stride, pool_out_h, pool_out_w = self._compute_geometry(
+            C, H, W_stride, W_logical
+        )
+        self._sync_param_dtypes(dtype)
+
         total_rows = N * conv_out_h * conv_out_w_stride
         total_cols = C * self.k_h * self.k_w
 
-        # High-Water Mark Capacity Check: Exit early if current capacity can hold the batch
-        if self._cached_dtype == dtype and total_rows <= self._col_cap and N <= self._max_N and self._dx_buffer is not None:
+        target_N = max(self._max_N, N)
+        if self._train_N_cap > 0:
+            if self._max_N > self._train_N_cap:
+                target_N = self._train_N_cap
+            else:
+                target_N = min(target_N, self._train_N_cap)
+
+        if (
+            self._cached_dtype == dtype
+            and N <= self._max_N
+            and self._max_N == target_N
+            and self._dx_buffer is not None
+        ):
             return
 
-        # Update high-water marks
-        self._col_cap = max(self._col_cap, total_rows)
-        self._max_N = max(self._max_N, N)
+        self._max_N = target_N
+        self._col_cap = max(self._col_cap, self._max_N * conv_out_h * conv_out_w_stride)
         self._cached_dtype = dtype
 
-        logger.warning(f"[ConvBlock] _ensure_buffers (N={N}, Max={self._max_N}). Reallocating spatial buffers.")
+        logger.debug(f"[ConvBlock] train buffers (N={N}, cap={self._max_N}).")
 
-        # Allocate standard spatial buffers using the maximum seen N
-        self._out_conv_buffer = np.zeros((self._max_N, self.out_channels, conv_out_h, conv_out_w_stride), dtype=dtype)
-        self._out_pool_buffer = np.empty((self._max_N, self.out_channels, pool_out_h, pool_out_w), dtype=dtype)
-        self._argmax_buffer   = np.empty((self._max_N, self.out_channels, pool_out_h, pool_out_w), dtype=np.uint8)
-        self._d_conv_buffer   = np.zeros((self._max_N, self.out_channels, conv_out_h, conv_out_w_stride), dtype=dtype)
-        self._dx_buffer       = np.zeros((self._max_N, C, H, W_stride), dtype=dtype)
+        self._out_conv_buffer = np.zeros(
+            (self._max_N, self.out_channels, conv_out_h, conv_out_w_stride), dtype=dtype
+        )
+        self._out_pool_buffer = np.empty(
+            (self._max_N, self.out_channels, pool_out_h, pool_out_w), dtype=dtype
+        )
+        self._argmax_buffer = np.empty(
+            (self._max_N, self.out_channels, pool_out_h, pool_out_w), dtype=np.uint8
+        )
+        self._d_conv_buffer = np.zeros(
+            (self._max_N, self.out_channels, conv_out_h, conv_out_w_stride), dtype=dtype
+        )
+        self._dx_buffer = np.zeros((self._max_N, C, H, W_stride), dtype=dtype)
 
-        # Conditionally allocate im2col expansion buffers ONLY if not using the NATIVE backend
         if self.backend != EngineBackend.NATIVE:
-            logger.warning(f"[ConvBlock] Allocating im2col arrays: col_buf=({self._col_cap}, {total_cols}), gemm_buf=({self._col_cap}, {self.out_channels})")
             self._dout_trans_buffer = np.empty((self._col_cap, self.out_channels), dtype=dtype)
-            self._col_buffer      = np.empty((self._col_cap, total_cols), dtype=dtype)
-            self._dcol_buffer     = np.empty((self._col_cap, total_cols), dtype=dtype)
+            self._col_buffer = np.empty((self._col_cap, total_cols), dtype=dtype)
+            self._dcol_buffer = np.empty((self._col_cap, total_cols), dtype=dtype)
             self._fwd_gemm_buffer = np.empty((self._col_cap, self.out_channels), dtype=dtype)
         else:
             self._dout_trans_buffer = None
-            self._col_buffer      = None
-            self._dcol_buffer     = None
+            self._col_buffer = None
+            self._dcol_buffer = None
             self._fwd_gemm_buffer = None
-    
-    
-    def forward(self, x: np.ndarray, W_logical: int = None) -> np.ndarray:
+
+    def _ensure_eval_buffers(self, N: int, C: int, H: int, W_stride: int, W_logical: int, dtype):
+        conv_out_h, conv_out_w_stride, pool_out_h, pool_out_w = self._compute_geometry(
+            C, H, W_stride, W_logical
+        )
+
+        target_N = max(self._eval_max_N, N)
+        if (
+            self._eval_cached_dtype == dtype
+            and N <= self._eval_max_N
+            and self._eval_out_conv_buffer is not None
+        ):
+            return
+
+        self._eval_max_N = target_N
+        self._eval_cached_dtype = dtype
+
+        logger.debug(f"[ConvBlock] eval buffers (N={N}, cap={self._eval_max_N}).")
+
+        self._eval_out_conv_buffer = np.zeros(
+            (self._eval_max_N, self.out_channels, conv_out_h, conv_out_w_stride), dtype=dtype
+        )
+        self._eval_out_pool_buffer = np.empty(
+            (self._eval_max_N, self.out_channels, pool_out_h, pool_out_w), dtype=dtype
+        )
+        self._eval_argmax_buffer = np.empty(
+            (self._eval_max_N, self.out_channels, pool_out_h, pool_out_w), dtype=np.uint8
+        )
+    def forward(self, x: np.ndarray, W_logical: int = None, inference: bool = False) -> np.ndarray:
         if not x.flags['C_CONTIGUOUS']:
             x = np.ascontiguousarray(x)
 
         N, C, H, W_stride = x.shape
         w_log = W_logical if W_logical is not None else W_stride
-        self._ensure_buffers(N, C, H, W_stride, w_log, x.dtype)
-        self.x_cached = x
 
-        out_pool, out_conv, argmax, self.col = conv_block_forward(
+        if inference:
+            self._ensure_eval_buffers(N, C, H, W_stride, w_log, x.dtype)
+            out_conv_buf = self._eval_out_conv_buffer
+            out_pool_buf = self._eval_out_pool_buffer
+            argmax_buf = self._eval_argmax_buffer
+            col_buf = None
+            gemm_buf = None
+        else:
+            self._ensure_train_buffers(N, C, H, W_stride, w_log, x.dtype)
+            out_conv_buf = self._out_conv_buffer
+            out_pool_buf = self._out_pool_buffer
+            argmax_buf = self._argmax_buffer
+            col_buf = self._col_buffer
+            gemm_buf = self._fwd_gemm_buffer
+            self.x_cached = x
+
+        out_pool, out_conv, argmax, col = conv_block_forward(
             x=x, W=self.W, bias=self.b,
-            out_conv_buf=self._out_conv_buffer[:N],
-            out_pool_buf=self._out_pool_buffer[:N],
-            argmax_buf=self._argmax_buffer[:N],
+            out_conv_buf=out_conv_buf[:N],
+            out_pool_buf=out_pool_buf[:N],
+            argmax_buf=argmax_buf[:N],
             conv_stride=self.conv_stride, conv_pad=self.conv_pad,
             pool_size=self.pool_size, pool_stride=self.pool_stride,
-            col_buf=self._col_buffer, gemm_buf=self._fwd_gemm_buffer,
+            col_buf=col_buf, gemm_buf=gemm_buf,
             W_logical=w_log
         )
 
-        self.conv_act_cached = out_conv
-        self.argmax_cached = argmax
+        if not inference:
+            self.conv_act_cached = out_conv
+            self.argmax_cached = argmax
+            self.col = col
         return out_pool
 
     
@@ -205,7 +279,7 @@ class ConvBlock:
         N, C, H, W_stride = self.x_cached.shape
         w_log = W_logical if W_logical is not None else W_stride
         inv_m = 1.0 / float(N)
-        self._ensure_buffers(N, C, H, W_stride, w_log, dout.dtype)
+        self._ensure_train_buffers(N, C, H, W_stride, w_log, dout.dtype)
 
         dx, self.dW, self.db = conv_block_backward(
             dout_pool=dout,
@@ -378,6 +452,26 @@ class MaxPool2D:
         self._out_buf = None
         self._dx_buf = None
         self._argmax_buf = None
+        self._max_N = 0
+        self._cached_dtype = None
+
+    def _ensure_buffers(self, N: int, C: int, H: int, W_stride: int, w_log: int, dtype):
+        self.out_h = (H - self.pool_size) // self.stride + 1
+        self.out_w = (w_log - self.pool_size) // self.stride + 1
+        out_w_stride = (W_stride - self.pool_size) // self.stride + 1
+
+        if (
+            self._cached_dtype == dtype
+            and N <= self._max_N
+            and self._out_buf is not None
+            and self._out_buf.shape[1:] == (C, self.out_h, out_w_stride)
+        ):
+            return
+
+        self._max_N = max(self._max_N, N)
+        self._cached_dtype = dtype
+        self._out_buf = np.empty((self._max_N, C, self.out_h, out_w_stride), dtype=dtype)
+        self._argmax_buf = np.empty((self._max_N, C, self.out_h, out_w_stride), dtype=np.uint8)
 
     def forward(self, x: np.ndarray, W_logical: int = None) -> np.ndarray:
         if not x.flags['C_CONTIGUOUS']:
@@ -387,18 +481,12 @@ class MaxPool2D:
         N, C, H, W_stride = self.x_shape
         w_log = W_logical if W_logical is not None else W_stride
         
-        self.out_h = (H - self.pool_size) // self.stride + 1
-        self.out_w = (w_log - self.pool_size) // self.stride + 1
-        out_w_stride = (W_stride - self.pool_size) // self.stride + 1
-
-        if self._out_buf is None or self._out_buf.shape != (N, C, self.out_h, out_w_stride) or self._out_buf.dtype != x.dtype:
-            self._out_buf = np.empty((N, C, self.out_h, out_w_stride), dtype=x.dtype)
-            self._argmax_buf = np.empty((N, C, self.out_h, out_w_stride), dtype=np.uint8)
+        self._ensure_buffers(N, C, H, W_stride, w_log, x.dtype)
 
         out, self._cache = maxpool_forward(
             x, self.pool_size, self.stride,
-            out_buf=self._out_buf,
-            argmax_buf=self._argmax_buf
+            out_buf=self._out_buf[:N],
+            argmax_buf=self._argmax_buf[:N]
         )
         return out
 
