@@ -683,22 +683,20 @@ void conv2d_backward_fallback_avx2(
             }
 
             if (do_dw && tls_priv_dW) {
-                #pragma omp for collapse(3) schedule(dynamic, 1)
-                for (int64_t n = 0; n < N; ++n) {
-                    for (int64_t cout = 0; cout < C_out; ++cout) {
-                        for (int64_t cin = 0; cin < C_in; ++cin) {
-                            float* __restrict dw_slice = &tls_priv_dW[(cout * C_in + cin) * k_spatial];
-                            process_dw_nci_task(
-                                n, cout, cin, dw_slice,
-                                d_conv_buf, x,
-                                C_in, C_out, H, W_in, W_in_stride,
-                                k_h, k_w, stride, pad,
-                                spatial_in, conv_spatial, k_spatial,
-                                conv_out_h, conv_out_w, conv_out_w_stride,
-                                v_idx
-                            );
-                        }
-                    }
+                #pragma omp for schedule(dynamic, 1)
+                for (int64_t task_id = 0; task_id < dw_task_count; ++task_id) {
+                    int64_t n, cout, cin;
+                    decode_dw_nci_task(task_id, N, C_out, C_in, n, cout, cin);
+                    float* __restrict dw_slice = &tls_priv_dW[(cout * C_in + cin) * k_spatial];
+                    process_dw_nci_task(
+                        n, cout, cin, dw_slice,
+                        d_conv_buf, x,
+                        C_in, C_out, H, W_in, W_in_stride,
+                        k_h, k_w, stride, pad,
+                        spatial_in, conv_spatial, k_spatial,
+                        conv_out_h, conv_out_w, conv_out_w_stride,
+                        v_idx
+                    );
                 }
 
                 #pragma omp critical(dw_batch_merge)
