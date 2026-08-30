@@ -5,25 +5,41 @@ __pycache__/
 *.pyd
 .pytest_cache/
 
-# Data and large binaries (Don't track massive training datasets)
-*.csv
-*.npy
-*.npz
-*.datasets/
-
-# IDE and Environment
+# IDE and environment
 .venv/
 venv/
 .env
 .cursor/
 
+# Data and large binaries (don't track massive training datasets)
+*.csv
+*.npy
+*.npz
+*.datasets/
+data/
+
+# Native build artifacts
+bin/
 *.dll
+*.so
 *.lib
 *.exp
 *.obj
 *.pdb
 
-# Diagnostics and monitoring 
-/diagnostics_output/
+# Diagnostics, profiling, and benchmark outputs
+diagnostics_output/
+benchmark_diagnostics/
+profiler_results/
+uprof_reports/
 *.log
 *.prof
+*.dat
+
+# Packaging / temp
+build/
+dist/
+output/
+logs/
+tmp/
+test_run.log
