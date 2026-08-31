@@ -48,6 +48,7 @@ class CNNNetwork:
         logging.info("-------------------------\n")
 
         self.spatial_inputs = []
+        self.spatial_logical_ws = []
         self.dense_inputs = []
         self.masks = []
         self.activations = []
@@ -202,6 +203,7 @@ class CNNNetwork:
     
     def _forward(self, X: np.ndarray, training: bool = True) -> np.ndarray:
         self.spatial_inputs.clear()
+        self.spatial_logical_ws.clear()
         self.dense_inputs.clear()
         self.masks.clear()
         self.activations = [X]
@@ -227,14 +229,17 @@ class CNNNetwork:
             if layer == "relu":
                 if training:
                     self.spatial_inputs.append(current_act)
+                    self.spatial_logical_ws.append(current_logical_w)
                 current_act = relu_spatial_forward(current_act)
             elif isinstance(layer, Flatten):
                 if training:
                     self.spatial_inputs.append(current_act)
+                    self.spatial_logical_ws.append(current_logical_w)
                 current_act = layer.forward(current_act, logical_w=current_logical_w)
             elif isinstance(layer, (Conv2D, ConvBlock, MaxPool2D)):
                 if training:
                     self.spatial_inputs.append(current_act)
+                    self.spatial_logical_ws.append(current_logical_w)
                 if isinstance(layer, ConvBlock):
                     current_act = layer.forward(
                         current_act, W_logical=current_logical_w, inference=not training
@@ -245,6 +250,7 @@ class CNNNetwork:
             else:
                 if training:
                     self.spatial_inputs.append(current_act)
+                    self.spatial_logical_ws.append(current_logical_w)
                 current_act = layer.forward(current_act)
             self.activations.append(current_act)
 
@@ -375,12 +381,14 @@ class CNNNetwork:
 
             if layer == "relu":
                 spatial_grad = relu_spatial_backward(spatial_grad, in_act)
+            elif isinstance(layer, (Conv2D, ConvBlock)):
+                w_log = self.spatial_logical_ws[i]
+                spatial_grad = layer.backward(spatial_grad, W_logical=w_log)
+                c_idx = self.param_layers.index(layer)
+                grad_weights[c_idx] = layer.dW
+                grad_biases[c_idx] = layer.db
             else:
                 spatial_grad = layer.backward(spatial_grad)
-                if isinstance(layer, (Conv2D, ConvBlock)):
-                    c_idx = self.param_layers.index(layer)
-                    grad_weights[c_idx] = layer.dW
-                    grad_biases[c_idx] = layer.db
 
         # 3. L1 Penalty
         if self.lam_l1 > 0.0:
@@ -388,17 +396,22 @@ class CNNNetwork:
             for i in range(num_params):
                 grad_weights[i] += scale * np.sign(self.weights[i])
 
-        # 4. Fast Gradient Clipping
+        # 4. Gradient clipping (float64 norm avoids overflow before clip can run)
         total_sq = 0.0
-        for gw in grad_weights:
-            total_sq += float(np.sum(gw * gw))
+        for gw, gb in zip(grad_weights, grad_biases):
+            if gw is not None:
+                total_sq += float(np.sum(gw.astype(np.float64) ** 2))
+            if gb is not None:
+                total_sq += float(np.sum(gb.astype(np.float64) ** 2))
         total_norm = np.sqrt(total_sq)
 
         if total_norm > self.max_norm:
             scaling_factor = self.max_norm / (total_norm + 1e-15)
             for i in range(num_params):
-                grad_weights[i] *= scaling_factor
-                grad_biases[i] *= scaling_factor
+                if grad_weights[i] is not None:
+                    grad_weights[i] *= scaling_factor
+                if grad_biases[i] is not None:
+                    grad_biases[i] *= scaling_factor
 
         # 5. Optimizer Update Step
         self.optimizer.update(

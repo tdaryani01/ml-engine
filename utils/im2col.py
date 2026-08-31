@@ -567,9 +567,9 @@ def conv2d_backward_input(dout: np.ndarray, W: np.ndarray, dx_buf: np.ndarray,
     total_rows = N * out_h * out_w
 
     W_2d = W.reshape(W.shape[0], -1)
-    
-    # Extract only active logical rows for backprop GEMM
-    active_dout_trans = dout[:, :, :out_h, :out_w].transpose(0, 2, 3, 1).reshape(total_rows, W.shape[0])
+
+    dout_logical = dout[:, :, :out_h, :out_w]
+    active_dout_trans = dout_logical.transpose(0, 2, 3, 1).reshape(total_rows, W.shape[0])
     active_dcol = dcol_buf[:total_rows] if dcol_buf is not None else np.empty((total_rows, W_2d.shape[1]), dtype=dout.dtype)
     np.dot(active_dout_trans, W_2d, out=active_dcol)
     

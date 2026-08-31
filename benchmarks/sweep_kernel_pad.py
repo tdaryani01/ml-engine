@@ -205,12 +205,15 @@ def run_sweep(
     pad: int,
     config_path: Optional[str] = None,
     output_path: Optional[str] = None,
+    backend_override: Optional[str] = None,
 ) -> List[dict]:
     if config_path is None:
         config_path = os.path.join(project_root, "config", "config.yaml")
 
     data_provider, cfg_dict = load_benchmark_data(config_path)
     cfg_dict["optimization"]["early_stopping_enabled"] = False
+    if backend_override:
+        cfg_dict["architecture"]["backend"] = backend_override
 
     cnn_base = cfg_dict["architecture"]["cnn"]
     input_shape = tuple(cnn_base.get("input_shape", [3, 28, 28]))
@@ -377,6 +380,7 @@ if __name__ == "__main__":
     parser.add_argument("--pad", type=int, default=1)
     parser.add_argument("--k-min", type=int, default=1)
     parser.add_argument("--k-max", type=int, default=7)
+    parser.add_argument("--backend", default=None, help="Override config backend (native | im2col+gemm)")
     parser.add_argument("--config", default=None, help="YAML config path")
     parser.add_argument(
         "--output",
@@ -390,4 +394,5 @@ if __name__ == "__main__":
         pad=args.pad,
         config_path=args.config,
         output_path=args.output,
+        backend_override=args.backend,
     )

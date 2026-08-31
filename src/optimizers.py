@@ -72,13 +72,20 @@ class AdamOptimizer(Optimizer):
             gw = grad_weights[i]
             gb = grad_biases[i]
 
+            gw64 = gw.astype(np.float64)
+            gb64 = gb.astype(np.float64)
+
             # First moment updates
             self.ms_w[i] = self.beta1 * self.ms_w[i] + one_minus_beta1 * gw
             self.ms_b[i] = self.beta1 * self.ms_b[i] + one_minus_beta1 * gb
             
-            # Second moment updates
-            self.vs_w[i] = self.beta2 * self.vs_w[i] + one_minus_beta2 * (gw * gw)
-            self.vs_b[i] = self.beta2 * self.vs_b[i] + one_minus_beta2 * (gb * gb)
+            # Second moment updates (float64 avoids overflow when |g| is large)
+            self.vs_w[i] = (
+                self.beta2 * self.vs_w[i].astype(np.float64) + one_minus_beta2 * (gw64 * gw64)
+            ).astype(self.vs_w[i].dtype)
+            self.vs_b[i] = (
+                self.beta2 * self.vs_b[i].astype(np.float64) + one_minus_beta2 * (gb64 * gb64)
+            ).astype(self.vs_b[i].dtype)
             
             # In-place step application
             if decay_factor > 0.0:
