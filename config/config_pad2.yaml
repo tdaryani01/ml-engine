@@ -1,0 +1,127 @@
+# config/config.yaml
+
+# =====================================================================
+# SYSTEM META CONFIGURATION
+# =====================================================================
+meta:
+  pipeline_name: "synthetic_spatial_cnn_run"
+  stage: "development"
+  suppress_logging: false
+  logging_level: "warning"
+  output_dir: "diagnostics_output"
+
+# =====================================================================
+# DATA INGESTION MATRIX
+# =====================================================================
+ingestion:
+  source_mode: "csv"                 # IngestionMode: "csv" or "stream"
+  data_file_path: "data/samples/csv/synthetic_shapes.csv"
+  feature_names: "auto"              # Ingest all pixel feature columns (px_0 to px_2351)
+  splits:
+    train: 0.70
+    val: 0.15
+  drain_on_empty: false
+  amqp_url: "amqp://guest:guest@localhost:5672/%2f"
+  queue_name: "supply_chain.incoming_batches"
+  val_queue_name: "supply_chain.validation_batches"
+
+# =====================================================================
+# NETWORK ARCHITECTURE CONFIGURATION
+# =====================================================================
+architecture:
+  model_type: "cnn"                  # Options: "multi_class", "binary_classification", "regression", "cnn"
+  backend: "native"                  # Options: "native" | "im2col+gemm" | "numpy"
+  num_classes: 4                     # 4 Synthetic Classes: Circle, Square, Cross, Diamond
+  hidden_layers: []                  # Dense MLP hidden layers (bypassed for CNN)
+  p_dropout: 0.1                     # Regularization dropout rate
+  use_batch_norm: false              #
+  bn_momentum: 0.9                   #
+
+  # -------------------------------------------------------------------
+  # CNN SPECIFIC PIPELINE CONFIGURATION (Active when model_type: "cnn")
+  # -------------------------------------------------------------------
+  cnn:
+    input_shape: [3, 28, 28]         # [Channels, Height, Width]
+    spatial_pipeline:
+      - type: "conv"
+        in_channels: 3
+        out_channels: 8
+        kernel_size: 6
+        stride: 1
+        pad: 2
+      - type: "relu"
+      - type: "pool"
+        pool_size: 2
+        stride: 2
+      - type: "conv"
+        in_channels: 8
+        out_channels: 16
+        kernel_size: 6
+        stride: 1
+        pad: 2
+      - type: "relu"
+      - type: "pool"
+        pool_size: 2
+        stride: 2
+      - type: "flatten"
+    dense_head: [64]                 # Hidden dense dims between Flatten and Output classes
+
+# =====================================================================
+# OPTIMIZATION LOOP CONTROLS
+# =====================================================================
+optimization:
+  num_threads: 4
+  optimizer: "adam"
+  epochs_full_dataset: 100
+  steps_streaming: 31
+  batch_size: 32
+  learning_rate: 0.001               # Initial learning rate for Adam
+  
+  # Learning Rate Schedule
+  lr_scheduler: "exponential"
+  scheduler_decay_rate: 0.98
+  scheduler_epochs_per_drop: 10
+  scheduler_drop_ratio: 0.5
+
+  # Early Stopping Monitor
+  early_stopping_enabled: false
+  patience: 10
+  min_delta: 1.0e-04
+
+  # Numerical Defensive Guardrails
+  gradient_clipping_max_norm: 5.0
+
+# =====================================================================
+# REGULARIZATION STRAIN MATRIX
+# =====================================================================
+regularization:
+  lam_l1: 1.0e-05
+  lam_l2: 1.0e-04                    # L2 weight decay penalty
+  sparsity_tolerance: 1.0e-05
+
+# =====================================================================
+# PIPELINE FEATURE TRANSLATION TRANSFORMATIONS
+# =====================================================================
+transformations:
+  fourier_expansion:
+    enabled: false
+    num_frequencies: 4
+
+# =====================================================================
+# PERSISTENCE & LIFECYCLE MANAGEMENT
+# =====================================================================
+persistence:
+  load_saved_model: false             # Set to false for clean CNN training run
+  model_asset_path: "deployed_cnn_model.npz"
+
+# =====================================================================
+# DIAGNOSTICS & REPORTING
+# =====================================================================
+diagnostics:
+  enabled: false
+  metric_to_plot: "all"
+  save_raw_logs: true
+  figure_width: 10
+  figure_height: 6
+  plot_style: "seaborn-v0_8-darkgrid"
+  output_format: "png"

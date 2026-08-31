@@ -537,6 +537,14 @@ def run_pytorch_benchmark(
         "inf_time": float(torch_inf_time)
     }
 
+def reset_benchmark_data_provider(data_provider) -> None:
+    """Reset epoch cursor so a shared InMemoryDataProvider can run another benchmark."""
+    data_provider._epochs_completed = 0
+    data_provider._batch_idx = 0
+    data_provider._has_more = True
+    data_provider.reset_epoch()
+
+
 def run_custom_engine_benchmark(
     data_provider: InMemoryDataProvider,
     X_train: np.ndarray,
@@ -572,7 +580,8 @@ def run_custom_engine_benchmark(
     if native_lib and hasattr(native_lib, "reset_thread_execution_stats"):
         native_lib.reset_thread_execution_stats()
 
-    data_provider.reset_epoch()
+    # Fresh epoch budget when the provider is reused across benchmark runs.
+    reset_benchmark_data_provider(data_provider)
     
     controller = ModelController(
         data_provider=data_provider,
@@ -684,8 +693,126 @@ def run_custom_engine_benchmark(
     }
 
 
-def run_cnn_benchmark():
-    data_provider, cfg_dict = load_benchmark_data()
+def format_system_banner(
+    *,
+    data_path: str,
+    backend,
+    epochs: int,
+    batch_size: int,
+    lr_init: float,
+    lam_l2: float,
+    lam_l1: float,
+    lr_scheduler_type: str,
+    early_stopping_enabled: bool,
+    patience: int,
+    min_delta: float,
+    num_threads: int,
+    specs: list,
+    title: str = "CONVERGENCE BENCHMARK: CUSTOM ENGINE vs PYTORCH CNN",
+) -> str:
+    user_name = getpass.getuser()
+    system_node = platform.node()
+    os_name = f"{platform.system()} {platform.release()} ({platform.machine()})"
+    cpu_model = platform.processor() or "AMD x86_64 Family"
+    logical_cores = os.cpu_count()
+    backend_value = backend.value if hasattr(backend, "value") else str(backend)
+
+    lines = [
+        "=" * 80,
+        f"      {title}",
+        "=" * 80,
+        f"User / Host         : {user_name}@{system_node}",
+        f"OS / Architecture   : {os_name}",
+        f"CPU Model           : {cpu_model}",
+        f"Logical CPU Cores   : {logical_cores}",
+        f"Dataset Path        : {data_path}",
+        f"Active Backend      : {backend_value}",
+        f"Epochs / Batch Size : {epochs} / {batch_size}",
+        f"Learning Rate / L2  : {lr_init} / {lam_l2} (L1: {lam_l1})",
+        f"LR Scheduler Type   : {lr_scheduler_type}",
+        (
+            f"Early Stopping      : Enabled={early_stopping_enabled} "
+            f"(Patience={patience}, Min Delta={min_delta})"
+        ),
+        "-" * 80,
+        f"Configured Threads  : {num_threads} Threads (Enforced via OMP/MKL/PyTorch)",
+        f"CNN Layer Specs     : {specs}",
+        "=" * 80,
+    ]
+    return "\n".join(lines)
+
+
+def format_head_to_head_report(
+    t_res: dict,
+    c_res: dict,
+    *,
+    epochs: int,
+    n_train: int,
+    n_val: int,
+    backend,
+    kernel_label: str = "",
+) -> str:
+    backend_value = backend.value if hasattr(backend, "value") else str(backend)
+    torch_col_header = f"PyTorch CNN ({t_res['threads_verified']}T)"
+    custom_col_header = f"Custom [{backend_value}] ({c_res['threads_verified']}T)"
+    torch_throughput = (n_train * t_res["epochs_completed"]) / t_res["train_time"]
+    custom_throughput = (n_train * c_res["epochs_completed"]) / c_res["train_time"]
+    ratio = c_res["train_time"] / t_res["train_time"] if t_res["train_time"] > 0 else float("inf")
+
+    title = "HEAD-TO-HEAD BENCHMARK REPORT"
+    if kernel_label:
+        title = f"HEAD-TO-HEAD REPORT — {kernel_label}"
+
+    lines = [
+        "",
+        "=" * 80,
+        title.center(80),
+        "=" * 80,
+        f"{'Performance Metric':<32} | {torch_col_header:<20} | {custom_col_header:<20}",
+        "-" * 80,
+        f"{'Active Hardware Threads':<32} | {t_res['threads_verified']:<20d} | {c_res['threads_verified']:<20d}",
+        f"{'Total Trainable Parameters':<32} | {t_res['params']:<20,d} | {c_res['params']:<20,d}",
+        f"{'Target Epochs':<32} | {epochs:<20d} | {epochs:<20d}",
+        f"{'Epochs Completed':<32} | {t_res['epochs_completed']:<20d} | {c_res['epochs_completed']:<20d}",
+        f"{'Best Validation Epoch':<32} | {t_res['best_epoch']:<20d} | {c_res['best_epoch']:<20d}",
+        f"{'Early Stopping Triggered':<32} | {str(t_res['early_stopped']):<20} | {str(c_res['early_stopped']):<20}",
+        f"{'Forward Pass Count':<32} | {t_res['forward_counts']:<20,d} | {c_res['forward_counts']:<20,d}",
+        f"{'Backward Pass Count':<32} | {t_res['backward_counts']:<20,d} | {c_res['backward_counts']:<20,d}",
+        f"{'Final Training Loss':<32} | {t_res['train_loss']:<20.6f} | {c_res['train_loss']:<20.6f}",
+        f"{'Final Validation Loss':<32} | {t_res['val_loss']:<20.6f} | {c_res['val_loss']:<20.6f}",
+        f"{'Final Validation Accuracy':<32} | {t_res['val_acc'] * 100:>19.2f}% | {c_res['val_acc'] * 100:>19.2f}%",
+        "-" * 80,
+        f"{'Total Training Time':<32} | {t_res['train_time']:>18.3f} s | {c_res['train_time']:>18.3f} s",
+        f"{'Training Throughput':<32} | {torch_throughput:>14.1f} smp/s | {custom_throughput:>14.1f} smp/s",
+        (
+            f"{'Time per Epoch':<32} | "
+            f"{(t_res['train_time'] / t_res['epochs_completed']) * 1000:>16.2f} ms | "
+            f"{(c_res['train_time'] / c_res['epochs_completed']) * 1000:>16.2f} ms"
+        ),
+        (
+            f"{'Val Inference Latency (Batch)':<32} | "
+            f"{t_res['inf_time'] * 1000:>16.3f} ms | {c_res['inf_time'] * 1000:>16.3f} ms"
+        ),
+        (
+            f"{'Per-Sample Inference Latency':<32} | "
+            f"{(t_res['inf_time'] / n_val) * 1000:>16.4f} ms | "
+            f"{(c_res['inf_time'] / n_val) * 1000:>16.4f} ms"
+        ),
+        "-" * 80,
+        f"{'Custom / PyTorch Train Ratio':<32} | {ratio:>18.3f}x | {'(>1 = custom slower)':>20}",
+        "=" * 80,
+    ]
+    return "\n".join(lines)
+
+
+def print_head_to_head_report(*args, **kwargs) -> str:
+    report = format_head_to_head_report(*args, **kwargs)
+    print(report)
+    return report
+
+
+def run_cnn_benchmark(config_path: str = None):
+    data_provider, cfg_dict = load_benchmark_data(config_path)
     
     data_path = cfg_dict["ingestion"]["data_file_path"]
     raw_model_type = cfg_dict["architecture"]["model_type"]
@@ -708,31 +835,23 @@ def run_cnn_benchmark():
     min_delta = float(cfg_dict["optimization"].get("min_delta", 1e-4))
     lr_scheduler_type = cfg_dict["optimization"].get("lr_scheduler", "none")
 
-    user_name = getpass.getuser()
-    system_node = platform.node()
-    os_name = f"{platform.system()} {platform.release()} ({platform.machine()})"
-    cpu_model = platform.processor() or "AMD x86_64 Family"
-    logical_cores = os.cpu_count()
-
     specs = extract_layer_specs(cnn_dict)
 
-    print("=" * 80)
-    print("      CONVERGENCE BENCHMARK: CUSTOM ENGINE vs PYTORCH CNN")
-    print("=" * 80)
-    print(f"User / Host         : {user_name}@{system_node}")
-    print(f"OS / Architecture   : {os_name}")
-    print(f"CPU Model           : {cpu_model}")
-    print(f"Logical CPU Cores   : {logical_cores}")
-    print(f"Dataset Path        : {data_path}")
-    print(f"Active Backend      : {backend.value}")
-    print(f"Epochs / Batch Size : {epochs} / {batch_size}")
-    print(f"Learning Rate / L2  : {lr_init} / {lam_l2} (L1: {lam_l1})")
-    print(f"LR Scheduler Type   : {lr_scheduler_type}")
-    print(f"Early Stopping      : Enabled={early_stopping_enabled} (Patience={patience}, Min Delta={min_delta})")
-    print("-" * 80)
-    print(f"Configured Threads  : {num_threads} Threads (Enforced via OMP/MKL/PyTorch)")
-    print(f"CNN Layer Specs     : {specs}")
-    print("=" * 80)
+    print(format_system_banner(
+        data_path=data_path,
+        backend=backend,
+        epochs=epochs,
+        batch_size=batch_size,
+        lr_init=lr_init,
+        lam_l2=lam_l2,
+        lam_l1=lam_l1,
+        lr_scheduler_type=lr_scheduler_type,
+        early_stopping_enabled=early_stopping_enabled,
+        patience=patience,
+        min_delta=min_delta,
+        num_threads=num_threads,
+        specs=specs,
+    ))
 
     X_train = data_provider.splits[DataKeys.X_TRAIN]
     y_train = data_provider.splits[DataKeys.Y_TRAIN]
@@ -780,36 +899,23 @@ def run_cnn_benchmark():
     )
 
     n_val_samples = len(X_val)
-    torch_throughput = (len(X_train) * t_res["epochs_completed"]) / t_res["train_time"]
-    custom_throughput = (len(X_train) * c_res["epochs_completed"]) / c_res["train_time"]
-
-    torch_col_header = f"PyTorch CNN ({t_res['threads_verified']}T)"
-    custom_col_header = f"Custom [{backend.value}] ({c_res['threads_verified']}T)"
-
-    print("\n" + "=" * 80)
-    print("                    HEAD-TO-HEAD BENCHMARK REPORT")
-    print("=" * 80)
-    print(f"{'Performance Metric':<32} | {torch_col_header:<20} | {custom_col_header:<20}")
-    print("-" * 80)
-    print(f"{'Active Hardware Threads':<32} | {t_res['threads_verified']:<20d} | {c_res['threads_verified']:<20d}")
-    print(f"{'Total Trainable Parameters':<32} | {t_res['params']:<20,d} | {c_res['params']:<20,d}")
-    print(f"{'Target Epochs':<32} | {epochs:<20d} | {epochs:<20d}")
-    print(f"{'Epochs Completed':<32} | {t_res['epochs_completed']:<20d} | {c_res['epochs_completed']:<20d}")
-    print(f"{'Best Validation Epoch':<32} | {t_res['best_epoch']:<20d} | {c_res['best_epoch']:<20d}")
-    print(f"{'Early Stopping Triggered':<32} | {str(t_res['early_stopped']):<20} | {str(c_res['early_stopped']):<20}")
-    print(f"{'Forward Pass Count':<32} | {t_res['forward_counts']:<20,d} | {c_res['forward_counts']:<20,d}")
-    print(f"{'Backward Pass Count':<32} | {t_res['backward_counts']:<20,d} | {c_res['backward_counts']:<20,d}")
-    print(f"{'Final Training Loss':<32} | {t_res['train_loss']:<20.6f} | {c_res['train_loss']:<20.6f}")
-    print(f"{'Final Validation Loss':<32} | {t_res['val_loss']:<20.6f} | {c_res['val_loss']:<20.6f}")
-    print(f"{'Final Validation Accuracy':<32} | {t_res['val_acc'] * 100:>19.2f}% | {c_res['val_acc'] * 100:>19.2f}%")
-    print("-" * 80)
-    print(f"{'Total Training Time':<32} | {t_res['train_time']:>18.3f} s | {c_res['train_time']:>18.3f} s")
-    print(f"{'Training Throughput':<32} | {torch_throughput:>14.1f} smp/s | {custom_throughput:>14.1f} smp/s")
-    print(f"{'Time per Epoch':<32} | {(t_res['train_time'] / t_res['epochs_completed']) * 1000:>16.2f} ms | {(c_res['train_time'] / c_res['epochs_completed']) * 1000:>16.2f} ms")
-    print(f"{'Val Inference Latency (Batch)':<32} | {t_res['inf_time'] * 1000:>16.3f} ms | {c_res['inf_time'] * 1000:>16.3f} ms")
-    print(f"{'Per-Sample Inference Latency':<32} | {(t_res['inf_time'] / n_val_samples) * 1000:>16.4f} ms | {(c_res['inf_time'] / n_val_samples) * 1000:>16.4f} ms")
-    print("=" * 80)
+    print_head_to_head_report(
+        t_res, c_res,
+        epochs=epochs,
+        n_train=len(X_train),
+        n_val=n_val_samples,
+        backend=backend,
+    )
 
 
 if __name__ == "__main__":
-    run_cnn_benchmark()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CNN convergence benchmark: custom engine vs PyTorch")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help="Path to YAML config (default: config/config.yaml)",
+    )
+    args = parser.parse_args()
+    run_cnn_benchmark(config_path=args.config)

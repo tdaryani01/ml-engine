@@ -8,6 +8,118 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.model_factory import ModelFactory
 from config.constants import EngineBackend
+from utils.im2col import conv2d_forward, conv2d_backward_fused, init_engine_backend
+
+
+CONV_DX_KERNEL_PAD_CASES = [
+    (3, 1),
+    (6, 1),
+]
+
+
+def _relative_grad_error(analytic: float, numeric: float) -> float:
+    abs_diff = abs(analytic - numeric)
+    if abs(analytic) < 1e-7 and abs(numeric) < 1e-7:
+        return abs_diff
+    return abs_diff / max(abs(analytic) + abs(numeric), 1e-12)
+
+
+def check_conv2d_input_gradient(
+    backend: EngineBackend,
+    kernel: int,
+    pad: int,
+    *,
+    fuse_relu: bool = False,
+    epsilon: float = 1e-4,
+    tolerance: float = 8e-2,
+) -> bool:
+    """
+    Finite-difference check for conv2d dX (input gradient).
+    Catches native fallback dX regressions that weight-only CNN grad checks miss.
+    """
+    init_engine_backend(backend)
+    rng = np.random.default_rng(1000 + kernel * 17 + pad)
+    n, c_in, h, w = 1, 2, 10, 10
+    c_out = 3
+    x = (rng.standard_normal((n, c_in, h, w), dtype=np.float32) * 0.1).copy()
+    weight = (rng.standard_normal((c_out, c_in, kernel, kernel), dtype=np.float32) * 0.1).copy()
+    bias = np.zeros((1, c_out), dtype=np.float32)
+    out_h = (h + 2 * pad - kernel) + 1
+    out_w = (w + 2 * pad - kernel) + 1
+
+    out = np.zeros((n, c_out, out_h, out_w), dtype=np.float32)
+    conv2d_forward(x, weight, bias, stride=1, pad=pad, out_buf=out, fuse_relu=fuse_relu)
+
+    # Linear loss L = sum(out * dout_fixed) => dL/d(out) = dout_fixed (constant).
+    dout_fixed = (rng.standard_normal(out.shape, dtype=np.float32) * 0.1).copy()
+    dx_analytic = np.zeros_like(x)
+    dW = np.zeros_like(weight)
+    conv2d_backward_fused(
+        dout=dout_fixed,
+        x=x,
+        W=weight,
+        dx_buf=dx_analytic,
+        dW_buf=dW,
+        stride=1,
+        pad=pad,
+        inv_m=1.0 / float(n),
+        in_act=out if fuse_relu else None,
+        fuse_relu=fuse_relu,
+    )
+
+    max_error = 0.0
+    worst = None
+    for c in range(c_in):
+        for ih in range(h):
+            for iw in range(w):
+                orig = float(x[0, c, ih, iw])
+
+                x[0, c, ih, iw] = orig + epsilon
+                out_pos = np.zeros_like(out)
+                conv2d_forward(x, weight, bias, stride=1, pad=pad, out_buf=out_pos, fuse_relu=fuse_relu)
+                loss_pos = float(np.sum(out_pos * dout_fixed))
+
+                x[0, c, ih, iw] = orig - epsilon
+                out_neg = np.zeros_like(out)
+                conv2d_forward(x, weight, bias, stride=1, pad=pad, out_buf=out_neg, fuse_relu=fuse_relu)
+                loss_neg = float(np.sum(out_neg * dout_fixed))
+
+                x[0, c, ih, iw] = orig
+                grad_num = (loss_pos - loss_neg) / (2.0 * epsilon)
+                grad_ana = float(dx_analytic[0, c, ih, iw])
+                rel_error = _relative_grad_error(grad_ana, grad_num)
+                if rel_error > max_error:
+                    max_error = rel_error
+                    worst = (c, ih, iw, grad_ana, grad_num)
+
+    relu_tag = "relu" if fuse_relu else "linear"
+    status = "PASSED" if max_error <= tolerance else "FAILED"
+    print(
+        f"[{status}] conv2d dX [{backend.value}] k={kernel} pad={pad} {relu_tag} "
+        f"| Max Rel Error: {max_error:.2e} (Threshold: {tolerance:.0e})"
+    )
+    if status == "FAILED" and worst is not None:
+        c, ih, iw, grad_ana, grad_num = worst
+        print(f"  └── Worst at (c,h,w)=({c},{ih},{iw}) ana={grad_ana:+.6e} num={grad_num:+.6e}")
+    return status == "PASSED"
+
+
+def run_conv_dx_gradient_check(backend: EngineBackend = EngineBackend.NATIVE) -> int:
+    print("\n" + "=" * 70)
+    print(f" RUNNING CHECK: conv2d dX | Backend='{backend.value}'")
+    print("=" * 70)
+
+    passed_all = True
+    for kernel, pad in CONV_DX_KERNEL_PAD_CASES:
+        passed_all &= check_conv2d_input_gradient(backend, kernel, pad, fuse_relu=False)
+        # ReLU fused dX needs a separate numeric setup; linear check catches native regressions.
+
+    print("-" * 70)
+    if passed_all:
+        print(f"[SUCCESS] conv2d dX gradient check passed for backend '{backend.value}'.")
+        return 0
+    print(f"[ERROR] conv2d dX gradient check failed for backend '{backend.value}'.")
+    return 1
 
 
 class MockOptimizer:
@@ -251,6 +363,11 @@ def run_all_checks():
     for backend in backends_to_test:
         cnn_exit_code = run_cnn_gradient_check(backend=backend)
         if cnn_exit_code != 0:
+            overall_status = 1
+
+    for backend in backends_to_test:
+        dx_exit_code = run_conv_dx_gradient_check(backend=backend)
+        if dx_exit_code != 0:
             overall_status = 1
             
     print("\n" + "=" * 70)

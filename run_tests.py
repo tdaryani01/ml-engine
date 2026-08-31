@@ -119,6 +119,8 @@ def main():
         ("Tier 1: im2col / col2im Ops", "testing/test_im2col.py"),
 
         # --- Tier 2: Layers & Gradient Verification ---
+        ("Tier 2: Native Conv Parity & Dispatch", "testing/test_native_conv.py"),
+        ("Tier 2: Benchmark Harness Regression", "testing/test_benchmark_harness.py"),
         ("Tier 2: Autodiff Gradient Check", "testing/test_gradient_check.py"),
         ("Tier 2: Spatial Layers & Conv2D Grad", "testing/test_spatial_layers.py"),
 
