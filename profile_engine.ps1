@@ -11,7 +11,8 @@
     [switch]$IncludeDisasm,
     [int]$ActiveCores = 4,
     [string]$OutputDir = "$env:APPDATA\AMDuProf",
-    [switch]$CheckContiguity
+    [switch]$CheckContiguity,
+    [switch]$MockDxEdges
 )
 
 # 1. Paths & Locations
@@ -29,7 +30,38 @@ if (-not (Test-Path $UprofCli)) {
     exit 1
 }
 
+$PdbPath = Join-Path $BinDir "conv_kernels.pdb"
 $SymbolPath = "$BinDir;srv*C:\Symbols*https://msdl.microsoft.com/download/symbols"
+if (Test-Path $PdbPath) {
+    $SymbolPath = "$BinDir;$SymbolPath"
+}
+
+function Test-NativeSymbolPair {
+    param(
+        [string]$DllPath,
+        [string]$PdbPath
+    )
+    if (-not (Test-Path $DllPath)) {
+        return @{ Ok = $false; Reason = "missing DLL: $DllPath" }
+    }
+    if (-not (Test-Path $PdbPath)) {
+        return @{ Ok = $false; Reason = "missing PDB (run .\build_native.ps1)" }
+    }
+    $dll = Get-Item $DllPath
+    $pdb = Get-Item $PdbPath
+    $ageSec = [math]::Abs(($dll.LastWriteTime - $pdb.LastWriteTime).TotalSeconds)
+    if ($ageSec -gt 5) {
+        return @{
+            Ok = $false
+            Reason = "PDB/DLL timestamp mismatch - rerun .\build_native.ps1 (close Python first)"
+        }
+    }
+    $stageDll = Join-Path (Split-Path $DllPath -Parent) "conv_kernels_stage.dll"
+    if (Test-Path $stageDll) {
+        return @{ Ok = $false; Reason = "incomplete build - rerun .\build_native.ps1" }
+    }
+    return @{ Ok = $true; Reason = "" }
+}
 
 # 2. Ensure Zen 3 Barcelo-R config file exists
 $Zen3Config = Join-Path $ConfigDir "0x19_0x5.conf"
@@ -60,15 +92,35 @@ Write-Host "==================================================================" 
 Write-Host "  Scope:              $(if ($SystemWide) { 'System-Wide (--system-wide)' } else { 'Target Application Only' })" -ForegroundColor Cyan
 Write-Host "  Executing Command:  python $($ExecArgs -join ' ')" -ForegroundColor Cyan
 Write-Host "  Active Cores:       $ActiveCores" -ForegroundColor Cyan
+if (Test-Path (Join-Path $BinDir "conv_kernels.dll")) {
+    $symPair = Test-NativeSymbolPair `
+        -DllPath (Join-Path $BinDir "conv_kernels.dll") `
+        -PdbPath $PdbPath
+    if ($symPair.Ok) {
+        Write-Host "  Native symbols:     bin\conv_kernels.pdb (paired with DLL)" -ForegroundColor Cyan
+    } else {
+        Write-Host "  Native symbols:     $($symPair.Reason)" -ForegroundColor Yellow
+    }
+}
+if ($MockDxEdges) {
+    $env:BWD_DX_MOCK_EDGES = "1"
+    Write-Host "  BWD_DX_MOCK_EDGES:  1 (skip LR dX tiles)" -ForegroundColor Yellow
+}
 Write-Host "==================================================================`n" -ForegroundColor Yellow
+
+$DllPath = Join-Path $BinDir "conv_kernels.dll"
+if (Test-Path $DllPath) {
+    $symPair = Test-NativeSymbolPair -DllPath $DllPath -PdbPath $PdbPath
+    if (-not $symPair.Ok) {
+        Write-Error "[ERROR] $($symPair.Reason)"
+        exit 1
+    }
+}
 
 if (Test-Path $ReportDir) {
     Remove-Item -Path $ReportDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 New-Item -ItemType Directory -Path $ReportDir -Force | Out-Null
-
-$PathArgs = @("--bin-path", "$BinDir", "--symbol-path", "$SymbolPath")
-if (Test-Path $SrcDir) { $PathArgs += @("--src-path", "$SrcDir") } else { $PathArgs += @("--src-path", "$WorkDir") }
 
 function Get-UProfSectionTable {
     param ([string[]]$Lines, [string]$SectionHeaderName)
@@ -90,6 +142,183 @@ function Get-UProfSectionTable {
     }
     if ($SectionLines.Count -gt 1) { return ($SectionLines | Out-String | ConvertFrom-Csv) }
     return @()
+}
+
+function Get-UProfRowValue {
+    param(
+        [object]$Row,
+        [string[]]$Candidates
+    )
+    if (-not $Row) { return $null }
+    foreach ($name in $Candidates) {
+        if ($Row.PSObject.Properties.Name -contains $name) {
+            $val = $Row.$name
+            if ($null -ne $val -and [string]$val -ne '') { return [string]$val }
+        }
+    }
+    foreach ($prop in $Row.PSObject.Properties) {
+        foreach ($name in $Candidates) {
+            if ($prop.Name -like "*$name*") {
+                $val = $prop.Value
+                if ($null -ne $val -and [string]$val -ne '') { return [string]$val }
+            }
+        }
+    }
+    return $null
+}
+
+function Get-UProfShortSymbol {
+    param([string]$FunctionName)
+    if ([string]::IsNullOrWhiteSpace($FunctionName)) { return '<unknown>' }
+
+    $s = $FunctionName.Trim()
+    $s = $s -replace '^\s*static\s+', ''
+
+    # OpenMP outlined helper: foo$omp$1()
+    if ($s -match '^(.*)\$omp\$\d+\(\s*\)\s*$') {
+        $base = $Matches[1].Trim()
+        $base = $base -replace '^(?:void|int\w*|float|double|bool|long|short|unsigned|signed)\s+', ''
+        $base = $base -replace '\s*\(\s*\)$', ''
+        if ($base -match '([A-Za-z_]\w*)\s*$') { return "$($Matches[1]) [omp]" }
+        return "$base [omp]"
+    }
+
+    # Strip C++ return type, keep identifier immediately before '('
+    $s = $s -replace '^(?:void|int\w*|float|double|bool|long|short|unsigned|signed|struct\s+\S+|class\s+\S+|const\s+\S+)\s+', ''
+    if ($s -match '([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(') {
+        return $Matches[1]
+    }
+
+    # module!symbol or kernel!0xADDR
+    if ($s -match '![^!\\\/]+$') {
+        $leaf = ($s -split '!')[-1]
+        if ($leaf -match '^(0x[0-9A-Fa-f]+)$') { return $leaf }
+        if ($leaf -match '([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\(') { return $Matches[1] }
+        if ($leaf.Length -gt 48) { return $leaf.Substring(0, 45) + '...' }
+        return $leaf
+    }
+
+    if ($s.Length -gt 48) { return $s.Substring(0, 45) + '...' }
+    return $s
+}
+
+function Write-UProfFunctionTable {
+    param(
+        [object[]]$Rows,
+        [int]$Limit = 15,
+        [string]$Title = 'FUNCTION HOTSPOTS'
+    )
+    if (-not $Rows -or $Rows.Count -eq 0) { return }
+
+    $parsed = @()
+    $totalCpu = 0.0
+    foreach ($row in $Rows) {
+        $cpuStr = Get-UProfRowValue $row @('CPU_TIME (seconds)', 'CPU_TIME', 'CPU TIME (seconds)')
+        $cpu = 0.0
+        if ($cpuStr) { [void][double]::TryParse($cpuStr, [ref]$cpu) }
+        $totalCpu += $cpu
+        $parsed += [PSCustomObject]@{
+            Cpu      = $cpu
+            Samples  = Get-UProfRowValue $row @('SAMPLES', 'Samples', 'SAMPLE COUNT')
+            Module   = Get-UProfRowValue $row @('Module', 'MODULE')
+            Function = Get-UProfRowValue $row @('FUNCTION', 'Function', 'Function Name')
+        }
+    }
+
+    Write-Host ""
+    Write-Host $Title -ForegroundColor Green
+    Write-Host ("-" * 110)
+    Write-Host ("{0,12} {1,9} {2,8} {3,-40} {4}" -f 'CPU (s)', 'Share %', 'Samples', 'Symbol', 'Module')
+    Write-Host ("-" * 110)
+
+    $rank = 0
+    foreach ($entry in $parsed) {
+        if ($rank -ge $Limit) { break }
+        $rank++
+        $share = if ($totalCpu -gt 0.0) { 100.0 * $entry.Cpu / $totalCpu } else { 0.0 }
+        $sym = Get-UProfShortSymbol $entry.Function
+        $samples = if ($entry.Samples) { $entry.Samples } else { '-' }
+        $mod = if ($entry.Module) {
+            $leaf = Split-Path $entry.Module -Leaf
+            if ($leaf.Length -gt 28) { $leaf.Substring(0, 25) + '...' } else { $leaf }
+        } else { '-' }
+
+        Write-Host ("{0,12:N4} {1,8:N1}% {2,8} {3,-40} {4}" -f $entry.Cpu, $share, $samples, $sym, $mod)
+    }
+
+    Write-Host ("-" * 110)
+    Write-Host ("Listed: {0} functions, {1:N4} s CPU (section sum)" -f $rank, $totalCpu) -ForegroundColor DarkGray
+
+    $kernelHex = @($parsed | Where-Object {
+        ($_.Module -match 'conv_kernels') -and
+        ((Get-UProfShortSymbol $_.Function) -match '^0x[0-9A-Fa-f]+$')
+    })
+    if ($kernelHex.Count -ge 2) {
+        Write-Host ""
+        Write-Host "SYMBOL RESOLUTION FAILED: conv_kernels shows raw offsets." -ForegroundColor Yellow
+        Write-Host "  Rebuild (/Zi PDB) and re-profile:" -ForegroundColor Yellow
+        Write-Host "    .\build_native.ps1" -ForegroundColor Yellow
+        Write-Host "    .\profile_engine.ps1 -AnalysisType ConcurrencyBound" -ForegroundColor Yellow
+    }
+}
+
+function Write-UProfAssessFunctionTable {
+    param(
+        [object[]]$Rows,
+        [int]$Limit = 15,
+        [string]$Title = 'ASSESS: FUNCTIONS BY CYCLES (with cache counters)'
+    )
+    if (-not $Rows -or $Rows.Count -eq 0) { return }
+
+    $parsed = @()
+    $totalCycles = 0.0
+    foreach ($row in $Rows) {
+        $cycStr = Get-UProfRowValue $row @(
+            'CYCLES_NOT_IN_HALT', 'CPU_TIME (seconds)', 'CPU_TIME'
+        )
+        $cycles = 0.0
+        if ($cycStr) { [void][double]::TryParse($cycStr, [ref]$cycles) }
+        $totalCycles += $cycles
+        $parsed += [PSCustomObject]@{
+            Cycles   = $cycles
+            Ipc      = Get-UProfRowValue $row @('IPC')
+            L1Pct    = Get-UProfRowValue $row @('%L1_DC_MISSES')
+            L1Pti    = Get-UProfRowValue $row @('L1_DC_MISSES (PTI)')
+            Module   = Get-UProfRowValue $row @('Module', 'MODULE')
+            Function = Get-UProfRowValue $row @('FUNCTION', 'Function', 'Function Name')
+        }
+    }
+
+    Write-Host ""
+    Write-Host $Title -ForegroundColor Green
+    Write-Host ("-" * 118)
+    Write-Host ("{0,12} {1,7} {2,10} {3,12} {4,-36} {5}" -f `
+        'Cycles', 'IPC', '%L1 miss', 'L1 miss/pti', 'Symbol', 'Module')
+    Write-Host ("-" * 118)
+
+    $rank = 0
+    foreach ($entry in ($parsed | Sort-Object { $_.Cycles } -Descending)) {
+        if ($rank -ge $Limit) { break }
+        $rank++
+        $share = if ($totalCycles -gt 0.0) { 100.0 * $entry.Cycles / $totalCycles } else { 0.0 }
+        $sym = Get-UProfShortSymbol $entry.Function
+        $mod = if ($entry.Module) {
+            $leaf = Split-Path $entry.Module -Leaf
+            if ($leaf.Length -gt 28) { $leaf.Substring(0, 25) + '...' } else { $leaf }
+        } else { '-' }
+        $ipc = if ($entry.Ipc) { $entry.Ipc } else { '-' }
+        $l1p = if ($entry.L1Pct) { $entry.L1Pct } else { '-' }
+        $l1t = if ($entry.L1Pti) { $entry.L1Pti } else { '-' }
+
+        Write-Host ("{0,12:N0} {1,7} {2,10} {3,12} {4,-36} {5}" -f `
+            $entry.Cycles, $ipc, $l1p, $l1t, $sym, $mod)
+        if ($rank -eq 1) {
+            Write-Host ("{0,12} {1,7} {2,9:N1}% share of listed cycles" -f '', '', $share) -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ("-" * 118)
+    Write-Host ("Listed: {0} functions, {1:N0} cycles (section sum)" -f $rank, $totalCycles) -ForegroundColor DarkGray
 }
 
 # -------------------------------------------------------------------------
@@ -200,6 +429,11 @@ Write-Host "[2/4] Generating Profile Summary Reports from: $SessionDir" -Foregro
 $SummaryCsv = Join-Path $ReportDir "summary_report.csv"
 $DetailCsv  = Join-Path $ReportDir "detail_report.csv"
 
+$PathArgs = @("--bin-path", "$BinDir", "--symbol-path", "$SymbolPath")
+if ($UseSourceDisasm) {
+    if (Test-Path $SrcDir) { $PathArgs += @("--src-path", "$SrcDir") } else { $PathArgs += @("--src-path", "$WorkDir") }
+}
+
 & $UprofCli report -i "$SessionDir" --report-output "$SummaryCsv" --show-sample-count @PathArgs
 if ($UseSourceDisasm) {
     & $UprofCli report -i "$SessionDir" --report-output "$DetailCsv" --disasm --disasm-style intel --show-sample-count @PathArgs
@@ -278,21 +512,44 @@ if (Test-Path $SummaryCsv) {
         $ModuleData | Select-Object -First 10 | Format-Table -AutoSize
     }
 
-    # 5. Function Hotspots
-    $FuncData = Get-UProfSectionTable -Lines $AllLines -SectionHeaderName "FUNCTION SUMMARY"
-    if ($FuncData.Count -eq 0) { $FuncData = Get-UProfSectionTable -Lines $AllLines -SectionHeaderName "HOTTEST FUNCTIONS" }
-    if ($FuncData.Count -gt 0) {
-        Write-Host "`nTOP HOTTEST FUNCTIONS & PIPELINE METRICS (uProf Native):" -ForegroundColor Green
-        Write-Host "========================================================================================================"
-        $FuncData | Select-Object -First 15 | Format-Table -AutoSize
-
-        $KernelFuncs = $FuncData | Where-Object {
-            $_.FUNCTION -match 'process_bwd_dx|process_dw_nci|process_fwd_tile|conv2d_.*fallback'
+    # 5. Function hotspots (Hotspots/ConcurrencyBound) or Assess cache table
+    if ($AnalysisType -eq "Assess") {
+        $AssessFuncs = Get-UProfSectionTable -Lines $AllLines -SectionHeaderName "HOTTEST FUNCTIONS \(Sort Event"
+        if ($AssessFuncs.Count -eq 0) {
+            $AssessFuncs = Get-UProfSectionTable -Lines $AllLines -SectionHeaderName "HOTTEST FUNCTIONS"
         }
-        if ($KernelFuncs.Count -gt 0) {
-            Write-Host "`nCONV FALLBACK KERNEL HOTSPOTS (uProf Native):" -ForegroundColor Green
-            Write-Host "--------------------------------------------------------------------------------------------------------"
-            $KernelFuncs | Format-Table -AutoSize
+        if ($AssessFuncs.Count -gt 0) {
+            Write-Host "`nASSESS PERFORMANCE (uProf Native):" -ForegroundColor Green
+            Write-Host "========================================================================================================"
+            Write-UProfAssessFunctionTable -Rows $AssessFuncs -Limit 15
+
+            $KernelFuncs = @($AssessFuncs | Where-Object {
+                $fn = Get-UProfRowValue $_ @('FUNCTION', 'Function', 'Function Name')
+                $mod = Get-UProfRowValue $_ @('Module', 'MODULE')
+                ($mod -match 'conv_kernels') -or ($fn -match 'process_bwd_dx|process_dw_nci|process_fwd_tile|conv2d_.*fallback|direct_conv_block')
+            })
+            if ($KernelFuncs.Count -gt 0) {
+                Write-UProfAssessFunctionTable -Rows $KernelFuncs -Limit 20 `
+                    -Title "ASSESS: CONV FALLBACK KERNELS (cache counters)"
+            }
+        }
+    } else {
+        $FuncData = Get-UProfSectionTable -Lines $AllLines -SectionHeaderName "FUNCTION SUMMARY"
+        if ($FuncData.Count -eq 0) {
+            $FuncData = Get-UProfSectionTable -Lines $AllLines -SectionHeaderName "HOTTEST FUNCTIONS"
+        }
+        if ($FuncData.Count -gt 0) {
+            Write-Host "`nTOP HOTTEST FUNCTIONS & PIPELINE METRICS (uProf Native):" -ForegroundColor Green
+            Write-Host "========================================================================================================"
+            Write-UProfFunctionTable -Rows $FuncData -Limit 15 -Title "TOP HOTTEST FUNCTIONS (uProf Native)"
+
+            $KernelFuncs = @($FuncData | Where-Object {
+                $fn = Get-UProfRowValue $_ @('FUNCTION', 'Function', 'Function Name')
+                $fn -match 'process_bwd_dx|process_dw_nci|process_fwd_tile|build_dy_pad_buf|conv2d_.*fallback|direct_conv_block'
+            })
+            if ($KernelFuncs.Count -gt 0) {
+                Write-UProfFunctionTable -Rows $KernelFuncs -Limit 20 -Title "CONV FALLBACK KERNEL HOTSPOTS (uProf Native)"
+            }
         }
     }
 }
