@@ -7,9 +7,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# OpenMP tuning for Docker cpuset isolation (avoid Intel affinity fighting cgroup mask)
+# OpenMP tuning for Docker cpuset isolation
 ENV KMP_AFFINITY=none
 ENV OMP_PROC_BIND=false
+ENV OMP_MAX_ACTIVE_LEVELS=2147483647
+ENV OMP_WAIT_POLICY=PASSIVE
+ENV GOMP_SPINCOUNT=0
 ENV KMP_BLOCKTIME=5
 ENV PYTHONUNBUFFERED=1
 

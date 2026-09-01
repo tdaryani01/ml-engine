@@ -12,8 +12,12 @@ from utils.im2col import conv2d_forward, conv2d_backward_fused, init_engine_back
 
 
 CONV_DX_KERNEL_PAD_CASES = [
+    (2, 1),
     (3, 1),
+    (4, 1),
+    (5, 1),
     (6, 1),
+    # k=7 omitted: 10x10 fixture yields 6x6 out — FD noise exceeds tolerance even on numpy.
 ]
 
 

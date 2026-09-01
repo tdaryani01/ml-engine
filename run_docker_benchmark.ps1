@@ -1,11 +1,14 @@
 param(
-    [ValidateSet("All", "Build", "Run", "Clean")]
+    [ValidateSet("All", "Build", "Run", "Clean", "Sweep")]
     [string]$Action = "All",
     [int]$Cores = 4,
     [ValidateRange(0, 2)]
     [int]$OneDnnVerbose = 0,
     [switch]$VerboseTracing,
-    [switch]$NoCache
+    [switch]$NoCache,
+    [int]$KMin = 1,
+    [int]$KMax = 7,
+    [int]$Pad = 1
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,6 +67,9 @@ function Get-DockerSharedEnvArgs {
         "-e", "OMP_THREAD_LIMIT=$Threads",
         "-e", "OMP_PROC_BIND=false",
         "-e", "OMP_DYNAMIC=false",
+        "-e", "OMP_MAX_ACTIVE_LEVELS=2147483647",
+        "-e", "OMP_WAIT_POLICY=PASSIVE",
+        "-e", "GOMP_SPINCOUNT=0",
         "-e", "PYTHONUNBUFFERED=1"
     )
 }
@@ -82,14 +88,9 @@ function Get-DockerPyTorchEnvArgs {
     )
 }
 
-# libgomp (custom native AVX2 kernels)
 function Get-DockerCustomEnvArgs {
     param([int]$Threads)
-    return @(
-        (Get-DockerSharedEnvArgs -Threads $Threads)
-        "-e", "OMP_WAIT_POLICY=ACTIVE",
-        "-e", "GOMP_SPINCOUNT=100000"
-    )
+    return Get-DockerPyTorchEnvArgs -Threads $Threads
 }
 
 function Test-DockerEndpoint {
@@ -100,6 +101,28 @@ function Test-DockerEndpoint {
         Write-Warning "Docker daemon unresponsive. Re-evaluating default context..."
         docker context use default | Out-Null
     }
+}
+
+function Build-CustomContainer {
+    Write-Host ""
+    Write-Host "[+] Verifying Docker context and endpoint connectivity..." -ForegroundColor Cyan
+    Test-DockerEndpoint
+
+    $CacheArg = if ($NoCache) { "--no-cache" } else { "" }
+
+    Write-Host ""
+    Write-Host "[+] Building Custom Engine Isolated Image (scripts/Dockerfile.custom)..." -ForegroundColor Cyan
+    docker build $CacheArg `
+        -f scripts/Dockerfile.custom `
+        -t $CustomImg .
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "[ERROR] Custom Engine image build failed."
+        exit 1
+    }
+
+    Write-Host ""
+    Write-Host "[OK] Custom benchmark container image successfully built." -ForegroundColor Green
 }
 
 function Build-Containers {
@@ -120,19 +143,46 @@ function Build-Containers {
         exit 1
     }
 
+    Build-CustomContainer
     Write-Host ""
-    Write-Host "[+] Building Custom Engine Isolated Image (scripts/Dockerfile.custom)..." -ForegroundColor Cyan
-    docker build $CacheArg `
-        -f scripts/Dockerfile.custom `
-        -t $CustomImg .
+    Write-Host "[OK] Both benchmark container images successfully built." -ForegroundColor Green
+}
+
+function Run-KernelSweep {
+    Test-DockerEndpoint
+    Stop-ExistingBenchmarkContainers
+
+    $CustomEnv = Get-DockerCustomEnvArgs -Threads $ThreadCount
+    $SweepLog = Join-Path $DiagDir "kernel_sweep_pad${Pad}_k${KMin}-${KMax}.log"
+
+    Write-Host ""
+    Write-Host "==================================================================" -ForegroundColor Yellow
+    Write-Host "  DOCKER KERNEL SWEEP - GENERIC FALLBACK ONLY (k=${KMin}-${KMax}, pad=${Pad})" -ForegroundColor Yellow
+    Write-Host "  Hardware Allocation  : $Cores Dedicated Cores (cpuset: $CpuSet)" -ForegroundColor Yellow
+    Write-Host "  OpenMP Thread Count  : $ThreadCount" -ForegroundColor Yellow
+    Write-Host "  Log file             : $SweepLog" -ForegroundColor Yellow
+    Write-Host "==================================================================" -ForegroundColor Yellow
+
+    Write-Host ""
+    Write-Host "[+] Executing kernel sweep in Custom Engine container..." -ForegroundColor Cyan
+    docker run --rm `
+        --entrypoint python `
+        --name ml-engine-bench-sweep `
+        --cpuset-cpus=$CpuSet `
+        @CustomEnv `
+        -v "${DiagDir}:/workspace/benchmark_diagnostics" `
+        $CustomImg `
+        -u benchmarks/sweep_kernel_pad.py `
+        --k-min $KMin --k-max $KMax --pad $Pad `
+        --output "/workspace/benchmark_diagnostics/kernel_sweep_pad${Pad}_k${KMin}-${KMax}.log"
 
     if ($LASTEXITCODE -ne 0) {
-        Write-Error "[ERROR] Custom Engine image build failed."
+        Write-Error "[ERROR] Kernel sweep container run failed."
         exit 1
     }
 
     Write-Host ""
-    Write-Host "[OK] Both benchmark container images successfully built." -ForegroundColor Green
+    Write-Host "[OK] Kernel sweep complete. Log: $SweepLog" -ForegroundColor Green
 }
 
 function Run-Benchmarks {
@@ -147,8 +197,7 @@ function Run-Benchmarks {
     Write-Host "  DOCKER CONVERGENCE BENCHMARK ORCHESTRATOR - ISOLATED RUN" -ForegroundColor Yellow
     Write-Host "  Hardware Allocation  : $Cores Dedicated Cores (cpuset: $CpuSet)" -ForegroundColor Yellow
     Write-Host "  OpenMP Thread Count  : $ThreadCount" -ForegroundColor Yellow
-    Write-Host "  PyTorch Runtime Tuning : Intel KMP (affinity=none, blocktime=5)" -ForegroundColor Yellow
-    Write-Host "  Custom Runtime Tuning  : libgomp (wait=ACTIVE, spin=100k)" -ForegroundColor Yellow
+    Write-Host "  OpenMP Wait Policy   : PASSIVE (GOMP_SPINCOUNT=0)" -ForegroundColor Yellow
     Write-Host "  oneDNN Verbose Level : $VerboseLevel" -ForegroundColor Yellow
     Write-Host "==================================================================" -ForegroundColor Yellow
 
@@ -176,6 +225,7 @@ function Run-Benchmarks {
         --name ml-engine-bench-custom `
         --cpuset-cpus=$CpuSet `
         @CustomEnv `
+        -e ONEDNN_VERBOSE=$VerboseLevel `
         -v "${DiagDir}:/workspace/benchmark_diagnostics" `
         $CustomImg `
         --target=custom
@@ -198,6 +248,10 @@ switch ($Action) {
     "Build" { Build-Containers }
     "Run"   { Run-Benchmarks }
     "Clean" { Clean-Containers }
+    "Sweep" {
+        Build-CustomContainer
+        Run-KernelSweep
+    }
     "All"   {
         Build-Containers
         Run-Benchmarks

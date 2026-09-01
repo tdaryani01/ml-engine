@@ -2,14 +2,17 @@
 
 void conv2d_forward_3x3_avx2(
     const float* __restrict x, const float* __restrict W, const float* __restrict bias, float* __restrict out,
-    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t C_out, int64_t stride, int64_t pad, int32_t fuse_relu
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride, int64_t out_w_stride,
+    int64_t C_out, int64_t stride, int64_t pad, int32_t fuse_relu
 ) {
     DIAG_INC(fwd_3x3);
     TIME_SCOPE(time_fwd_3x3_ns);
     const int64_t out_h = (H + 2 * pad - 3) / stride + 1;
     const int64_t out_w = (W_in + 2 * pad - 3) / stride + 1;
-    const int64_t spatial_out = out_h * out_w;
-    const int64_t spatial_in  = H * W_in;
+    const int64_t w_stride = W_in_stride > 0 ? W_in_stride : W_in;
+    const int64_t ow_stride = out_w_stride > 0 ? out_w_stride : out_w;
+    const int64_t spatial_out = out_h * ow_stride;
+    const int64_t spatial_in  = H * w_stride;
     const __m256 v_zero = _mm256_setzero_ps();
 
     #pragma omp parallel for collapse(2) schedule(static)
@@ -23,10 +26,10 @@ void conv2d_forward_3x3_avx2(
                 const int64_t ih1 = oh * stride - pad + 1;
                 const int64_t ih2 = oh * stride - pad + 2;
 
-                float* __restrict out_r0 = &out[(n * C_out + cout0 + 0) * spatial_out + oh * out_w];
-                float* __restrict out_r1 = (c_rem > 1) ? &out[(n * C_out + cout0 + 1) * spatial_out + oh * out_w] : nullptr;
-                float* __restrict out_r2 = (c_rem > 2) ? &out[(n * C_out + cout0 + 2) * spatial_out + oh * out_w] : nullptr;
-                float* __restrict out_r3 = (c_rem > 3) ? &out[(n * C_out + cout0 + 3) * spatial_out + oh * out_w] : nullptr;
+                float* __restrict out_r0 = &out[(n * C_out + cout0 + 0) * spatial_out + oh * ow_stride];
+                float* __restrict out_r1 = (c_rem > 1) ? &out[(n * C_out + cout0 + 1) * spatial_out + oh * ow_stride] : nullptr;
+                float* __restrict out_r2 = (c_rem > 2) ? &out[(n * C_out + cout0 + 2) * spatial_out + oh * ow_stride] : nullptr;
+                float* __restrict out_r3 = (c_rem > 3) ? &out[(n * C_out + cout0 + 3) * spatial_out + oh * ow_stride] : nullptr;
 
                 const __m256 vb0 = bias ? _mm256_set1_ps(bias[cout0 + 0]) : _mm256_setzero_ps();
                 const __m256 vb1 = (bias && c_rem > 1) ? _mm256_set1_ps(bias[cout0 + 1]) : _mm256_setzero_ps();
@@ -45,9 +48,9 @@ void conv2d_forward_3x3_avx2(
                         const float* __restrict wp2 = (c_rem > 2) ? &W[((cout0 + 2) * C_in + cin) * 9] : nullptr;
                         const float* __restrict wp3 = (c_rem > 3) ? &W[((cout0 + 3) * C_in + cin) * 9] : nullptr;
 
-                        const float* __restrict r0 = (ih0 >= 0 && ih0 < H) ? &xp[ih0 * W_in] : nullptr;
-                        const float* __restrict r1 = (ih1 >= 0 && ih1 < H) ? &xp[ih1 * W_in] : nullptr;
-                        const float* __restrict r2 = (ih2 >= 0 && ih2 < H) ? &xp[ih2 * W_in] : nullptr;
+                        const float* __restrict r0 = (ih0 >= 0 && ih0 < H) ? &xp[ih0 * w_stride] : nullptr;
+                        const float* __restrict r1 = (ih1 >= 0 && ih1 < H) ? &xp[ih1 * w_stride] : nullptr;
+                        const float* __restrict r2 = (ih2 >= 0 && ih2 < H) ? &xp[ih2 * w_stride] : nullptr;
 
                         #define TAP_FWD_3X3(ROW_PTR, KW, W_IDX) { \
                             if (ROW_PTR) { \
@@ -102,9 +105,9 @@ void conv2d_forward_3x3_avx2(
                         const float* __restrict wp2 = (c_rem > 2) ? &W[((cout0 + 2) * C_in + cin) * 9] : nullptr;
                         const float* __restrict wp3 = (c_rem > 3) ? &W[((cout0 + 3) * C_in + cin) * 9] : nullptr;
 
-                        const float* __restrict r0 = (ih0 >= 0 && ih0 < H) ? &xp[ih0 * W_in] : nullptr;
-                        const float* __restrict r1 = (ih1 >= 0 && ih1 < H) ? &xp[ih1 * W_in] : nullptr;
-                        const float* __restrict r2 = (ih2 >= 0 && ih2 < H) ? &xp[ih2 * W_in] : nullptr;
+                        const float* __restrict r0 = (ih0 >= 0 && ih0 < H) ? &xp[ih0 * w_stride] : nullptr;
+                        const float* __restrict r1 = (ih1 >= 0 && ih1 < H) ? &xp[ih1 * w_stride] : nullptr;
+                        const float* __restrict r2 = (ih2 >= 0 && ih2 < H) ? &xp[ih2 * w_stride] : nullptr;
 
                         #define TAP_SCALAR_3X3(ROW_PTR, KW, W_IDX) { \
                             if (ROW_PTR) { \
@@ -143,15 +146,17 @@ void conv2d_forward_3x3_avx2(
 void conv2d_backward_3x3_avx2(
     const float* __restrict d_conv_buf, const float* __restrict x, const float* __restrict W,
     float* __restrict dx, float* __restrict dW,
-    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t C_out, int64_t stride, int64_t pad, float inv_m
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride, int64_t conv_out_w_stride,
+    int64_t C_out, int64_t stride, int64_t pad, float inv_m
 ) {
     (void)stride;
-    (void)pad;
     DIAG_INC(bwd_3x3);
-    const int64_t conv_out_h = H;
-    const int64_t conv_out_w = W_in;
-    const int64_t conv_spatial = conv_out_h * conv_out_w;
-    const int64_t spatial_in   = H * W_in;
+    const int64_t conv_out_h = (H + 2 * pad - 3) / stride + 1;
+    const int64_t conv_out_w = (W_in + 2 * pad - 3) / stride + 1;
+    const int64_t w_stride = W_in_stride > 0 ? W_in_stride : W_in;
+    const int64_t cw_stride = conv_out_w_stride > 0 ? conv_out_w_stride : conv_out_w;
+    const int64_t conv_spatial = conv_out_h * cw_stride;
+    const int64_t spatial_in   = H * w_stride;
 
     // 1. dX Backpropagation Pass (2-Way Cin / 2-Way Cout Tiled)
     if (dx && W) {
@@ -170,8 +175,8 @@ void conv2d_backward_3x3_avx2(
                     const int64_t oh1 = ih + 1 - 1;
                     const int64_t oh2 = ih + 1 - 2;
 
-                    float* __restrict dx_row0 = &dx_p0[ih * W_in];
-                    float* __restrict dx_row1 = dx_p1 ? &dx_p1[ih * W_in] : nullptr;
+                    float* __restrict dx_row0 = &dx_p0[ih * w_stride];
+                    float* __restrict dx_row1 = dx_p1 ? &dx_p1[ih * w_stride] : nullptr;
 
                     // Left Column Peel
                     {
@@ -185,7 +190,7 @@ void conv2d_backward_3x3_avx2(
                                 if ((OH_VAL) >= 0 && (OH_VAL) < conv_out_h) { \
                                     const int64_t cur_ow = 1 - (KW); \
                                     if (cur_ow >= 0 && cur_ow < conv_out_w) { \
-                                        const float val = dp[(OH_VAL) * conv_out_w + cur_ow]; \
+                                        const float val = dp[(OH_VAL) * cw_stride + cur_ow]; \
                                         sum0 += val * wp0[W_IDX]; \
                                         if (cin_rem > 1) sum1 += val * wp1[W_IDX]; \
                                     } \
@@ -218,8 +223,8 @@ void conv2d_backward_3x3_avx2(
 
                             #define TAP_DX_FAST_3X3(OH_VAL, KW, W_IDX) { \
                                 if ((OH_VAL) >= 0 && (OH_VAL) < conv_out_h) { \
-                                    const float* __restrict dr0 = &dp0[(OH_VAL) * conv_out_w + iw + 1 - (KW)]; \
-                                    const float* __restrict dr1 = &dp1[(OH_VAL) * conv_out_w + iw + 1 - (KW)]; \
+                                    const float* __restrict dr0 = &dp0[(OH_VAL) * cw_stride + iw + 1 - (KW)]; \
+                                    const float* __restrict dr1 = &dp1[(OH_VAL) * cw_stride + iw + 1 - (KW)]; \
                                     const __m256 v0 = _mm256_loadu_ps(dr0); \
                                     const __m256 v1 = _mm256_loadu_ps(dr1); \
                                     acc0 = _mm256_fmadd_ps(v0, _mm256_set1_ps(wp0_c0[W_IDX]), acc0); \
@@ -243,7 +248,7 @@ void conv2d_backward_3x3_avx2(
 
                             #define TAP_DX_FAST_1_3X3(OH_VAL, KW, W_IDX) { \
                                 if ((OH_VAL) >= 0 && (OH_VAL) < conv_out_h) { \
-                                    const float* __restrict dr = &dp[(OH_VAL) * conv_out_w + iw + 1 - (KW)]; \
+                                    const float* __restrict dr = &dp[(OH_VAL) * cw_stride + iw + 1 - (KW)]; \
                                     const __m256 v = _mm256_loadu_ps(dr); \
                                     acc0 = _mm256_fmadd_ps(v, _mm256_set1_ps(wp0[W_IDX]), acc0); \
                                     if (cin_rem > 1) acc1 = _mm256_fmadd_ps(v, _mm256_set1_ps(wp1[W_IDX]), acc1); \
@@ -271,7 +276,7 @@ void conv2d_backward_3x3_avx2(
                                 if ((OH_VAL) >= 0 && (OH_VAL) < conv_out_h) { \
                                     const int64_t cur_ow = iw + 1 - (KW); \
                                     if (cur_ow >= 0 && cur_ow < conv_out_w) { \
-                                        const float val = dp[(OH_VAL) * conv_out_w + cur_ow]; \
+                                        const float val = dp[(OH_VAL) * cw_stride + cur_ow]; \
                                         sum0 += val * wp0[W_IDX]; \
                                         if (cin_rem > 1) sum1 += val * wp1[W_IDX]; \
                                     } \
@@ -308,12 +313,12 @@ void conv2d_backward_3x3_avx2(
                     const float* __restrict xp = &x[(n * C_in + cin) * spatial_in];
 
                     for (int64_t oh = 0; oh < conv_out_h; ++oh) {
-                        const float* __restrict dr = &dp[oh * conv_out_w];
-                        const int64_t ih_base = oh - 1;
+                        const float* __restrict dr = &dp[oh * cw_stride];
+                        const int64_t ih_base = oh - pad;
 
-                        const float* __restrict xr0 = (ih_base + 0 >= 0 && ih_base + 0 < H) ? &xp[(ih_base + 0) * W_in] : nullptr;
-                        const float* __restrict xr1 = (ih_base + 1 >= 0 && ih_base + 1 < H) ? &xp[(ih_base + 1) * W_in] : nullptr;
-                        const float* __restrict xr2 = (ih_base + 2 >= 0 && ih_base + 2 < H) ? &xp[(ih_base + 2) * W_in] : nullptr;
+                        const float* __restrict xr0 = (ih_base + 0 >= 0 && ih_base + 0 < H) ? &xp[(ih_base + 0) * w_stride] : nullptr;
+                        const float* __restrict xr1 = (ih_base + 1 >= 0 && ih_base + 1 < H) ? &xp[(ih_base + 1) * w_stride] : nullptr;
+                        const float* __restrict xr2 = (ih_base + 2 >= 0 && ih_base + 2 < H) ? &xp[(ih_base + 2) * w_stride] : nullptr;
 
                         // Left Border Peel
                         {

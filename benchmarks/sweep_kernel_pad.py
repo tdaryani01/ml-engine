@@ -63,12 +63,9 @@ def pool_out_hw(h: int, w: int, pool: int, stride: int) -> Tuple[int, int]:
 
 
 def expected_native_dispatch(kernel: int, pad: int) -> Tuple[str, str]:
-    """Mirror conv_dispatcher.cpp routing (stride=1, W_in == W_stride)."""
-    if kernel == 3 and pad == 1:
-        fwd = "3x3_SPECIALIZED"
-    else:
-        fwd = "GENERIC_FALLBACK"
-    return fwd, "GENERIC_FALLBACK"
+    """All conv traffic routes through generic fallback + Stride1Specialist plugins."""
+    del kernel, pad
+    return "GENERIC_FALLBACK", "GENERIC_FALLBACK"
 
 
 def format_geometry_section(

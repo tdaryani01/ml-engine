@@ -2,11 +2,12 @@ FROM python:3.13-slim
 
 WORKDIR /workspace
 
-# libgomp tuning for native AVX2 kernels (cpuset-isolated Docker run)
+# libgomp: avoid worker spin under Docker cpuset (4 OMP threads + main on 4 CPUs)
 ENV OMP_PROC_BIND=false
 ENV OMP_DYNAMIC=false
-ENV OMP_WAIT_POLICY=ACTIVE
-ENV GOMP_SPINCOUNT=100000
+ENV OMP_MAX_ACTIVE_LEVELS=2147483647
+ENV OMP_WAIT_POLICY=PASSIVE
+ENV GOMP_SPINCOUNT=0
 ENV PYTHONUNBUFFERED=1
 
 # Native build toolchain & OpenMP runtime

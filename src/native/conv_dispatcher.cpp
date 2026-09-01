@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <stdexcept>
@@ -13,44 +14,8 @@ KernelTelemetry g_diag = {};
 #endif
 
 // -----------------------------------------------------------------------------
-// Specialized Kernel Prototypes
+// Fallback kernel prototypes (sole conv path)
 // -----------------------------------------------------------------------------
-void conv2d_forward_1x1_avx2(
-    const float* __restrict x, const float* __restrict W, const float* __restrict bias, float* __restrict out,
-    int64_t N, int64_t C_in, int64_t HW, int64_t C_out,
-    int64_t stride, int32_t fuse_relu
-);
-void conv2d_backward_1x1_avx2(
-    const float* __restrict dout, const float* __restrict x, const float* __restrict W,
-    float* __restrict dx, float* __restrict dW,
-    int64_t N, int64_t C_in, int64_t HW, int64_t C_out,
-    int64_t stride, float inv_m
-);
-
-void conv2d_forward_3x3_avx2(
-    const float* __restrict x, const float* __restrict W, const float* __restrict bias, float* __restrict out,
-    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t C_out,
-    int64_t stride, int64_t pad, int32_t fuse_relu
-);
-void conv2d_backward_3x3_avx2(
-    const float* __restrict dout, const float* __restrict x, const float* __restrict W,
-    float* __restrict dx, float* __restrict dW,
-    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t C_out,
-    int64_t stride, int64_t pad, float inv_m
-);
-
-void conv2d_forward_5x5_avx2(
-    const float* __restrict x, const float* __restrict W, const float* __restrict bias, float* __restrict out,
-    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t C_out,
-    int64_t stride, int64_t pad, int32_t fuse_relu
-);
-void conv2d_backward_5x5_avx2(
-    const float* __restrict dout, const float* __restrict x, const float* __restrict W,
-    float* __restrict dx, float* __restrict dW,
-    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t C_out,
-    int64_t stride, int64_t pad, float inv_m
-);
-
 void conv2d_forward_fallback_avx2(
     const float* x, const float* W, const float* bias, float* out,
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
@@ -70,13 +35,7 @@ void conv2d_backward_fallback_avx2(
 // -----------------------------------------------------------------------------
 static void log_routing_decision(const char* pass_type, const char* kernel_name, int64_t k_h, int64_t k_w, int64_t stride, int64_t pad) {
     static std::atomic<uint32_t> logged_mask{0};
-    uint32_t bit_id = 0;
-    if (std::strcmp(kernel_name, "1x1_SPECIALIZED") == 0) bit_id = 1;
-    else if (std::strcmp(kernel_name, "3x3_SPECIALIZED") == 0) bit_id = 2;
-    else if (std::strcmp(kernel_name, "5x5_SPECIALIZED") == 0) bit_id = 4;
-    else bit_id = 8;
-
-    if (std::strcmp(pass_type, "BWD") == 0) bit_id <<= 4;
+    const uint32_t bit_id = (std::strcmp(pass_type, "BWD") == 0) ? 0x10u : 0x01u;
 
     if (!(logged_mask.fetch_or(bit_id) & bit_id)) {
         std::printf("[ENGINE_DISPATCH] %s -> %s | Geometry: [%lldx%lld], Stride: %lld, Pad: %lld\n",
@@ -86,31 +45,20 @@ static void log_routing_decision(const char* pass_type, const char* kernel_name,
 }
 
 // -----------------------------------------------------------------------------
-// Explicit Dispatch Decision Matrix
+// Dispatch: generic fallback only (Stride1Specialist plugins inside conv_fallback)
 // -----------------------------------------------------------------------------
 static inline void dispatch_forward(
     const float* x, const float* W, const float* bias, float* out,
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride, int64_t C_out,
     int64_t k_h, int64_t k_w, int64_t stride, int64_t pad, int64_t out_w_stride, int32_t fuse_relu
 ) {
-    if (k_h == 1 && k_w == 1 && pad == 0 && W_in == W_in_stride && stride == 1) {
-        log_routing_decision("FWD", "1x1_SPECIALIZED", k_h, k_w, stride, pad);
-        conv2d_forward_1x1_avx2(x, W, bias, out, N, C_in, H * W_in, C_out, stride, fuse_relu);
-    } else if (k_h == 3 && k_w == 3 && pad == 1 && W_in == W_in_stride && stride == 1) {
-        log_routing_decision("FWD", "3x3_SPECIALIZED", k_h, k_w, stride, pad);
-        conv2d_forward_3x3_avx2(x, W, bias, out, N, C_in, H, W_in, C_out, stride, pad, fuse_relu);
-    } else if (k_h == 5 && k_w == 5 && pad == 2 && W_in == W_in_stride && stride == 1) {
-        log_routing_decision("FWD", "5x5_SPECIALIZED", k_h, k_w, stride, pad);
-        conv2d_forward_5x5_avx2(x, W, bias, out, N, C_in, H, W_in, C_out, stride, pad, fuse_relu);
-    } else {
-        log_routing_decision("FWD", "GENERIC_FALLBACK", k_h, k_w, stride, pad);
-        conv2d_forward_fallback_avx2(
-            x, W, bias, out,
-            N, C_in, H, W_in, W_in_stride,
-            C_out, k_h, k_w, stride, pad,
-            out_w_stride, fuse_relu
-        );
-    }
+    log_routing_decision("FWD", "GENERIC_FALLBACK", k_h, k_w, stride, pad);
+    conv2d_forward_fallback_avx2(
+        x, W, bias, out,
+        N, C_in, H, W_in, W_in_stride,
+        C_out, k_h, k_w, stride, pad,
+        out_w_stride, fuse_relu
+    );
 }
 
 static inline void dispatch_backward(
@@ -119,24 +67,13 @@ static inline void dispatch_backward(
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride, int64_t C_out,
     int64_t k_h, int64_t k_w, int64_t stride, int64_t pad, int64_t conv_out_w_stride, float inv_m
 ) {
-    if (k_h == 1 && k_w == 1 && pad == 0 && W_in == W_in_stride && stride == 1) {
-        log_routing_decision("BWD", "1x1_SPECIALIZED", k_h, k_w, stride, pad);
-        conv2d_backward_1x1_avx2(dout, x, W, dx, dW, N, C_in, H * W_in, C_out, stride, inv_m);
-    } else if (k_h == 3 && k_w == 3 && pad == 2 && W_in == W_in_stride && stride == 1) {
-        log_routing_decision("BWD", "3x3_SPECIALIZED", k_h, k_w, stride, pad);
-        conv2d_backward_3x3_avx2(dout, x, W, dx, dW, N, C_in, H, W_in, C_out, stride, pad, inv_m);
-    } else if (k_h == 5 && k_w == 5 && pad == 2 && W_in == W_in_stride && stride == 1) {
-        log_routing_decision("BWD", "5x5_SPECIALIZED", k_h, k_w, stride, pad);
-        conv2d_backward_5x5_avx2(dout, x, W, dx, dW, N, C_in, H, W_in, C_out, stride, pad, inv_m);
-    } else {
-        log_routing_decision("BWD", "GENERIC_FALLBACK", k_h, k_w, stride, pad);
-        conv2d_backward_fallback_avx2(
-            dout, x, W, dx, dW,
-            N, C_in, H, W_in, W_in_stride,
-            C_out, k_h, k_w, stride, pad,
-            conv_out_w_stride, inv_m
-        );
-    }
+    log_routing_decision("BWD", "GENERIC_FALLBACK", k_h, k_w, stride, pad);
+    conv2d_backward_fallback_avx2(
+        dout, x, W, dx, dW,
+        N, C_in, H, W_in, W_in_stride,
+        C_out, k_h, k_w, stride, pad,
+        conv_out_w_stride, inv_m
+    );
 }
 
 void maxpool2d_backward_avx2(

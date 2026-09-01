@@ -35,6 +35,10 @@ os.environ["KMP_ALL_THREADS"] = str(_NUM_THREADS)
 os.environ["OMP_THREAD_LIMIT"] = str(_NUM_THREADS)
 os.environ["KMP_DEVICE_THREAD_LIMIT"] = str(_NUM_THREADS)
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+if "KMP_BLOCKTIME" not in os.environ:
+    os.environ["KMP_BLOCKTIME"] = "5"
+if "KMP_AFFINITY" not in os.environ:
+    os.environ["KMP_AFFINITY"] = "none"
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
