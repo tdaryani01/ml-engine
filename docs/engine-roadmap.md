@@ -1,0 +1,246 @@
+# ML Engine Architecture Roadmap
+
+Design doc for refactoring the Python training stack before expanding im2col/GEMM
+and moving more ops to native. Goal: **separation**, **testable increments**, and a
+path toward **parallel training workers** and **multi-request inference** without
+shared mutable globals.
+
+Last updated: 2026-09-01 (post stride-2 native parity commit `a358629`).
+
+---
+
+## 1. Current state
+
+### What works
+
+- Native conv: k=1..7, stride 1/2, pad 1/2 (PyTorch parity at 28×28 verified).
+- Training loop: `ModelController.fit()` → `CNNNetwork.backward()` (one forward inside backward per batch).
+- Benchmarks: head-to-head vs PyTorch, Docker matrix sweep (`benchmark_diagnostics/`).
+
+### Technical debt (do not build im2col→native on top of this)
+
+| Issue | Location | Risk |
+|-------|----------|------|
+| Global backend singleton | `utils/im2col.py` (`_active_backend`, `_native_lib`) | Races if two sessions use different backends |
+| Layer-owned step scratch | `ConvBlock`, `Conv2D` (`col`, `x_cached`, gemm buffers) | Not serializable; blocks ledger/worker model |
+| `init_engine_backend()` at layer init | `spatial_layers.py` | Side effect on import/construct |
+| Dual weight storage | `CNNNetwork.weights` + `layer.W` | ES restore bugs (fixed once; structurally fragile) |
+| Shared ctypes BLAS scalars | `utils/im2col_fast.py` | Concurrent GEMM from multiple threads unsafe |
+| Implicit NATIVE→im2col fallback | `im2col.py` dispatch | Hard to reason about which backend ran |
+
+### Non-goals for early phases
+
+- Merge `CNNNetwork` into `BaseNeuralNetwork` (cosmetic).
+- True Hogwild / lock-free shared-model training (defer until ledger exists).
+- Multi-VM infrastructure (queues, object store) before local ledger proof.
+
+---
+
+## 2. Target architecture
+
+```
+EngineContext              # immutable per model/session: backend + DLL + kernel bundle
+  └── ConvOps              # protocol: conv2d_*, conv_block_*, pool (later)
+
+TrainingSession            # model + optimizer + provider + ctx + optional ledger client
+  └── train_step(X, y)     # → TrainStepResult (grads, loss, metrics)
+
+Consolidator (later)       # single writer: aggregate results → optimizer → version++
+
+PublishedModel (later)     # versioned read-only weights for inference
+
+Layer (ConvBlock, …)       # params + config only; no globals; receives ctx + scratch at call time
+ForwardCache               # activations, masks, argmax (per batch step)
+ScratchArena               # col, gemm, padded buffers (per step or thread-local)
+```
+
+### Database analogy (distributed / serving vision)
+
+| Database | Training equivalent |
+|----------|---------------------|
+| Command / transaction | `TrainStepCommand` (batch, lr, `base_version`) |
+| WAL / ledger | Append-only `TrainStepResult` (grads or deltas) |
+| Roll-forward | Consolidator applies optimizer → new weight version |
+| Read replica | Inference serves immutable checkpoint at version N |
+| Single writer | Consolidator owns Adam `m/v/t` |
+
+Workers do **not** share live `CNNNetwork` state. They emit immutable step results;
+one consolidator materializes the latest weights.
+
+---
+
+## 3. Phase map (granular)
+
+Each sub-phase is one reviewable PR. Run grad check + one benchmark case before merge.
+Do not combine more than **one letter-group** (e.g. all of A) in a single PR unless trivial.
+
+---
+
+### Phase A — Engine context & ops backends (no behavior change)
+
+**Outcome:** Dispatch reads `EngineContext`, not module globals. External API unchanged.
+
+| ID | Scope | Files (typical) | Done when |
+|----|--------|-------------------|-----------|
+| **A1** | Define `ConvOps` protocol (forward, backward_fused, conv_block_*) | `utils/engine_ops.py` (new) | Protocol + docstrings; no callers yet |
+| **A2** | `NativeConvOps` — delegate to existing ctypes paths in `im2col.py` | `engine_ops.py`, `im2col.py` | Native grad matrix still passes |
+| **A3** | `NumpyConvOps` — delegate to reference im2col path | `engine_ops.py` | Used only in tests |
+| **A4** | `Im2colGemmConvOps` — explicit class (same code as today’s IM2COL_GEMM path) | `engine_ops.py`, `im2col_fast.py` | No implicit fallback from NATIVE |
+| **A5** | `EngineContext(backend)` factory loads correct `ConvOps` + native handle | `engine_ops.py` | Unit test: ctx.native vs ctx.numpy |
+| **A6** | Add optional `ctx=` param to top-level `im2col` entrypoints; default = legacy global | `im2col.py` | All existing callers pass without change |
+| **A7** | `ConvBlock` stores `self._ctx`, removes `init_engine_backend()` from `__init__` | `spatial_layers.py` | Construct block with injected ctx |
+| **A8** | `ModelFactory` / `CNNNetwork` create one `EngineContext`, pass to layers | `model_factory.py`, `cnn_network.py` | Pipeline + benchmark unchanged numerically |
+| **A9** | Deprecate direct `init_engine_backend()` in app code; shim for tests only | `im2col.py`, `testing/*` | Grep shows no production init calls |
+
+**Exit criteria (Phase A):** 28-case native grad check; one `benchmark_cnn.py` run; no new globals.
+
+---
+
+### Phase B — Step state separation
+
+**Outcome:** Layers hold parameters only; per-batch state lives in cache/arena.
+
+| ID | Scope | Files | Done when |
+|----|--------|-------|-----------|
+| **B1** | Define `ForwardCache` dataclass (spatial_inputs, masks, activations refs) | `src/training_cache.py` (new) | Populated in one forward pass |
+| **B2** | Define `ScratchArena` (col, gemm, dout_trans, pad buffers) sized by batch cap | `src/scratch_arena.py` (new) | Alloc once per session or per step |
+| **B3** | `ConvBlock.forward(..., cache, arena)` — stop writing `self.x_cached` | `spatial_layers.py` | ConvBlock tests or grad check k=3 |
+| **B4** | `ConvBlock.backward(..., cache, arena)` — read from cache | `spatial_layers.py` | Same |
+| **B5** | `CNNNetwork._forward` returns/ fills `ForwardCache` | `cnn_network.py` | backward uses cache, no re-forward |
+| **B6** | Wire `set_train_batch_cap` to arena policy, not layer fields | `cnn_network.py`, `spatial_layers.py` | Variable batch sizes work |
+| **B7** | Remove dead cache fields from layer instances | `spatial_layers.py` | Layers only have W, b, hyperparams |
+
+**Exit criteria (Phase B):** Grad check + benchmark; backward must not call `_forward` (explicit split).
+
+---
+
+### Phase C — Training session boundary
+
+**Outcome:** Training is a session object; controller becomes thin orchestration.
+
+| ID | Scope | Files | Done when |
+|----|--------|-------|-----------|
+| **C1** | Define `TrainStepResult` (loss, grad_weights, grad_biases, step_id) | `src/training_session.py` (new) | Serializable numpy arrays |
+| **C2** | `TrainingSession.train_step(X, y, lr)` — forward+cache → backward → return result | `training_session.py` | Does not call optimizer yet |
+| **C3** | `TrainingSession.apply_step(result)` or inline optimizer in `train_step` | `training_session.py` | Matches current Adam behavior |
+| **C4** | `TrainingSession.fit(epochs)` — epoch loop extracted from controller | `training_session.py` | ES + val predict optional flags |
+| **C5** | `ModelController` delegates to `TrainingSession` (keep public API) | `controller.py` | `run_pipeline.py` unchanged |
+| **C6** | Benchmark constructs session explicitly (optional cleanup) | `benchmarks/benchmark_cnn.py` | Benchmark numbers unchanged |
+
+**Exit criteria (Phase C):** Two independent `TrainingSession` instances in one process (sequential OK); no shared globals mutated between them.
+
+---
+
+### Phase D — im2col/GEMM first-class & native expansion
+
+**Outcome:** Three backends are peers; im2col/GEMM not a silent fallback.
+
+| ID | Scope | Files | Done when |
+|----|--------|-------|-----------|
+| **D1** | Fix `im2col_fast.py` ctypes scalars — stack-local per GEMM call | `im2col_fast.py` | Thread-safe GEMM smoke test |
+| **D2** | Config/backend switch uses `Im2colGemmConvOps` only (no NATIVE fallback unless configured) | `engine_ops.py`, config | Benchmark both backends |
+| **D3** | Grad check: native vs im2col_gemm vs numpy for conv matrix | `testing/test_gradient_check.py` | Document tolerances |
+| **D4** | Move maxpool/ReLU behind ops protocol (optional split from conv) | `engine_ops.py`, native | Same pattern as conv |
+| **D5** | Port dense head hot paths to native (if/when needed) | `src/native/*` | Per-op decision |
+
+**Exit criteria (Phase D):** IM2COL_GEMM is selectable and correct; im2col path ready to shrink as native grows.
+
+---
+
+### Phase E — Ledger, consolidator, serving (local proof first)
+
+**Outcome:** Command/result training model on one machine; then VMs.
+
+| ID | Scope | Files | Done when |
+|----|--------|-------|-----------|
+| **E1** | Define `TrainStepCommand` (base_version, batch ref, lr, step_id) | `src/ledger.py` (new) | JSON/msgpack schema |
+| **E2** | `TrainStepResult.to_bytes()` / `from_bytes()` | `ledger.py` | Round-trip test |
+| **E3** | In-memory queue + single `Consolidator` process/thread | `src/consolidator.py` (new) | Two worker threads → one model |
+| **E4** | `WeightStore`: versioned weights, `publish()` / `get(version)` | `src/weight_store.py` (new) | Inference reads vN while training writes vN+1 |
+| **E5** | `InferenceSession` — read-only weights + thread-local arena | `src/inference_session.py` (new) | Two concurrent forwards, same version |
+| **E6** | File-based ledger (append log) for crash recovery sketch | `ledger.py` | Replay last K steps |
+| **E7** | Document VM protocol (queue transport TBD: Redis/SQS/Kafka) | `docs/distributed-training.md` | No impl required yet |
+
+**Exit criteria (Phase E):** Local two-worker gradient pipeline matches single-thread training for N steps (same seed).
+
+---
+
+## 4. Parallelism models (what we support when)
+
+| Model | Phase | Notes |
+|-------|-------|-------|
+| Sequential two experiments | A | Two sessions, two models, different configs |
+| Thread-safe IM2COL GEMM | D1 | Required before any multi-thread compute |
+| Two training workers → consolidator | E3 | **Preferred** multi-core / multi-VM pattern |
+| Two inference requests, same version | E5 | Read-only weights + thread-local scratch |
+| Shared-model multi-thread training (Hogwild) | — | **Not planned** unless ledger path insufficient |
+
+---
+
+## 5. Testing gates (every PR)
+
+1. `python testing/test_gradient_check.py` (native conv matrix).
+2. At least one `benchmarks/benchmark_cnn.py` or sweep case (quick config).
+3. No new `init_engine_backend()` in `src/` outside factory/shim.
+
+Optional before Phase E: extend matrix sweep for regression timing.
+
+---
+
+## 6. File layout (target)
+
+```
+utils/
+  engine_ops.py       # ConvOps, EngineContext, backend factories
+  im2col.py           # thin dispatch; ctx-aware; legacy shim
+  im2col_fast.py      # numba kernels (thread-safe after D1)
+
+src/
+  training_session.py
+  training_cache.py
+  scratch_arena.py
+  ledger.py
+  consolidator.py
+  weight_store.py
+  inference_session.py
+  spatial_layers.py   # params + forward/backward(ctx, cache, arena)
+  cnn_network.py      # topology + weights
+  controller.py       # thin wrapper
+
+docs/
+  engine-roadmap.md   # this file
+  distributed-training.md  # (Phase E7) wire format & VM ops runbook
+```
+
+---
+
+## 7. Suggested order of work
+
+```
+A1 → A2 → A3 → A4 → A5 → A6 → A7 → A8 → A9
+  → B1 → B2 → B3 → B4 → B5 → B6 → B7
+  → C1 → C2 → C3 → C4 → C5 → C6
+  → D1 → D2 → D3 → …
+  → E1 → E2 → E3 → E4 → E5 → …
+```
+
+**Stop and ship** after each sub-phase. If a sub-phase grows beyond ~300 lines changed, split it.
+
+---
+
+## 8. Open decisions (record answers here)
+
+| Question | Decision | Date |
+|----------|----------|------|
+| Ledger stores grads or weight deltas? | TBD (recommend **grads**; consolidator owns Adam) | |
+| Queue technology for VMs? | TBD | |
+| Keep `ModelController` name vs rename to `TrainingSession` publicly? | TBD (recommend keep controller as facade) | |
+| im2col/GEMM parity required before native pool/ReLU port? | TBD | |
+
+---
+
+## 9. References
+
+- Grad matrix: `testing/test_gradient_check.py` (k=1..7 × s=1,2 × p=1,2).
+- Docker matrix log: `benchmark_diagnostics/conv_matrix_k1-7_s1-2_p1-2_*.log`.
+- Runtime threading: `config/runtime.yaml`, `utils/runtime.py`.
