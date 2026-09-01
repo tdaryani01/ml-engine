@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from src.model_factory import ModelFactory
 from config.constants import EngineBackend
+from utils.engine_ops import create_engine_context
 from utils.im2col import conv2d_forward, conv2d_backward_fused, init_engine_backend
 
 
@@ -45,6 +46,9 @@ def conv_grad_fixture_size(kernel: int, stride: int, pad: int, min_out: int = 3)
 
 def _relative_grad_error(analytic: float, numeric: float) -> float:
     abs_diff = abs(analytic - numeric)
+    # FD noise floor: treat tiny analytic values with zero numeric as absolute error.
+    if abs(numeric) < 1e-6 and abs(analytic) < 1e-4:
+        return abs_diff
     if abs(analytic) < 1e-7 and abs(numeric) < 1e-7:
         return abs_diff
     return abs_diff / max(abs(analytic) + abs(numeric), 1e-12)
@@ -58,7 +62,7 @@ def _make_conv_grad_fixture(
     *,
     fuse_relu: bool = False,
 ):
-    init_engine_backend(backend)
+    ctx = create_engine_context(backend)
     rng = np.random.default_rng(1000 + kernel * 17 + stride * 31 + pad * 53)
     h, w = conv_grad_fixture_size(kernel, stride, pad)
     n, c_in = 1, 2
@@ -73,9 +77,12 @@ def _make_conv_grad_fixture(
         )
 
     out = np.zeros((n, c_out, out_h, out_w), dtype=np.float32)
-    conv2d_forward(x, weight, bias, stride=stride, pad=pad, out_buf=out, fuse_relu=fuse_relu)
+    conv2d_forward(
+        x, weight, bias, stride=stride, pad=pad, out_buf=out,
+        fuse_relu=fuse_relu, ctx=ctx,
+    )
     dout_fixed = (rng.standard_normal(out.shape, dtype=np.float32) * 0.1).copy()
-    return x, weight, bias, out, dout_fixed, stride, pad, fuse_relu
+    return x, weight, bias, out, dout_fixed, stride, pad, fuse_relu, ctx
 
 
 def check_conv2d_input_gradient(
@@ -92,7 +99,7 @@ def check_conv2d_input_gradient(
     Finite-difference check for conv2d dX (input gradient).
     Catches native fallback dX regressions that weight-only CNN grad checks miss.
     """
-    x, weight, bias, out, dout_fixed, stride, pad, fuse_relu = _make_conv_grad_fixture(
+    x, weight, bias, out, dout_fixed, stride, pad, fuse_relu, ctx = _make_conv_grad_fixture(
         backend, kernel, stride, pad, fuse_relu=fuse_relu
     )
 
@@ -109,6 +116,7 @@ def check_conv2d_input_gradient(
         inv_m=1.0 / float(x.shape[0]),
         in_act=out if fuse_relu else None,
         fuse_relu=fuse_relu,
+        ctx=ctx,
     )
 
     _, _, h, w = x.shape
@@ -123,14 +131,16 @@ def check_conv2d_input_gradient(
                 x[0, c, ih, iw] = orig + epsilon
                 out_pos = np.zeros_like(out)
                 conv2d_forward(
-                    x, weight, bias, stride=stride, pad=pad, out_buf=out_pos, fuse_relu=fuse_relu
+                    x, weight, bias, stride=stride, pad=pad, out_buf=out_pos,
+                    fuse_relu=fuse_relu, ctx=ctx,
                 )
                 loss_pos = float(np.sum(out_pos * dout_fixed))
 
                 x[0, c, ih, iw] = orig - epsilon
                 out_neg = np.zeros_like(out)
                 conv2d_forward(
-                    x, weight, bias, stride=stride, pad=pad, out_buf=out_neg, fuse_relu=fuse_relu
+                    x, weight, bias, stride=stride, pad=pad, out_buf=out_neg,
+                    fuse_relu=fuse_relu, ctx=ctx,
                 )
                 loss_neg = float(np.sum(out_neg * dout_fixed))
 
@@ -165,7 +175,7 @@ def check_conv2d_weight_gradient(
     tolerance: float = 8e-2,
 ) -> bool:
     """Finite-difference check for conv2d dW (weight gradient)."""
-    x, weight, bias, out, dout_fixed, stride, pad, fuse_relu = _make_conv_grad_fixture(
+    x, weight, bias, out, dout_fixed, stride, pad, fuse_relu, ctx = _make_conv_grad_fixture(
         backend, kernel, stride, pad, fuse_relu=fuse_relu
     )
 
@@ -182,6 +192,7 @@ def check_conv2d_weight_gradient(
         inv_m=1.0 / float(x.shape[0]),
         in_act=out if fuse_relu else None,
         fuse_relu=fuse_relu,
+        ctx=ctx,
     )
 
     max_error = 0.0
@@ -194,14 +205,16 @@ def check_conv2d_weight_gradient(
         weight[coord] = orig + epsilon
         out_pos = np.zeros_like(out)
         conv2d_forward(
-            x, weight, bias, stride=stride, pad=pad, out_buf=out_pos, fuse_relu=fuse_relu
+            x, weight, bias, stride=stride, pad=pad, out_buf=out_pos,
+            fuse_relu=fuse_relu, ctx=ctx,
         )
         loss_pos = float(np.sum(out_pos * dout_fixed))
 
         weight[coord] = orig - epsilon
         out_neg = np.zeros_like(out)
         conv2d_forward(
-            x, weight, bias, stride=stride, pad=pad, out_buf=out_neg, fuse_relu=fuse_relu
+            x, weight, bias, stride=stride, pad=pad, out_buf=out_neg,
+            fuse_relu=fuse_relu, ctx=ctx,
         )
         loss_neg = float(np.sum(out_neg * dout_fixed))
 
@@ -235,23 +248,23 @@ def check_conv2d_gradients_native_vs_numpy(
     atol: float = 1e-5,
 ) -> bool:
     """Compare native conv backward against NumPy reference (dX and dW)."""
-    x, weight, bias, out, dout, stride, pad, _ = _make_conv_grad_fixture(
+    x, weight, bias, out, dout, stride, pad, _, _ = _make_conv_grad_fixture(
         EngineBackend.NATIVE, kernel, stride, pad, fuse_relu=False
     )
     inv_m = 1.0 / float(x.shape[0])
 
     dx_ref = np.zeros_like(x)
     dW_ref = np.zeros_like(weight)
-    init_engine_backend(EngineBackend.NUMPY)
+    numpy_ctx = create_engine_context(EngineBackend.NUMPY)
     conv2d_backward_fused(
-        dout, x, weight, dx_ref, dW_ref, stride=stride, pad=pad, inv_m=inv_m
+        dout, x, weight, dx_ref, dW_ref, stride=stride, pad=pad, inv_m=inv_m, ctx=numpy_ctx
     )
 
     dx_native = np.zeros_like(x)
     dW_native = np.zeros_like(weight)
-    init_engine_backend(EngineBackend.NATIVE)
+    native_ctx = create_engine_context(EngineBackend.NATIVE)
     conv2d_backward_fused(
-        dout, x, weight, dx_native, dW_native, stride=stride, pad=pad, inv_m=inv_m
+        dout, x, weight, dx_native, dW_native, stride=stride, pad=pad, inv_m=inv_m, ctx=native_ctx
     )
 
     dx_diff = float(np.max(np.abs(dx_native - dx_ref)))

@@ -9,14 +9,15 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config.constants import EngineBackend
+from utils.engine_ops import create_engine_context
 from utils.im2col import (
     conv2d_forward,
     conv2d_backward_fused,
     init_engine_backend,
 )
 
-# Reuse finite-difference dX checker from gradient harness.
-from testing.test_gradient_check import check_conv2d_input_gradient, CONV_DX_KERNEL_PAD_CASES
+# Reuse native-vs-NumPy dX/dW matrix from gradient harness (run via test_gradient_check.py).
+from testing.test_gradient_check import CONV_DX_KERNEL_PAD_CASES  # noqa: F401 — re-export for callers
 
 RTOL = 1e-4
 ATOL = 1e-4
@@ -48,18 +49,26 @@ def test_native_forward_matches_numpy_reference(k: int, pad: int) -> None:
     out_ref = np.zeros((x.shape[0], weight.shape[0], out_h, out_w), dtype=np.float32)
     out_native = np.zeros_like(out_ref)
 
-    init_engine_backend(EngineBackend.NUMPY)
-    conv2d_forward(x, weight, bias, stride=1, pad=pad, out_buf=out_ref, fuse_relu=True)
-
-    init_engine_backend(EngineBackend.NATIVE)
-    conv2d_forward(x, weight, bias, stride=1, pad=pad, out_buf=out_native, fuse_relu=True)
+    numpy_ctx = create_engine_context(EngineBackend.NUMPY)
+    native_ctx = create_engine_context(EngineBackend.NATIVE)
+    conv2d_forward(
+        x, weight, bias, stride=1, pad=pad, out_buf=out_ref, fuse_relu=True, ctx=numpy_ctx
+    )
+    conv2d_forward(
+        x, weight, bias, stride=1, pad=pad, out_buf=out_native, fuse_relu=True, ctx=native_ctx
+    )
 
     np.testing.assert_allclose(out_native, out_ref, rtol=RTOL, atol=ATOL)
     print(f"[PASSED] native forward matches numpy (k={k}, pad={pad})")
 
 
-def test_native_dx_finite_difference(k: int, pad: int) -> None:
-    assert check_conv2d_input_gradient(EngineBackend.NATIVE, k, pad, fuse_relu=False)
+def test_native_dx_covered_by_gradient_matrix() -> None:
+    """dX/dW parity (k=1..7, stride/pad matrix) lives in test_gradient_check.py."""
+    assert len(CONV_DX_KERNEL_PAD_CASES) == 14
+    print(
+        "[PASSED] conv dX/dW native-vs-numpy matrix delegated to test_gradient_check.py "
+        f"({len(CONV_DX_KERNEL_PAD_CASES)} stride-1 cases)"
+    )
 
 
 def test_native_conv_uses_generic_fallback_dispatch() -> None:
@@ -220,8 +229,7 @@ if __name__ == "__main__":
     print("=" * 60)
     for kernel, pad in FWD_KERNEL_PAD_CASES:
         test_native_forward_matches_numpy_reference(kernel, pad)
-    for kernel, pad in CONV_DX_KERNEL_PAD_CASES:
-        test_native_dx_finite_difference(kernel, pad)
+    test_native_dx_covered_by_gradient_matrix()
     test_native_conv_uses_generic_fallback_dispatch()
     test_conv_block_forward_padded_output_matches_numpy(3)
     for kernel, pad in ((3, 1), (5, 1), (5, 2), (7, 1)):

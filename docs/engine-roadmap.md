@@ -39,8 +39,10 @@ Last updated: 2026-09-01 (post stride-2 native parity commit `a358629`).
 ## 2. Target architecture
 
 ```
-EngineContext              # immutable per model/session: backend + DLL + kernel bundle
-  └── ConvOps              # protocol: conv2d_*, conv_block_*, pool (later)
+EngineContext              # model-agnostic session: backend + ops registry
+  ├── conv: ConvOps        # CNN / spatial models
+  ├── ops("attention")     # future: transformer / attention models
+  └── native_lib           # shared DLL handle when backend=NATIVE
 
 TrainingSession            # model + optimizer + provider + ctx + optional ledger client
   └── train_step(X, y)     # → TrainStepResult (grads, loss, metrics)
@@ -179,9 +181,40 @@ Do not combine more than **one letter-group** (e.g. all of A) in a single PR unl
 
 ## 5. Testing gates (every PR)
 
+### Universal gates (all phases)
+
 1. `python testing/test_gradient_check.py` (native conv matrix).
 2. At least one `benchmarks/benchmark_cnn.py` or sweep case (quick config).
 3. No new `init_engine_backend()` in `src/` outside factory/shim.
+
+### Phase-specific gates (`testing/test_engine_ops.py`)
+
+| Phase | Test function | Pass criteria |
+|-------|---------------|---------------|
+| **A1** | `test_a1_conv_ops_protocol` | `ConvOps` exposes forward/backward/block/pool methods |
+| **A2** | `test_a2_native_conv_ops_matches_im2col` | `NativeConvOps` output matches `im2col` with same ctx |
+| **A3** | `test_a3_numpy_conv_ops_runs_reference_path` | NumPy reference path runs without error |
+| **A4** | `test_a4_im2col_gemm_conv_ops` | `Im2colGemmConvOps` is explicit, not implicit fallback |
+| **A5** | `test_a5_engine_context_factory` | Factory sets backend; native lib only for NATIVE |
+| **A6** | `test_a6_ctx_param_overrides_global` | `ctx=` dispatch ignores stale module global |
+| **A7** | `test_a7_conv_block_uses_injected_ctx` | Layer stores injected ctx, no layer-level init |
+| **A8** | `test_a8_model_factory_shares_engine_ctx` | One `EngineContext` shared across all spatial layers |
+| **A9** | `test_a9_no_init_engine_backend_in_src` | Grep: zero `init_engine_backend` in `src/` |
+| **A\*** | `test_model_agnostic_ops_registry` | `ctx.register("attention", …)` extensibility |
+| **A\*** | `test_sequential_two_contexts` | Two contexts (NATIVE + NUMPY) coexist sequentially |
+
+Run Phase A suite: `python testing/test_engine_ops.py`
+
+### Future phase test stubs (add when implementing)
+
+| Phase | Planned test | Pass criteria |
+|-------|--------------|---------------|
+| **B** | `test_b_backward_no_reforward` | backward does not call `_forward` |
+| **B** | `test_b_convblock_no_layer_cache` | no `self.x_cached` on ConvBlock after B7 |
+| **C** | `test_c_two_training_sessions` | two `TrainingSession` instances, no shared globals |
+| **D** | `test_d_gemm_thread_safe` | concurrent GEMM smoke test passes |
+| **D** | `test_d_three_backend_grad_parity` | native vs im2col_gemm vs numpy matrix |
+| **E** | `test_e_two_worker_consolidator` | two workers → consolidator matches single-thread |
 
 Optional before Phase E: extend matrix sweep for regression timing.
 

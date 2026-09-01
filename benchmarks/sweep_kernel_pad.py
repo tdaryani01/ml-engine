@@ -425,6 +425,13 @@ if __name__ == "__main__":
     parser.add_argument("--k-min", type=int, default=1)
     parser.add_argument("--k-max", type=int, default=7)
     parser.add_argument(
+        "--kernels",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit kernel sizes (overrides --k-min/--k-max and --full-matrix)",
+    )
+    parser.add_argument(
         "--full-matrix",
         action="store_true",
         help="Run k=1..7 × stride=1,2 × pad=1,2 (28 cases, skip invalid geometry)",
@@ -438,7 +445,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.full_matrix:
+    if args.kernels:
+        kernel_sizes = list(args.kernels)
+        strides = args.strides
+        pads = [args.pad] if args.pad is not None else args.pads
+    elif args.full_matrix:
         kernel_sizes = list(range(1, 8))
         strides = [1, 2]
         pads = [1, 2]

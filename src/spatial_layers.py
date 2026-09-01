@@ -3,17 +3,8 @@ import builtins
 import logging
 import numpy as np
 from config.constants import EngineBackend
-from utils.im2col import (
-    init_engine_backend,
-    conv2d_forward,
-    conv2d_backward_fused,
-    conv_block_forward,
-    conv_block_backward,
-    col2im,
-    maxpool_forward,
-    maxpool_backward,
-    fuse_dout_transpose_and_bias
-)
+from utils.engine_ops import EngineContext, resolve_engine_context
+from utils.im2col import col2im
 
 logger = logging.getLogger(__name__)
 
@@ -34,50 +25,10 @@ class ConvBlock:
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3,
                  conv_stride: int = 1, conv_pad: int = 0,
                  pool_size: int = 2, pool_stride: int = 2,
-                 backend: EngineBackend = EngineBackend.NATIVE):
-        init_engine_backend(backend)
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.k_h = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
-        self.k_w = kernel_size if isinstance(kernel_size, int) else kernel_size[1]
-        self.conv_stride = conv_stride
-        self.conv_pad = conv_pad
-        self.pool_size = pool_size
-        self.pool_stride = pool_stride
-
-        fan_in = in_channels * self.k_h * self.k_w
-        limit = np.sqrt(6.0 / fan_in)
-        self.W = np.random.uniform(-limit, limit, (out_channels, in_channels, self.k_h, self.k_w)).astype(np.float32)
-        self.b = np.zeros((1, out_channels), dtype=np.float32)
-
-        self.dW = np.zeros_like(self.W)
-        self.db = np.zeros_like(self.b)
-
-        self.x_cached = None
-        self.conv_act_cached = None
-        self.argmax_cached = None
-        self.col = None
-        self.out_h = 0
-        self.out_w = 0
-
-        self._cached_batch_size = 0
-        self._cached_dtype = None
-        self._out_conv_buffer = None
-        self._out_pool_buffer = None
-        self._argmax_buffer = None
-        self._d_conv_buffer = None
-        self._dx_buffer = None
-        self._dout_trans_buffer = None
-        self._col_buffer = None
-        self._dcol_buffer = None
-        self._fwd_gemm_buffer = None
-
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3,
-                 conv_stride: int = 1, conv_pad: int = 0,
-                 pool_size: int = 2, pool_stride: int = 2,
-                 backend: EngineBackend = EngineBackend.NATIVE):
-        init_engine_backend(backend)
-        self.backend = backend  # Save backend state for buffer conditional checks
+                 engine_ctx: EngineContext | None = None,
+                 backend: EngineBackend | None = None):
+        self._ctx = resolve_engine_context(engine_ctx, backend)
+        self.backend = self._ctx.backend
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.k_h = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
@@ -254,7 +205,7 @@ class ConvBlock:
             gemm_buf = self._fwd_gemm_buffer
             self.x_cached = x
 
-        out_pool, out_conv, argmax, col = conv_block_forward(
+        out_pool, out_conv, argmax, col = self._ctx.conv.conv_block_forward(
             x=x, W=self.W, bias=self.b,
             out_conv_buf=out_conv_buf[:N],
             out_pool_buf=out_pool_buf[:N],
@@ -281,7 +232,7 @@ class ConvBlock:
         inv_m = 1.0 / float(N)
         self._ensure_train_buffers(N, C, H, W_stride, w_log, dout.dtype)
 
-        dx, self.dW, self.db = conv_block_backward(
+        dx, self.dW, self.db = self._ctx.conv.conv_block_backward(
             dout_pool=dout,
             argmax_buf=self.argmax_cached,
             x=self.x_cached,
@@ -311,8 +262,10 @@ class Conv2D:
     """
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3,
                  stride: int = 1, pad: int = 0,
-                 backend: EngineBackend = EngineBackend.NATIVE):
-        init_engine_backend(backend)
+                 engine_ctx: EngineContext | None = None,
+                 backend: EngineBackend | None = None):
+        self._ctx = resolve_engine_context(engine_ctx, backend)
+        self.backend = self._ctx.backend
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.k_h = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
@@ -390,7 +343,7 @@ class Conv2D:
         self._ensure_buffers(N, C, H, W_stride, w_log, x.dtype)
         active_out = self._fwd_out_buffer[:N]
 
-        active_out, self.col = conv2d_forward(
+        active_out, self.col = self._ctx.conv.conv2d_forward(
             x=x, W=self.W, bias=self.b,
             stride=self.stride, pad=self.pad,
             out_buf=active_out,
@@ -415,10 +368,10 @@ class Conv2D:
 
         active_dout_trans = self._dout_trans_buffer[:total_rows]
 
-        fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
+        self._ctx.conv.fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
 
         active_dx = self._dx_buffer[:N]
-        dx, self.dW = conv2d_backward_fused(
+        dx, self.dW = self._ctx.conv.conv2d_backward_fused(
             dout=dout,
             x=self.x_cached,
             W=self.W,
@@ -441,8 +394,11 @@ class MaxPool2D:
     """
     Spatial Max-Pooling layer with index tracking for backward routing.
     """
-    def __init__(self, pool_size: int = 2, stride: int = 2, backend: EngineBackend = EngineBackend.NATIVE):
-        init_engine_backend(backend)
+    def __init__(self, pool_size: int = 2, stride: int = 2,
+                 engine_ctx: EngineContext | None = None,
+                 backend: EngineBackend | None = None):
+        self._ctx = resolve_engine_context(engine_ctx, backend)
+        self.backend = self._ctx.backend
         self.pool_size = pool_size
         self.stride = stride
         self.x_shape = None
@@ -483,7 +439,7 @@ class MaxPool2D:
         
         self._ensure_buffers(N, C, H, W_stride, w_log, x.dtype)
 
-        out, self._cache = maxpool_forward(
+        out, self._cache = self._ctx.conv.maxpool_forward(
             x, self.pool_size, self.stride,
             out_buf=self._out_buf[:N],
             argmax_buf=self._argmax_buf[:N]
@@ -497,7 +453,7 @@ class MaxPool2D:
         if self._dx_buf is None or self._dx_buf.shape != self.x_shape or self._dx_buf.dtype != dout.dtype:
             self._dx_buf = np.zeros(self.x_shape, dtype=dout.dtype)
 
-        return maxpool_backward(
+        return self._ctx.conv.maxpool_backward(
             dout, self._cache, self.x_shape,
             self.pool_size, self.stride,
             dx_buf=self._dx_buf

@@ -2,6 +2,7 @@
 import logging
 import numpy as np
 from config.constants import EngineBackend
+from utils.engine_ops import create_engine_context
 from src.models import BinaryClassificationNetwork, RegressionNetwork, MultiClassNetwork
 from src.cnn_network import CNNNetwork
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten
@@ -124,10 +125,13 @@ class ModelFactory:
             factory_kwargs.pop("use_batch_norm", None)
             factory_kwargs.pop("bn_momentum", None)
 
+            engine_ctx = create_engine_context(backend_val)
+
             return model_class(
                 conv_configs=spatial_pipeline,
                 dense_sizes=resolved_dense_sizes,
                 backend=backend_val,
+                engine_ctx=engine_ctx,
                 **factory_kwargs
             )
 

@@ -4,6 +4,7 @@ import logging
 import numpy as np
 from config.constants import EngineBackend
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten, ConvBlock
+from utils.engine_ops import create_engine_context
 from utils.im2col import relu_spatial_forward, relu_spatial_backward
 
 if 'profile' not in builtins.__dict__:
@@ -18,9 +19,11 @@ class CNNNetwork:
     """
     def __init__(self, conv_configs: list, dense_sizes: list, optimizer_instance,
                  backend: EngineBackend = EngineBackend.NATIVE,
+                 engine_ctx=None,
                  lam_l1: float = 0.01, lam_l2: float = 0.01, p_dropout: float = 0.0,
                  max_norm: float = 5.0, task_type: str = "multiclass", **kwargs):
-        self.backend = backend
+        self.engine_ctx = engine_ctx or create_engine_context(backend)
+        self.backend = self.engine_ctx.backend
         self.optimizer = optimizer_instance
         self.lam_l1 = lam_l1
         self.lam_l2 = lam_l2
@@ -106,7 +109,7 @@ class CNNNetwork:
                     conv_pad=cfg.get("pad", 0),
                     pool_size=pool_cfg.get("pool_size", 2),
                     pool_stride=pool_cfg.get("stride", 2),
-                    backend=self.backend
+                    engine_ctx=self.engine_ctx,
                 )
                 self.layers.append(block)
                 self.param_layers.append(block)
@@ -122,7 +125,7 @@ class CNNNetwork:
                     kernel_size=cfg.get("kernel_size", 3),
                     stride=cfg.get("stride", 1),
                     pad=cfg.get("pad", 0),
-                    backend=self.backend
+                    engine_ctx=self.engine_ctx,
                 )
                 self.layers.append(layer)
                 self.param_layers.append(layer)
@@ -132,7 +135,7 @@ class CNNNetwork:
                 self.layers.append(MaxPool2D(
                     pool_size=cfg.get("pool_size", 2),
                     stride=cfg.get("stride", 2),
-                    backend=self.backend
+                    engine_ctx=self.engine_ctx,
                 ))
             elif l_type == "flatten":
                 self.layers.append(Flatten())
@@ -237,7 +240,7 @@ class CNNNetwork:
                 if training:
                     self.spatial_inputs.append(current_act)
                     self.spatial_logical_ws.append(current_logical_w)
-                current_act = relu_spatial_forward(current_act)
+                current_act = relu_spatial_forward(current_act, ctx=self.engine_ctx)
             elif isinstance(layer, Flatten):
                 if training:
                     self.spatial_inputs.append(current_act)
@@ -387,7 +390,7 @@ class CNNNetwork:
             in_act = self.spatial_inputs[i]
 
             if layer == "relu":
-                spatial_grad = relu_spatial_backward(spatial_grad, in_act)
+                spatial_grad = relu_spatial_backward(spatial_grad, in_act, ctx=self.engine_ctx)
             elif isinstance(layer, (Conv2D, ConvBlock)):
                 w_log = self.spatial_logical_ws[i]
                 spatial_grad = layer.backward(spatial_grad, W_logical=w_log)

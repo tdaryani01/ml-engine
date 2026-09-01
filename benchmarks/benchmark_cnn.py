@@ -32,7 +32,7 @@ from config.constants import ModelType, IngestionMode, LRHierarchy, DataKeys, En
 from src.controller import ModelController
 from src.data.base_loader import BaseDataLoader
 from src.data.in_memory_provider import InMemoryDataProvider
-from utils.im2col import init_engine_backend
+from utils.engine_ops import create_engine_context
 from config.schema import (
     PipelineConfig, MetaConfig, IngestionConfig, ArchitectureConfig, 
     OptimizationConfig, RegularizationConfig, TransformationsConfig,
@@ -592,9 +592,11 @@ def run_custom_engine_benchmark(
     backend: EngineBackend = EngineBackend.NATIVE,
     num_threads: int = 4
 ) -> dict:
-    init_engine_backend(backend)
+    engine_ctx = create_engine_context(backend)
 
-    native_lib = load_native_telemetry_lib() if backend == EngineBackend.NATIVE else None
+    native_lib = engine_ctx.native_lib or (
+        load_native_telemetry_lib() if backend == EngineBackend.NATIVE else None
+    )
     verified_threads = num_threads
     if native_lib and hasattr(native_lib, "get_omp_threads"):
         try:

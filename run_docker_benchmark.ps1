@@ -1,6 +1,7 @@
 param(
-    [ValidateSet("All", "Build", "Run", "Clean", "Sweep", "Matrix")]
+    [ValidateSet("All", "Build", "Run", "Clean", "Sweep", "Matrix", "Sample")]
     [string]$Action = "All",
+    [int[]]$SampleKernels = @(1, 3, 4, 7),
     [int]$Cores = 4,
     [ValidateRange(0, 2)]
     [int]$OneDnnVerbose = 0,
@@ -246,6 +247,53 @@ function Run-KernelSweep {
     Write-Host "[OK] Kernel sweep complete. Log: $SweepLog" -ForegroundColor Green
 }
 
+function Run-SampleSweep {
+    Test-DockerEndpoint
+    Stop-ExistingBenchmarkContainers
+
+    $EnvOverrides = Get-DockerEnvOverrides
+    $RuntimeEnvFile = Write-RuntimeEnvFile -Threads $ThreadCount -Overrides $EnvOverrides
+    $Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $KernelTag = ($SampleKernels -join "-")
+    $SweepLog = Join-Path $DiagDir "conv_sample_k${KernelTag}_s1-2_p1-2_$Stamp.log"
+
+    Write-Host ""
+    Write-Host "==================================================================" -ForegroundColor Yellow
+    Write-Host "  DOCKER CONV SAMPLE SWEEP (kernels=$KernelTag, stride=1,2, pad=1,2)" -ForegroundColor Yellow
+    Write-Host "  Hardware Allocation  : $Cores Dedicated Cores (cpuset: $CpuSet)" -ForegroundColor Yellow
+    Write-Host "  OpenMP Thread Count  : $ThreadCount" -ForegroundColor Yellow
+    Write-Host "  Log file             : $SweepLog" -ForegroundColor Yellow
+    Write-Host "==================================================================" -ForegroundColor Yellow
+
+    $KernelArgs = $SampleKernels | ForEach-Object { "$_" }
+
+    $CommandArgs = @(
+        "-u", "benchmarks/sweep_kernel_pad.py",
+        "--kernels"
+    ) + $KernelArgs + @(
+        "--strides", "1", "2",
+        "--pads", "1", "2",
+        "--output", "/workspace/$($RuntimeYaml.diagnostics_dir)/conv_sample_k${KernelTag}_s1-2_p1-2_$Stamp.log"
+    )
+
+    Write-Host ""
+    Write-Host "[+] Executing sample conv sweep in Custom Engine container..." -ForegroundColor Cyan
+    Invoke-DockerBenchmarkRun `
+        -Name "ml-engine-bench-sample" `
+        -Image $CustomImg `
+        -EnvFile $RuntimeEnvFile `
+        -ExtraArgs @("--entrypoint", "python") `
+        -CommandArgs $CommandArgs
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "[ERROR] Sample conv sweep container run failed."
+        exit 1
+    }
+
+    Write-Host ""
+    Write-Host "[OK] Sample conv sweep complete. Log: $SweepLog" -ForegroundColor Green
+}
+
 function Run-MatrixSweep {
     Test-DockerEndpoint
     Stop-ExistingBenchmarkContainers
@@ -354,6 +402,10 @@ switch ($Action) {
     "Matrix" {
         Build-CustomContainer
         Run-MatrixSweep
+    }
+    "Sample" {
+        Build-CustomContainer
+        Run-SampleSweep
     }
     "All"   {
         Build-Containers
