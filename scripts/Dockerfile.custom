@@ -2,14 +2,6 @@ FROM python:3.13-slim
 
 WORKDIR /workspace
 
-# libgomp: avoid worker spin under Docker cpuset (4 OMP threads + main on 4 CPUs)
-ENV OMP_PROC_BIND=false
-ENV OMP_DYNAMIC=false
-ENV OMP_MAX_ACTIVE_LEVELS=2147483647
-ENV OMP_WAIT_POLICY=PASSIVE
-ENV GOMP_SPINCOUNT=0
-ENV PYTHONUNBUFFERED=1
-
 # Native build toolchain & OpenMP runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
@@ -21,7 +13,7 @@ COPY requirements-docker-custom.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements-docker-custom.txt
 
-# Copy source repository
+# Copy source repository (includes config/docker_omp.yaml)
 COPY . .
 
 # Compile native kernels
@@ -33,4 +25,8 @@ RUN mkdir -p bin && \
     -Isrc/native \
     -o bin/conv_kernels.so'
 
-ENTRYPOINT ["python", "-u", "benchmarks/run_benchmarks_docker.py"]
+ENV DOCKER_OMP_TARGET=custom
+RUN sed -i 's/\r$//' scripts/docker_bench_entrypoint.sh && chmod +x scripts/docker_bench_entrypoint.sh
+
+ENTRYPOINT ["/workspace/scripts/docker_bench_entrypoint.sh"]
+CMD ["python", "-u", "benchmarks/run_benchmarks_docker.py"]

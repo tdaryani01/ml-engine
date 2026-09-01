@@ -22,6 +22,7 @@ from benchmarks.benchmark_cnn import (
     resolve_model_type,
 )
 from config.constants import DataKeys
+from utils.docker_omp_env import apply_docker_omp_env
 
 
 class _Tee(TextIO):
@@ -292,6 +293,7 @@ def run_sweep(
                     epochs=epochs,
                 ))
 
+                apply_docker_omp_env("pytorch", num_threads, overwrite=True)
                 t_res = run_pytorch_benchmark(
                     X_train=X_train,
                     y_train_classes=y_train_classes,
@@ -309,6 +311,7 @@ def run_sweep(
                     num_threads=num_threads,
                 )
 
+                apply_docker_omp_env("custom", num_threads, overwrite=True)
                 c_res = run_custom_engine_benchmark(
                     data_provider=data_provider,
                     X_train=X_train,

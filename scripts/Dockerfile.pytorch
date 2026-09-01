@@ -7,15 +7,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# OpenMP tuning for Docker cpuset isolation
-ENV KMP_AFFINITY=none
-ENV OMP_PROC_BIND=false
-ENV OMP_MAX_ACTIVE_LEVELS=2147483647
-ENV OMP_WAIT_POLICY=PASSIVE
-ENV GOMP_SPINCOUNT=0
-ENV KMP_BLOCKTIME=5
-ENV PYTHONUNBUFFERED=1
-
 # Inline PyTorch and pipeline data ingestion stack
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --extra-index-url https://download.pytorch.org/whl/cpu \
@@ -28,6 +19,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     "pyyaml>=6.0" \
     "threadpoolctl>=3.4.0"
 
+# Copy source repository (includes config/docker_omp.yaml)
 COPY . .
 
-ENTRYPOINT ["python", "-u", "benchmarks/run_benchmarks_docker.py"]
+ENV DOCKER_OMP_TARGET=pytorch
+RUN sed -i 's/\r$//' scripts/docker_bench_entrypoint.sh && chmod +x scripts/docker_bench_entrypoint.sh
+
+ENTRYPOINT ["/workspace/scripts/docker_bench_entrypoint.sh"]
+CMD ["python", "-u", "benchmarks/run_benchmarks_docker.py"]

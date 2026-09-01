@@ -6,6 +6,8 @@ import sys
 # Ensure workspace root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from utils.docker_omp_env import get_docker_section
+
 import numpy as np
 from config.constants import DataKeys
 from benchmarks.benchmark_cnn import (
@@ -30,7 +32,9 @@ def parse_args():
     parser.add_argument(
         "--output",
         type=str,
-        default="benchmark_diagnostics/docker_benchmark_results.json",
+        default=get_docker_section().get(
+            "results_file", "benchmark_diagnostics/docker_benchmark_results.json"
+        ),
         help="Path to output JSON results",
     )
     return parser.parse_args()

@@ -1,0 +1,39 @@
+# Shared Docker benchmark configuration (both PyTorch + custom images).
+# Linux containers only. Both use GNU libgomp (different .so paths, same OMP_/GOMP_ API).
+# Windows native: see benchmarks/benchmark_cnn.py.
+#
+# Goal: fair isolated Docker runs on a fixed cpuset; cap BLAS pools (OPENBLAS=1)
+# so libgomp conv threads are not competing with a second thread pool.
+#
+# Placeholders:
+#   {num_threads} <- config.yaml optimization.num_threads
+
+shared:
+  OMP_NUM_THREADS: "{num_threads}"
+  OMP_THREAD_LIMIT: "{num_threads}"
+  OMP_PROC_BIND: "false"
+  OMP_DYNAMIC: "false"
+  OMP_MAX_ACTIVE_LEVELS: "1"
+  PYTHONUNBUFFERED: "1"
+  ONEDNN_VERBOSE: "0"
+  # Cap BLAS pools so they do not add runnable threads on top of libgomp under cpuset.
+  OPENBLAS_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "{num_threads}"
+  NUMEXPR_NUM_THREADS: "{num_threads}"
+  VECLIB_MAXIMUM_THREADS: "{num_threads}"
+
+pytorch:
+  OMP_WAIT_POLICY: "ACTIVE"
+  GOMP_SPINCOUNT: "500000"
+
+custom:
+  OMP_WAIT_POLICY: "ACTIVE"
+  GOMP_SPINCOUNT: "500000"
+
+docker:
+  benchmark_runner:
+    - python
+    - -u
+    - benchmarks/run_benchmarks_docker.py
+  diagnostics_dir: benchmark_diagnostics
+  results_file: benchmark_diagnostics/docker_benchmark_results.json
