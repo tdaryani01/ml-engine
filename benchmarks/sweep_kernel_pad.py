@@ -1,7 +1,8 @@
 # benchmarks/sweep_kernel_pad.py
-"""Sweep conv kernel size vs PyTorch with a full per-kernel log report."""
+"""Sweep conv kernel / stride / pad vs PyTorch with per-case log reports."""
 import copy
 import datetime
+import itertools
 import math
 import os
 import sys
@@ -20,6 +21,7 @@ from benchmarks.benchmark_cnn import (
     run_pytorch_benchmark,
     resolve_backend,
     resolve_model_type,
+    validate_cnn_spatial_geometry,
 )
 from config.constants import DataKeys
 
@@ -41,12 +43,15 @@ class _Tee(TextIO):
             stream.flush()
 
 
-def patch_cnn_kernel(cnn_dict: dict, kernel_size: int, pad: int) -> dict:
+def patch_cnn_kernel(
+    cnn_dict: dict, kernel_size: int, pad: int, stride: int = 1
+) -> dict:
     cfg = copy.deepcopy(cnn_dict)
     for item in cfg.get("spatial_pipeline", []):
         if isinstance(item, dict) and item.get("type") == "conv":
             item["kernel_size"] = int(kernel_size)
             item["pad"] = int(pad)
+            item["stride"] = int(stride)
     return cfg
 
 
@@ -72,6 +77,7 @@ def format_geometry_section(
     *,
     kernel: int,
     pad: int,
+    stride: int,
     input_shape: tuple,
     specs: list,
     n_train: int,
@@ -87,7 +93,7 @@ def format_geometry_section(
     lines = [
         "",
         "-" * 80,
-        f"GEOMETRY & WORKLOAD — kernel={kernel}, pad={pad}",
+        f"GEOMETRY & WORKLOAD — kernel={kernel}, stride={stride}, pad={pad}",
         "-" * 80,
         f"Input shape (C,H,W)           : ({c}, {h}, {w})",
         f"Train samples / batch / steps : {n_train} / {batch_size} / {steps} per epoch",
@@ -100,7 +106,7 @@ def format_geometry_section(
             f"(= {steps} batches × {conv_layers} blocks × {epochs} epochs)"
         ),
         "",
-        "Layer spatial trace (stride=1 conv, then pool):",
+        "Layer spatial trace (conv, then pool):",
     ]
 
     cur_h, cur_w = h, w
@@ -175,23 +181,24 @@ def format_derived_metrics(
 def format_summary_table(rows: List[dict]) -> str:
     lines = [
         "",
-        "=" * 110,
+        "=" * 120,
         "SWEEP SUMMARY",
-        "=" * 110,
+        "=" * 120,
         (
-            f"{'k':>3} | {'PyTorch(s)':>10} | {'Custom(s)':>10} | {'Ratio':>7} | "
+            f"{'k':>3} {'s':>2} {'p':>2} | {'PyTorch(s)':>10} | {'Custom(s)':>10} | {'Ratio':>7} | "
             f"{'Torch ms/ep':>11} | {'Custom ms/ep':>12} | "
             f"{'Torch bwd':>10} | {'Custom bwd':>10} | {'Val acc T/C':>14}"
         ),
-        "-" * 110,
+        "-" * 120,
     ]
     for row in rows:
         lines.append(
-            f"{row['kernel']:3d} | {row['torch_train_s']:10.3f} | {row['custom_train_s']:10.3f} | "
+            f"{row['kernel']:3d} {row['stride']:2d} {row['pad']:2d} | "
+            f"{row['torch_train_s']:10.3f} | {row['custom_train_s']:10.3f} | "
             f"{row['ratio']:7.2f}x | {row['torch_ms_per_epoch']:11.2f} | {row['custom_ms_per_epoch']:12.2f} | "
             f"{row['torch_bwd_ms']:10.3f} | {row['custom_bwd_ms']:10.3f} | {row['val_acc']:>14}"
         )
-    lines.append("=" * 110)
+    lines.append("=" * 120)
     lines.append("Ratio = Custom / PyTorch total train time (>1 means custom slower)")
     lines.append("bwd ms = train_time / backward_counts (model.backward granularity)")
     return "\n".join(lines)
@@ -199,7 +206,8 @@ def format_summary_table(rows: List[dict]) -> str:
 
 def run_sweep(
     kernel_sizes: List[int],
-    pad: int,
+    pads: List[int],
+    strides: List[int],
     config_path: Optional[str] = None,
     output_path: Optional[str] = None,
     backend_override: Optional[str] = None,
@@ -242,15 +250,21 @@ def run_sweep(
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = os.path.join(project_root, "benchmark_diagnostics")
         os.makedirs(out_dir, exist_ok=True)
-        output_path = os.path.join(out_dir, f"kernel_sweep_pad{pad}_{stamp}.log")
+        output_path = os.path.join(
+            out_dir,
+            f"conv_matrix_k{kernel_sizes[0]}-{kernel_sizes[-1]}_s{min(strides)}-{max(strides)}_p{min(pads)}-{max(pads)}_{stamp}.log",
+        )
 
+    cases = list(itertools.product(kernel_sizes, strides, pads))
     summary_rows: List[dict] = []
+    skipped: List[tuple] = []
 
     with open(output_path, "w", encoding="utf-8") as log_file:
         tee = _Tee(sys.stdout, log_file)
         old_stdout = sys.stdout
         sys.stdout = tee
         try:
+            first_k, first_s, first_p = cases[0]
             print(format_system_banner(
                 data_path=data_path,
                 backend=backend,
@@ -264,27 +278,44 @@ def run_sweep(
                 patience=patience,
                 min_delta=min_delta,
                 num_threads=num_threads,
-                specs=extract_layer_specs(patch_cnn_kernel(cnn_base, kernel_sizes[0], pad)),
-                title="KERNEL SWEEP: CUSTOM ENGINE vs PYTORCH CNN",
+                specs=extract_layer_specs(
+                    patch_cnn_kernel(cnn_base, first_k, first_p, first_s)
+                ),
+                title="CONV MATRIX SWEEP: CUSTOM ENGINE vs PYTORCH CNN",
             ))
             print("")
-            print(f"Sweep parameters : kernel={kernel_sizes[0]}..{kernel_sizes[-1]}, pad={pad}")
+            print(
+                f"Sweep parameters : k={kernel_sizes[0]}..{kernel_sizes[-1]}, "
+                f"stride={strides}, pad={pads} ({len(cases)} cases)"
+            )
             print(f"Config file      : {config_path}")
             print(f"Log file         : {output_path}")
             print(f"Started (UTC)    : {datetime.datetime.now(datetime.timezone.utc).isoformat()}")
 
-            for k in kernel_sizes:
-                cnn_dict = patch_cnn_kernel(cnn_base, k, pad)
+            for k, stride, pad in cases:
+                cnn_dict = patch_cnn_kernel(cnn_base, k, pad, stride)
                 specs = extract_layer_specs(cnn_dict)
                 conv_layers = len(specs)
 
+                try:
+                    validate_cnn_spatial_geometry(input_shape, specs)
+                except ValueError as exc:
+                    skipped.append((k, stride, pad, str(exc)))
+                    print("")
+                    print("#" * 80)
+                    print(f"# SKIP k={k} stride={stride} pad={pad} — invalid geometry")
+                    print(f"#   {exc}")
+                    print("#" * 80)
+                    continue
+
                 print("")
                 print("#" * 80)
-                print(f"# KERNEL SIZE {k} × {k}  |  pad={pad}")
+                print(f"# KERNEL {k}×{k}  |  stride={stride}  |  pad={pad}")
                 print("#" * 80)
                 print(format_geometry_section(
                     kernel=k,
                     pad=pad,
+                    stride=stride,
                     input_shape=input_shape,
                     specs=specs,
                     n_train=n_train,
@@ -336,7 +367,7 @@ def run_sweep(
                     n_train=n_train,
                     n_val=n_val,
                     backend=backend,
-                    kernel_label=f"kernel={k}, pad={pad}",
+                    kernel_label=f"kernel={k}, stride={stride}, pad={pad}",
                 ))
                 print(format_derived_metrics(
                     kernel=k,
@@ -349,6 +380,8 @@ def run_sweep(
                 ratio = c_res["train_time"] / t_res["train_time"] if t_res["train_time"] > 0 else float("inf")
                 summary_rows.append({
                     "kernel": k,
+                    "stride": stride,
+                    "pad": pad,
                     "torch_train_s": t_res["train_time"],
                     "custom_train_s": c_res["train_time"],
                     "ratio": ratio,
@@ -359,7 +392,19 @@ def run_sweep(
                     "val_acc": f"{t_res['val_acc'] * 100:.1f}%/{c_res['val_acc'] * 100:.1f}%",
                 })
 
+            if skipped:
+                print("")
+                print("-" * 80)
+                print(f"SKIPPED CASES ({len(skipped)}):")
+                for k, stride, pad, reason in skipped:
+                    print(f"  k={k} stride={stride} pad={pad}: {reason}")
+                print("-" * 80)
+
             print(format_summary_table(summary_rows))
+            print(
+                f"Completed {len(summary_rows)}/{len(cases)} cases "
+                f"({len(skipped)} skipped for invalid geometry)"
+            )
             print(f"Finished (UTC)   : {datetime.datetime.now(datetime.timezone.utc).isoformat()}")
             print(f"Log written to   : {output_path}")
         finally:
@@ -372,23 +417,40 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Sweep conv kernel size vs PyTorch with per-kernel log reports"
+        description="Sweep conv kernel/stride/pad vs PyTorch with per-case log reports"
     )
-    parser.add_argument("--pad", type=int, default=1)
+    parser.add_argument("--pads", type=int, nargs="+", default=[1])
+    parser.add_argument("--strides", type=int, nargs="+", default=[1])
+    parser.add_argument("--pad", type=int, default=None, help="Single pad (alias for --pads)")
     parser.add_argument("--k-min", type=int, default=1)
     parser.add_argument("--k-max", type=int, default=7)
+    parser.add_argument(
+        "--full-matrix",
+        action="store_true",
+        help="Run k=1..7 × stride=1,2 × pad=1,2 (28 cases, skip invalid geometry)",
+    )
     parser.add_argument("--backend", default=None, help="Override config backend (native | im2col+gemm)")
     parser.add_argument("--config", default=None, help="YAML config path")
     parser.add_argument(
         "--output",
         default=None,
-        help="Log file path (default: benchmark_diagnostics/kernel_sweep_pad{N}_<ts>.log)",
+        help="Log file path (default: benchmark_diagnostics/conv_matrix_*.log)",
     )
     args = parser.parse_args()
 
+    if args.full_matrix:
+        kernel_sizes = list(range(1, 8))
+        strides = [1, 2]
+        pads = [1, 2]
+    else:
+        kernel_sizes = list(range(args.k_min, args.k_max + 1))
+        strides = args.strides
+        pads = [args.pad] if args.pad is not None else args.pads
+
     run_sweep(
-        kernel_sizes=list(range(args.k_min, args.k_max + 1)),
-        pad=args.pad,
+        kernel_sizes=kernel_sizes,
+        pads=pads,
+        strides=strides,
         config_path=args.config,
         output_path=args.output,
         backend_override=args.backend,

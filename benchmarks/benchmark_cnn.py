@@ -126,6 +126,42 @@ def extract_layer_specs(cnn_config: dict) -> list:
     return []
 
 
+def validate_cnn_spatial_geometry(input_shape: tuple, specs: list) -> None:
+    """Fail fast when conv/pool stacks collapse spatial dims (before PyTorch init)."""
+    if not specs:
+        return
+
+    if len(input_shape) == 3:
+        h, w = int(input_shape[1]), int(input_shape[2])
+    elif len(input_shape) == 2:
+        h, w = int(input_shape[0]), int(input_shape[1])
+    else:
+        return
+
+    for i, sp in enumerate(specs):
+        k = int(sp["kernel_size"])
+        p = int(sp["padding"])
+        s = int(sp["stride"])
+        h = (h + 2 * p - k) // s + 1
+        w = (w + 2 * p - k) // s + 1
+        if h < 1 or w < 1:
+            raise ValueError(
+                f"CNN layer {i + 1} conv output invalid ({h}x{w}) for input_shape={input_shape} "
+                f"and kernel_size={k}, stride={s}, pad={p}."
+            )
+
+        pool_size = int(sp.get("pool_size") or 0)
+        pool_stride = int(sp.get("pool_stride") or 0)
+        if pool_size > 0:
+            h = (h - pool_size) // pool_stride + 1
+            w = (w - pool_size) // pool_stride + 1
+            if h < 1 or w < 1:
+                raise ValueError(
+                    f"CNN layer {i + 1} pool output invalid ({h}x{w}) for input_shape={input_shape}. "
+                    f"Reduce kernel/stride or increase input size."
+                )
+
+
 def ensure_nchw_format(data: np.ndarray, target_shape: tuple) -> np.ndarray:
     if len(target_shape) == 3:
         c, h, w = target_shape
@@ -573,6 +609,8 @@ def run_custom_engine_benchmark(
 
     # Fresh epoch budget when the provider is reused across benchmark runs.
     reset_benchmark_data_provider(data_provider)
+
+    np.random.seed(42)
     
     controller = ModelController(
         data_provider=data_provider,
@@ -830,6 +868,13 @@ def run_cnn_benchmark(config_path: str = None):
     lr_scheduler_type = cfg_dict["optimization"].get("lr_scheduler", "none")
 
     specs = extract_layer_specs(cnn_dict)
+    if cnn_dict:
+        raw_shape = tuple(cnn_dict.get("input_shape", (1, 28, 28)))
+        if len(raw_shape) == 2:
+            bench_input_shape = (1, raw_shape[0], raw_shape[1])
+        else:
+            bench_input_shape = raw_shape
+        validate_cnn_spatial_geometry(bench_input_shape, specs)
 
     print(format_system_banner(
         data_path=data_path,

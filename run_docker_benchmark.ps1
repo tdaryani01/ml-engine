@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("All", "Build", "Run", "Clean", "Sweep")]
+    [ValidateSet("All", "Build", "Run", "Clean", "Sweep", "Matrix")]
     [string]$Action = "All",
     [int]$Cores = 4,
     [ValidateRange(0, 2)]
@@ -246,6 +246,45 @@ function Run-KernelSweep {
     Write-Host "[OK] Kernel sweep complete. Log: $SweepLog" -ForegroundColor Green
 }
 
+function Run-MatrixSweep {
+    Test-DockerEndpoint
+    Stop-ExistingBenchmarkContainers
+
+    $EnvOverrides = Get-DockerEnvOverrides
+    $RuntimeEnvFile = Write-RuntimeEnvFile -Threads $ThreadCount -Overrides $EnvOverrides
+    $Stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+    $SweepLog = Join-Path $DiagDir "conv_matrix_k1-7_s1-2_p1-2_$Stamp.log"
+
+    Write-Host ""
+    Write-Host "==================================================================" -ForegroundColor Yellow
+    Write-Host "  DOCKER CONV MATRIX SWEEP (k=1-7, stride=1,2, pad=1,2)" -ForegroundColor Yellow
+    Write-Host "  Hardware Allocation  : $Cores Dedicated Cores (cpuset: $CpuSet)" -ForegroundColor Yellow
+    Write-Host "  OpenMP Thread Count  : $ThreadCount" -ForegroundColor Yellow
+    Write-Host "  Log file             : $SweepLog" -ForegroundColor Yellow
+    Write-Host "==================================================================" -ForegroundColor Yellow
+
+    Write-Host ""
+    Write-Host "[+] Executing full conv matrix in Custom Engine container..." -ForegroundColor Cyan
+    Invoke-DockerBenchmarkRun `
+        -Name "ml-engine-bench-matrix" `
+        -Image $CustomImg `
+        -EnvFile $RuntimeEnvFile `
+        -ExtraArgs @("--entrypoint", "python") `
+        -CommandArgs @(
+            "-u", "benchmarks/sweep_kernel_pad.py",
+            "--full-matrix",
+            "--output", "/workspace/$($RuntimeYaml.diagnostics_dir)/conv_matrix_k1-7_s1-2_p1-2_$Stamp.log"
+        )
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "[ERROR] Conv matrix sweep container run failed."
+        exit 1
+    }
+
+    Write-Host ""
+    Write-Host "[OK] Conv matrix sweep complete. Log: $SweepLog" -ForegroundColor Green
+}
+
 function Run-Benchmarks {
     Test-DockerEndpoint
     Stop-ExistingBenchmarkContainers
@@ -311,6 +350,10 @@ switch ($Action) {
     "Sweep" {
         Build-CustomContainer
         Run-KernelSweep
+    }
+    "Matrix" {
+        Build-CustomContainer
+        Run-MatrixSweep
     }
     "All"   {
         Build-Containers

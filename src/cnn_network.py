@@ -150,6 +150,13 @@ class CNNNetwork:
             self.biases.append(b)
             self.param_layers.append("dense")
 
+    def _sync_restored_weights(self) -> None:
+        """Re-link ConvBlock/Conv2D params after early-stopping restores model.weights."""
+        for w_idx, layer in enumerate(self.param_layers):
+            if isinstance(layer, (ConvBlock, Conv2D)):
+                layer.W = self.weights[w_idx]
+                layer.b = self.biases[w_idx]
+
     def set_train_batch_cap(self, cap: int) -> None:
         self._train_batch_cap = int(cap)
         for layer in self.layers:

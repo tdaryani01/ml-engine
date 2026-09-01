@@ -1,6 +1,7 @@
 # testing/test_gradient_check.py
 import sys
 import os
+import itertools
 import numpy as np
 
 # Ensure project root is discoverable
@@ -11,14 +12,35 @@ from config.constants import EngineBackend
 from utils.im2col import conv2d_forward, conv2d_backward_fused, init_engine_backend
 
 
-CONV_DX_KERNEL_PAD_CASES = [
-    (2, 1),
-    (3, 1),
-    (4, 1),
-    (5, 1),
-    (6, 1),
-    # k=7 omitted: 10x10 fixture yields 6x6 out — FD noise exceeds tolerance even on numpy.
+CONV_KERNELS = tuple(range(1, 8))
+CONV_STRIDES = (1, 2)
+CONV_PADS = (1, 2)
+
+# Full matrix: k=1..7, stride=1..2, pad=1..2 (28 cases).
+CONV_GRAD_CASES = [
+    (k, stride, pad)
+    for k, stride, pad in itertools.product(CONV_KERNELS, CONV_STRIDES, CONV_PADS)
 ]
+
+# Backward-compatible alias used by test_native_conv.py (stride-1 only).
+CONV_DX_KERNEL_PAD_CASES = [(k, pad) for k, stride, pad in CONV_GRAD_CASES if stride == 1]
+
+
+def _conv_output_size(h: int, w: int, kernel: int, stride: int, pad: int) -> tuple[int, int]:
+    out_h = (h + 2 * pad - kernel) // stride + 1
+    out_w = (w + 2 * pad - kernel) // stride + 1
+    return out_h, out_w
+
+
+def conv_grad_fixture_size(kernel: int, stride: int, pad: int, min_out: int = 3) -> tuple[int, int]:
+    """Pick spatial dims large enough for stable finite-difference checks."""
+    for size in range(max(kernel, min_out + kernel), 128):
+        out_h, out_w = _conv_output_size(size, size, kernel, stride, pad)
+        if out_h >= min_out and out_w >= min_out:
+            return size, size
+    raise ValueError(
+        f"No valid fixture size for kernel={kernel}, stride={stride}, pad={pad}."
+    )
 
 
 def _relative_grad_error(analytic: float, numeric: float) -> float:
@@ -28,11 +50,40 @@ def _relative_grad_error(analytic: float, numeric: float) -> float:
     return abs_diff / max(abs(analytic) + abs(numeric), 1e-12)
 
 
+def _make_conv_grad_fixture(
+    backend: EngineBackend,
+    kernel: int,
+    stride: int,
+    pad: int,
+    *,
+    fuse_relu: bool = False,
+):
+    init_engine_backend(backend)
+    rng = np.random.default_rng(1000 + kernel * 17 + stride * 31 + pad * 53)
+    h, w = conv_grad_fixture_size(kernel, stride, pad)
+    n, c_in = 1, 2
+    c_out = 3
+    x = (rng.standard_normal((n, c_in, h, w), dtype=np.float32) * 0.1).copy()
+    weight = (rng.standard_normal((c_out, c_in, kernel, kernel), dtype=np.float32) * 0.1).copy()
+    bias = np.zeros((1, c_out), dtype=np.float32)
+    out_h, out_w = _conv_output_size(h, w, kernel, stride, pad)
+    if out_h < 1 or out_w < 1:
+        raise ValueError(
+            f"Invalid conv geometry for fixture: k={kernel}, stride={stride}, pad={pad}, input={h}x{w}"
+        )
+
+    out = np.zeros((n, c_out, out_h, out_w), dtype=np.float32)
+    conv2d_forward(x, weight, bias, stride=stride, pad=pad, out_buf=out, fuse_relu=fuse_relu)
+    dout_fixed = (rng.standard_normal(out.shape, dtype=np.float32) * 0.1).copy()
+    return x, weight, bias, out, dout_fixed, stride, pad, fuse_relu
+
+
 def check_conv2d_input_gradient(
     backend: EngineBackend,
     kernel: int,
     pad: int,
     *,
+    stride: int = 1,
     fuse_relu: bool = False,
     epsilon: float = 1e-4,
     tolerance: float = 8e-2,
@@ -41,21 +92,10 @@ def check_conv2d_input_gradient(
     Finite-difference check for conv2d dX (input gradient).
     Catches native fallback dX regressions that weight-only CNN grad checks miss.
     """
-    init_engine_backend(backend)
-    rng = np.random.default_rng(1000 + kernel * 17 + pad)
-    n, c_in, h, w = 1, 2, 10, 10
-    c_out = 3
-    x = (rng.standard_normal((n, c_in, h, w), dtype=np.float32) * 0.1).copy()
-    weight = (rng.standard_normal((c_out, c_in, kernel, kernel), dtype=np.float32) * 0.1).copy()
-    bias = np.zeros((1, c_out), dtype=np.float32)
-    out_h = (h + 2 * pad - kernel) + 1
-    out_w = (w + 2 * pad - kernel) + 1
+    x, weight, bias, out, dout_fixed, stride, pad, fuse_relu = _make_conv_grad_fixture(
+        backend, kernel, stride, pad, fuse_relu=fuse_relu
+    )
 
-    out = np.zeros((n, c_out, out_h, out_w), dtype=np.float32)
-    conv2d_forward(x, weight, bias, stride=1, pad=pad, out_buf=out, fuse_relu=fuse_relu)
-
-    # Linear loss L = sum(out * dout_fixed) => dL/d(out) = dout_fixed (constant).
-    dout_fixed = (rng.standard_normal(out.shape, dtype=np.float32) * 0.1).copy()
     dx_analytic = np.zeros_like(x)
     dW = np.zeros_like(weight)
     conv2d_backward_fused(
@@ -64,13 +104,15 @@ def check_conv2d_input_gradient(
         W=weight,
         dx_buf=dx_analytic,
         dW_buf=dW,
-        stride=1,
+        stride=stride,
         pad=pad,
-        inv_m=1.0 / float(n),
+        inv_m=1.0 / float(x.shape[0]),
         in_act=out if fuse_relu else None,
         fuse_relu=fuse_relu,
     )
 
+    _, _, h, w = x.shape
+    c_in = x.shape[1]
     max_error = 0.0
     worst = None
     for c in range(c_in):
@@ -80,12 +122,16 @@ def check_conv2d_input_gradient(
 
                 x[0, c, ih, iw] = orig + epsilon
                 out_pos = np.zeros_like(out)
-                conv2d_forward(x, weight, bias, stride=1, pad=pad, out_buf=out_pos, fuse_relu=fuse_relu)
+                conv2d_forward(
+                    x, weight, bias, stride=stride, pad=pad, out_buf=out_pos, fuse_relu=fuse_relu
+                )
                 loss_pos = float(np.sum(out_pos * dout_fixed))
 
                 x[0, c, ih, iw] = orig - epsilon
                 out_neg = np.zeros_like(out)
-                conv2d_forward(x, weight, bias, stride=1, pad=pad, out_buf=out_neg, fuse_relu=fuse_relu)
+                conv2d_forward(
+                    x, weight, bias, stride=stride, pad=pad, out_buf=out_neg, fuse_relu=fuse_relu
+                )
                 loss_neg = float(np.sum(out_neg * dout_fixed))
 
                 x[0, c, ih, iw] = orig
@@ -99,13 +145,177 @@ def check_conv2d_input_gradient(
     relu_tag = "relu" if fuse_relu else "linear"
     status = "PASSED" if max_error <= tolerance else "FAILED"
     print(
-        f"[{status}] conv2d dX [{backend.value}] k={kernel} pad={pad} {relu_tag} "
+        f"[{status}] conv2d dX [{backend.value}] k={kernel} s={stride} pad={pad} {relu_tag} "
         f"| Max Rel Error: {max_error:.2e} (Threshold: {tolerance:.0e})"
     )
     if status == "FAILED" and worst is not None:
         c, ih, iw, grad_ana, grad_num = worst
         print(f"  └── Worst at (c,h,w)=({c},{ih},{iw}) ana={grad_ana:+.6e} num={grad_num:+.6e}")
     return status == "PASSED"
+
+
+def check_conv2d_weight_gradient(
+    backend: EngineBackend,
+    kernel: int,
+    pad: int,
+    *,
+    stride: int = 1,
+    fuse_relu: bool = False,
+    epsilon: float = 1e-4,
+    tolerance: float = 8e-2,
+) -> bool:
+    """Finite-difference check for conv2d dW (weight gradient)."""
+    x, weight, bias, out, dout_fixed, stride, pad, fuse_relu = _make_conv_grad_fixture(
+        backend, kernel, stride, pad, fuse_relu=fuse_relu
+    )
+
+    dx_analytic = np.zeros_like(x)
+    dW_analytic = np.zeros_like(weight)
+    conv2d_backward_fused(
+        dout=dout_fixed,
+        x=x,
+        W=weight,
+        dx_buf=dx_analytic,
+        dW_buf=dW_analytic,
+        stride=stride,
+        pad=pad,
+        inv_m=1.0 / float(x.shape[0]),
+        in_act=out if fuse_relu else None,
+        fuse_relu=fuse_relu,
+    )
+
+    max_error = 0.0
+    worst = None
+    it = np.nditer(weight, flags=["multi_index"], op_flags=["readwrite"])
+    while not it.finished:
+        coord = it.multi_index
+        orig = float(weight[coord])
+
+        weight[coord] = orig + epsilon
+        out_pos = np.zeros_like(out)
+        conv2d_forward(
+            x, weight, bias, stride=stride, pad=pad, out_buf=out_pos, fuse_relu=fuse_relu
+        )
+        loss_pos = float(np.sum(out_pos * dout_fixed))
+
+        weight[coord] = orig - epsilon
+        out_neg = np.zeros_like(out)
+        conv2d_forward(
+            x, weight, bias, stride=stride, pad=pad, out_buf=out_neg, fuse_relu=fuse_relu
+        )
+        loss_neg = float(np.sum(out_neg * dout_fixed))
+
+        weight[coord] = orig
+        grad_num = (loss_pos - loss_neg) / (2.0 * epsilon)
+        grad_ana = float(dW_analytic[coord])
+        rel_error = _relative_grad_error(grad_ana, grad_num)
+        if rel_error > max_error:
+            max_error = rel_error
+            worst = (coord, grad_ana, grad_num)
+        it.iternext()
+
+    relu_tag = "relu" if fuse_relu else "linear"
+    status = "PASSED" if max_error <= tolerance else "FAILED"
+    print(
+        f"[{status}] conv2d dW [{backend.value}] k={kernel} s={stride} pad={pad} {relu_tag} "
+        f"| Max Rel Error: {max_error:.2e} (Threshold: {tolerance:.0e})"
+    )
+    if status == "FAILED" and worst is not None:
+        coord, grad_ana, grad_num = worst
+        print(f"  └── Worst at W{coord} ana={grad_ana:+.6e} num={grad_num:+.6e}")
+    return status == "PASSED"
+
+
+def check_conv2d_gradients_native_vs_numpy(
+    kernel: int,
+    stride: int,
+    pad: int,
+    *,
+    rtol: float = 1e-4,
+    atol: float = 1e-5,
+) -> bool:
+    """Compare native conv backward against NumPy reference (dX and dW)."""
+    x, weight, bias, out, dout, stride, pad, _ = _make_conv_grad_fixture(
+        EngineBackend.NATIVE, kernel, stride, pad, fuse_relu=False
+    )
+    inv_m = 1.0 / float(x.shape[0])
+
+    dx_ref = np.zeros_like(x)
+    dW_ref = np.zeros_like(weight)
+    init_engine_backend(EngineBackend.NUMPY)
+    conv2d_backward_fused(
+        dout, x, weight, dx_ref, dW_ref, stride=stride, pad=pad, inv_m=inv_m
+    )
+
+    dx_native = np.zeros_like(x)
+    dW_native = np.zeros_like(weight)
+    init_engine_backend(EngineBackend.NATIVE)
+    conv2d_backward_fused(
+        dout, x, weight, dx_native, dW_native, stride=stride, pad=pad, inv_m=inv_m
+    )
+
+    dx_diff = float(np.max(np.abs(dx_native - dx_ref)))
+    dW_diff = float(np.max(np.abs(dW_native - dW_ref)))
+    dx_ok = np.allclose(dx_native, dx_ref, rtol=rtol, atol=atol)
+    dW_ok = np.allclose(dW_native, dW_ref, rtol=rtol, atol=atol)
+
+    for label, ok, diff in (("dX", dx_ok, dx_diff), ("dW", dW_ok, dW_diff)):
+        status = "PASSED" if ok else "FAILED"
+        print(
+            f"[{status}] conv2d {label} [native] k={kernel} s={stride} pad={pad} "
+            f"| Max Abs Error vs ref: {diff:.2e} (rtol={rtol:.0e}, atol={atol:.0e})"
+        )
+    return dx_ok and dW_ok
+
+
+def check_conv2d_gradients(
+    backend: EngineBackend,
+    kernel: int,
+    stride: int,
+    pad: int,
+    *,
+    fuse_relu: bool = False,
+) -> bool:
+    if backend == EngineBackend.NATIVE:
+        return check_conv2d_gradients_native_vs_numpy(kernel, stride, pad)
+    return (
+        check_conv2d_input_gradient(
+            backend, kernel, pad, stride=stride, fuse_relu=fuse_relu
+        )
+        and check_conv2d_weight_gradient(
+            backend, kernel, pad, stride=stride, fuse_relu=fuse_relu
+        )
+    )
+
+
+def run_conv_gradient_check(
+    backend: EngineBackend = EngineBackend.NATIVE,
+    *,
+    cases: list[tuple[int, int, int]] | None = None,
+) -> int:
+    """Run conv backward checks across geometry matrix (native vs NumPy reference)."""
+    cases = cases or CONV_GRAD_CASES
+    print("\n" + "=" * 70)
+    print(
+        f" RUNNING CHECK: conv2d dX+dW matrix | Backend='{backend.value}' "
+        f"| {len(cases)} cases (k=1..7, stride=1..2, pad=1..2)"
+    )
+    if backend == EngineBackend.NATIVE:
+        print(" Reference: NumPy im2col backward (not finite-difference)")
+    print("=" * 70)
+
+    passed_all = True
+    for kernel, stride, pad in cases:
+        passed_all &= check_conv2d_gradients(
+            backend, kernel, stride, pad, fuse_relu=False
+        )
+
+    print("-" * 70)
+    if passed_all:
+        print(f"[SUCCESS] conv2d gradient matrix passed for backend '{backend.value}'.")
+        return 0
+    print(f"[ERROR] conv2d gradient matrix failed for backend '{backend.value}'.")
+    return 1
 
 
 def run_conv_dx_gradient_check(backend: EngineBackend = EngineBackend.NATIVE) -> int:
@@ -115,7 +325,7 @@ def run_conv_dx_gradient_check(backend: EngineBackend = EngineBackend.NATIVE) ->
 
     passed_all = True
     for kernel, pad in CONV_DX_KERNEL_PAD_CASES:
-        passed_all &= check_conv2d_input_gradient(backend, kernel, pad, fuse_relu=False)
+        passed_all &= check_conv2d_input_gradient(backend, kernel, pad, stride=1, fuse_relu=False)
         # ReLU fused dX needs a separate numeric setup; linear check catches native regressions.
 
     print("-" * 70)
@@ -369,10 +579,13 @@ def run_all_checks():
         if cnn_exit_code != 0:
             overall_status = 1
 
-    for backend in backends_to_test:
-        dx_exit_code = run_conv_dx_gradient_check(backend=backend)
-        if dx_exit_code != 0:
-            overall_status = 1
+    # Conv kernel matrix validates native DLL vs NumPy reference only.
+    conv_exit_code = run_conv_gradient_check(backend=EngineBackend.NATIVE)
+    if conv_exit_code != 0:
+        overall_status = 1
+        print(
+            "[HINT] Native conv grad check failed. Rebuild the DLL first: .\\build_native.ps1"
+        )
             
     print("\n" + "=" * 70)
     if overall_status == 0:
