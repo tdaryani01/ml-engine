@@ -209,8 +209,12 @@ Run Phase A suite: `python testing/test_engine_ops.py`
 
 | Phase | Planned test | Pass criteria |
 |-------|--------------|---------------|
-| **B** | `test_b_backward_no_reforward` | backward does not call `_forward` |
-| **B** | `test_b_convblock_no_layer_cache` | no `self.x_cached` on ConvBlock after B7 |
+| **B\*** | `test_b5_explicit_forward_backward_split` | `_backward_from_cache` does not call `_forward` |
+| **B\*** | `test_b7_convblock_no_layer_cache_fields` | Layers hold params only, not step buffers |
+
+Run Phase B suite: `python testing/test_training_cache.py`
+
+### Future phase test stubs (add when implementing)
 | **C** | `test_c_two_training_sessions` | two `TrainingSession` instances, no shared globals |
 | **D** | `test_d_gemm_thread_safe` | concurrent GEMM smoke test passes |
 | **D** | `test_d_three_backend_grad_parity` | native vs im2col_gemm vs numpy matrix |

@@ -3,6 +3,14 @@ import builtins
 import logging
 import numpy as np
 from config.constants import EngineBackend
+from src.scratch_arena import ScratchArena
+from src.training_cache import (
+    Conv2DStepCache,
+    ConvBlockStepCache,
+    FlattenStepCache,
+    ForwardCache,
+    MaxPoolStepCache,
+)
 from utils.engine_ops import EngineContext, resolve_engine_context
 from utils.im2col import col2im
 
@@ -20,8 +28,9 @@ def _round_up_simd(w: int, align: int = 8) -> int:
 class ConvBlock:
     """
     Fused spatial block executing Conv2D -> ReLU -> MaxPool2D in a single C++ dispatch.
-    Operates directly on SIMD-padded memory grids.
+    Holds parameters only; per-step state lives in ForwardCache + ScratchArena.
     """
+
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3,
                  conv_stride: int = 1, conv_pad: int = 0,
                  pool_size: int = 2, pool_stride: int = 2,
@@ -42,52 +51,18 @@ class ConvBlock:
         limit = np.sqrt(6.0 / fan_in)
         self.W = np.random.uniform(-limit, limit, (out_channels, in_channels, self.k_h, self.k_w)).astype(np.float32)
         self.b = np.zeros((1, out_channels), dtype=np.float32)
-
         self.dW = np.zeros_like(self.W)
         self.db = np.zeros_like(self.b)
-
-        self.x_cached = None
-        self.conv_act_cached = None
-        self.argmax_cached = None
-        self.col = None
         self.out_h = 0
         self.out_w = 0
-
-        # Train-buffer capacity (inference uses separate eval buffers)
-        self._train_N_cap = 0
-        self._max_N = 0
-        self._col_cap = 0
-        self._cached_dtype = None
-
-        self._out_conv_buffer = None
-        self._out_pool_buffer = None
-        self._argmax_buffer = None
-        self._d_conv_buffer = None
-        self._dx_buffer = None
-
-        self._eval_max_N = 0
-        self._eval_cached_dtype = None
-        self._eval_out_conv_buffer = None
-        self._eval_out_pool_buffer = None
-        self._eval_argmax_buffer = None
-
-        self._dout_trans_buffer = None
-        self._col_buffer = None
-        self._dcol_buffer = None
-        self._fwd_gemm_buffer = None
-
-    def set_train_batch_cap(self, cap: int) -> None:
-        self._train_N_cap = int(cap)
 
     def _compute_geometry(self, C: int, H: int, W_stride: int, W_logical: int):
         conv_out_h = (H + 2 * self.conv_pad - self.k_h) // self.conv_stride + 1
         conv_out_w = (W_logical + 2 * self.conv_pad - self.k_w) // self.conv_stride + 1
-        conv_out_w_stride = _round_up_simd(conv_out_w)
         pool_out_h = (conv_out_h - self.pool_size) // self.pool_stride + 1
         pool_out_w = (conv_out_w - self.pool_size) // self.pool_stride + 1
         self.out_h = pool_out_h
         self.out_w = pool_out_w
-        return conv_out_h, conv_out_w_stride, pool_out_h, pool_out_w
 
     def _sync_param_dtypes(self, dtype):
         if self.W.dtype != dtype:
@@ -95,115 +70,71 @@ class ConvBlock:
             self.b = self.b.astype(dtype)
             self.dW = np.zeros_like(self.W, dtype=dtype)
             self.db = np.zeros_like(self.b, dtype=dtype)
-        if self.db is None or self.db.dtype != dtype:
-            self.db = np.zeros_like(self.b, dtype=dtype)
-        if self.dW is None or self.dW.dtype != dtype:
-            self.dW = np.zeros_like(self.W, dtype=dtype)
 
-    def _ensure_train_buffers(self, N: int, C: int, H: int, W_stride: int, W_logical: int, dtype):
-        conv_out_h, conv_out_w_stride, pool_out_h, pool_out_w = self._compute_geometry(
-            C, H, W_stride, W_logical
-        )
-        self._sync_param_dtypes(dtype)
-
-        total_rows = N * conv_out_h * conv_out_w_stride
-        total_cols = C * self.k_h * self.k_w
-
-        target_N = max(self._max_N, N)
-        if self._train_N_cap > 0:
-            if self._max_N > self._train_N_cap:
-                target_N = self._train_N_cap
-            else:
-                target_N = min(target_N, self._train_N_cap)
-
-        if (
-            self._cached_dtype == dtype
-            and N <= self._max_N
-            and self._max_N == target_N
-            and self._dx_buffer is not None
-        ):
-            return
-
-        self._max_N = target_N
-        self._col_cap = max(self._col_cap, self._max_N * conv_out_h * conv_out_w_stride)
-        self._cached_dtype = dtype
-
-        logger.debug(f"[ConvBlock] train buffers (N={N}, cap={self._max_N}).")
-
-        self._out_conv_buffer = np.zeros(
-            (self._max_N, self.out_channels, conv_out_h, conv_out_w_stride), dtype=dtype
-        )
-        self._out_pool_buffer = np.empty(
-            (self._max_N, self.out_channels, pool_out_h, pool_out_w), dtype=dtype
-        )
-        self._argmax_buffer = np.empty(
-            (self._max_N, self.out_channels, pool_out_h, pool_out_w), dtype=np.uint8
-        )
-        self._d_conv_buffer = np.zeros(
-            (self._max_N, self.out_channels, conv_out_h, conv_out_w_stride), dtype=dtype
-        )
-        self._dx_buffer = np.zeros((self._max_N, C, H, W_stride), dtype=dtype)
-
-        if self.backend != EngineBackend.NATIVE:
-            self._dout_trans_buffer = np.empty((self._col_cap, self.out_channels), dtype=dtype)
-            self._col_buffer = np.empty((self._col_cap, total_cols), dtype=dtype)
-            self._dcol_buffer = np.empty((self._col_cap, total_cols), dtype=dtype)
-            self._fwd_gemm_buffer = np.empty((self._col_cap, self.out_channels), dtype=dtype)
-        else:
-            self._dout_trans_buffer = None
-            self._col_buffer = None
-            self._dcol_buffer = None
-            self._fwd_gemm_buffer = None
-
-    def _ensure_eval_buffers(self, N: int, C: int, H: int, W_stride: int, W_logical: int, dtype):
-        conv_out_h, conv_out_w_stride, pool_out_h, pool_out_w = self._compute_geometry(
-            C, H, W_stride, W_logical
-        )
-
-        target_N = max(self._eval_max_N, N)
-        if (
-            self._eval_cached_dtype == dtype
-            and N <= self._eval_max_N
-            and self._eval_out_conv_buffer is not None
-        ):
-            return
-
-        self._eval_max_N = target_N
-        self._eval_cached_dtype = dtype
-
-        logger.debug(f"[ConvBlock] eval buffers (N={N}, cap={self._eval_max_N}).")
-
-        self._eval_out_conv_buffer = np.zeros(
-            (self._eval_max_N, self.out_channels, conv_out_h, conv_out_w_stride), dtype=dtype
-        )
-        self._eval_out_pool_buffer = np.empty(
-            (self._eval_max_N, self.out_channels, pool_out_h, pool_out_w), dtype=dtype
-        )
-        self._eval_argmax_buffer = np.empty(
-            (self._eval_max_N, self.out_channels, pool_out_h, pool_out_w), dtype=np.uint8
-        )
-    def forward(self, x: np.ndarray, W_logical: int = None, inference: bool = False) -> np.ndarray:
+    def forward(
+        self,
+        x: np.ndarray,
+        W_logical: int = None,
+        inference: bool = False,
+        cache: ForwardCache | None = None,
+        arena: ScratchArena | None = None,
+        layer_idx: int = 0,
+    ) -> np.ndarray:
         if not x.flags['C_CONTIGUOUS']:
             x = np.ascontiguousarray(x)
 
         N, C, H, W_stride = x.shape
         w_log = W_logical if W_logical is not None else W_stride
+        self._compute_geometry(C, H, W_stride, w_log)
+        self._sync_param_dtypes(x.dtype)
+
+        if arena is None:
+            raise ValueError("ConvBlock.forward requires a ScratchArena")
 
         if inference:
-            self._ensure_eval_buffers(N, C, H, W_stride, w_log, x.dtype)
-            out_conv_buf = self._eval_out_conv_buffer
-            out_pool_buf = self._eval_out_pool_buffer
-            argmax_buf = self._eval_argmax_buffer
+            scratch = arena.ensure_conv_block_eval(
+                layer_idx,
+                out_channels=self.out_channels,
+                k_h=self.k_h,
+                k_w=self.k_w,
+                conv_stride=self.conv_stride,
+                conv_pad=self.conv_pad,
+                pool_size=self.pool_size,
+                pool_stride=self.pool_stride,
+                N=N,
+                C=C,
+                H=H,
+                W_logical=w_log,
+                dtype=x.dtype,
+            )
+            out_conv_buf = scratch.eval_out_conv_buffer
+            out_pool_buf = scratch.eval_out_pool_buffer
+            argmax_buf = scratch.eval_argmax_buffer
             col_buf = None
             gemm_buf = None
         else:
-            self._ensure_train_buffers(N, C, H, W_stride, w_log, x.dtype)
-            out_conv_buf = self._out_conv_buffer
-            out_pool_buf = self._out_pool_buffer
-            argmax_buf = self._argmax_buffer
-            col_buf = self._col_buffer
-            gemm_buf = self._fwd_gemm_buffer
-            self.x_cached = x
+            scratch = arena.ensure_conv_block_train(
+                layer_idx,
+                out_channels=self.out_channels,
+                in_channels=self.in_channels,
+                k_h=self.k_h,
+                k_w=self.k_w,
+                conv_stride=self.conv_stride,
+                conv_pad=self.conv_pad,
+                pool_size=self.pool_size,
+                pool_stride=self.pool_stride,
+                N=N,
+                C=C,
+                H=H,
+                W_stride=W_stride,
+                W_logical=w_log,
+                dtype=x.dtype,
+            )
+            out_conv_buf = scratch.out_conv_buffer
+            out_pool_buf = scratch.out_pool_buffer
+            argmax_buf = scratch.argmax_buffer
+            col_buf = scratch.col_buffer
+            gemm_buf = scratch.fwd_gemm_buffer
 
         out_pool, out_conv, argmax, col = self._ctx.conv.conv_block_forward(
             x=x, W=self.W, bias=self.b,
@@ -213,33 +144,63 @@ class ConvBlock:
             conv_stride=self.conv_stride, conv_pad=self.conv_pad,
             pool_size=self.pool_size, pool_stride=self.pool_stride,
             col_buf=col_buf, gemm_buf=gemm_buf,
-            W_logical=w_log
+            W_logical=w_log,
         )
 
-        if not inference:
-            self.conv_act_cached = out_conv
-            self.argmax_cached = argmax
-            self.col = col
+        if cache is not None and not inference:
+            cache.conv_blocks[layer_idx] = ConvBlockStepCache(
+                x=x, conv_act=out_conv, argmax=argmax, col=col,
+            )
         return out_pool
 
-    
-    def backward(self, dout: np.ndarray, W_logical: int = None) -> np.ndarray:
+    def backward(
+        self,
+        dout: np.ndarray,
+        W_logical: int = None,
+        cache: ForwardCache | None = None,
+        arena: ScratchArena | None = None,
+        layer_idx: int = 0,
+    ) -> np.ndarray:
+        if cache is None or arena is None:
+            raise ValueError("ConvBlock.backward requires ForwardCache and ScratchArena")
+        step = cache.conv_blocks.get(layer_idx)
+        if step is None:
+            raise KeyError(f"ConvBlock backward missing step cache for layer {layer_idx}")
+
         if not dout.flags['C_CONTIGUOUS']:
             dout = np.ascontiguousarray(dout)
 
-        N, C, H, W_stride = self.x_cached.shape
+        N, C, H, W_stride = step.x.shape
         w_log = W_logical if W_logical is not None else W_stride
         inv_m = 1.0 / float(N)
-        self._ensure_train_buffers(N, C, H, W_stride, w_log, dout.dtype)
+
+        scratch = arena.ensure_conv_block_train(
+            layer_idx,
+            out_channels=self.out_channels,
+            in_channels=self.in_channels,
+            k_h=self.k_h,
+            k_w=self.k_w,
+            conv_stride=self.conv_stride,
+            conv_pad=self.conv_pad,
+            pool_size=self.pool_size,
+            pool_stride=self.pool_stride,
+            N=N,
+            C=C,
+            H=H,
+            W_stride=W_stride,
+            W_logical=w_log,
+            dtype=dout.dtype,
+        )
+        self._sync_param_dtypes(dout.dtype)
 
         dx, self.dW, self.db = self._ctx.conv.conv_block_backward(
             dout_pool=dout,
-            argmax_buf=self.argmax_cached,
-            x=self.x_cached,
+            argmax_buf=step.argmax,
+            x=step.x,
             W=self.W,
-            conv_act=self.conv_act_cached,
-            d_conv_buf=self._d_conv_buffer[:N],
-            dx_buf=self._dx_buffer[:N],
+            conv_act=step.conv_act,
+            d_conv_buf=scratch.d_conv_buffer[:N],
+            dx_buf=scratch.dx_buffer[:N],
             dW_buf=self.dW,
             db_buf=self.db,
             conv_stride=self.conv_stride,
@@ -247,19 +208,17 @@ class ConvBlock:
             pool_size=self.pool_size,
             pool_stride=self.pool_stride,
             inv_m=inv_m,
-            col=self.col,
-            dout_trans=self._dout_trans_buffer,
-            dcol_buf=self._dcol_buffer,
-            W_logical=w_log
+            col=step.col,
+            dout_trans=scratch.dout_trans_buffer,
+            dcol_buf=scratch.dcol_buffer,
+            W_logical=w_log,
         )
         return dx
 
 
 class Conv2D:
-    """
-    Standalone 2D Convolution Layer executing optimized AVX2 kernels
-    across stride-aligned feature maps.
-    """
+    """Standalone 2D convolution; parameters only, step state in cache/arena."""
+
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3,
                  stride: int = 1, pad: int = 0,
                  engine_ctx: EngineContext | None = None,
@@ -277,123 +236,130 @@ class Conv2D:
         limit = np.sqrt(6.0 / fan_in)
         self.W = np.random.uniform(-limit, limit, (out_channels, in_channels, self.k_h, self.k_w)).astype(np.float32)
         self.b = np.zeros((1, out_channels), dtype=np.float32)
-
         self.dW = np.zeros_like(self.W)
         self.db = np.zeros_like(self.b)
-
-        self.x_shape = None
-        self.x_cached = None
-        self.col = None
         self.out_h = 0
         self.out_w = 0
         self.out_w_stride = 0
 
-        self._col_cap = 0
-        self._col_buffer = None
-        self._dx_buffer = None
-        self._dout_trans_buffer = None
-        self._dcol_buffer = None
-        self._fwd_gemm_buffer = None
-        self._fwd_out_buffer = None
-        self._cached_dtype = None
-
-    def _ensure_buffers(self, N: int, C: int, H: int, W_stride: int, W_logical: int, dtype):
-        self.out_h = (H + 2 * self.pad - self.k_h) // self.stride + 1
-        self.out_w = (W_logical + 2 * self.pad - self.k_w) // self.stride + 1
-        self.out_w_stride = _round_up_simd(self.out_w)
-        total_rows = N * self.out_h * self.out_w_stride
-
-        if self.W.dtype != dtype:
-            self.W = self.W.astype(dtype)
-            self.b = self.b.astype(dtype)
-            self.dW = np.zeros_like(self.W, dtype=dtype)
-            self.db = np.zeros_like(self.b, dtype=dtype)
-
-        if self.db is None or self.db.dtype != dtype:
-            self.db = np.zeros_like(self.b, dtype=dtype)
-        if self.dW is None or self.dW.dtype != dtype:
-            self.dW = np.zeros_like(self.W, dtype=dtype)
-
-        if self._cached_dtype == dtype and total_rows <= self._col_cap and self._dx_buffer is not None:
-            return
-
-        total_cols = C * self.k_h * self.k_w
-        self._col_cap = total_rows
-        self._cached_dtype = dtype
-
-        logger.warning(f"[Conv2D] _ensure_buffers (N={N}). Allocating im2col arrays: col_buf=({total_rows}, {total_cols}), gemm_buf=({total_rows}, {self.out_channels})")
-
-        self._col_buffer = np.empty((total_rows, total_cols), dtype=dtype)
-        self._dcol_buffer = np.empty((total_rows, total_cols), dtype=dtype)
-        self._dout_trans_buffer = np.empty((total_rows, self.out_channels), dtype=dtype)
-        self._fwd_gemm_buffer = np.empty((total_rows, self.out_channels), dtype=dtype)
-        self._fwd_out_buffer = np.zeros((N, self.out_channels, self.out_h, self.out_w_stride), dtype=dtype)
-        self._dx_buffer = np.zeros((N, C, H, W_stride), dtype=dtype)
-
-    
-    def forward(self, x: np.ndarray, W_logical: int = None) -> np.ndarray:
+    def forward(
+        self,
+        x: np.ndarray,
+        W_logical: int = None,
+        cache: ForwardCache | None = None,
+        arena: ScratchArena | None = None,
+        layer_idx: int = 0,
+    ) -> np.ndarray:
         if not x.flags['C_CONTIGUOUS']:
             x = np.ascontiguousarray(x)
+        if arena is None:
+            raise ValueError("Conv2D.forward requires a ScratchArena")
 
-        self.x_shape = x.shape
-        self.x_cached = x
-        N, C, H, W_stride = self.x_shape
+        N, C, H, W_stride = x.shape
         w_log = W_logical if W_logical is not None else W_stride
+        if self.W.dtype != x.dtype:
+            self.W = self.W.astype(x.dtype)
+            self.b = self.b.astype(x.dtype)
+        if self.dW is None or self.dW.dtype != x.dtype:
+            self.dW = np.zeros_like(self.W, dtype=x.dtype)
+        if self.db is None or self.db.dtype != x.dtype:
+            self.db = np.zeros_like(self.b, dtype=x.dtype)
+        scratch = arena.ensure_conv2d(
+            layer_idx,
+            out_channels=self.out_channels,
+            in_channels=self.in_channels,
+            k_h=self.k_h,
+            k_w=self.k_w,
+            stride=self.stride,
+            pad=self.pad,
+            N=N,
+            C=C,
+            H=H,
+            W_stride=W_stride,
+            W_logical=w_log,
+            dtype=x.dtype,
+        )
+        self.out_h = (H + 2 * self.pad - self.k_h) // self.stride + 1
+        self.out_w = (w_log + 2 * self.pad - self.k_w) // self.stride + 1
+        self.out_w_stride = _round_up_simd(self.out_w)
 
-        self._ensure_buffers(N, C, H, W_stride, w_log, x.dtype)
-        active_out = self._fwd_out_buffer[:N]
-
-        active_out, self.col = self._ctx.conv.conv2d_forward(
+        active_out, col = self._ctx.conv.conv2d_forward(
             x=x, W=self.W, bias=self.b,
             stride=self.stride, pad=self.pad,
-            out_buf=active_out,
-            col_buf=self._col_buffer,
-            gemm_buf=self._fwd_gemm_buffer,
+            out_buf=scratch.fwd_out_buffer[:N],
+            col_buf=scratch.col_buffer,
+            gemm_buf=scratch.fwd_gemm_buffer,
             fuse_relu=False,
-            W_logical=w_log
+            W_logical=w_log,
         )
+        if cache is not None:
+            cache.conv2d[layer_idx] = Conv2DStepCache(x=x, col=col)
         return active_out
 
-    
-    def backward(self, dout: np.ndarray, in_act: np.ndarray = None, fuse_relu: bool = False, W_logical: int = None) -> np.ndarray:
+    def backward(
+        self,
+        dout: np.ndarray,
+        in_act: np.ndarray = None,
+        fuse_relu: bool = False,
+        W_logical: int = None,
+        cache: ForwardCache | None = None,
+        arena: ScratchArena | None = None,
+        layer_idx: int = 0,
+    ) -> np.ndarray:
+        if cache is None or arena is None:
+            raise ValueError("Conv2D.backward requires ForwardCache and ScratchArena")
+        step = cache.conv2d.get(layer_idx)
+        if step is None:
+            raise KeyError(f"Conv2D backward missing step cache for layer {layer_idx}")
+
         if not dout.flags['C_CONTIGUOUS']:
             dout = np.ascontiguousarray(dout)
 
-        N, C, H, W_stride = self.x_shape
+        N, C, H, W_stride = step.x.shape
         w_log = W_logical if W_logical is not None else W_stride
         inv_m = 1.0 / float(N)
         total_rows = N * self.out_h * self.out_w_stride
 
-        self._ensure_buffers(N, C, H, W_stride, w_log, dout.dtype)
-
-        active_dout_trans = self._dout_trans_buffer[:total_rows]
-
+        scratch = arena.ensure_conv2d(
+            layer_idx,
+            out_channels=self.out_channels,
+            in_channels=self.in_channels,
+            k_h=self.k_h,
+            k_w=self.k_w,
+            stride=self.stride,
+            pad=self.pad,
+            N=N,
+            C=C,
+            H=H,
+            W_stride=W_stride,
+            W_logical=w_log,
+            dtype=dout.dtype,
+        )
+        active_dout_trans = scratch.dout_trans_buffer[:total_rows]
         self._ctx.conv.fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
 
-        active_dx = self._dx_buffer[:N]
         dx, self.dW = self._ctx.conv.conv2d_backward_fused(
             dout=dout,
-            x=self.x_cached,
+            x=step.x,
             W=self.W,
-            dx_buf=active_dx,
+            dx_buf=scratch.dx_buffer[:N],
             dW_buf=self.dW,
             stride=self.stride,
             pad=self.pad,
             inv_m=inv_m,
             in_act=in_act,
             fuse_relu=fuse_relu,
-            col=self.col,
+            col=step.col,
             dout_trans=active_dout_trans,
-            dcol_buf=self._dcol_buffer,
-            W_logical=w_log
+            dcol_buf=scratch.dcol_buffer,
+            W_logical=w_log,
         )
         return dx
 
 
 class MaxPool2D:
-    """
-    Spatial Max-Pooling layer with index tracking for backward routing.
-    """
+    """Spatial max-pooling; parameters only, step state in cache/arena."""
+
     def __init__(self, pool_size: int = 2, stride: int = 2,
                  engine_ctx: EngineContext | None = None,
                  backend: EngineBackend | None = None):
@@ -401,100 +367,127 @@ class MaxPool2D:
         self.backend = self._ctx.backend
         self.pool_size = pool_size
         self.stride = stride
-        self.x_shape = None
         self.out_h = 0
         self.out_w = 0
-        self._cache = None
-        self._out_buf = None
-        self._dx_buf = None
-        self._argmax_buf = None
-        self._max_N = 0
-        self._cached_dtype = None
 
-    def _ensure_buffers(self, N: int, C: int, H: int, W_stride: int, w_log: int, dtype):
-        self.out_h = (H - self.pool_size) // self.stride + 1
-        self.out_w = (w_log - self.pool_size) // self.stride + 1
-        out_w_stride = (W_stride - self.pool_size) // self.stride + 1
-
-        if (
-            self._cached_dtype == dtype
-            and N <= self._max_N
-            and self._out_buf is not None
-            and self._out_buf.shape[1:] == (C, self.out_h, out_w_stride)
-        ):
-            return
-
-        self._max_N = max(self._max_N, N)
-        self._cached_dtype = dtype
-        self._out_buf = np.empty((self._max_N, C, self.out_h, out_w_stride), dtype=dtype)
-        self._argmax_buf = np.empty((self._max_N, C, self.out_h, out_w_stride), dtype=np.uint8)
-
-    def forward(self, x: np.ndarray, W_logical: int = None) -> np.ndarray:
+    def forward(
+        self,
+        x: np.ndarray,
+        W_logical: int = None,
+        cache: ForwardCache | None = None,
+        arena: ScratchArena | None = None,
+        layer_idx: int = 0,
+    ) -> np.ndarray:
         if not x.flags['C_CONTIGUOUS']:
             x = np.ascontiguousarray(x)
+        if arena is None:
+            raise ValueError("MaxPool2D.forward requires a ScratchArena")
 
-        self.x_shape = x.shape
-        N, C, H, W_stride = self.x_shape
+        N, C, H, W_stride = x.shape
         w_log = W_logical if W_logical is not None else W_stride
-        
-        self._ensure_buffers(N, C, H, W_stride, w_log, x.dtype)
+        self.out_h = (H - self.pool_size) // self.stride + 1
+        self.out_w = (w_log - self.pool_size) // self.stride + 1
 
-        out, self._cache = self._ctx.conv.maxpool_forward(
-            x, self.pool_size, self.stride,
-            out_buf=self._out_buf[:N],
-            argmax_buf=self._argmax_buf[:N]
+        scratch = arena.ensure_maxpool(
+            layer_idx,
+            N=N,
+            C=C,
+            H=H,
+            W_stride=W_stride,
+            w_log=w_log,
+            pool_size=self.pool_size,
+            pool_stride=self.stride,
+            dtype=x.dtype,
         )
+        out, pool_cache = self._ctx.conv.maxpool_forward(
+            x, self.pool_size, self.stride,
+            out_buf=scratch.out_buf[:N],
+            argmax_buf=scratch.argmax_buf[:N],
+        )
+        if cache is not None:
+            cache.maxpool[layer_idx] = MaxPoolStepCache(x_shape=x.shape, pool_cache=pool_cache)
         return out
 
-    def backward(self, dout: np.ndarray) -> np.ndarray:
+    def backward(
+        self,
+        dout: np.ndarray,
+        cache: ForwardCache | None = None,
+        arena: ScratchArena | None = None,
+        layer_idx: int = 0,
+    ) -> np.ndarray:
+        if cache is None or arena is None:
+            raise ValueError("MaxPool2D.backward requires ForwardCache and ScratchArena")
+        step = cache.maxpool.get(layer_idx)
+        if step is None:
+            raise KeyError(f"MaxPool backward missing step cache for layer {layer_idx}")
+
         if not dout.flags['C_CONTIGUOUS']:
             dout = np.ascontiguousarray(dout)
 
-        if self._dx_buf is None or self._dx_buf.shape != self.x_shape or self._dx_buf.dtype != dout.dtype:
-            self._dx_buf = np.zeros(self.x_shape, dtype=dout.dtype)
+        scratch = arena.maxpool_layer(layer_idx)
+        if scratch.dx_buf is None or scratch.dx_buf.shape != step.x_shape or scratch.dx_buf.dtype != dout.dtype:
+            scratch.dx_buf = np.zeros(step.x_shape, dtype=dout.dtype)
 
         return self._ctx.conv.maxpool_backward(
-            dout, self._cache, self.x_shape,
+            dout, step.pool_cache, step.x_shape,
             self.pool_size, self.stride,
-            dx_buf=self._dx_buf
+            dx_buf=scratch.dx_buf,
         )
 
 
 class Flatten:
-    """
-    Zero-overhead adapter connecting SIMD-padded spatial layers to dense layers.
-    Slices logical spatial bounds on forward, and re-pads stride margins on backward.
-    """
-    def __init__(self):
-        self.logical_shape = None
-        self.padded_shape = None
+    """Zero-overhead spatial-to-dense adapter; shape state in ForwardCache."""
 
-    def forward(self, x: np.ndarray, logical_w: int = None) -> np.ndarray:
+    def forward(
+        self,
+        x: np.ndarray,
+        logical_w: int = None,
+        cache: ForwardCache | None = None,
+        layer_idx: int = 0,
+    ) -> np.ndarray:
         if not x.flags['C_CONTIGUOUS']:
             x = np.ascontiguousarray(x)
 
         if x.ndim == 4:
             N, C, H, W_stride = x.shape
             lw = logical_w if logical_w is not None else W_stride
-            self.logical_shape = (N, C, H, lw)
-            self.padded_shape = (N, C, H, W_stride)
-            
+            logical_shape = (N, C, H, lw)
+            padded_shape = (N, C, H, W_stride)
+            if cache is not None:
+                cache.flatten[layer_idx] = FlattenStepCache(
+                    logical_shape=logical_shape,
+                    padded_shape=padded_shape,
+                )
             if W_stride != lw:
                 return np.ascontiguousarray(x[:, :, :, :lw].reshape(N, -1))
             return x.reshape(N, -1)
 
-        self.logical_shape = x.shape
-        self.padded_shape = x.shape
+        logical_shape = x.shape
+        if cache is not None:
+            cache.flatten[layer_idx] = FlattenStepCache(
+                logical_shape=logical_shape,
+                padded_shape=logical_shape,
+            )
         return x.reshape(x.shape[0], -1)
 
-    def backward(self, dout: np.ndarray) -> np.ndarray:
+    def backward(
+        self,
+        dout: np.ndarray,
+        cache: ForwardCache | None = None,
+        layer_idx: int = 0,
+    ) -> np.ndarray:
+        if cache is None:
+            raise ValueError("Flatten.backward requires ForwardCache")
+        step = cache.flatten.get(layer_idx)
+        if step is None:
+            raise KeyError(f"Flatten backward missing step cache for layer {layer_idx}")
+
         if not dout.flags['C_CONTIGUOUS']:
             dout = np.ascontiguousarray(dout)
 
-        if self.padded_shape is not None and len(self.padded_shape) == 4:
-            N, C, H, W_stride = self.padded_shape
-            _, _, _, lw = self.logical_shape
-
+        if step.padded_shape is not None and len(step.padded_shape) == 4:
+            N, C, H, W_stride = step.padded_shape
+            _, _, _, lw = step.logical_shape
             dout_spatial = dout.reshape(N, C, H, lw)
             if W_stride != lw:
                 dx_padded = np.zeros((N, C, H, W_stride), dtype=dout.dtype)
@@ -502,4 +495,4 @@ class Flatten:
                 return dx_padded
             return np.ascontiguousarray(dout_spatial)
 
-        return dout.reshape(self.logical_shape)
+        return dout.reshape(step.logical_shape)

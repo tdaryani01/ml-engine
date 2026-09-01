@@ -3,7 +3,9 @@ import builtins
 import logging
 import numpy as np
 from config.constants import EngineBackend
+from src.scratch_arena import ScratchArena
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten, ConvBlock
+from src.training_cache import ForwardCache
 from utils.engine_ops import create_engine_context
 from utils.im2col import relu_spatial_forward, relu_spatial_backward
 
@@ -24,6 +26,7 @@ class CNNNetwork:
                  max_norm: float = 5.0, task_type: str = "multiclass", **kwargs):
         self.engine_ctx = engine_ctx or create_engine_context(backend)
         self.backend = self.engine_ctx.backend
+        self.scratch_arena = ScratchArena(self.backend)
         self.optimizer = optimizer_instance
         self.lam_l1 = lam_l1
         self.lam_l2 = lam_l2
@@ -50,13 +53,6 @@ class CNNNetwork:
                  logging.info(f"Layer {i} (MaxPool2D): pool_size={layer.pool_size}, stride={layer.stride}")
         logging.info("-------------------------\n")
 
-        self.spatial_inputs = []
-        self.spatial_logical_ws = []
-        self.dense_inputs = []
-        self.masks = []
-        self.activations = []
-
-        # Zero-allocation buffer caches for dense head
         self._dense_z_bufs = []
         self._dense_delta_bufs = []
         self._grad_weights_bufs = []
@@ -95,7 +91,6 @@ class CNNNetwork:
             cfg = conv_configs[i]
             l_type = cfg["type"].lower()
 
-            # Pattern Match: [Conv2D -> ReLU -> MaxPool2D] -> Fuse into ConvBlock
             if (l_type == "conv" and i + 2 < n and
                 conv_configs[i + 1]["type"].lower() == "relu" and
                 conv_configs[i + 2]["type"].lower() == "pool"):
@@ -162,9 +157,7 @@ class CNNNetwork:
 
     def set_train_batch_cap(self, cap: int) -> None:
         self._train_batch_cap = int(cap)
-        for layer in self.layers:
-            if isinstance(layer, ConvBlock) and hasattr(layer, "set_train_batch_cap"):
-                layer.set_train_batch_cap(cap)
+        self.scratch_arena.set_train_batch_cap(cap)
 
     def _ensure_dense_buffers(self, m: int, dtype, inference: bool = False):
         if inference:
@@ -210,15 +203,24 @@ class CNNNetwork:
             self._grad_weights_bufs.append(np.empty((fan_in, fan_out), dtype=dtype))
             self._grad_biases_bufs.append(np.empty((1, fan_out), dtype=dtype))
 
-    
-    def _forward(self, X: np.ndarray, training: bool = True) -> np.ndarray:
-        self.spatial_inputs.clear()
-        self.spatial_logical_ws.clear()
-        self.dense_inputs.clear()
-        self.masks.clear()
-        self.activations = [X]
+    def _forward(
+        self,
+        X: np.ndarray,
+        training: bool = True,
+        cache: ForwardCache | None = None,
+    ) -> np.ndarray:
+        arena = self.scratch_arena
 
-        # Sync spatial parameter pointers
+        if training and cache is None:
+            cache = ForwardCache()
+
+        if cache is not None:
+            cache.activations = [X]
+            cache.spatial_inputs.clear()
+            cache.spatial_logical_ws.clear()
+            cache.dense_inputs.clear()
+            cache.masks.clear()
+
         for i, layer in enumerate(self.param_layers):
             if isinstance(layer, (Conv2D, ConvBlock)):
                 if layer.W is not self.weights[i]:
@@ -227,44 +229,64 @@ class CNNNetwork:
                     layer.b = self.biases[i]
 
         current_act = X
-
-        # 1. Spatial Forward Pass (Tracking logical width across layers)
         current_logical_w = getattr(self, "input_logical_w", None)
         if current_logical_w is None:
-            # If input is (N, C, H, W_stride), derive logical width
-            # Standard MNIST/benchmark logical width is 28 if stride-padded to 32
             current_logical_w = 28 if (X.ndim == 4 and X.shape[3] == 32) else (X.shape[3] if X.ndim == 4 else None)
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
             if layer == "relu":
-                if training:
-                    self.spatial_inputs.append(current_act)
-                    self.spatial_logical_ws.append(current_logical_w)
+                if training and cache is not None:
+                    cache.spatial_inputs.append(current_act)
+                    cache.spatial_logical_ws.append(current_logical_w)
                 current_act = relu_spatial_forward(current_act, ctx=self.engine_ctx)
             elif isinstance(layer, Flatten):
-                if training:
-                    self.spatial_inputs.append(current_act)
-                    self.spatial_logical_ws.append(current_logical_w)
-                current_act = layer.forward(current_act, logical_w=current_logical_w)
+                if training and cache is not None:
+                    cache.spatial_inputs.append(current_act)
+                    cache.spatial_logical_ws.append(current_logical_w)
+                current_act = layer.forward(
+                    current_act,
+                    logical_w=current_logical_w,
+                    cache=cache,
+                    layer_idx=layer_idx,
+                )
             elif isinstance(layer, (Conv2D, ConvBlock, MaxPool2D)):
-                if training:
-                    self.spatial_inputs.append(current_act)
-                    self.spatial_logical_ws.append(current_logical_w)
+                if training and cache is not None:
+                    cache.spatial_inputs.append(current_act)
+                    cache.spatial_logical_ws.append(current_logical_w)
                 if isinstance(layer, ConvBlock):
                     current_act = layer.forward(
-                        current_act, W_logical=current_logical_w, inference=not training
+                        current_act,
+                        W_logical=current_logical_w,
+                        inference=not training,
+                        cache=cache,
+                        arena=arena,
+                        layer_idx=layer_idx,
+                    )
+                elif isinstance(layer, Conv2D):
+                    current_act = layer.forward(
+                        current_act,
+                        W_logical=current_logical_w,
+                        cache=cache,
+                        arena=arena,
+                        layer_idx=layer_idx,
                     )
                 else:
-                    current_act = layer.forward(current_act, W_logical=current_logical_w)
+                    current_act = layer.forward(
+                        current_act,
+                        W_logical=current_logical_w,
+                        cache=cache,
+                        arena=arena,
+                        layer_idx=layer_idx,
+                    )
                 current_logical_w = layer.out_w
             else:
-                if training:
-                    self.spatial_inputs.append(current_act)
-                    self.spatial_logical_ws.append(current_logical_w)
+                if training and cache is not None:
+                    cache.spatial_inputs.append(current_act)
+                    cache.spatial_logical_ws.append(current_logical_w)
                 current_act = layer.forward(current_act)
-            self.activations.append(current_act)
+            if cache is not None:
+                cache.activations.append(current_act)
 
-        # 2. Dense Forward Pass
         m = current_act.shape[0]
         self._ensure_dense_buffers(m, current_act.dtype, inference=not training)
         dense_w_indices = [i for i, l in enumerate(self.param_layers) if l == "dense"]
@@ -272,9 +294,9 @@ class CNNNetwork:
         z_buf_source = self._eval_dense_z_bufs if not training else self._dense_z_bufs
 
         for idx, w_idx in enumerate(dense_w_indices):
-            if training:
-                self.dense_inputs.append(current_act)
-            
+            if training and cache is not None:
+                cache.dense_inputs.append(current_act)
+
             z_buf = z_buf_source[idx]
             W_mat = self.weights[w_idx]
             if W_mat.dtype != current_act.dtype:
@@ -289,20 +311,28 @@ class CNNNetwork:
 
             if idx == num_dense - 1:
                 current_act = self.apply_output_activation(active_z)
-                if training:
-                    self.masks.append(None)
+                if training and cache is not None:
+                    cache.masks.append(None)
             else:
                 current_act = np.maximum(0.0, active_z)
                 if training and self.p_dropout > 0.0:
                     mask = (np.random.rand(*current_act.shape) >= self.p_dropout).astype(current_act.dtype) / (1.0 - self.p_dropout)
                     current_act *= mask
-                    self.masks.append(mask)
-                elif training:
-                    self.masks.append(None)
+                    if cache is not None:
+                        cache.masks.append(mask)
+                elif training and cache is not None:
+                    cache.masks.append(None)
 
-            self.activations.append(current_act)
+            if cache is not None:
+                cache.activations.append(current_act)
 
         return current_act
+
+    def forward_train(self, X: np.ndarray) -> tuple[np.ndarray, ForwardCache]:
+        """One training forward; returns output and cache for explicit backward."""
+        cache = ForwardCache()
+        output = self._forward(X, training=True, cache=cache)
+        return output, cache
 
     def apply_output_activation(self, z_out: np.ndarray) -> np.ndarray:
         if self.task_type == "multiclass":
@@ -340,12 +370,13 @@ class CNNNetwork:
                 l1_sum += float(np.sum(np.abs(w)))
         return raw_cost + (self.lam_l2 / (2.0 * m)) * l2_sum + (self.lam_l1 / m) * l1_sum
 
-    
-    def backward(self, X: np.ndarray, y: np.ndarray, active_lr: float) -> float:
-        m = X.shape[0]
+    def _backward_from_cache(self, cache: ForwardCache, y: np.ndarray, active_lr: float) -> float:
+        """Backward pass using a prior forward cache (no re-forward)."""
+        m = cache.batch_size
         inv_m = 1.0 / float(m)
-        output = self._forward(X, training=True)
+        output = cache.output
         delta = self.compute_output_delta(output, y)
+        arena = self.scratch_arena
 
         num_params = len(self.weights)
         grad_weights = [None] * num_params
@@ -354,10 +385,9 @@ class CNNNetwork:
         dense_w_indices = [i for i, l in enumerate(self.param_layers) if l == "dense"]
         num_dense = len(dense_w_indices)
 
-        # 1. Backprop Dense Head
         for local_idx in reversed(range(num_dense)):
             w_idx = dense_w_indices[local_idx]
-            act_in = self.dense_inputs[local_idx]
+            act_in = cache.dense_inputs[local_idx]
 
             gw_buf = self._grad_weights_bufs[local_idx]
             gb_buf = self._grad_biases_bufs[local_idx]
@@ -379,34 +409,58 @@ class CNNNetwork:
             delta = next_delta_buf
 
             if local_idx > 0:
-                if self.masks[local_idx - 1] is not None:
-                    delta *= self.masks[local_idx - 1]
+                if cache.masks[local_idx - 1] is not None:
+                    delta *= cache.masks[local_idx - 1]
                 delta *= (act_in > 0.0)
 
-        # 2. Backprop Spatial Pipeline
         spatial_grad = delta
         for i in reversed(range(len(self.layers))):
             layer = self.layers[i]
-            in_act = self.spatial_inputs[i]
+            in_act = cache.spatial_inputs[i]
 
             if layer == "relu":
                 spatial_grad = relu_spatial_backward(spatial_grad, in_act, ctx=self.engine_ctx)
-            elif isinstance(layer, (Conv2D, ConvBlock)):
-                w_log = self.spatial_logical_ws[i]
-                spatial_grad = layer.backward(spatial_grad, W_logical=w_log)
+            elif isinstance(layer, ConvBlock):
+                w_log = cache.spatial_logical_ws[i]
+                spatial_grad = layer.backward(
+                    spatial_grad,
+                    W_logical=w_log,
+                    cache=cache,
+                    arena=arena,
+                    layer_idx=i,
+                )
                 c_idx = self.param_layers.index(layer)
                 grad_weights[c_idx] = layer.dW
                 grad_biases[c_idx] = layer.db
+            elif isinstance(layer, Conv2D):
+                w_log = cache.spatial_logical_ws[i]
+                spatial_grad = layer.backward(
+                    spatial_grad,
+                    W_logical=w_log,
+                    cache=cache,
+                    arena=arena,
+                    layer_idx=i,
+                )
+                c_idx = self.param_layers.index(layer)
+                grad_weights[c_idx] = layer.dW
+                grad_biases[c_idx] = layer.db
+            elif isinstance(layer, MaxPool2D):
+                spatial_grad = layer.backward(
+                    spatial_grad,
+                    cache=cache,
+                    arena=arena,
+                    layer_idx=i,
+                )
+            elif isinstance(layer, Flatten):
+                spatial_grad = layer.backward(spatial_grad, cache=cache, layer_idx=i)
             else:
                 spatial_grad = layer.backward(spatial_grad)
 
-        # 3. L1 Penalty
         if self.lam_l1 > 0.0:
             scale = self.lam_l1 * inv_m
             for i in range(num_params):
                 grad_weights[i] += scale * np.sign(self.weights[i])
 
-        # 4. Gradient clipping (float64 norm avoids overflow before clip can run)
         total_sq = 0.0
         for gw, gb in zip(grad_weights, grad_biases):
             if gw is not None:
@@ -423,7 +477,6 @@ class CNNNetwork:
                 if grad_biases[i] is not None:
                     grad_biases[i] *= scaling_factor
 
-        # 5. Optimizer Update Step
         self.optimizer.update(
             weights=self.weights, biases=self.biases,
             grad_weights=grad_weights, grad_biases=grad_biases,
@@ -433,6 +486,11 @@ class CNNNetwork:
 
         self.diagnostic_counter += 1
         return self.compute_total_loss(output, y)
+
+    def backward(self, X: np.ndarray, y: np.ndarray, active_lr: float) -> float:
+        """Training step: forward once, then backward from cache."""
+        output, cache = self.forward_train(X)
+        return self._backward_from_cache(cache, y, active_lr)
 
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
         return self._forward(processed_data, training=False)
