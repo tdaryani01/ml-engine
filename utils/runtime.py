@@ -12,6 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterator, Mapping, Optional
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_project_root_str = str(PROJECT_ROOT)
+if _project_root_str not in sys.path:
+    sys.path.insert(0, _project_root_str)
+
 import yaml
 from threadpoolctl import threadpool_info, threadpool_limits
 
@@ -19,7 +24,6 @@ from config.constants import EngineBackend
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "config.yaml"
 DEFAULT_RUNTIME_PATH = PROJECT_ROOT / "config" / "runtime.yaml"
 
