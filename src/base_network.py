@@ -184,50 +184,50 @@ class BaseNeuralNetwork(ABC):
         l1_penalty = (self.lam_l1 / m) * sum(np.sum(np.abs(w)) for w in self.weights)
         return raw_cost + l2_penalty + l1_penalty
 
-    def backward(self, X, y, active_lr):
-        """Performs backpropagation, applies gradient stability clipping, and updates weights."""
+    def _compute_grads(self, X, y):
+        """Compute gradients; does not update weights."""
         m = X.shape[0]
         num_layers = len(self.weights)
         grad_weights, grad_biases = [None] * num_layers, [None] * num_layers
-        
+
         grad_gammas = [None] * (num_layers - 1)
         grad_betas = [None] * (num_layers - 1)
-        
-        self.zs = []            
-        self.z_bns = []         
-        self.z_hats = []        
-        self.batch_means = []   
-        self.batch_vars = []    
+
+        self.zs = []
+        self.z_bns = []
+        self.z_hats = []
+        self.batch_means = []
+        self.batch_vars = []
         self.activations = [X]
         self.masks = []
-        
+
         output = self._forward(X, training=True)
         delta = self.compute_output_delta(output, y)
-        
+
         for i in reversed(range(num_layers)):
             grad_weights[i] = np.dot(self.activations[i].T, delta) / m
             grad_biases[i] = np.sum(delta, axis=0, keepdims=True) / m
-            
+
             if i > 0:
                 delta = np.dot(delta, self.weights[i].T)
-                
+
                 activation_z = self.z_bns[i-1] if self.use_batch_norm else self.zs[i-1]
                 delta = delta * self.leaky_relu_der(activation_z)
-                
+
                 if self.masks[i-1] is not None:
                     delta = delta * self.masks[i-1]
-                
+
                 if self.use_batch_norm and (i - 1 < len(self.gammas)):
                     delta, dgamma, dbeta = self._bn_backward(delta, layer_idx=i-1, m=m)
                     grad_gammas[i-1] = dgamma
                     grad_betas[i-1] = dbeta
-                
+
         for i in range(num_layers):
             grad_weights[i] += (self.lam_l1 / m) * np.sign(self.weights[i])
 
         total_norm = np.sqrt(sum(np.sum(gw**2) for gw in grad_weights))
-        
-        if total_norm > self.max_norm:  
+
+        if total_norm > self.max_norm:
             scaling_factor = self.max_norm / (total_norm + 1e-15)
             logging.debug(f"[Backward Stability] Exploding gradient threat detected! Total Norm: {total_norm:.4f} | Scaling down by factor: {scaling_factor:.4f}")
             for i in range(num_layers):
@@ -235,18 +235,36 @@ class BaseNeuralNetwork(ABC):
                 if grad_biases[i] is not None:
                     grad_biases[i] *= scaling_factor
 
+        loss = self.compute_total_loss(output, y)
+        gg = grad_gammas if self.use_batch_norm else None
+        gbb = grad_betas if self.use_batch_norm else None
+        return loss, grad_weights, grad_biases, m, gg, gbb
+
+    def _apply_grads(
+        self,
+        grad_weights,
+        grad_biases,
+        m_samples,
+        active_lr,
+        grad_gammas=None,
+        grad_betas=None,
+    ) -> None:
         self.optimizer.update(
             weights=self.weights, biases=self.biases,
             grad_weights=grad_weights, grad_biases=grad_biases,
-            m_samples=m, lam_l2=self.lam_l2, active_lr=active_lr,
+            m_samples=m_samples, lam_l2=self.lam_l2, active_lr=active_lr,
             gammas=self.gammas if self.use_batch_norm else None,
             betas=self.betas if self.use_batch_norm else None,
             grad_gammas=grad_gammas if self.use_batch_norm else None,
-            grad_betas=grad_betas if self.use_batch_norm else None
+            grad_betas=grad_betas if self.use_batch_norm else None,
         )
-        
         self.diagnostic_counter += 1
-        
+
+    def backward(self, X, y, active_lr):
+        """Performs backpropagation, applies gradient stability clipping, and updates weights."""
+        loss, gw, gb, m, gg, gbb = self._compute_grads(X, y)
+        self._apply_grads(gw, gb, m, active_lr, gg, gbb)
+        return loss
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
         """Performs model inference securely with input shape verification."""
         if processed_data.ndim == 1:

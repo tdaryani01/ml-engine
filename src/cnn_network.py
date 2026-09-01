@@ -377,8 +377,8 @@ class CNNNetwork:
                 l1_sum += float(np.sum(np.abs(w)))
         return raw_cost + (self.lam_l2 / (2.0 * m)) * l2_sum + (self.lam_l1 / m) * l1_sum
 
-    def _backward_from_cache(self, cache: ForwardCache, y: np.ndarray, active_lr: float) -> float:
-        """Backward pass using a prior forward cache (no re-forward)."""
+    def _compute_grads_from_cache(self, cache: ForwardCache, y: np.ndarray):
+        """Compute gradients from a prior forward cache; does not update weights."""
         m = cache.batch_size
         inv_m = 1.0 / float(m)
         output = cache.output
@@ -483,15 +483,31 @@ class CNNNetwork:
                 if grad_biases[i] is not None:
                     grad_biases[i] *= scaling_factor
 
+        loss = self.compute_total_loss(output, y)
+        return loss, grad_weights, grad_biases, m, None, None
+
+    def _apply_grads(
+        self,
+        grad_weights,
+        grad_biases,
+        m_samples: int,
+        active_lr: float,
+        grad_gammas=None,
+        grad_betas=None,
+    ) -> None:
         self.optimizer.update(
             weights=self.weights, biases=self.biases,
             grad_weights=grad_weights, grad_biases=grad_biases,
-            m_samples=m, lam_l2=self.lam_l2, active_lr=active_lr,
-            gammas=None, betas=None, grad_gammas=None, grad_betas=None
+            m_samples=m_samples, lam_l2=self.lam_l2, active_lr=active_lr,
+            gammas=None, betas=None, grad_gammas=grad_gammas, grad_betas=grad_betas,
         )
-
         self.diagnostic_counter += 1
-        return self.compute_total_loss(output, y)
+
+    def _backward_from_cache(self, cache: ForwardCache, y: np.ndarray, active_lr: float) -> float:
+        """Backward pass using a prior forward cache (no re-forward)."""
+        loss, gw, gb, m, _, _ = self._compute_grads_from_cache(cache, y)
+        self._apply_grads(gw, gb, m, active_lr)
+        return loss
 
     def backward(self, X: np.ndarray, y: np.ndarray, active_lr: float) -> float:
         """Training step: forward once, then backward from cache."""
