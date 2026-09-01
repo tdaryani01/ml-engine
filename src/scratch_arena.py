@@ -23,6 +23,7 @@ class ConvBlockScratch:
     cached_dtype: object = None
     eval_cached_dtype: object = None
     col_cap: int = 0
+    geom_key: tuple | None = None  # (C, H, W_stride, W_logical) — skip geometry recompute
     out_conv_buffer: np.ndarray | None = None
     out_pool_buffer: np.ndarray | None = None
     argmax_buffer: np.ndarray | None = None
@@ -41,6 +42,7 @@ class ConvBlockScratch:
 class Conv2DScratch:
     col_cap: int = 0
     cached_dtype: object = None
+    geom_key: tuple | None = None
     col_buffer: np.ndarray | None = None
     dcol_buffer: np.ndarray | None = None
     dout_trans_buffer: np.ndarray | None = None
@@ -107,6 +109,15 @@ class ScratchArena:
         dtype,
     ) -> ConvBlockScratch:
         scratch = self.conv_block(layer_idx)
+        geom_key = (C, H, W_stride, W_logical)
+        if (
+            scratch.cached_dtype == dtype
+            and N <= scratch.max_n
+            and scratch.dx_buffer is not None
+            and scratch.geom_key == geom_key
+        ):
+            return scratch
+
         conv_out_h = (H + 2 * conv_pad - k_h) // conv_stride + 1
         conv_out_w = (W_logical + 2 * conv_pad - k_w) // conv_stride + 1
         conv_out_w_stride = _round_up_simd(conv_out_w)
@@ -121,17 +132,10 @@ class ScratchArena:
             else:
                 target_n = min(target_n, self.train_batch_cap)
 
-        if (
-            scratch.cached_dtype == dtype
-            and N <= scratch.max_n
-            and scratch.max_n == target_n
-            and scratch.dx_buffer is not None
-        ):
-            return scratch
-
         scratch.max_n = target_n
         scratch.col_cap = max(scratch.col_cap, scratch.max_n * conv_out_h * conv_out_w_stride)
         scratch.cached_dtype = dtype
+        scratch.geom_key = geom_key
 
         scratch.out_conv_buffer = np.zeros(
             (scratch.max_n, out_channels, conv_out_h, conv_out_w_stride), dtype=dtype
@@ -222,6 +226,16 @@ class ScratchArena:
         dtype,
     ) -> Conv2DScratch:
         scratch = self.conv2d_layer(layer_idx)
+        geom_key = (C, H, W_stride, W_logical)
+        if (
+            scratch.cached_dtype == dtype
+            and N <= scratch.max_n
+            and scratch.dx_buffer is not None
+            and scratch.fwd_out_buffer is not None
+            and scratch.geom_key == geom_key
+        ):
+            return scratch
+
         out_h = (H + 2 * pad - k_h) // stride + 1
         out_w = (W_logical + 2 * pad - k_w) // stride + 1
         out_w_stride = _round_up_simd(out_w)
@@ -232,13 +246,10 @@ class ScratchArena:
         if self.train_batch_cap > 0:
             target_n = min(target_n, self.train_batch_cap) if scratch.max_n <= self.train_batch_cap else self.train_batch_cap
 
-        if scratch.cached_dtype == dtype and total_rows <= scratch.col_cap and scratch.dx_buffer is not None:
-            if scratch.fwd_out_buffer is not None and scratch.fwd_out_buffer.shape[0] >= N:
-                return scratch
-
         scratch.col_cap = max(scratch.col_cap, total_rows)
         scratch.max_n = max(scratch.max_n, target_n)
         scratch.cached_dtype = dtype
+        scratch.geom_key = geom_key
         scratch.col_buffer = np.empty((scratch.col_cap, total_cols), dtype=dtype)
         scratch.dcol_buffer = np.empty((scratch.col_cap, total_cols), dtype=dtype)
         scratch.dout_trans_buffer = np.empty((scratch.col_cap, out_channels), dtype=dtype)

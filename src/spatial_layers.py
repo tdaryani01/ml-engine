@@ -37,6 +37,7 @@ class ConvBlock:
                  engine_ctx: EngineContext | None = None,
                  backend: EngineBackend | None = None):
         self._ctx = resolve_engine_context(engine_ctx, backend)
+        self._conv = self._ctx.conv
         self.backend = self._ctx.backend
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -55,6 +56,7 @@ class ConvBlock:
         self.db = np.zeros_like(self.b)
         self.out_h = 0
         self.out_w = 0
+        self._bound_scratch = None
 
     def _compute_geometry(self, C: int, H: int, W_stride: int, W_logical: int):
         conv_out_h = (H + 2 * self.conv_pad - self.k_h) // self.conv_stride + 1
@@ -136,7 +138,7 @@ class ConvBlock:
             col_buf = scratch.col_buffer
             gemm_buf = scratch.fwd_gemm_buffer
 
-        out_pool, out_conv, argmax, col = self._ctx.conv.conv_block_forward(
+        out_pool, out_conv, argmax, col = self._conv.conv_block_forward(
             x=x, W=self.W, bias=self.b,
             out_conv_buf=out_conv_buf[:N],
             out_pool_buf=out_pool_buf[:N],
@@ -151,6 +153,7 @@ class ConvBlock:
             cache.conv_blocks[layer_idx] = ConvBlockStepCache(
                 x=x, conv_act=out_conv, argmax=argmax, col=col,
             )
+            self._bound_scratch = scratch
         return out_pool
 
     def backward(
@@ -174,26 +177,28 @@ class ConvBlock:
         w_log = W_logical if W_logical is not None else W_stride
         inv_m = 1.0 / float(N)
 
-        scratch = arena.ensure_conv_block_train(
-            layer_idx,
-            out_channels=self.out_channels,
-            in_channels=self.in_channels,
-            k_h=self.k_h,
-            k_w=self.k_w,
-            conv_stride=self.conv_stride,
-            conv_pad=self.conv_pad,
-            pool_size=self.pool_size,
-            pool_stride=self.pool_stride,
-            N=N,
-            C=C,
-            H=H,
-            W_stride=W_stride,
-            W_logical=w_log,
-            dtype=dout.dtype,
-        )
+        scratch = self._bound_scratch
+        if scratch is None:
+            scratch = arena.ensure_conv_block_train(
+                layer_idx,
+                out_channels=self.out_channels,
+                in_channels=self.in_channels,
+                k_h=self.k_h,
+                k_w=self.k_w,
+                conv_stride=self.conv_stride,
+                conv_pad=self.conv_pad,
+                pool_size=self.pool_size,
+                pool_stride=self.pool_stride,
+                N=N,
+                C=C,
+                H=H,
+                W_stride=W_stride,
+                W_logical=w_log,
+                dtype=dout.dtype,
+            )
         self._sync_param_dtypes(dout.dtype)
 
-        dx, self.dW, self.db = self._ctx.conv.conv_block_backward(
+        dx, self.dW, self.db = self._conv.conv_block_backward(
             dout_pool=dout,
             argmax_buf=step.argmax,
             x=step.x,
@@ -213,6 +218,7 @@ class ConvBlock:
             dcol_buf=scratch.dcol_buffer,
             W_logical=w_log,
         )
+        self._bound_scratch = None
         return dx
 
 
@@ -224,6 +230,7 @@ class Conv2D:
                  engine_ctx: EngineContext | None = None,
                  backend: EngineBackend | None = None):
         self._ctx = resolve_engine_context(engine_ctx, backend)
+        self._conv = self._ctx.conv
         self.backend = self._ctx.backend
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -241,6 +248,7 @@ class Conv2D:
         self.out_h = 0
         self.out_w = 0
         self.out_w_stride = 0
+        self._bound_scratch = None
 
     def forward(
         self,
@@ -283,7 +291,7 @@ class Conv2D:
         self.out_w = (w_log + 2 * self.pad - self.k_w) // self.stride + 1
         self.out_w_stride = _round_up_simd(self.out_w)
 
-        active_out, col = self._ctx.conv.conv2d_forward(
+        active_out, col = self._conv.conv2d_forward(
             x=x, W=self.W, bias=self.b,
             stride=self.stride, pad=self.pad,
             out_buf=scratch.fwd_out_buffer[:N],
@@ -294,6 +302,7 @@ class Conv2D:
         )
         if cache is not None:
             cache.conv2d[layer_idx] = Conv2DStepCache(x=x, col=col)
+            self._bound_scratch = scratch
         return active_out
 
     def backward(
@@ -320,25 +329,27 @@ class Conv2D:
         inv_m = 1.0 / float(N)
         total_rows = N * self.out_h * self.out_w_stride
 
-        scratch = arena.ensure_conv2d(
-            layer_idx,
-            out_channels=self.out_channels,
-            in_channels=self.in_channels,
-            k_h=self.k_h,
-            k_w=self.k_w,
-            stride=self.stride,
-            pad=self.pad,
-            N=N,
-            C=C,
-            H=H,
-            W_stride=W_stride,
-            W_logical=w_log,
-            dtype=dout.dtype,
-        )
+        scratch = self._bound_scratch
+        if scratch is None:
+            scratch = arena.ensure_conv2d(
+                layer_idx,
+                out_channels=self.out_channels,
+                in_channels=self.in_channels,
+                k_h=self.k_h,
+                k_w=self.k_w,
+                stride=self.stride,
+                pad=self.pad,
+                N=N,
+                C=C,
+                H=H,
+                W_stride=W_stride,
+                W_logical=w_log,
+                dtype=dout.dtype,
+            )
         active_dout_trans = scratch.dout_trans_buffer[:total_rows]
-        self._ctx.conv.fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
+        self._conv.fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
 
-        dx, self.dW = self._ctx.conv.conv2d_backward_fused(
+        dx, self.dW = self._conv.conv2d_backward_fused(
             dout=dout,
             x=step.x,
             W=self.W,
@@ -354,6 +365,7 @@ class Conv2D:
             dcol_buf=scratch.dcol_buffer,
             W_logical=w_log,
         )
+        self._bound_scratch = None
         return dx
 
 
@@ -364,11 +376,13 @@ class MaxPool2D:
                  engine_ctx: EngineContext | None = None,
                  backend: EngineBackend | None = None):
         self._ctx = resolve_engine_context(engine_ctx, backend)
+        self._conv = self._ctx.conv
         self.backend = self._ctx.backend
         self.pool_size = pool_size
         self.stride = stride
         self.out_h = 0
         self.out_w = 0
+        self._bound_scratch = None
 
     def forward(
         self,
@@ -399,13 +413,14 @@ class MaxPool2D:
             pool_stride=self.stride,
             dtype=x.dtype,
         )
-        out, pool_cache = self._ctx.conv.maxpool_forward(
+        out, pool_cache = self._conv.maxpool_forward(
             x, self.pool_size, self.stride,
             out_buf=scratch.out_buf[:N],
             argmax_buf=scratch.argmax_buf[:N],
         )
         if cache is not None:
             cache.maxpool[layer_idx] = MaxPoolStepCache(x_shape=x.shape, pool_cache=pool_cache)
+            self._bound_scratch = scratch
         return out
 
     def backward(
@@ -424,15 +439,17 @@ class MaxPool2D:
         if not dout.flags['C_CONTIGUOUS']:
             dout = np.ascontiguousarray(dout)
 
-        scratch = arena.maxpool_layer(layer_idx)
+        scratch = self._bound_scratch if self._bound_scratch is not None else arena.maxpool_layer(layer_idx)
         if scratch.dx_buf is None or scratch.dx_buf.shape != step.x_shape or scratch.dx_buf.dtype != dout.dtype:
             scratch.dx_buf = np.zeros(step.x_shape, dtype=dout.dtype)
 
-        return self._ctx.conv.maxpool_backward(
+        result = self._conv.maxpool_backward(
             dout, step.pool_cache, step.x_shape,
             self.pool_size, self.stride,
             dx_buf=scratch.dx_buf,
         )
+        self._bound_scratch = None
+        return result
 
 
 class Flatten:

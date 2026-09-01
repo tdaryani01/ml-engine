@@ -63,3 +63,14 @@ class ForwardCache:
         if not self.activations:
             raise ValueError("ForwardCache has no activations")
         return self.activations[-1]
+
+
+def new_forward_cache(num_layers: int, num_dense: int) -> ForwardCache:
+    """Pre-sized step store; spatial slots indexed by pipeline layer index."""
+    return ForwardCache(
+        spatial_inputs=[None] * num_layers,
+        spatial_logical_ws=[None] * num_layers,
+        dense_inputs=[None] * num_dense,
+        masks=[None] * num_dense,
+        activations=[],
+    )

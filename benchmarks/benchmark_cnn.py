@@ -648,9 +648,9 @@ def run_custom_engine_benchmark(
     forward_counter = [0]
     backward_counter = [0]
 
-    def counted_forward(X, training=True):
+    def counted_forward(X, training=True, **kwargs):
         forward_counter[0] += 1
-        return orig_forward(X, training=training)
+        return orig_forward(X, training=training, **kwargs)
 
     def counted_backward(*args, **kwargs):
         backward_counter[0] += 1

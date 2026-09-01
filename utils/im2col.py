@@ -17,8 +17,13 @@ _native_lib = None
 _is_initialized: bool = False
 
 
-def _resolve_backend(ctx: "EngineContext | None" = None) -> EngineBackend:
-    """Prefer explicit context backend; fall back to legacy module global."""
+def _resolve_backend(
+    ctx: "EngineContext | None" = None,
+    backend: EngineBackend | None = None,
+) -> EngineBackend:
+    """Prefer explicit backend enum; then context; then legacy module global."""
+    if backend is not None:
+        return backend
     if ctx is not None:
         return ctx.backend
     _ensure_initialized()
@@ -267,10 +272,12 @@ def conv_block_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
                        pool_size: int = 2, pool_stride: int = 2,
                        col_buf: np.ndarray = None, gemm_buf: np.ndarray = None,
                        W_logical: int = None, out_w_logical: int = None,
-                       ctx: "EngineContext | None" = None) -> tuple:
+                       ctx: "EngineContext | None" = None,
+                       backend: EngineBackend | None = None) -> tuple:
     _ensure_initialized()
+    be = _resolve_backend(ctx, backend)
 
-    if _resolve_backend(ctx) == EngineBackend.NATIVE:
+    if be == EngineBackend.NATIVE:
         if _native_lib is None:
             _log_fallback("conv_block_forward", "Native library not loaded")
         elif x.dtype != np.float32:
@@ -300,7 +307,7 @@ def conv_block_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
     out_conv, col = conv2d_forward(
         x=x, W=W, bias=bias, stride=conv_stride, pad=conv_pad,
         out_buf=out_conv_buf, col_buf=col_buf, gemm_buf=gemm_buf,
-        fuse_relu=True, W_logical=W_logical, ctx=ctx
+        fuse_relu=True, W_logical=W_logical, backend=be
     )
     
     # Extract logical slice before pooling on fallback backends
@@ -310,7 +317,7 @@ def conv_block_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
 
     out_pool, argmax = maxpool_forward(
         valid_conv, pool_size, pool_stride, out_buf=out_pool_buf,
-        argmax_buf=argmax_buf, ctx=ctx
+        argmax_buf=argmax_buf, backend=be
     )
     return out_pool, out_conv, argmax, col
 
@@ -323,10 +330,12 @@ def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
                         inv_m: float = 1.0,
                         col: np.ndarray = None, dout_trans: np.ndarray = None, dcol_buf: np.ndarray = None,
                         W_logical: int = None, out_w_logical: int = None,
-                        ctx: "EngineContext | None" = None) -> tuple:
+                        ctx: "EngineContext | None" = None,
+                        backend: EngineBackend | None = None) -> tuple:
     _ensure_initialized()
+    be = _resolve_backend(ctx, backend)
 
-    if _resolve_backend(ctx) == EngineBackend.NATIVE:
+    if be == EngineBackend.NATIVE:
         if _native_lib is None:
             _log_fallback("conv_block_backward", "Native library not loaded")
         elif dout_pool.dtype != np.float32:
@@ -364,7 +373,7 @@ def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
     conv_act_logical = conv_act[:, :, :out_h, :out_w] if conv_act.shape[3] != out_w else conv_act
 
     d_conv_logical = maxpool_backward(
-        dout_pool, argmax_buf, conv_act_logical.shape, pool_size, pool_stride, ctx=ctx
+        dout_pool, argmax_buf, conv_act_logical.shape, pool_size, pool_stride, backend=be
     )
     _ensure_fast_kernels()
     _relu_bwd_inplace_kernel(d_conv_logical, conv_act_logical)
@@ -373,13 +382,13 @@ def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
     d_conv_buf[:, :, :out_h, :out_w] = d_conv_logical
 
     if db_buf is not None:
-        fuse_dout_transpose_and_bias(d_conv_logical, dout_trans, db_buf, ctx=ctx)
+        fuse_dout_transpose_and_bias(d_conv_logical, dout_trans, db_buf, backend=be)
 
     dx, dW = conv2d_backward_fused(
         d_conv_buf, x, W, dx_buf, dW_buf,
         stride=conv_stride, pad=conv_pad, inv_m=inv_m,
         in_act=None, fuse_relu=False, col=col, dout_trans=dout_trans,
-        dcol_buf=dcol_buf, W_logical=W_logical, ctx=ctx
+        dcol_buf=dcol_buf, W_logical=W_logical, backend=be
     )
     return dx, dW, db_buf
 
@@ -391,14 +400,16 @@ def conv2d_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
                    stride: int, pad: int, out_buf: np.ndarray,
                    col_buf: np.ndarray = None, gemm_buf: np.ndarray = None,
                    fuse_relu: bool = False, W_logical: int = None,
-                   ctx: "EngineContext | None" = None) -> tuple:
+                   ctx: "EngineContext | None" = None,
+                   backend: EngineBackend | None = None) -> tuple:
     _ensure_initialized()
+    be = _resolve_backend(ctx, backend)
     N, C_in, H, W_in_stride = x.shape
     C_out, _, k_h, k_w = W.shape
     W_in = W_logical if W_logical is not None else W_in_stride
     out_w_stride = out_buf.shape[3]
 
-    if _resolve_backend(ctx) == EngineBackend.NATIVE:
+    if be == EngineBackend.NATIVE:
         if _native_lib is None:
             _log_fallback("conv2d_forward", "Native library not loaded")
         elif x.dtype != np.float32:
@@ -424,7 +435,7 @@ def conv2d_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
 
     x_logical = x[:, :, :, :W_in] if x.shape[3] != W_in else x
 
-    if _resolve_backend(ctx) in (EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM):
+    if be in (EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM):
         _ensure_fast_kernels()
         active_col = col_buf[:total_rows] if col_buf is not None else np.empty((total_rows, C_in * k_h * k_w), dtype=x.dtype)
         active_gemm = gemm_buf[:total_rows] if gemm_buf is not None else np.empty((total_rows, C_out), dtype=x.dtype)
@@ -462,14 +473,16 @@ def conv2d_backward_fused(dout: np.ndarray, x: np.ndarray, W: np.ndarray,
                           in_act: np.ndarray = None, fuse_relu: bool = False,
                           col: np.ndarray = None, dout_trans: np.ndarray = None,
                           dcol_buf: np.ndarray = None, W_logical: int = None,
-                          ctx: "EngineContext | None" = None) -> tuple:
+                          ctx: "EngineContext | None" = None,
+                          backend: EngineBackend | None = None) -> tuple:
     _ensure_initialized()
+    be = _resolve_backend(ctx, backend)
     N, C_in, H, W_in_stride = x.shape
     C_out, _, k_h, k_w = W.shape
     W_in = W_logical if W_logical is not None else W_in_stride
     conv_out_w_stride = dout.shape[3]
 
-    if _resolve_backend(ctx) == EngineBackend.NATIVE:
+    if be == EngineBackend.NATIVE:
         if _native_lib is None:
             _log_fallback("conv2d_backward_fused", "Native library not loaded")
         elif dout.dtype != np.float32:
@@ -494,11 +507,11 @@ def conv2d_backward_fused(dout: np.ndarray, x: np.ndarray, W: np.ndarray,
 
     dx = conv2d_backward_input(
         dout, W, dx_buf, stride, pad, dout_trans=dout_trans, dcol_buf=dcol_buf,
-        in_act=in_act, fuse_relu=fuse_relu, W_logical=W_logical, ctx=ctx
+        in_act=in_act, fuse_relu=fuse_relu, W_logical=W_logical, backend=be
     )
     dW = conv2d_backward_weight(
         dout, x, dW_buf, col, dout_trans, stride, pad, inv_m,
-        W_logical=W_logical, ctx=ctx
+        W_logical=W_logical, backend=be
     )
     return dx, dW
 
@@ -506,9 +519,11 @@ def conv2d_backward_fused(dout: np.ndarray, x: np.ndarray, W: np.ndarray,
 def conv2d_backward_weight(dout: np.ndarray, x: np.ndarray, dW: np.ndarray,
                            col: np.ndarray, dout_trans: np.ndarray,
                            stride: int, pad: int, inv_m: float, W_logical: int = None,
-                           ctx: "EngineContext | None" = None) -> np.ndarray:
+                           ctx: "EngineContext | None" = None,
+                           backend: EngineBackend | None = None) -> np.ndarray:
     _ensure_initialized()
-    if _resolve_backend(ctx) == EngineBackend.NATIVE:
+    be = _resolve_backend(ctx, backend)
+    if be == EngineBackend.NATIVE:
         if _native_lib is None:
             _log_fallback("conv2d_backward_weight", "Native library not loaded")
         elif dout.dtype != np.float32:
@@ -547,7 +562,7 @@ def conv2d_backward_weight(dout: np.ndarray, x: np.ndarray, dW: np.ndarray,
         x_logical = x[:, :, :, :W_in] if x.shape[3] != W_in else x
         active_col = im2col(x_logical, k_h, k_w, stride, pad)
 
-    if _resolve_backend(ctx) in (EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM):
+    if be in (EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM):
         _ensure_fast_kernels()
         orig_shape = dW.shape
         dW_flat = np.empty((orig_shape[0], int(np.prod(orig_shape[1:]))), dtype=active_dout_trans.dtype)
@@ -564,9 +579,11 @@ def conv2d_backward_input(dout: np.ndarray, W: np.ndarray, dx_buf: np.ndarray,
                           stride: int, pad: int,
                           dout_trans: np.ndarray = None, dcol_buf: np.ndarray = None,
                           in_act: np.ndarray = None, fuse_relu: bool = False, W_logical: int = None,
-                          ctx: "EngineContext | None" = None) -> np.ndarray:
+                          ctx: "EngineContext | None" = None,
+                          backend: EngineBackend | None = None) -> np.ndarray:
     _ensure_initialized()
-    if _resolve_backend(ctx) == EngineBackend.NATIVE:
+    be = _resolve_backend(ctx, backend)
+    if be == EngineBackend.NATIVE:
         if _native_lib is None:
             _log_fallback("conv2d_backward_input", "Native library not loaded")
         elif dout.dtype != np.float32:
@@ -676,13 +693,14 @@ def col2im(col: np.ndarray, input_shape: tuple, k_h: int, k_w: int, stride: int 
 
 
 def maxpool_forward(x: np.ndarray, pool_size: int, stride: int, out_buf: np.ndarray = None, argmax_buf: np.ndarray = None,
-                    ctx: "EngineContext | None" = None):
+                    ctx: "EngineContext | None" = None, backend: EngineBackend | None = None):
     _ensure_initialized()
+    be = _resolve_backend(ctx, backend)
     N, C, H, W = x.shape
     out_h = (H - pool_size) // stride + 1
     out_w = (W - pool_size) // stride + 1
 
-    if _resolve_backend(ctx) == EngineBackend.NATIVE:
+    if be == EngineBackend.NATIVE:
         if _native_lib is None:
             _log_fallback("maxpool_forward", "Native library not loaded")
         elif x.dtype != np.float32:
@@ -701,7 +719,7 @@ def maxpool_forward(x: np.ndarray, pool_size: int, stride: int, out_buf: np.ndar
                 return out_buf, argmax_buf
             _log_fallback("maxpool_forward", f"Native DLL returned error code {status}")
 
-    if _resolve_backend(ctx) in (EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM):
+    if be in (EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM):
         _ensure_fast_kernels()
         if out_buf is None or out_buf.shape != (N, C, out_h, out_w) or out_buf.dtype != x.dtype:
             out_buf = np.empty((N, C, out_h, out_w), dtype=x.dtype)
@@ -720,8 +738,9 @@ def maxpool_forward(x: np.ndarray, pool_size: int, stride: int, out_buf: np.ndar
 
 
 def maxpool_backward(dout: np.ndarray, cache: np.ndarray, x_shape: tuple, pool_size: int, stride: int, dx_buf: np.ndarray = None,
-                     ctx: "EngineContext | None" = None):
+                     ctx: "EngineContext | None" = None, backend: EngineBackend | None = None):
     _ensure_initialized()
+    be = _resolve_backend(ctx, backend)
     if dx_buf is None or dx_buf.shape != x_shape or dx_buf.dtype != dout.dtype:
         dx_buf = np.zeros(x_shape, dtype=dout.dtype)
     else:
@@ -730,7 +749,7 @@ def maxpool_backward(dout: np.ndarray, cache: np.ndarray, x_shape: tuple, pool_s
     N, C, in_h, in_w = x_shape
     out_h, out_w = dout.shape[2], dout.shape[3]
 
-    if _resolve_backend(ctx) == EngineBackend.NATIVE:
+    if be == EngineBackend.NATIVE:
         if _native_lib is None:
             _log_fallback("maxpool_backward", "Native library not loaded")
         elif dout.dtype != np.float32:
@@ -744,7 +763,7 @@ def maxpool_backward(dout: np.ndarray, cache: np.ndarray, x_shape: tuple, pool_s
                 return dx_buf
             _log_fallback("maxpool_backward", f"Native DLL returned error code {status}")
 
-    if _resolve_backend(ctx) in (EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM):
+    if be in (EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM):
         _ensure_fast_kernels()
         _maxpool_backward_kernel(dout, cache, dx_buf)
         return dx_buf
@@ -756,9 +775,11 @@ def maxpool_backward(dout: np.ndarray, cache: np.ndarray, x_shape: tuple, pool_s
 
 
 def fuse_dout_transpose_and_bias(dout: np.ndarray, dout_trans_buf: np.ndarray, db_buf: np.ndarray,
-                               ctx: "EngineContext | None" = None):
+                               ctx: "EngineContext | None" = None,
+                               backend: EngineBackend | None = None):
     _ensure_initialized()
-    if _resolve_backend(ctx) == EngineBackend.NATIVE:
+    be = _resolve_backend(ctx, backend)
+    if be == EngineBackend.NATIVE:
         if _native_lib is None:
             _log_fallback("fuse_dout_transpose_and_bias", "Native library not loaded")
         elif dout.dtype != np.float32:
@@ -785,9 +806,11 @@ def gemm_param_grad(dout_trans: np.ndarray, col: np.ndarray, dW_flat: np.ndarray
     _gemm_param_grad_impl(dout_trans, col, dW_flat, inv_m)
 
 
-def relu_spatial_forward(x: np.ndarray, ctx: "EngineContext | None" = None) -> np.ndarray:
+def relu_spatial_forward(x: np.ndarray, ctx: "EngineContext | None" = None,
+                         backend: EngineBackend | None = None) -> np.ndarray:
     _ensure_initialized()
-    if _resolve_backend(ctx) == EngineBackend.NATIVE:
+    be = _resolve_backend(ctx, backend)
+    if be == EngineBackend.NATIVE:
         if _native_lib is None:
             _log_fallback("relu_spatial_forward", "Native library not loaded")
         elif x.dtype != np.float32:
@@ -802,9 +825,11 @@ def relu_spatial_forward(x: np.ndarray, ctx: "EngineContext | None" = None) -> n
     return x
 
 
-def relu_spatial_backward(dout: np.ndarray, in_act: np.ndarray, ctx: "EngineContext | None" = None) -> np.ndarray:
+def relu_spatial_backward(dout: np.ndarray, in_act: np.ndarray, ctx: "EngineContext | None" = None,
+                          backend: EngineBackend | None = None) -> np.ndarray:
     _ensure_initialized()
-    if _resolve_backend(ctx) == EngineBackend.NATIVE:
+    be = _resolve_backend(ctx, backend)
+    if be == EngineBackend.NATIVE:
         if _native_lib is None:
             _log_fallback("relu_spatial_backward", "Native library not loaded")
         elif dout.dtype != np.float32:
