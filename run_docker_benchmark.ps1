@@ -21,30 +21,30 @@ $PyTorchImg = "ml-engine-pytorch-bench:latest"
 $CustomImg  = "ml-engine-custom-bench:latest"
 $CpuSet     = "0-$($Cores - 1)"
 $ConfigPath = Join-Path $ScriptDir "config\config.yaml"
-$DockerEnvScript = Join-Path $ScriptDir "utils\docker_omp_env.py"
+$RuntimeScript = Join-Path $ScriptDir "utils\runtime.py"
 
 function Convert-DockerMountPath {
     param([string]$Path)
     return ($Path -replace '\\', '/')
 }
 
-function Get-DockerYamlSettings {
-    if (-not (Test-Path $DockerEnvScript)) {
-        Write-Error "[ERROR] Missing Docker config loader: $DockerEnvScript"
+function Get-RuntimeYamlSettings {
+    if (-not (Test-Path $RuntimeScript)) {
+        Write-Error "[ERROR] Missing runtime loader: $RuntimeScript"
         exit 1
     }
-    $json = & python $DockerEnvScript --format docker-json | ConvertFrom-Json
+    $json = & python $RuntimeScript --format docker-json | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) {
-        Write-Error "[ERROR] Failed to read config/docker_omp.yaml"
+        Write-Error "[ERROR] Failed to read config/runtime.yaml"
         exit 1
     }
     return $json
 }
 
-$DockerYaml = Get-DockerYamlSettings
-$DiagDir = Join-Path $ScriptDir ($DockerYaml.diagnostics_dir)
-$DockerConfigMount = @(
-    "-v", "$(Convert-DockerMountPath (Join-Path $ScriptDir 'config/docker_omp.yaml')):/workspace/config/docker_omp.yaml"
+$RuntimeYaml = Get-RuntimeYamlSettings
+$DiagDir = Join-Path $ScriptDir ($RuntimeYaml.diagnostics_dir)
+$RuntimeConfigMount = @(
+    "-v", "$(Convert-DockerMountPath (Join-Path $ScriptDir 'config/runtime.yaml')):/workspace/config/runtime.yaml"
 )
 if (-not (Test-Path $DiagDir)) {
     New-Item -ItemType Directory -Path $DiagDir -Force | Out-Null
@@ -83,16 +83,14 @@ function Stop-ExistingBenchmarkContainers {
     docker rm -f ml-engine-bench-pytorch ml-engine-bench-custom 2>$null | Out-Null
 }
 
-function Write-DockerOmpEnvFile {
+function Write-RuntimeEnvFile {
     param(
-        [ValidateSet("pytorch", "custom")]
-        [string]$Target,
         [int]$Threads,
         [hashtable]$Overrides = @{}
     )
 
-    if (-not (Test-Path $DockerEnvScript)) {
-        Write-Error "[ERROR] Missing Docker config loader: $DockerEnvScript"
+    if (-not (Test-Path $RuntimeScript)) {
+        Write-Error "[ERROR] Missing runtime loader: $RuntimeScript"
         exit 1
     }
 
@@ -101,10 +99,10 @@ function Write-DockerOmpEnvFile {
         $overrideArgs += "--override", "${key}=$($Overrides[$key])"
     }
 
-    $envFile = Join-Path $DiagDir ".docker_omp_${Target}.env"
-    $lines = & python $DockerEnvScript --target $Target --threads $Threads --format docker-args @overrideArgs
+    $envFile = Join-Path $DiagDir ".runtime.env"
+    $lines = & python $RuntimeScript --threads $Threads --platform linux --format docker-args @overrideArgs
     if ($LASTEXITCODE -ne 0) {
-        Write-Error "[ERROR] Failed to load Docker profile '$Target' from config/docker_omp.yaml"
+        Write-Error "[ERROR] Failed to load config/runtime.yaml"
         exit 1
     }
 
@@ -127,30 +125,17 @@ function Invoke-DockerBenchmarkRun {
         "--name", $Name,
         "--cpuset-cpus=$CpuSet",
         "--env-file=$EnvFile"
-    ) + $CapArgs + $ExtraArgs + $DockerConfigMount + @(
-        "-v", "$(Convert-DockerMountPath $DiagDir):/workspace/$($DockerYaml.diagnostics_dir)",
+    ) + $CapArgs + $ExtraArgs + $RuntimeConfigMount + @(
+        "-v", "$(Convert-DockerMountPath $DiagDir):/workspace/$($RuntimeYaml.diagnostics_dir)",
         $Image
     ) + $CommandArgs
 
     & docker @runArgs
 }
 
-function Get-DockerPyTorchEnvArgs {
+function Get-RuntimeProfileSummary {
     param([int]$Threads)
-    return Write-DockerOmpEnvFile -Target pytorch -Threads $Threads
-}
-
-function Get-DockerCustomEnvArgs {
-    param([int]$Threads)
-    return Write-DockerOmpEnvFile -Target custom -Threads $Threads
-}
-
-function Get-DockerOmpProfileSummary {
-    param(
-        [string]$Target,
-        [int]$Threads
-    )
-    $json = & python $DockerEnvScript --target $Target --threads $Threads --format json | ConvertFrom-Json
+    $json = & python $RuntimeScript --threads $Threads --platform linux --format json | ConvertFrom-Json
     $wait = if ($json.PSObject.Properties.Name -contains "OMP_WAIT_POLICY") { $json.OMP_WAIT_POLICY } else { "default" }
     $spin = if ($json.PSObject.Properties.Name -contains "GOMP_SPINCOUNT") { $json.GOMP_SPINCOUNT } else { "default" }
     return "wait=$wait, spin=$spin"
@@ -228,7 +213,7 @@ function Run-KernelSweep {
     Stop-ExistingBenchmarkContainers
 
     $EnvOverrides = Get-DockerEnvOverrides
-    $CustomEnvFile = Write-DockerOmpEnvFile -Target custom -Threads $ThreadCount -Overrides $EnvOverrides
+    $RuntimeEnvFile = Write-RuntimeEnvFile -Threads $ThreadCount -Overrides $EnvOverrides
     $SweepLog = Join-Path $DiagDir "kernel_sweep_pad${Pad}_k${KMin}-${KMax}.log"
 
     Write-Host ""
@@ -244,12 +229,12 @@ function Run-KernelSweep {
     Invoke-DockerBenchmarkRun `
         -Name "ml-engine-bench-sweep" `
         -Image $CustomImg `
-        -EnvFile $CustomEnvFile `
+        -EnvFile $RuntimeEnvFile `
         -ExtraArgs @("--entrypoint", "python") `
         -CommandArgs @(
             "-u", "benchmarks/sweep_kernel_pad.py",
             "--k-min", "$KMin", "--k-max", "$KMax", "--pad", "$Pad",
-            "--output", "/workspace/$($DockerYaml.diagnostics_dir)/kernel_sweep_pad${Pad}_k${KMin}-${KMax}.log"
+            "--output", "/workspace/$($RuntimeYaml.diagnostics_dir)/kernel_sweep_pad${Pad}_k${KMin}-${KMax}.log"
         )
 
     if ($LASTEXITCODE -ne 0) {
@@ -266,12 +251,11 @@ function Run-Benchmarks {
     Stop-ExistingBenchmarkContainers
 
     $EnvOverrides = Get-DockerEnvOverrides
-    $PyTorchEnvFile = Write-DockerOmpEnvFile -Target pytorch -Threads $ThreadCount -Overrides $EnvOverrides
-    $CustomEnvFile = Write-DockerOmpEnvFile -Target custom -Threads $ThreadCount -Overrides $EnvOverrides
+    $RuntimeEnvFile = Write-RuntimeEnvFile -Threads $ThreadCount -Overrides $EnvOverrides
 
     $OnednnDisplay = $EnvOverrides["ONEDNN_VERBOSE"]
     if (-not $OnednnDisplay) {
-        $OnednnDisplay = (& python $DockerEnvScript --target pytorch --threads $ThreadCount --format json | ConvertFrom-Json).ONEDNN_VERBOSE
+        $OnednnDisplay = (& python $RuntimeScript --threads $ThreadCount --platform linux --format json | ConvertFrom-Json).ONEDNN_VERBOSE
     }
 
     Write-Host ""
@@ -279,9 +263,8 @@ function Run-Benchmarks {
     Write-Host "  DOCKER CONVERGENCE BENCHMARK ORCHESTRATOR - ISOLATED RUN" -ForegroundColor Yellow
     Write-Host "  Hardware Allocation  : $Cores Dedicated Cores (cpuset: $CpuSet)" -ForegroundColor Yellow
     Write-Host "  OpenMP Thread Count  : $ThreadCount" -ForegroundColor Yellow
-    Write-Host "  PyTorch OMP Profile  : $(Get-DockerOmpProfileSummary -Target pytorch -Threads $ThreadCount)" -ForegroundColor Yellow
-    Write-Host "  Custom OMP Profile   : $(Get-DockerOmpProfileSummary -Target custom -Threads $ThreadCount)" -ForegroundColor Yellow
-    Write-Host "  oneDNN Verbose Level : $OnednnDisplay (config/docker_omp.yaml)" -ForegroundColor Yellow
+    Write-Host "  Runtime OMP Profile  : $(Get-RuntimeProfileSummary -Threads $ThreadCount)" -ForegroundColor Yellow
+    Write-Host "  oneDNN Verbose Level : $OnednnDisplay (config/runtime.yaml)" -ForegroundColor Yellow
     Write-Host "==================================================================" -ForegroundColor Yellow
 
     # 1. Run PyTorch in isolation
@@ -290,7 +273,7 @@ function Run-Benchmarks {
     Invoke-DockerBenchmarkRun `
         -Name "ml-engine-bench-pytorch" `
         -Image $PyTorchImg `
-        -EnvFile $PyTorchEnvFile `
+        -EnvFile $RuntimeEnvFile `
         -CommandArgs @("--target=pytorch")
 
     if ($LASTEXITCODE -ne 0) {
@@ -304,7 +287,7 @@ function Run-Benchmarks {
     Invoke-DockerBenchmarkRun `
         -Name "ml-engine-bench-custom" `
         -Image $CustomImg `
-        -EnvFile $CustomEnvFile `
+        -EnvFile $RuntimeEnvFile `
         -CommandArgs @("--target=custom")
 
     if ($LASTEXITCODE -ne 0) {

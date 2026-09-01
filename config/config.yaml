@@ -69,6 +69,7 @@ architecture:
 # =====================================================================
 # OPTIMIZATION LOOP CONTROLS
 # =====================================================================
+# Thread / BLAS / OMP policy: config/runtime.yaml (see utils/runtime.py)
 optimization:
   num_threads: 4
   optimizer: "adam"

@@ -1,0 +1,38 @@
+# Threading / pool policy (single source of truth for desktop, tests, Docker).
+# num_threads <- config.yaml optimization.num_threads
+#
+# env:          shared across platforms
+# linux:        GNU libgomp (Docker + Linux native conv)
+# windows:      Intel OpenMP / MKL (PyTorch, NumPy wheels on Windows)
+# blas_threads: per-backend caps via threadpoolctl during fit (Python-side)
+# docker:       container benchmark paths only
+
+env:
+  OMP_DYNAMIC: "false"
+  OMP_MAX_ACTIVE_LEVELS: "1"
+  PYTHONUNBUFFERED: "1"
+  ONEDNN_VERBOSE: "0"
+
+linux:
+  OMP_PROC_BIND: "false"
+  OMP_WAIT_POLICY: "ACTIVE"
+  GOMP_SPINCOUNT: "500000"
+
+windows:
+  KMP_BLOCKTIME: "5"
+  KMP_AFFINITY: "none"
+  KMP_DUPLICATE_LIB_OK: "TRUE"
+  OMP_WAIT_POLICY: "ACTIVE"
+
+blas_threads:
+  native: 1
+  numpy: null          # null -> use optimization.num_threads
+  im2col_gemm: null
+
+docker:
+  benchmark_runner:
+    - python
+    - -u
+    - benchmarks/run_benchmarks_docker.py
+  diagnostics_dir: benchmark_diagnostics
+  results_file: benchmark_diagnostics/docker_benchmark_results.json

@@ -1,16 +1,20 @@
 # run_pipeline.py
 import logging
-import numpy as np
-from threadpoolctl import threadpool_limits
+import sys
 
 from config.config_loader import load_production_config
+from config.constants import IngestionMode, ModelType, DataKeys
 from src.data.base_loader import BaseDataLoader
 from src.data.in_memory_provider import InMemoryDataProvider
 from src.data.stream_provider import StreamDataProvider
 from src.controller import ModelController
-from config.constants import IngestionMode, ModelType, DataKeys
 from utils.logger import initialize_global_logging
 from utils.diagnostics import NeuralNetworkDiagnostics
+from utils.runtime import apply_process_env, configure_runtime, load_runtime_settings, training_threadpool
+
+apply_process_env(load_runtime_settings(), if_unset=True)
+
+import numpy as np
 
 @profile
 def execute_training_pipeline():
@@ -21,9 +25,11 @@ def execute_training_pipeline():
     # 2. Initialize enterprise dual-destination logging
     initialize_global_logging(cfg)
 
-    # 3. Resolve Thread Limit from Config
-    num_threads = getattr(cfg.optimization, "num_threads", 4)
-    logging.info(f"[Runtime] Scoping OpenMP/BLAS thread pools to {num_threads} threads via threadpoolctl.")
+    # 3. Runtime threading policy (config/runtime.yaml)
+    runtime = configure_runtime(
+        cfg.architecture.backend,
+        config_path="config/config.yaml",
+    )
 
     is_cnn = (cfg.architecture.model_type == ModelType.CNN)
     source_mode = cfg.ingestion.source_mode
@@ -109,7 +115,7 @@ def execute_training_pipeline():
         logging.info("=============================\n")
 
     # 9. Train Model & Execute Diagnostics Inside Thread-Clamped Context
-    with threadpool_limits(limits=num_threads):
+    with training_threadpool(runtime, cfg.architecture.backend):
         train_history, val_history = controller.fit(
             steps=steps,
             source_mode=source_mode,

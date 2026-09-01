@@ -6,65 +6,27 @@ import time
 import ctypes
 import getpass
 import platform
-import yaml
-import numpy as np
 import warnings
-from threadpoolctl import threadpool_limits
-
-warnings.filterwarnings("ignore", category=RuntimeWarning, module="threadpoolctl")
-
-
-def _training_threadpool(num_threads: int):
-    """Cap BLAS pools during fit; OMP conv threads follow OMP_NUM_THREADS."""
-    blas_raw = os.environ.get("OPENBLAS_NUM_THREADS")
-    if blas_raw is None:
-        return threadpool_limits(limits=num_threads)
-    blas = int(blas_raw)
-    if blas == num_threads:
-        return threadpool_limits(limits=num_threads)
-    return threadpool_limits(
-        limits={"openblas": blas, "blas": blas, "openmp": num_threads}
-    )
-
-
-# -----------------------------------------------------------------------------
-# 1. Enforce Thread Environment Variables BEFORE Torch/BLAS Imports
-# -----------------------------------------------------------------------------
-_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "config", "config.yaml")
-_NUM_THREADS = 4
-if os.path.exists(_CONFIG_PATH):
-    try:
-        with open(_CONFIG_PATH, "r") as _f:
-            _raw_cfg = yaml.safe_load(_f)
-            _NUM_THREADS = int(_raw_cfg.get("optimization", {}).get("num_threads", 4))
-    except Exception:
-        pass
-
-if "OMP_NUM_THREADS" not in os.environ:
-    os.environ["OMP_NUM_THREADS"] = str(_NUM_THREADS)
-if "MKL_NUM_THREADS" not in os.environ:
-    os.environ["MKL_NUM_THREADS"] = str(_NUM_THREADS)
-if "OPENBLAS_NUM_THREADS" not in os.environ:
-    os.environ["OPENBLAS_NUM_THREADS"] = str(_NUM_THREADS)
-if "VECLIB_MAXIMUM_THREADS" not in os.environ:
-    os.environ["VECLIB_MAXIMUM_THREADS"] = str(_NUM_THREADS)
-if "NUMEXPR_NUM_THREADS" not in os.environ:
-    os.environ["NUMEXPR_NUM_THREADS"] = str(_NUM_THREADS)
-if "OMP_THREAD_LIMIT" not in os.environ:
-    os.environ["OMP_THREAD_LIMIT"] = str(_NUM_THREADS)
-if "KMP_ALL_THREADS" not in os.environ:
-    os.environ["KMP_ALL_THREADS"] = str(_NUM_THREADS)
-if "KMP_DEVICE_THREAD_LIMIT" not in os.environ:
-    os.environ["KMP_DEVICE_THREAD_LIMIT"] = str(_NUM_THREADS)
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-if "KMP_BLOCKTIME" not in os.environ:
-    os.environ["KMP_BLOCKTIME"] = "5"
-if "KMP_AFFINITY" not in os.environ:
-    os.environ["KMP_AFFINITY"] = "none"
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
+
+from utils.runtime import (
+    apply_process_env,
+    load_runtime_settings,
+    log_runtime_settings,
+    training_threadpool,
+)
+
+# Apply threading env from config/runtime.yaml before NumPy/BLAS init.
+_RUNTIME = load_runtime_settings()
+apply_process_env(_RUNTIME, if_unset=True)
+
+import yaml
+import numpy as np
+
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="threadpoolctl")
 
 from config.constants import ModelType, IngestionMode, LRHierarchy, DataKeys, EngineBackend
 from src.controller import ModelController
@@ -492,7 +454,10 @@ def run_pytorch_benchmark(
     torch_forward_counts = 0
     torch_backward_counts = 0
 
-    with _training_threadpool(num_threads):
+    settings = load_runtime_settings(num_threads=num_threads)
+    log_runtime_settings(settings, EngineBackend.NUMPY, prefix="[Benchmark PyTorch]")
+
+    with training_threadpool(settings, EngineBackend.NUMPY):
         for ep in range(epochs):
             torch_model.train()
             running_loss = torch.tensor(0.0)
@@ -661,7 +626,10 @@ def run_custom_engine_benchmark(
 
     custom_total_params = extract_custom_engine_param_count(controller)
 
-    with _training_threadpool(num_threads):
+    settings = load_runtime_settings(num_threads=num_threads)
+    log_runtime_settings(settings, backend, prefix="[Benchmark Custom]")
+
+    with training_threadpool(settings, backend):
         t0_train = time.perf_counter()
         train_history, val_history = controller.fit(
             steps=data_provider.recomment_steps(),

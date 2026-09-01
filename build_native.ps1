@@ -41,7 +41,7 @@ $BuildBat = Join-Path $env:TEMP "ml-engine-build-native.bat"
 
 call "$Vcvars" >nul
 cd /d "$Root"
-cl.exe /nologo /O2 /Oi /Ot /Ox /GL /Gy /Gw /fp:fast /arch:AVX2 /openmp:llvm /DNDEBUG /LD /I. /Isrc\native $SymbolCl src\native\conv_1x1.cpp src\native\conv_3x3.cpp src\native\conv_5x5.cpp src\native\conv_fallback.cpp src\native\conv_dispatcher.cpp /Fo:bin\ /Fe:bin\conv_kernels_stage.dll /link /LTCG /OPT:REF /OPT:ICF /NODEFAULTLIB:libcmtd.lib /NODEFAULTLIB:msvcrtd.lib /IMPLIB:bin\conv_kernels.lib $SymbolLink
+cl.exe /nologo /O2 /Oi /Ot /Ox /GL /Gy /Gw /fp:fast /arch:AVX2 /openmp:llvm /DNDEBUG /LD /I. /Isrc\native $SymbolCl src\native\conv_fallback.cpp src\native\conv_dispatcher.cpp /Fo:bin\ /Fe:bin\conv_kernels_stage.dll /link /LTCG /OPT:REF /OPT:ICF /NODEFAULTLIB:libcmtd.lib /NODEFAULTLIB:msvcrtd.lib /IMPLIB:bin\conv_kernels.lib $SymbolLink
 exit /b %ERRORLEVEL%
 
 "@ | Set-Content -Path $BuildBat -Encoding ASCII

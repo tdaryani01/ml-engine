@@ -6,7 +6,7 @@ import sys
 # Ensure workspace root is in sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from utils.docker_omp_env import get_docker_section
+from utils.runtime import get_docker_section
 
 import numpy as np
 from config.constants import DataKeys

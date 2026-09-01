@@ -11,9 +11,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Slim deps for native-backend benchmark (no numba/scipy/llvmlite)
 COPY requirements-docker-custom.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements-docker-custom.txt
+    pip install -r requirements-docker-custom.txt && \
+    pip install --extra-index-url https://download.pytorch.org/whl/cpu torch
 
-# Copy source repository (includes config/docker_omp.yaml)
+# Copy source repository (includes config/runtime.yaml)
 COPY . .
 
 # Compile native kernels
@@ -25,7 +26,6 @@ RUN mkdir -p bin && \
     -Isrc/native \
     -o bin/conv_kernels.so'
 
-ENV DOCKER_OMP_TARGET=custom
 RUN sed -i 's/\r$//' scripts/docker_bench_entrypoint.sh && chmod +x scripts/docker_bench_entrypoint.sh
 
 ENTRYPOINT ["/workspace/scripts/docker_bench_entrypoint.sh"]

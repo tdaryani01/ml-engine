@@ -1,10 +1,8 @@
 #!/bin/sh
 set -e
 
-TARGET="${DOCKER_OMP_TARGET:?DOCKER_OMP_TARGET must be set (pytorch or custom)}"
-
-if [ -n "${DOCKER_OMP_NUM_THREADS:-}" ]; then
-  THREADS="${DOCKER_OMP_NUM_THREADS}"
+if [ -n "${RUNTIME_NUM_THREADS:-}" ]; then
+  THREADS="${RUNTIME_NUM_THREADS}"
 else
   THREADS="$(python - <<'PY'
 import yaml
@@ -21,7 +19,7 @@ PY
 )"
 fi
 
-eval "$(python /workspace/utils/docker_omp_env.py --target "$TARGET" --threads "$THREADS" --format shell-exports --if-unset)"
+eval "$(python /workspace/utils/runtime.py --threads "$THREADS" --format shell-exports --if-unset)"
 
 # docker run IMAGE --target=... replaces CMD; restore default benchmark command.
 if [ "$#" -eq 0 ] || [ "${1#-}" != "$1" ]; then
