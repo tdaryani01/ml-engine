@@ -93,6 +93,16 @@ optimization:
   gradient_clipping_max_norm: 5.0
 
 # =====================================================================
+# TRAINING LEDGER (Phase E — append-only document log during fit)
+# =====================================================================
+ledger:
+  enabled: true
+  path: "training_ledger"
+  branch_id: "main"
+  checkpoint_every_steps: 50
+  checkpoint_on_local_best: true
+
+# =====================================================================
 # REGULARIZATION STRAIN MATRIX
 # =====================================================================
 regularization:

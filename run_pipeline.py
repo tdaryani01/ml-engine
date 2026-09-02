@@ -134,7 +134,9 @@ def execute_training_pipeline():
             model_type=cfg.architecture.model_type,
             early_stopping_enabled=cfg.optimization.early_stopping_enabled,
             patience=cfg.optimization.patience,
-            min_delta=cfg.optimization.min_delta
+            min_delta=cfg.optimization.min_delta,
+            ledger_settings=cfg.ledger,
+            output_dir=cfg.meta.output_dir,
         )
 
         if cfg.architecture.backend == EngineBackend.IM2COL_GEMM:

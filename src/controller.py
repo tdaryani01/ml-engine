@@ -9,6 +9,7 @@ from src.serializer import ModelSerializer
 from src.schedulers import StepDecay, ExponentialDecay
 from src.training_session import TrainingSession
 from config.constants import ModelType, LRHierarchy, EngineBackend
+from config.schema import LedgerSettings
 
 
 class ModelController:
@@ -143,7 +144,9 @@ class ModelController:
         model_type: ModelType,
         early_stopping_enabled: bool = True,
         patience: int = 15,
-        min_delta: float = 1e-5
+        min_delta: float = 1e-5,
+        ledger_settings: LedgerSettings | None = None,
+        output_dir: str = "diagnostics_output",
     ) -> Tuple[List[float], List[float]]:
         """Executes the training loop via TrainingSession (Phase C boundary)."""
         if self.model is None:
@@ -159,6 +162,29 @@ class ModelController:
             predict_fn=self.predict,
         )
         session.steps_completed = self.steps_completed
+
+        engine = None
+        if ledger_settings is not None and ledger_settings.enabled:
+            import os
+
+            from src.ledger import LedgerConfig
+            from src.training_engine import create_training_engine
+
+            ledger_dir = os.path.join(output_dir, ledger_settings.path)
+            arch_id = model_type.name if hasattr(model_type, "name") else str(model_type)
+            engine = create_training_engine(
+                session,
+                ledger_dir,
+                branch_id=ledger_settings.branch_id,
+                model_instance_id=ledger_settings.branch_id,
+                architecture_id=arch_id,
+                config=LedgerConfig(
+                    checkpoint_every_steps=ledger_settings.checkpoint_every_steps,
+                    checkpoint_on_local_best=ledger_settings.checkpoint_on_local_best,
+                ),
+            )
+            logging.info("[Model Controller] Training ledger enabled: %s", ledger_dir)
+
         self.train_history, self.val_history = session.fit(
             steps=steps,
             source_mode=source_mode,
@@ -167,6 +193,7 @@ class ModelController:
             patience=patience,
             min_delta=min_delta,
             compute_r2_score=self.compute_r2_score,
+            engine=engine,
         )
         self.steps_completed = session.steps_completed
         return self.train_history, self.val_history

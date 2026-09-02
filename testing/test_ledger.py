@@ -8,7 +8,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from config.constants import EngineBackend
+from config.constants import EngineBackend, IngestionMode, ModelType, LRHierarchy
+from config.schema import LedgerSettings
 from src.ledger import (
     BatchRef,
     CHECKPOINT,
@@ -23,8 +24,9 @@ from src.ledger import (
     train_step_result_to_body,
 )
 from src.model_factory import ModelFactory
-from src.training_engine import StepInput, TrainingEngine
+from src.training_engine import StepInput, TrainingEngine, create_training_engine
 from src.training_session import TrainStepResult, TrainingSession
+from src.controller import ModelController
 
 
 def _tiny_cnn():
@@ -206,6 +208,92 @@ def test_e5_fork_freezes_parent():
     print("[PASSED] E5: fork freezes parent and copies checkpoint")
 
 
+def test_e6_prime_fit_with_ledger_and_early_stop_rollback():
+    """E6′: fit via controller writes ledger; ES rollback uses ledger checkpoint."""
+    import shutil
+
+    rng = np.random.default_rng(11)
+    lr = 0.01
+    ledger_root = tempfile.mkdtemp(prefix="ml_engine_ledger_fit_")
+    try:
+        class _Provider:
+            def __init__(self):
+                self.batch_size = 4
+                self._cursor = 0
+                self._epoch = 0
+                self.X = rng.standard_normal((8, 1, 28, 32), dtype=np.float32)
+                self.y = np.eye(4, dtype=np.float32)
+                self.y = np.vstack([self.y, self.y])
+                self.splits = {}
+                self.y_train_processed = self.y
+
+            def get_validation_set(self):
+                return self.X[:4], self.y[:4]
+
+            def reset_epoch(self):
+                self._cursor = 0
+                self._epoch += 1
+
+            def has_more_batches(self):
+                return self._cursor < len(self.X)
+
+            def next_batch(self):
+                end = min(self._cursor + self.batch_size, len(self.X))
+                x, y = self.X[self._cursor:end], self.y[self._cursor:end]
+                self._cursor = end
+                return x, y
+
+            def normalize(self, x):
+                return x
+
+        provider = _Provider()
+        controller = ModelController(data_provider=provider, learning_rate=lr)
+        controller.initialize_network_from_dimensions(
+            input_dim=28 * 32,
+            output_dim=4,
+            model_type=ModelType.CNN,
+            hidden_layers=[],
+            cnn_config={
+                "input_shape": [1, 28, 28],
+                "spatial_pipeline": [
+                    {"type": "conv", "in_channels": 1, "out_channels": 4, "kernel_size": 3, "stride": 1, "pad": 1},
+                    {"type": "relu"},
+                    {"type": "pool", "pool_size": 2, "stride": 2},
+                    {"type": "flatten"},
+                ],
+                "dense_head": [8],
+            },
+            backend=EngineBackend.NATIVE,
+        )
+
+        ledger_cfg = LedgerSettings(
+            enabled=True,
+            path="branch_main",
+            branch_id="main",
+            checkpoint_every_steps=100,
+            checkpoint_on_local_best=True,
+        )
+        controller.fit(
+            steps=8,
+            source_mode=IngestionMode.CSV,
+            model_type=ModelType.CNN,
+            early_stopping_enabled=False,
+            ledger_settings=ledger_cfg,
+            output_dir=ledger_root,
+        )
+
+        from src.ledger import FileLedgerStore
+
+        store = FileLedgerStore(os.path.join(ledger_root, "branch_main"))
+        assert store.head_lsn() > 0
+        journal_types = {d.doc_type for d in store.scan()}
+        assert "step.command" in journal_types
+        assert "step.result" in journal_types
+        print("[PASSED] E6′: fit with ledger writes step documents")
+    finally:
+        shutil.rmtree(ledger_root, ignore_errors=True)
+
+
 PHASE_E_TESTS = [
     test_e1_batch_ref_uuid_unique,
     test_e1_document_round_trip,
@@ -215,6 +303,7 @@ PHASE_E_TESTS = [
     test_e3_engine_matches_train_and_apply,
     test_e5_replay_from_checkpoint,
     test_e5_fork_freezes_parent,
+    test_e6_prime_fit_with_ledger_and_early_stop_rollback,
 ]
 
 

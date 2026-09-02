@@ -77,6 +77,7 @@ class TrainingSession:
         self.steps_completed = 0
         self.train_history: List[float] = []
         self.val_history: List[float] = []
+        self.engine: Any = None  # TrainingEngine when ledger enabled
 
     def train_step(self, X: np.ndarray, y: np.ndarray, lr: float) -> TrainStepResult:
         """Forward + backward grad compute; does not mutate weights."""
@@ -138,8 +139,19 @@ class TrainingSession:
         patience: int = 15,
         min_delta: float = 1e-5,
         compute_r2_score: Callable[[np.ndarray, np.ndarray], float] | None = None,
+        engine: Any = None,
     ) -> Tuple[List[float], List[float]]:
         """Epoch training loop (extracted from ModelController)."""
+        self.engine = engine
+        if engine is not None:
+            logging.info(
+                "[TrainingSession] Ledger active: branch=%s path=%s version=%d",
+                engine.ledger.branch_id,
+                getattr(engine.ledger.store, "root", "?"),
+                engine.ledger.version,
+            )
+            if engine.ledger.version == 0:
+                engine.ledger.push_checkpoint(self.model, version=0)
         epoch = 0
         is_classification = model_type in (
             ModelType.BINARY_CLASSIFICATION,
@@ -174,6 +186,7 @@ class TrainingSession:
             "patience_counter": 0,
             "weights": None,
             "biases": None,
+            "best_version": None,
         }
 
         while True:
@@ -196,7 +209,10 @@ class TrainingSession:
             )
 
             if early_stopping_enabled:
-                if self._handle_early_stopping(epoch, current_val_raw_cost, min_delta, patience, es_state):
+                if self._handle_early_stopping(
+                    epoch, current_val_raw_cost, min_delta, patience, es_state,
+                    current_val_loss=current_val_loss,
+                ):
                     break
             epoch += 1
 
@@ -218,13 +234,21 @@ class TrainingSession:
         batch_idx = 0
         forensic_data: Dict[str, Any] = {}
 
+        from src.ledger import BatchRef
+        from src.training_engine import StepInput
+
         while self.data_provider.has_more_batches():
             X_b, y_b = self.data_provider.next_batch()
             if X_b.size == 0:
                 break
 
             X_b_norm = self.data_provider.normalize(X_b)
-            batch_loss = self.train_and_apply(X_b_norm, y_b, active_lr)
+            if self.engine is not None:
+                batch_ref = BatchRef.new(epoch=epoch, batch_idx=batch_idx)
+                step = StepInput(X=X_b_norm, y=y_b, batch_ref=batch_ref, lr=active_lr)
+                batch_loss = self.engine.run_step(step)
+            else:
+                batch_loss = self.train_and_apply(X_b_norm, y_b, active_lr)
             batch_losses.append(batch_loss)
 
             if batch_idx == 0 and epoch % 10 == 0:
@@ -317,6 +341,7 @@ class TrainingSession:
         min_delta: float,
         patience: int,
         es_state: Dict[str, Any],
+        current_val_loss: float | None = None,
     ) -> bool:
         if current_val_raw_cost < (es_state["best_val_loss"] - min_delta):
             es_state["best_val_loss"] = current_val_raw_cost
@@ -324,6 +349,20 @@ class TrainingSession:
             es_state["patience_counter"] = 0
             es_state["weights"] = copy.deepcopy(self.model.weights)
             es_state["biases"] = copy.deepcopy(self.model.biases)
+            if self.engine is not None:
+                version = self.engine.ledger.version
+                self.engine.ledger.push_checkpoint(
+                    self.model,
+                    version=version,
+                    val_loss=current_val_loss,
+                    is_local_best=True,
+                )
+                es_state["best_version"] = version
+                logging.info(
+                    "[Early Stopping] New best epoch %d → ledger checkpoint version=%d",
+                    epoch,
+                    version,
+                )
             return False
 
         es_state["patience_counter"] += 1
@@ -332,10 +371,17 @@ class TrainingSession:
                 f"[Early Stopping] Validation divergence at epoch {epoch}. "
                 f"Restoring best checkpoint from epoch {es_state['best_epoch']}."
             )
-            self.model.weights = es_state["weights"]
-            self.model.biases = es_state["biases"]
-            if hasattr(self.model, "_sync_restored_weights"):
-                self.model._sync_restored_weights()
+            if self.engine is not None and es_state.get("best_version") is not None:
+                self.engine.ledger.restore_checkpoint(self.model, int(es_state["best_version"]))
+                logging.info(
+                    "[Early Stopping] Restored weights from ledger version=%s",
+                    es_state["best_version"],
+                )
+            else:
+                self.model.weights = es_state["weights"]
+                self.model.biases = es_state["biases"]
+                if hasattr(self.model, "_sync_restored_weights"):
+                    self.model._sync_restored_weights()
             return True
         return False
 

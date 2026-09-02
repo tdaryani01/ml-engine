@@ -347,18 +347,18 @@ after integration.
 | **E3** | `TrainingLedger` + single-thread consolidator / main loop | Replaces threaded E3 in roadmap |
 | **E4** | `FileLedgerStore` + checkpoint files | Crash recovery, replay |
 | **E5** | Rewind + fork + read-only replay | Branch tests |
-| **E6** | `TrainingManager` policy hooks (local best, last healthy) | Wire to early-stop semantics |
-| **E7** | Multi-slot / PathRecord / cross-model handoff | After v1 proof |
-| **E8** | VM transport doc | Redis/SQS/Kafka TBD |
+| **E6** | Ledger ↔ early-stop rollback (local-best checkpoint) | Align ES restore with ledger checkpoint |
+| **E7** | Multi-slot / PathRecord / cross-model handoff | After ledger + ES solid |
+| **E8** | Auto-fork / overfit policy (`TrainingManager`) | **Deferred** — ES is manager this phase |
+| **E9** | VM transport doc | Redis/SQS/Kafka TBD |
 
-### Exit criteria (revised)
+### Exit criteria (this phase)
 
-1. **E v1:** Replay from checkpoint matches sequential `train_and_apply` for N
-   steps (same seed, one branch).
-2. **E v1.5:** Rewind to local-best checkpoint + fork produces expected branch
-   isolation on tape.
-3. **E v2:** Manager detects synthetic overfit curve and forks; frozen branch
-   retained.
+1. **E v1:** Replay from checkpoint matches sequential `train_and_apply` for N steps ✅
+2. **E v1′:** Local-best ledger checkpoint = early-stop rollback target (same weights)
+3. Fork/replay infrastructure in place for later policy layer ✅
+
+~~**E v2:** Manager detects synthetic overfit and forks automatically.~~ Deferred.
 
 ---
 
@@ -380,3 +380,4 @@ All Phase E planning questions resolved. See decisions log.
 | 2026-09-02 | Q4: grads + metrics on tape; full snapshots at checkpoint events — [ledger-record-model.md](./ledger-record-model.md) |
 | 2026-09-02 | Q5: `batch_id` UUID per fetch; epoch/batch_idx hints only |
 | 2026-09-02 | Q6: `TrainingEngine` + tests first; no `ModelController` wire until E gates pass |
+| 2026-09-02 | This phase: early stopping = manager; defer auto-fork / E6 policy layer |

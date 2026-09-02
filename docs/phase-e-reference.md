@@ -197,23 +197,41 @@ Checkpoint at 420 must include **weights + Adam m/v/t** at 420 (not head at 500)
 
 ---
 
+## Training manager — this phase
+
+**Early stopping is the manager for now.** Existing `TrainingSession.fit()` already:
+
+- Tracks best validation epoch
+- Stops when patience expires
+- **Rolls back** weights to the best checkpoint (in RAM today)
+
+Phase E does **not** add a separate `TrainingManager` with auto-fork / overfit
+policies yet. The ledger must **support** that same story:
+
+- `checkpoint` documents at **local best val** = the rewind target early stopping uses
+- Tape keeps the full path; rollback = load that checkpoint document
+
+**Deferred (post–function-proper):** E6 auto-fork, SUSPECT/OVERFIT verdict policies,
+multi-model handoff. Get ledger + early-stop rollback aligned first.
+
+---
+
 ## Implementation phases & exit criteria
 
-| ID | Deliverable |
-|----|-------------|
-| E1 | `LedgerStore` + `LedgerDocument` + doc_type schemas |
-| E2 | `TrainStepResult` serialize round-trip |
-| E3 | `TrainingEngine` main loop |
-| E4 | `FileLedgerStore` + checkpoint sidecars |
-| E5 | Rewind + fork + read-only replay tests |
-| E6 | `TrainingManager` policy (local best, last healthy) |
-| E7+ | Multi-slot, path.record handoff, VM transport doc |
+| ID | Deliverable | Status |
+|----|-------------|--------|
+| E1 | `LedgerStore` + `LedgerDocument` + doc_type schemas | done |
+| E2 | `TrainStepResult` serialize round-trip | done |
+| E3 | `TrainingEngine` main loop | done |
+| E4 | `FileLedgerStore` + checkpoint sidecars | done |
+| E5 | Rewind + fork + read-only replay tests | done |
+| E6′ | Ledger ↔ early-stop rollback (local-best checkpoint) | **next** |
+| E7+ | Multi-slot, path.record, auto-fork policy | deferred |
 
-**Exit v1:** Replay from checkpoint matches `train_and_apply` for N steps (same seed).
+**Exit this phase:** Ledger replay works; local-best checkpoint matches early-stop
+restore; no new policy layer until that is solid.
 
-**Exit v1.5:** Fork from local-best; frozen branch intact on tape.
-
-**Exit v2:** Synthetic overfit triggers fork.
+~~**Exit v2:** Synthetic overfit triggers fork.~~ Deferred.
 
 ---
 
@@ -245,3 +263,4 @@ Scratch buffers, activations, dataset blobs, DLL handles, global backend singlet
 | 2026-09-02 | Q4: grads on tape; full weights at checkpoints only |
 | 2026-09-02 | Q5: batch_id UUID; epoch/batch_idx hints |
 | 2026-09-02 | Q6: TrainingEngine + tests before ModelController |
+| 2026-09-02 | **This phase:** early stopping = manager (stop + rollback to best); defer E6 auto-fork |

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from src.ledger import LedgerConfig, TrainingLedger, VERDICT_HEALTHY
+from src.ledger import BatchRef, LedgerConfig, TrainingLedger, VERDICT_HEALTHY
 from src.training_session import TrainingSession
 
 
@@ -110,3 +110,29 @@ class TrainingEngine:
                 self.ledger.push_checkpoint(self.session.model, version=target)
         child_ledger = self.ledger.fork_branch(new_branch_id, target, reason, settings_delta)
         return TrainingEngine(session=self.session, ledger=child_ledger, config=self.config)
+
+
+def create_training_engine(
+    session: TrainingSession,
+    ledger_dir: str,
+    *,
+    branch_id: str = "main",
+    model_instance_id: str = "default",
+    architecture_id: str = "unknown",
+    config: LedgerConfig | None = None,
+) -> TrainingEngine:
+    """Open FileLedgerStore and return a TrainingEngine bound to session."""
+    from pathlib import Path
+
+    from src.ledger import FileLedgerStore
+
+    root = Path(ledger_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    store = FileLedgerStore(root)
+    ledger = TrainingLedger(
+        store=store,
+        branch_id=branch_id,
+        model_instance_id=model_instance_id,
+        architecture_id=architecture_id,
+    )
+    return TrainingEngine(session=session, ledger=ledger, config=config)

@@ -93,6 +93,15 @@ class PersistenceConfig:
     model_asset_path: str
 
 @dataclass(frozen=True)
+class LedgerSettings:
+    """Phase E: append-only training document log (optional during fit)."""
+    enabled: bool = False
+    path: str = "training_ledger"
+    branch_id: str = "main"
+    checkpoint_every_steps: int = 50
+    checkpoint_on_local_best: bool = True
+
+@dataclass(frozen=True)
 class DiagnosticsConfig:
     """Defines plotting and output properties for pipeline diagnostics."""
     enabled: bool
@@ -114,3 +123,4 @@ class PipelineConfig:
     transformations: TransformationsConfig
     persistence: PersistenceConfig
     diagnostics: DiagnosticsConfig
+    ledger: LedgerSettings = field(default_factory=LedgerSettings)
