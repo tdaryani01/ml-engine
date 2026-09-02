@@ -43,6 +43,22 @@ def test_conv_backends_dll_omp_pinned():
     print("[PASSED] DLL shared LLVM OMP pool: dll_omp=4")
 
 
+def test_d9_unified_openblas_when_dll_present():
+    """D9: bin/libopenblas.dll present => unified LLVM OMP (not scipy capsule)."""
+    from pathlib import Path
+
+    from utils.conv_dispatch import bootstrap_im2col_gemm_runtime, native_blas_unified_omp
+
+    root = Path(__file__).resolve().parents[1]
+    dll = root / "bin" / "libopenblas.dll"
+    if not dll.exists():
+        print("[SKIPPED] D9: bin/libopenblas.dll not present")
+        return
+    bootstrap_im2col_gemm_runtime()
+    assert native_blas_unified_omp(), "bin/libopenblas.dll present but unified_omp=False"
+    print("[PASSED] D9: unified OpenBLAS runtime active")
+
+
 def test_conv_backends_numba_pinned_during_fit():
     import numba
 
@@ -63,6 +79,7 @@ def test_conv_backends_numba_pinned_during_fit():
 RUNTIME_TESTS = [
     test_conv_backends_shared_omp,
     test_conv_backends_dll_omp_pinned,
+    test_d9_unified_openblas_when_dll_present,
     test_conv_backends_numba_pinned_during_fit,
 ]
 

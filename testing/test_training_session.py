@@ -34,6 +34,19 @@ def _tiny_cnn():
     )
 
 
+def _clone_cnn_weights(template, target) -> None:
+    for w_t, w_s in zip(target.weights, template.weights):
+        w_t[...] = w_s
+    for b_t, b_s in zip(target.biases, template.biases):
+        b_t[...] = b_s
+    if hasattr(target, "gammas") and hasattr(template, "gammas"):
+        for g_t, g_s in zip(target.gammas, template.gammas):
+            g_t[...] = g_s
+    if hasattr(target, "betas") and hasattr(template, "betas"):
+        for b_t, b_s in zip(target.betas, template.betas):
+            b_t[...] = b_s
+
+
 def _batch():
     rng = np.random.default_rng(0)
     X = rng.standard_normal((4, 1, 28, 32), dtype=np.float32)
@@ -110,11 +123,33 @@ def test_c_two_training_sessions():
     print("[PASSED] C: two TrainingSession instances are independent")
 
 
+def test_e_bridge_sequential_worker_grad_parity():
+    """E-bridge: two sequential workers (same weights) emit identical TrainStepResult."""
+    template = _tiny_cnn()
+    X, y = _batch()
+
+    worker_a = _tiny_cnn()
+    worker_b = _tiny_cnn()
+    _clone_cnn_weights(template, worker_a)
+    _clone_cnn_weights(template, worker_b)
+
+    result_a = TrainingSession(model=worker_a, data_provider=None, initial_lr=0.01).train_step(X, y, lr=0.01)
+    result_b = TrainingSession(model=worker_b, data_provider=None, initial_lr=0.01).train_step(X, y, lr=0.01)
+
+    assert abs(result_a.loss - result_b.loss) < 1e-5
+    for gw_a, gw_b in zip(result_a.grad_weights, result_b.grad_weights):
+        assert np.allclose(gw_a, gw_b, rtol=1e-5, atol=1e-5)
+    for gb_a, gb_b in zip(result_a.grad_biases, result_b.grad_biases):
+        assert np.allclose(gb_a, gb_b, rtol=1e-5, atol=1e-5)
+    print("[PASSED] E-bridge: sequential worker grad parity (native, separate models)")
+
+
 PHASE_C_TESTS = [
     test_c1_train_step_result_serializable,
     test_c2_train_step_no_weight_change,
     test_c3_apply_step_matches_backward,
     test_c_two_training_sessions,
+    test_e_bridge_sequential_worker_grad_parity,
 ]
 
 

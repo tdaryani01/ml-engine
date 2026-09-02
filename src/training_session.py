@@ -1,5 +1,11 @@
 # src/training_session.py
-"""Training session boundary: step results, grad compute vs optimizer apply, fit loop."""
+"""Training session boundary: step results, grad compute vs optimizer apply, fit loop.
+
+Worker policy (Phase E): one model + ScratchArena per worker; never share a
+TrainingSession or call train_step on the same model instance concurrently.
+Workers run sequentially or in separate processes; a single consolidator applies
+TrainStepResult batches.
+"""
 from __future__ import annotations
 
 import copy

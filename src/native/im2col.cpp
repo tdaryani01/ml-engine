@@ -349,7 +349,7 @@ void col2im_scatter(
     im2col_telemetry::add_col2im_tiles(tiles_fast, tiles_xclip, tiles_yclip, tiles_corner);
 }
 
-void im2col_tile(
+void im2col_one_row(
     const float* x,
     float* out,
     int64_t n,
@@ -361,29 +361,26 @@ void im2col_tile(
     int64_t k_w,
     int64_t stride,
     int64_t pad,
-    int64_t out_h,
-    int64_t out_w,
-    int64_t spatial_out,
-    int64_t col_cols,
     int64_t out_y,
+    int64_t out_x,
+    int64_t spatial_out,
+    int64_t out_w,
+    int64_t col_cols,
     uint64_t& tiles_fast,
     uint64_t& tiles_padded
 ) {
-    const int64_t n_row_base = n * spatial_out;
-    for (int64_t out_x = 0; out_x < out_w; ++out_x) {
-        const int64_t row_idx = n_row_base + out_y * out_w + out_x;
-        float* row = out + row_idx * col_cols;
-        if (full_tile_interior(out_y, out_x, k_h, k_w, stride, pad, H, W_logical)) {
-            ++tiles_fast;
-            im2col_row_fast(
-                x, row, n, C, H, W_logical, W_stride,
-                k_h, k_w, stride, pad, out_y, out_x);
-        } else {
-            ++tiles_padded;
-            im2col_row_padded(
-                x, row, n, C, H, W_logical, W_stride,
-                k_h, k_w, stride, pad, out_y, out_x);
-        }
+    const int64_t row_idx = n * spatial_out + out_y * out_w + out_x;
+    float* row = out + row_idx * col_cols;
+    if (full_tile_interior(out_y, out_x, k_h, k_w, stride, pad, H, W_logical)) {
+        ++tiles_fast;
+        im2col_row_fast(
+            x, row, n, C, H, W_logical, W_stride,
+            k_h, k_w, stride, pad, out_y, out_x);
+    } else {
+        ++tiles_padded;
+        im2col_row_padded(
+            x, row, n, C, H, W_logical, W_stride,
+            k_h, k_w, stride, pad, out_y, out_x);
     }
 }
 
@@ -433,20 +430,24 @@ __declspec(dllexport) int32_t im2col_avx2(
     ml_omp_before_parallel();
     const int32_t omp_n = get_omp_threads();
     if (omp_n > 1) {
-        #pragma omp parallel for num_threads(omp_n) collapse(2) schedule(static) reduction(+:tiles_fast,tiles_padded)
+        #pragma omp parallel for num_threads(omp_n) collapse(3) schedule(static) reduction(+:tiles_fast,tiles_padded)
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t out_y = 0; out_y < out_h; ++out_y) {
-                im2col_tile(
-                    x, out, n, C, H, W_logical, W_stride, k_h, k_w, stride, pad,
-                    out_h, out_w, spatial_out, col_cols, out_y, tiles_fast, tiles_padded);
+                for (int64_t out_x = 0; out_x < out_w; ++out_x) {
+                    im2col_one_row(
+                        x, out, n, C, H, W_logical, W_stride, k_h, k_w, stride, pad,
+                        out_y, out_x, spatial_out, out_w, col_cols, tiles_fast, tiles_padded);
+                }
             }
         }
     } else {
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t out_y = 0; out_y < out_h; ++out_y) {
-                im2col_tile(
-                    x, out, n, C, H, W_logical, W_stride, k_h, k_w, stride, pad,
-                    out_h, out_w, spatial_out, col_cols, out_y, tiles_fast, tiles_padded);
+                for (int64_t out_x = 0; out_x < out_w; ++out_x) {
+                    im2col_one_row(
+                        x, out, n, C, H, W_logical, W_stride, k_h, k_w, stride, pad,
+                        out_y, out_x, spatial_out, out_w, col_cols, tiles_fast, tiles_padded);
+                }
             }
         }
     }
@@ -491,7 +492,16 @@ __declspec(dllexport) int32_t col2im_avx2(
     if (do_memset) {
         const int64_t dx_elems = N * C * H * W_stride;
         memset_bytes = static_cast<uint64_t>(dx_elems) * sizeof(float);
-        std::memset(dx, 0, static_cast<size_t>(dx_elems) * sizeof(float));
+        ml_omp_before_parallel();
+        const int32_t omp_n = get_omp_threads();
+        if (omp_n > 1) {
+            #pragma omp parallel for num_threads(omp_n) schedule(static)
+            for (int64_t i = 0; i < dx_elems; ++i) {
+                dx[i] = 0.0f;
+            }
+        } else {
+            std::memset(dx, 0, static_cast<size_t>(dx_elems) * sizeof(float));
+        }
     }
     im2col_telemetry::on_col2im_call(memset_bytes);
     im2col_telemetry::record_ptr_alignment(nullptr, col, dx);

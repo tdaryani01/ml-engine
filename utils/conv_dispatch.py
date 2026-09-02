@@ -313,6 +313,12 @@ def bootstrap_im2col_gemm_runtime() -> bool:
     return native_blas_unified_omp()
 
 
+def native_im2col_gemm_available() -> bool:
+    """True when conv2d_*_im2col_gemm_avx2 + OpenBLAS runtime are bound."""
+    _ensure_primitives_lib()
+    return _native_im2col_gemm_available
+
+
 def _openblas_build_marker_path() -> str:
     root_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     return os.path.join(root_dir, "bin", "openblas_build.json")
@@ -954,6 +960,7 @@ def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
 # -----------------------------------------------------------------------------
 # Standalone Layer Routines
 # -----------------------------------------------------------------------------
+# @profile
 def conv2d_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
                    stride: int, pad: int, out_buf: np.ndarray,
                    col_buf: np.ndarray = None, gemm_buf: np.ndarray = None,

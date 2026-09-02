@@ -49,13 +49,11 @@ void fuse_forward_transpose_bias(
 ) {
     const int64_t spatial = out_h * out_w;
     const int32_t omp_n = omp_threads_for_phase();
-    #pragma omp parallel for num_threads(omp_n) schedule(static) if(omp_n > 1)
+    #pragma omp parallel for num_threads(omp_n) collapse(3) schedule(static) if(omp_n > 1)
     for (int64_t n = 0; n < N; ++n) {
-        const int64_t row_n_base = n * spatial;
         for (int64_t h = 0; h < out_h; ++h) {
-            const int64_t row_h_base = row_n_base + h * out_w;
             for (int64_t w = 0; w < out_w; ++w) {
-                const int64_t row_idx = row_h_base + w;
+                const int64_t row_idx = n * spatial + h * out_w + w;
                 for (int64_t c = 0; c < C_out; ++c) {
                     out[((n * C_out + c) * out_h + h) * out_w_stride + w] =
                         gemm_out[row_idx * C_out + c] + bias[c];
@@ -88,7 +86,7 @@ void fuse_dout_transpose(
         0);
 
     const int32_t omp_n = omp_threads_for_phase();
-    #pragma omp parallel for num_threads(omp_n) schedule(static) if(omp_n > 1)
+    #pragma omp parallel for num_threads(omp_n) collapse(3) schedule(static) if(omp_n > 1)
     for (int64_t n = 0; n < N; ++n) {
         const int64_t row_n_offset = n * spatial;
         const int64_t n_plane = n * C_out * out_h * dout_w_stride;
@@ -242,16 +240,13 @@ __declspec(dllexport) int32_t conv2d_forward_im2col_gemm_avx2(
 
     fuse_forward_transpose_bias(gemm_buf, bias, out, N, C_out, out_h, out_w, out_w_stride);
     if (out_w_stride > out_w) {
-        const int64_t spatial = out_h * out_w_stride;
         const int32_t omp_n = omp_threads_for_phase();
-        #pragma omp parallel for num_threads(omp_n) collapse(2) schedule(static) if(omp_n > 1)
+        #pragma omp parallel for num_threads(omp_n) collapse(4) schedule(static) if(omp_n > 1)
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t c = 0; c < C_out; ++c) {
-                float* plane = out + (n * C_out + c) * spatial;
                 for (int64_t h = 0; h < out_h; ++h) {
-                    float* row = plane + h * out_w_stride;
                     for (int64_t w = out_w; w < out_w_stride; ++w) {
-                        row[w] = 0.0f;
+                        out[((n * C_out + c) * out_h + h) * out_w_stride + w] = 0.0f;
                     }
                 }
             }

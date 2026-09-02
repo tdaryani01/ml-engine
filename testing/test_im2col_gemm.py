@@ -131,6 +131,60 @@ def test_d_three_backend_forward_parity():
         print(f"[SKIPPED] D3 native forward parity: {exc}")
 
 
+def test_d8_native_im2col_gemm_k6_fwd_bwd():
+    """D8: C++ im2col+OpenBLAS SGEMM fwd/bwd vs NumPy oracle (k6/s1/p1, tiny)."""
+    from utils.conv_dispatch import (
+        bootstrap_im2col_gemm_runtime,
+        conv2d_backward_fused,
+        conv2d_forward,
+        init_engine_backend,
+        native_im2col_gemm_available,
+    )
+
+    init_engine_backend(EngineBackend.IM2COL_GEMM)
+    bootstrap_im2col_gemm_runtime()
+    if not native_im2col_gemm_available():
+        print("[SKIPPED] D8: native im2col+GEMM unavailable (build_native + bin/libopenblas.dll)")
+        return
+
+    rng = np.random.default_rng(42)
+    n, c_in, h, w = 2, 3, 8, 8
+    c_out, k, stride, pad = 8, 6, 1, 1
+    x = (rng.standard_normal((n, c_in, h, w), dtype=np.float32) * 0.1).copy()
+    wf = (rng.standard_normal((c_out, c_in, k, k), dtype=np.float32) * 0.1).copy()
+    bias = np.zeros((1, c_out), dtype=np.float32)
+    out_h = (h + 2 * pad - k) // stride + 1
+    out_w = (w + 2 * pad - k) // stride + 1
+
+    out_gemm = np.zeros((n, c_out, out_h, out_w), dtype=np.float32)
+    out_ref = np.zeros_like(out_gemm)
+    _, col_g = conv2d_forward(
+        x, wf, bias, stride, pad, out_buf=out_gemm, backend=EngineBackend.IM2COL_GEMM,
+    )
+    _, col_r = conv2d_forward(
+        x, wf, bias, stride, pad, out_buf=out_ref, backend=EngineBackend.NUMPY,
+    )
+    assert np.allclose(out_gemm, out_ref, rtol=1e-4, atol=1e-4)
+
+    dout = rng.standard_normal(out_gemm.shape, dtype=np.float32)
+    dx_g = np.zeros_like(x)
+    dx_r = np.zeros_like(x)
+    dw_g = np.zeros_like(wf)
+    dw_r = np.zeros_like(wf)
+    inv_m = 1.0 / float(n)
+    conv2d_backward_fused(
+        dout, x, wf, dx_g, dw_g, stride, pad, inv_m,
+        col=col_g, backend=EngineBackend.IM2COL_GEMM,
+    )
+    conv2d_backward_fused(
+        dout, x, wf, dx_r, dw_r, stride, pad, inv_m,
+        col=col_r, backend=EngineBackend.NUMPY,
+    )
+    assert np.allclose(dx_g, dx_r, rtol=1e-4, atol=1e-4)
+    assert np.allclose(dw_g, dw_r, rtol=1e-4, atol=1e-4)
+    print("[PASSED] D8: native im2col+GEMM k6/s1/p1 fwd+bwd vs NumPy")
+
+
 def _tiny_fixture():
     rng = np.random.default_rng(7)
     h, w = 8, 8
@@ -150,6 +204,7 @@ PHASE_D_TESTS = [
     test_d2_im2col_gemm_explicit_backend,
     test_d2_im2col_gemm_matches_numpy_reference,
     test_d_three_backend_forward_parity,
+    test_d8_native_im2col_gemm_k6_fwd_bwd,
 ]
 
 
