@@ -30,7 +30,7 @@ ingestion:
 # =====================================================================
 architecture:
   model_type: "cnn"                  # Options: "multi_class", "binary_classification", "regression", "cnn"
-  backend: "native"                  # Options: "native" | "im2col+gemm" | "numpy"
+  backend: "im2col+gemm"             # Options: "native" | "im2col+gemm" | "numpy"
   num_classes: 4                     # 4 Synthetic Classes: Circle, Square, Cross, Diamond
   hidden_layers: []                  # Dense MLP hidden layers (bypassed for CNN)
   p_dropout: 0.1                     # Regularization dropout rate
@@ -46,8 +46,8 @@ architecture:
       - type: "conv"
         in_channels: 3
         out_channels: 8
-        kernel_size: 4
-        stride: 2
+        kernel_size: 6
+        stride: 1
         pad: 1
       - type: "relu"
       - type: "pool"
@@ -56,8 +56,8 @@ architecture:
       - type: "conv"
         in_channels: 8
         out_channels: 16
-        kernel_size: 4
-        stride: 2
+        kernel_size: 7
+        stride: 1
         pad: 1
       - type: "relu"
       - type: "pool"
@@ -73,7 +73,7 @@ architecture:
 optimization:
   num_threads: 4
   optimizer: "adam"
-  epochs_full_dataset: 100
+  epochs_full_dataset: 20
   steps_streaming: 31
   batch_size: 32
   learning_rate: 0.001               # Initial learning rate for Adam

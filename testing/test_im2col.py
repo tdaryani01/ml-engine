@@ -7,7 +7,7 @@ import numpy as np
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from config.constants import EngineBackend
-from utils.im2col import im2col, col2im, init_engine_backend
+from utils.conv_dispatch import im2col, col2im, init_engine_backend
 
 
 def test_im2col_output_shape(backend: EngineBackend):
@@ -49,6 +49,34 @@ def test_im2col_col2im_roundtrip_gradient(backend: EngineBackend):
     print(f"[PASSED] [{backend.value}] im2col/col2im roundtrip gradient accumulation verified.")
 
 
+def test_native_im2col_matches_numpy_reference():
+    """Native C++ im2col/col2im matches NumPy reference when DLL is built."""
+    from utils.conv_dispatch import _ensure_primitives_lib, _native_im2col_available, _ensure_fast_kernels
+
+    init_engine_backend(EngineBackend.IM2COL_GEMM)
+    _ensure_fast_kernels()
+    if not _native_im2col_available:
+        print("[SKIPPED] native im2col: conv_kernels.dll missing or im2col_avx2 not exported")
+        return
+
+    rng = np.random.default_rng(7)
+    for k, pad, stride in [(3, 0, 1), (3, 1, 1), (1, 1, 1), (7, 2, 2)]:
+        N, C, H, W = 2, 3, 8, 8
+        x = rng.standard_normal((N, C, H, W), dtype=np.float32)
+        col_ref = im2col(x, k, k, stride=stride, pad=pad, backend=EngineBackend.NUMPY)
+        col_native = im2col(x, k, k, stride=stride, pad=pad, backend=EngineBackend.IM2COL_GEMM)
+        assert np.allclose(col_native, col_ref, rtol=1e-5, atol=1e-6), (
+            f"k={k} pad={pad} s={stride} max diff {np.max(np.abs(col_native - col_ref)):.2e}"
+        )
+        dcol = rng.standard_normal(col_ref.shape, dtype=np.float32)
+        dx_ref = col2im(dcol, x.shape, k, k, stride=stride, pad=pad, backend=EngineBackend.NUMPY)
+        dx_native = col2im(dcol, x.shape, k, k, stride=stride, pad=pad, backend=EngineBackend.IM2COL_GEMM)
+        assert np.allclose(dx_native, dx_ref, rtol=1e-5, atol=1e-6), (
+            f"col2im k={k} pad={pad} s={stride} max diff {np.max(np.abs(dx_native - dx_ref)):.2e}"
+        )
+    print("[PASSED] native im2col/col2im matches NumPy reference")
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print(" RUNNING IM2COL / COL2IM OPS UNIT TESTS ")
@@ -57,6 +85,7 @@ if __name__ == "__main__":
         print(f"\n--- Backend: {backend.value} ---")
         test_im2col_output_shape(backend)
         test_im2col_col2im_roundtrip_gradient(backend)
+    test_native_im2col_matches_numpy_reference()
     print("\n" + "=" * 60)
     print("[SUCCESS] All im2col ops tests passed cleanly across all backends!")
     print("=" * 60)

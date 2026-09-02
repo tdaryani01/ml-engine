@@ -1,18 +1,45 @@
-# Build bin/conv_kernels.dll with MSVC x64 Native Tools (user release flags).
+# Build conv_kernels.dll (MSVC x64 Native Tools).
+#   Artifacts: build/native/conv_kernels.dll (+ .pdb, .obj, .lib)
+#   Runtime:   bin/conv_kernels.dll copied from build/native on every successful build
+#
+#   .\build_native.ps1                      # default: release
+#   .\build_native.ps1 release              # optimized, no PDB
+#   .\build_native.ps1 release-symbols      # optimized + PDB (uProf)
+#   .\build_native.ps1 debug                # /Od + debug CRT + PDB
 param(
-    [switch]$NoSymbols,
+    [Parameter(Position = 0)]
+    [ValidateSet("debug", "release", "release-symbols")]
+    [string]$Mode = "release",
+
     [switch]$RunTests
 )
 
 $ErrorActionPreference = "Stop"
 $Root = $PSScriptRoot
+$BuildDir = Join-Path $Root "build\native"
 $BinDir = Join-Path $Root "bin"
+$BuiltDll = Join-Path $BuildDir "conv_kernels.dll"
+$BuiltPdb = Join-Path $BuildDir "conv_kernels.pdb"
 $OutDll = Join-Path $BinDir "conv_kernels.dll"
 $OutPdb = Join-Path $BinDir "conv_kernels.pdb"
-$StageDll = Join-Path $BinDir "conv_kernels_stage.dll"
-$StagePdb = Join-Path $BinDir "conv_kernels_stage.pdb"
 
-New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+$SourceFiles = @(
+    "src\native\conv_fallback.cpp",
+    "src\native\conv_dispatcher.cpp",
+    "src\native\omp_config.cpp",
+    "src\native\im2col.cpp",
+    "src\native\im2col_telemetry.cpp",
+    "src\native\blas_dynamic.cpp",
+    "src\native\conv_im2col_gemm.cpp"
+)
+
+$Selected = switch ($Mode) {
+    "debug" { "Debug" }
+    "release-symbols" { "ReleaseSymbols" }
+    default { "Release" }
+}
+$EmitPdb = $Mode -in @("debug", "release-symbols")
+New-Item -ItemType Directory -Force -Path $BuildDir, $BinDir | Out-Null
 
 $VsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" `
     -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
@@ -26,22 +53,44 @@ if (-not (Test-Path $Vcvars)) {
     Write-Error "[build] vcvars64.bat not found at $Vcvars"
 }
 
-# /Zi required for static function names under /GL + /LTCG. PDB is sidecar only (no runtime cost).
-# uProf gets names via PDB; source lines stay hidden unless -AnalysisType SourceDisasm.
-$SymbolCl = if ($NoSymbols) { "" } else { "/Zi /Fd$StagePdb" }
-$SymbolLink = if ($NoSymbols) { "" } else { "/DEBUG:FULL /PDB:$StagePdb" }
+$CommonCl = "/nologo /arch:AVX2 /openmp:llvm /LD /I. /Isrc\native"
+$SourceArg = ($SourceFiles -join " ")
+$Implib = Join-Path $BuildDir "conv_kernels.lib"
 
-Write-Host "[build] Release$(if ($NoSymbols) { ' (no PDB)' } else { ' + link PDB' })" -ForegroundColor Cyan
+switch ($Selected) {
+    "Release" {
+        $ClFlags = "$CommonCl /O2 /Oi /Ot /Ox /GL /Gy /Gw /fp:fast /DNDEBUG"
+        $LinkFlags = "/LTCG /OPT:REF /OPT:ICF /NODEFAULTLIB:libcmtd.lib /NODEFAULTLIB:msvcrtd.lib /IMPLIB:$Implib"
+        $BuildLabel = "Release"
+    }
+    "ReleaseSymbols" {
+        # /Zi + /DEBUG:FULL — PDB for uProf function names (/GL + /LTCG need /Fd sidecar).
+        $ClFlags = "$CommonCl /O2 /Oi /Ot /Ox /GL /Gy /Gw /fp:fast /DNDEBUG /Zi /Fd$BuiltPdb"
+        $LinkFlags = "/LTCG /OPT:REF /OPT:ICF /DEBUG:FULL /PDB:$BuiltPdb /NODEFAULTLIB:libcmtd.lib /NODEFAULTLIB:msvcrtd.lib /IMPLIB:$Implib"
+        $BuildLabel = "Release + PDB"
+    }
+    "Debug" {
+        $ClFlags = "$CommonCl /Od /Zi /MDd /D_DEBUG /Fd$BuiltPdb"
+        $LinkFlags = "/DEBUG:FULL /PDB:$BuiltPdb /IMPLIB:$Implib"
+        $BuildLabel = "Debug"
+    }
+}
+
+Write-Host "[build] $BuildLabel" -ForegroundColor Cyan
+Write-Host "[build] out: $BuiltDll" -ForegroundColor DarkGray
+Write-Host "[build] cl: $ClFlags" -ForegroundColor DarkGray
 Write-Host "[build] x64 Native Tools via vcvars64.bat" -ForegroundColor Cyan
 
-Remove-Item $StageDll, $StagePdb -Force -ErrorAction SilentlyContinue
+Remove-Item $BuiltDll, $BuiltPdb -Force -ErrorAction SilentlyContinue
+Get-ChildItem (Join-Path $BuildDir "*.obj") -ErrorAction SilentlyContinue | Remove-Item -Force
+Remove-Item (Join-Path $BuildDir "*.ilk") -Force -ErrorAction SilentlyContinue
 
 $BuildBat = Join-Path $env:TEMP "ml-engine-build-native.bat"
 @"
 
 call "$Vcvars" >nul
 cd /d "$Root"
-cl.exe /nologo /O2 /Oi /Ot /Ox /GL /Gy /Gw /fp:fast /arch:AVX2 /openmp:llvm /DNDEBUG /LD /I. /Isrc\native $SymbolCl src\native\conv_fallback.cpp src\native\conv_dispatcher.cpp /Fo:bin\ /Fe:bin\conv_kernels_stage.dll /link /LTCG /OPT:REF /OPT:ICF /NODEFAULTLIB:libcmtd.lib /NODEFAULTLIB:msvcrtd.lib /IMPLIB:bin\conv_kernels.lib $SymbolLink
+cl.exe $ClFlags $SourceArg /Fo:build\native\ /Fe:build\native\conv_kernels.dll /link $LinkFlags
 exit /b %ERRORLEVEL%
 
 "@ | Set-Content -Path $BuildBat -Encoding ASCII
@@ -51,46 +100,78 @@ if ($LASTEXITCODE -ne 0) {
     Write-Error "[build] cl.exe failed with exit code $LASTEXITCODE"
 }
 
-if (-not (Test-Path $StageDll)) {
-    Write-Error "[build] Expected output missing: $StageDll"
+if (-not (Test-Path $BuiltDll)) {
+    Write-Error "[build] Expected output missing: $BuiltDll"
 }
 
-function Install-BuildArtifact {
-    param(
-        [string]$FromDll,
-        [string]$ToDll,
-        [string]$FromPdb,
-        [string]$ToPdb,
-        [bool]$WithPdb
-    )
-    $bakDll = "$ToDll.bak"
-    Remove-Item $bakDll -Force -ErrorAction SilentlyContinue
-    if (Test-Path $ToDll) {
-        try {
-            Rename-Item -Path $ToDll -NewName (Split-Path $bakDll -Leaf) -Force
-        } catch {
-            Write-Error @"
-[build] Cannot replace locked $ToDll
+function Publish-BinArtifacts {
+    param([bool]$WithPdb)
+    try {
+        Copy-Item -Path $BuiltDll -Destination $OutDll -Force
+    } catch {
+        Write-Error @"
+[build] Cannot copy to $OutDll
         Close Python / any process using conv_kernels.dll, then rerun:
-          .\build_native.ps1
+          .\build_native.ps1 $Mode
 "@
-        }
     }
-    Move-Item -Path $FromDll -Destination $ToDll -Force
     if ($WithPdb) {
-        if (-not (Test-Path $FromPdb)) {
-            Write-Error "[build] Expected PDB missing: $FromPdb"
+        if (-not (Test-Path $BuiltPdb)) {
+            Write-Error "[build] Expected PDB missing: $BuiltPdb"
         }
-        Move-Item -Path $FromPdb -Destination $ToPdb -Force
+        Copy-Item -Path $BuiltPdb -Destination $OutPdb -Force
+    } else {
+        Remove-Item $OutPdb -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item $bakDll -Force -ErrorAction SilentlyContinue
 }
 
-Install-BuildArtifact -FromDll $StageDll -ToDll $OutDll -FromPdb $StagePdb -ToPdb $OutPdb -WithPdb (-not $NoSymbols)
+Publish-BinArtifacts -WithPdb $EmitPdb
 
-Write-Host "[build] Wrote $OutDll" -ForegroundColor Green
-if (Test-Path $OutPdb) {
-    Write-Host "[build] PDB: $OutPdb (paired with DLL, /Zi names only)" -ForegroundColor Green
+function Publish-OpenBlasToBin {
+    $ArtifactDir = Join-Path $Root "build\openblas"
+    if (-not (Test-Path $ArtifactDir)) {
+        return
+    }
+    $built = @(
+        Get-ChildItem -Path $ArtifactDir -Recurse -Filter "openblas.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+        Get-ChildItem -Path $ArtifactDir -Recurse -Filter "libopenblas.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+    ) | Where-Object { $_ } | Select-Object -First 1
+    if (-not $built) {
+        return
+    }
+    $outDll = Join-Path $BinDir "libopenblas.dll"
+    try {
+        Copy-Item -Path $built.FullName -Destination $outDll -Force
+    } catch {
+        Write-Warning "[build] OpenBLAS present in build/openblas but copy to $outDll failed (DLL locked?)"
+        return
+    }
+    $artifactMarker = Join-Path $ArtifactDir "openblas_build.json"
+    if (Test-Path $artifactMarker) {
+        Copy-Item -Path $artifactMarker -Destination (Join-Path $BinDir "openblas_build.json") -Force
+    }
+    Write-Host "[build] Copied OpenBLAS -> $outDll" -ForegroundColor Green
+}
+
+Publish-OpenBlasToBin
+
+Write-Host "[build] Wrote $BuiltDll" -ForegroundColor Green
+Write-Host "[build] Copied -> $OutDll" -ForegroundColor Green
+if (Test-Path $BuiltPdb) {
+    Write-Host "[build] PDB: $BuiltPdb" -ForegroundColor Green
+    if (Test-Path $OutPdb) {
+        Write-Host "[build] Copied -> $OutPdb" -ForegroundColor Green
+    }
+}
+if ($Selected -eq "Debug") {
+    $dumpbin = Join-Path $VsPath "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe"
+    $dumpbinExe = (Resolve-Path $dumpbin -ErrorAction SilentlyContinue | Select-Object -First 1).Path
+    if ($dumpbinExe) {
+        $deps = & $dumpbinExe /DEPENDENTS $BuiltDll 2>$null | Select-String "140D|omp140d|ucrtbased"
+        if ($deps) {
+            Write-Host "[build] Debug CRT verified: $($deps.Line.Trim() -join ', ')" -ForegroundColor Green
+        }
+    }
 }
 
 if ($RunTests) {

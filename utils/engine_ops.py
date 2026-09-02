@@ -15,7 +15,7 @@ from typing import Mapping, Protocol, runtime_checkable
 import numpy as np
 
 from config.constants import EngineBackend
-from utils import im2col
+from utils import conv_dispatch
 
 
 @runtime_checkable
@@ -40,6 +40,7 @@ class ConvOps(EngineOps, Protocol):
         out_buf: np.ndarray,
         col_buf: np.ndarray | None = None,
         gemm_buf: np.ndarray | None = None,
+        w_gemm_fwd_buf: np.ndarray | None = None,
         fuse_relu: bool = False,
         W_logical: int | None = None,
     ) -> tuple: ...
@@ -76,6 +77,7 @@ class ConvOps(EngineOps, Protocol):
         pool_stride: int = 2,
         col_buf: np.ndarray | None = None,
         gemm_buf: np.ndarray | None = None,
+        w_gemm_fwd_buf: np.ndarray | None = None,
         W_logical: int | None = None,
         out_w_logical: int | None = None,
     ) -> tuple: ...
@@ -129,9 +131,13 @@ class ConvOps(EngineOps, Protocol):
         db_buf: np.ndarray,
     ) -> None: ...
 
+    def relu_forward(self, x: np.ndarray) -> np.ndarray: ...
+
+    def relu_backward(self, dout: np.ndarray, in_act: np.ndarray) -> np.ndarray: ...
+
 
 class _Im2colConvOpsBase:
-    """Delegates to ``utils.im2col`` with a bound backend enum (no ctx lookup)."""
+    """Delegates to ``utils.conv_dispatch`` with a bound backend enum (no ctx lookup)."""
 
     __slots__ = ("_backend",)
 
@@ -143,17 +149,18 @@ class _Im2colConvOpsBase:
         return self._backend
 
     def conv2d_forward(self, x, W, bias, stride, pad, out_buf, col_buf=None, gemm_buf=None,
-                       fuse_relu=False, W_logical=None):
-        return im2col.conv2d_forward(
+                       w_gemm_fwd_buf=None, fuse_relu=False, W_logical=None):
+        return conv_dispatch.conv2d_forward(
             x=x, W=W, bias=bias, stride=stride, pad=pad, out_buf=out_buf,
-            col_buf=col_buf, gemm_buf=gemm_buf, fuse_relu=fuse_relu,
+            col_buf=col_buf, gemm_buf=gemm_buf, w_gemm_fwd_buf=w_gemm_fwd_buf,
+            fuse_relu=fuse_relu,
             W_logical=W_logical, backend=self._backend,
         )
 
     def conv2d_backward_fused(self, dout, x, W, dx_buf, dW_buf, stride, pad, inv_m,
                               in_act=None, fuse_relu=False, col=None, dout_trans=None,
                               dcol_buf=None, W_logical=None):
-        return im2col.conv2d_backward_fused(
+        return conv_dispatch.conv2d_backward_fused(
             dout=dout, x=x, W=W, dx_buf=dx_buf, dW_buf=dW_buf,
             stride=stride, pad=pad, inv_m=inv_m, in_act=in_act, fuse_relu=fuse_relu,
             col=col, dout_trans=dout_trans, dcol_buf=dcol_buf, W_logical=W_logical,
@@ -162,12 +169,14 @@ class _Im2colConvOpsBase:
 
     def conv_block_forward(self, x, W, bias, out_conv_buf, out_pool_buf, argmax_buf,
                            conv_stride=1, conv_pad=1, pool_size=2, pool_stride=2,
-                           col_buf=None, gemm_buf=None, W_logical=None, out_w_logical=None):
-        return im2col.conv_block_forward(
+                           col_buf=None, gemm_buf=None, w_gemm_fwd_buf=None,
+                           W_logical=None, out_w_logical=None):
+        return conv_dispatch.conv_block_forward(
             x=x, W=W, bias=bias, out_conv_buf=out_conv_buf, out_pool_buf=out_pool_buf,
             argmax_buf=argmax_buf, conv_stride=conv_stride, conv_pad=conv_pad,
             pool_size=pool_size, pool_stride=pool_stride, col_buf=col_buf,
-            gemm_buf=gemm_buf, W_logical=W_logical, out_w_logical=out_w_logical,
+            gemm_buf=gemm_buf, w_gemm_fwd_buf=w_gemm_fwd_buf,
+            W_logical=W_logical, out_w_logical=out_w_logical,
             backend=self._backend,
         )
 
@@ -175,7 +184,7 @@ class _Im2colConvOpsBase:
                             dx_buf, dW_buf, db_buf, conv_stride=1, conv_pad=1,
                             pool_size=2, pool_stride=2, inv_m=1.0, col=None,
                             dout_trans=None, dcol_buf=None, W_logical=None, out_w_logical=None):
-        return im2col.conv_block_backward(
+        return conv_dispatch.conv_block_backward(
             dout_pool=dout_pool, argmax_buf=argmax_buf, x=x, W=W, conv_act=conv_act,
             d_conv_buf=d_conv_buf, dx_buf=dx_buf, dW_buf=dW_buf, db_buf=db_buf,
             conv_stride=conv_stride, conv_pad=conv_pad, pool_size=pool_size,
@@ -185,21 +194,27 @@ class _Im2colConvOpsBase:
         )
 
     def maxpool_forward(self, x, pool_size, stride, out_buf=None, argmax_buf=None):
-        return im2col.maxpool_forward(
+        return conv_dispatch.maxpool_forward(
             x, pool_size, stride, out_buf=out_buf, argmax_buf=argmax_buf,
             backend=self._backend,
         )
 
     def maxpool_backward(self, dout, cache, x_shape, pool_size, stride, dx_buf=None):
-        return im2col.maxpool_backward(
+        return conv_dispatch.maxpool_backward(
             dout, cache, x_shape, pool_size, stride, dx_buf=dx_buf,
             backend=self._backend,
         )
 
     def fuse_dout_transpose_and_bias(self, dout, dout_trans_buf, db_buf):
-        return im2col.fuse_dout_transpose_and_bias(
+        return conv_dispatch.fuse_dout_transpose_and_bias(
             dout, dout_trans_buf, db_buf, backend=self._backend,
         )
+
+    def relu_forward(self, x: np.ndarray) -> np.ndarray:
+        return conv_dispatch.relu_spatial_forward(x, backend=self._backend)
+
+    def relu_backward(self, dout: np.ndarray, in_act: np.ndarray) -> np.ndarray:
+        return conv_dispatch.relu_spatial_backward(dout, in_act, backend=self._backend)
 
 
 class NativeConvOps(_Im2colConvOpsBase):
@@ -236,16 +251,19 @@ class EngineContext:
     backend: EngineBackend
     conv: ConvOps
     _registry: dict[str, EngineOps] = field(default_factory=dict, repr=False)
+    _native_lib_handle: object = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self._registry.setdefault("conv", self.conv)
+        if self.backend == EngineBackend.NATIVE:
+            self._native_lib_handle = conv_dispatch.get_native_lib()
 
     @property
     def native_lib(self):
-        """Loaded native DLL handle, or ``None`` when backend is not NATIVE."""
+        """Loaded native DLL handle for this session, or ``None`` if not NATIVE."""
         if self.backend != EngineBackend.NATIVE:
             return None
-        return im2col.get_native_lib()
+        return self._native_lib_handle
 
     def ops(self, name: str) -> EngineOps:
         """Return a registered ops bundle by name (extensible for new model types)."""
@@ -264,7 +282,7 @@ class EngineContext:
 
 def create_engine_context(backend: EngineBackend = EngineBackend.NATIVE) -> EngineContext:
     """Create a model-agnostic execution context with conv ops initialized."""
-    im2col.init_engine_backend(backend)
+    conv_dispatch.init_engine_backend(backend)
     conv_cls = _CONV_OPS_BY_BACKEND[backend]
     conv = conv_cls()
     return EngineContext(backend=backend, conv=conv)

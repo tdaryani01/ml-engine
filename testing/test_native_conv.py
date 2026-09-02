@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from config.constants import EngineBackend
 from utils.engine_ops import create_engine_context
-from utils.im2col import (
+from utils.conv_dispatch import (
     conv2d_forward,
     conv2d_backward_fused,
     init_engine_backend,
@@ -77,7 +77,7 @@ def test_native_conv_uses_generic_fallback_dispatch() -> None:
     code = """
 import numpy as np
 from config.constants import EngineBackend
-from utils.im2col import init_engine_backend, conv2d_forward
+from utils.conv_dispatch import init_engine_backend, conv2d_forward
 
 init_engine_backend(EngineBackend.NATIVE)
 x = np.zeros((1, 3, 14, 14), dtype=np.float32)
@@ -110,7 +110,7 @@ conv2d_forward(x, W, b, stride=1, pad=1, out_buf=out, fuse_relu=False)
 
 def test_conv_block_forward_padded_output_matches_numpy(k: int = 3) -> None:
     """Regression: SIMD-padded conv output must not use dense-layout specialists."""
-    from utils.im2col import conv_block_forward
+    from utils.conv_dispatch import conv_block_forward
 
     rng = np.random.default_rng(17)
     n, cin, cout = 2, 8, 16
@@ -157,7 +157,7 @@ def test_fallback_conv_block_backward_padded_dw(k: int, pad: int, h: int = 28, w
 import os
 import numpy as np
 from config.constants import EngineBackend
-from utils.im2col import init_engine_backend, conv_block_forward, conv_block_backward
+from utils.conv_dispatch import init_engine_backend, conv_block_forward, conv_block_backward
 
 k, pad, h, w_log = {k}, {pad}, {h}, {w_log}
 rng = np.random.default_rng(31 + k)

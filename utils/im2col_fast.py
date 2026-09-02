@@ -59,106 +59,148 @@ _BLAS_FUNC_TYPE_D = ctypes.CFUNCTYPE(
 _raw_sgemm = _BLAS_FUNC_TYPE_S(_sgemm_addr)
 _raw_dgemm = _BLAS_FUNC_TYPE_D(_dgemm_addr)
 
-_TRANS_N = ctypes.c_char(b'N')
-_TRANS_T = ctypes.c_char(b'T')
-_BETA_ZERO_F = ctypes.c_float(0.0)
-_BETA_ZERO_D = ctypes.c_double(0.0)
 
-_C_INT_M = ctypes.c_int()
-_C_INT_N = ctypes.c_int()
-_C_INT_K = ctypes.c_int()
-_C_INT_LDA = ctypes.c_int()
-_C_INT_LDB = ctypes.c_int()
-_C_INT_LDC = ctypes.c_int()
-
-_REF_TRANS_N = ctypes.byref(_TRANS_N)
-_REF_TRANS_T = ctypes.byref(_TRANS_T)
-_REF_M = ctypes.byref(_C_INT_M)
-_REF_N = ctypes.byref(_C_INT_N)
-_REF_K = ctypes.byref(_C_INT_K)
-_REF_LDA = ctypes.byref(_C_INT_LDA)
-_REF_LDB = ctypes.byref(_C_INT_LDB)
-_REF_LDC = ctypes.byref(_C_INT_LDC)
-_REF_BETA_F = ctypes.byref(_BETA_ZERO_F)
-_REF_BETA_D = ctypes.byref(_BETA_ZERO_D)
-
-_C_ALPHA_F = ctypes.c_float()
-_C_ALPHA_D = ctypes.c_double()
-_REF_ALPHA_F = ctypes.byref(_C_ALPHA_F)
-_REF_ALPHA_D = ctypes.byref(_C_ALPHA_D)
+def _sgemm(trans_a: bytes, trans_b: bytes, m: int, n: int, k: int,
+           alpha: float, a_ptr, lda: int, b_ptr, ldb: int,
+           beta: float, c_ptr, ldc: int) -> None:
+    """Thread-safe SGEMM: all BLAS scalar args are stack-local per call."""
+    ta = ctypes.c_char(trans_a)
+    tb = ctypes.c_char(trans_b)
+    mi = ctypes.c_int(m)
+    ni = ctypes.c_int(n)
+    ki = ctypes.c_int(k)
+    ldai = ctypes.c_int(lda)
+    ldbi = ctypes.c_int(ldb)
+    ldci = ctypes.c_int(ldc)
+    alphaf = ctypes.c_float(alpha)
+    betaf = ctypes.c_float(beta)
+    _raw_sgemm(
+        ctypes.byref(ta), ctypes.byref(tb),
+        ctypes.byref(mi), ctypes.byref(ni), ctypes.byref(ki),
+        ctypes.byref(alphaf),
+        a_ptr, ctypes.byref(ldai),
+        b_ptr, ctypes.byref(ldbi),
+        ctypes.byref(betaf),
+        c_ptr, ctypes.byref(ldci),
+    )
 
 
-def gemm_forward_fast(col: np.ndarray, W_2d: np.ndarray, out_gemm: np.ndarray):
-    """Computes out_gemm = col @ W_2d.T"""
+def _dgemm(trans_a: bytes, trans_b: bytes, m: int, n: int, k: int,
+           alpha: float, a_ptr, lda: int, b_ptr, ldb: int,
+           beta: float, c_ptr, ldc: int) -> None:
+    """Thread-safe DGEMM: all BLAS scalar args are stack-local per call."""
+    ta = ctypes.c_char(trans_a)
+    tb = ctypes.c_char(trans_b)
+    mi = ctypes.c_int(m)
+    ni = ctypes.c_int(n)
+    ki = ctypes.c_int(k)
+    ldai = ctypes.c_int(lda)
+    ldbi = ctypes.c_int(ldb)
+    ldci = ctypes.c_int(ldc)
+    alphad = ctypes.c_double(alpha)
+    betad = ctypes.c_double(beta)
+    _raw_dgemm(
+        ctypes.byref(ta), ctypes.byref(tb),
+        ctypes.byref(mi), ctypes.byref(ni), ctypes.byref(ki),
+        ctypes.byref(alphad),
+        a_ptr, ctypes.byref(ldai),
+        b_ptr, ctypes.byref(ldbi),
+        ctypes.byref(betad),
+        c_ptr, ctypes.byref(ldci),
+    )
+
+
+def gemm_forward_fast(col: np.ndarray, W_fwd: np.ndarray, out_gemm: np.ndarray):
+    """Computes out_gemm = col @ W_fwd; W_fwd is [K, C_out] contiguous."""
     m_dim = col.shape[0]
-    n_dim = W_2d.shape[0]
     k_dim = col.shape[1]
-
-    _C_INT_M.value = n_dim
-    _C_INT_N.value = m_dim
-    _C_INT_K.value = k_dim
-    _C_INT_LDA.value = k_dim
-    _C_INT_LDB.value = k_dim
-    _C_INT_LDC.value = n_dim
+    n_dim = W_fwd.shape[1]
 
     if col.dtype == np.float32:
-        _C_ALPHA_F.value = 1.0
-        _raw_sgemm(
-            _REF_TRANS_T, _REF_TRANS_N,
-            _REF_M, _REF_N, _REF_K,
-            _REF_ALPHA_F,
-            W_2d.ctypes.data, _REF_LDA,
-            col.ctypes.data, _REF_LDB,
-            _REF_BETA_F,
-            out_gemm.ctypes.data, _REF_LDC
+        _sgemm(
+            b'N', b'N',
+            n_dim, m_dim, k_dim,
+            1.0,
+            W_fwd.ctypes.data, n_dim,
+            col.ctypes.data, k_dim,
+            0.0,
+            out_gemm.ctypes.data, n_dim,
         )
     else:
-        _C_ALPHA_D.value = 1.0
-        _raw_dgemm(
-            _REF_TRANS_T, _REF_TRANS_N,
-            _REF_M, _REF_N, _REF_K,
-            _REF_ALPHA_D,
-            W_2d.ctypes.data, _REF_LDA,
-            col.ctypes.data, _REF_LDB,
-            _REF_BETA_D,
-            out_gemm.ctypes.data, _REF_LDC
+        _dgemm(
+            b'N', b'N',
+            n_dim, m_dim, k_dim,
+            1.0,
+            W_fwd.ctypes.data, n_dim,
+            col.ctypes.data, k_dim,
+            0.0,
+            out_gemm.ctypes.data, n_dim,
         )
 
 
 def gemm_param_grad_fast(dout_trans: np.ndarray, col: np.ndarray, dW_flat: np.ndarray, inv_m: float = 1.0):
     """Computes dW_flat = inv_m * (dout_trans.T @ col)"""
+    if not col.flags["C_CONTIGUOUS"]:
+        col = np.ascontiguousarray(col)
+    if not dout_trans.flags["C_CONTIGUOUS"]:
+        dout_trans = np.ascontiguousarray(dout_trans)
+
     n_cols = dW_flat.shape[1]
     n_rows = dW_flat.shape[0]
     k_dim = dout_trans.shape[0]
 
-    _C_INT_M.value = n_cols
-    _C_INT_N.value = n_rows
-    _C_INT_K.value = k_dim
-    _C_INT_LDA.value = n_cols
-    _C_INT_LDB.value = n_rows
-    _C_INT_LDC.value = n_cols
-
     if dout_trans.dtype == np.float32:
-        _C_ALPHA_F.value = inv_m
-        _raw_sgemm(
-            _REF_TRANS_N, _REF_TRANS_T,
-            _REF_M, _REF_N, _REF_K,
-            _REF_ALPHA_F,
-            col.ctypes.data, _REF_LDA,
-            dout_trans.ctypes.data, _REF_LDB,
-            _REF_BETA_F,
-            dW_flat.ctypes.data, _REF_LDC
+        _sgemm(
+            b"N", b"T",
+            n_cols, n_rows, k_dim,
+            inv_m,
+            col.ctypes.data, n_cols,
+            dout_trans.ctypes.data, n_rows,
+            0.0,
+            dW_flat.ctypes.data, n_cols,
         )
     else:
-        _C_ALPHA_D.value = inv_m
-        _raw_dgemm(
-            _REF_TRANS_N, _REF_TRANS_T,
-            _REF_M, _REF_N, _REF_K,
-            _REF_ALPHA_D,
-            col.ctypes.data, _REF_LDA,
-            dout_trans.ctypes.data, _REF_LDB,
-            _REF_BETA_D,
-            dW_flat.ctypes.data, _REF_LDC
+        _dgemm(
+            b"N", b"T",
+            n_cols, n_rows, k_dim,
+            inv_m,
+            col.ctypes.data, n_cols,
+            dout_trans.ctypes.data, n_rows,
+            0.0,
+            dW_flat.ctypes.data, n_cols,
+        )
+
+
+def gemm_backward_input_fast(dout_trans: np.ndarray, W_2d: np.ndarray, dcol_out: np.ndarray):
+    """Computes dcol_out = dout_trans @ W_2d (input-gradient GEMM)."""
+    if not dout_trans.flags["C_CONTIGUOUS"]:
+        dout_trans = np.ascontiguousarray(dout_trans)
+    if not W_2d.flags["C_CONTIGUOUS"]:
+        W_2d = np.ascontiguousarray(W_2d)
+
+    m_dim = dout_trans.shape[0]
+    k_dim = W_2d.shape[0]
+    n_dim = W_2d.shape[1]
+
+    if dout_trans.dtype == np.float32:
+        _sgemm(
+            b"N", b"N",
+            n_dim, m_dim, k_dim,
+            1.0,
+            W_2d.ctypes.data, n_dim,
+            dout_trans.ctypes.data, k_dim,
+            0.0,
+            dcol_out.ctypes.data, n_dim,
+        )
+    else:
+        _dgemm(
+            b"N", b"N",
+            n_dim, m_dim, k_dim,
+            1.0,
+            W_2d.ctypes.data, n_dim,
+            dout_trans.ctypes.data, k_dim,
+            0.0,
+            dcol_out.ctypes.data, n_dim,
         )
 
 

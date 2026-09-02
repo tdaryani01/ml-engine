@@ -37,11 +37,41 @@ _THREAD_ENV_KEYS = (
     "KMP_DEVICE_THREAD_LIMIT",
 )
 
+_FIT_THREAD_ENV_KEYS = (
+    "OMP_NUM_THREADS",
+    "OMP_THREAD_LIMIT",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    "NUMBA_NUM_THREADS",
+    "KMP_DEVICE_THREAD_LIMIT",
+)
+
 _VALID_PLATFORMS = ("linux", "windows")
+
+_CONV_BACKENDS = frozenset({EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM})
 
 
 def detect_platform() -> str:
     return "windows" if sys.platform == "win32" else "linux"
+
+
+def unified_omp_active() -> bool:
+    """True when bin/libopenblas.dll shares LLVM OpenMP with conv_kernels (USE_OPENMP=1)."""
+    raw = os.environ.get("ML_ENGINE_UNIFIED_OMP")
+    if raw is not None:
+        val = raw.strip().lower()
+        if val in ("0", "false", "no", "off"):
+            return False
+        if val in ("1", "true", "yes", "on"):
+            return True
+    try:
+        from utils.conv_dispatch import bootstrap_im2col_gemm_runtime, native_blas_unified_omp
+        bootstrap_im2col_gemm_runtime()
+        return native_blas_unified_omp()
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -64,11 +94,29 @@ class RuntimeSettings:
             return self.num_threads
         return int(raw)
 
+    def omp_threads_for(self, backend: EngineBackend) -> int:
+        """LLVM OpenMP thread count (shared with OpenBLAS for conv backends)."""
+        return self.num_threads
+
     def process_env(self) -> Dict[str, str]:
+        """Process-wide env before NumPy/SciPy first touch.
+
+        USE_OPENMP=1 OpenBLAS shares LLVM OMP — set OPENBLAS_NUM_THREADS=OMP_NUM_THREADS.
+        MKL/numba stay serial to avoid extra pools.
+        """
         merged = dict(self.env)
         n = str(self.num_threads)
-        for key in _THREAD_ENV_KEYS:
-            merged.setdefault(key, n)
+        merged.setdefault("OMP_NUM_THREADS", n)
+        merged.setdefault("OMP_THREAD_LIMIT", n)
+        merged.setdefault("OPENBLAS_NUM_THREADS", n)
+        serial = "1"
+        for key in (
+            "MKL_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+            "NUMBA_NUM_THREADS",
+        ):
+            merged.setdefault(key, serial)
         return merged
 
 
@@ -156,6 +204,80 @@ def apply_process_env(
     return applied
 
 
+def _shared_omp_fit(backend: EngineBackend) -> bool:
+    """native / im2col+gemm: one LLVM OMP pool for conv, im2col, and GEMM."""
+    return backend in _CONV_BACKENDS
+
+
+def _apply_fit_thread_env(settings: RuntimeSettings, backend: EngineBackend) -> Dict[str, str]:
+    """Backend-specific thread caps during fit."""
+    omp = settings.omp_threads_for(backend)
+    shared = _shared_omp_fit(backend)
+    serial = "1"
+    overrides = {
+        "OMP_NUM_THREADS": str(omp),
+        "OMP_THREAD_LIMIT": str(omp),
+        "OPENBLAS_NUM_THREADS": str(omp if shared else settings.blas_threads_for(backend)),
+    }
+    if omp > 1:
+        # LLVM OpenMP on Windows honors KMP_DEVICE_THREAD_LIMIT; =1 causes OMP warning #96.
+        overrides["KMP_DEVICE_THREAD_LIMIT"] = str(omp)
+    blas_env = serial if shared else str(settings.blas_threads_for(backend))
+    overrides.update({
+        "MKL_NUM_THREADS": blas_env,
+        "NUMEXPR_NUM_THREADS": blas_env,
+        "VECLIB_MAXIMUM_THREADS": blas_env,
+    })
+    if backend in _CONV_BACKENDS:
+        overrides["NUMBA_NUM_THREADS"] = serial
+    for key, value in overrides.items():
+        os.environ[key] = value
+    return overrides
+
+
+def _sync_native_dll_threads(settings: RuntimeSettings, backend: EngineBackend) -> int:
+    from utils.conv_dispatch import sync_im2col_parallel_cap, sync_native_thread_policy
+
+    omp = settings.omp_threads_for(backend)
+    sync_native_thread_policy(omp)
+    sync_im2col_parallel_cap(omp)
+    return omp
+
+
+def _sync_im2col_parallel_cap(settings: RuntimeSettings, backend: EngineBackend) -> int:
+    from utils.conv_dispatch import sync_im2col_parallel_cap
+    return sync_im2col_parallel_cap(settings.omp_threads_for(backend))
+
+
+def _query_native_dll_omp() -> Optional[int]:
+    try:
+        from utils.conv_dispatch import _load_conv_dll
+        lib = _load_conv_dll()
+        if lib is not None and hasattr(lib, "get_omp_threads"):
+            return int(lib.get_omp_threads())
+    except Exception:
+        pass
+    return None
+
+
+def _query_native_im2col_cap() -> Optional[int]:
+    try:
+        from utils.conv_dispatch import _load_conv_dll
+        lib = _load_conv_dll()
+        if lib is not None and hasattr(lib, "get_im2col_parallel_cap"):
+            return int(lib.get_im2col_parallel_cap())
+    except Exception:
+        pass
+    return None
+
+
+def _query_native_unified_omp() -> Optional[bool]:
+    try:
+        return unified_omp_active()
+    except Exception:
+        return None
+
+
 def log_runtime_settings(
     settings: RuntimeSettings,
     backend: EngineBackend,
@@ -163,19 +285,38 @@ def log_runtime_settings(
     prefix: str = "[Runtime]",
 ) -> None:
     blas = settings.blas_threads_for(backend)
+    omp = settings.omp_threads_for(backend)
+    shared = _shared_omp_fit(backend)
+    openblas_fit = omp if shared else blas
     if settings.platform == "windows":
+        kmp_limit = os.environ.get("KMP_DEVICE_THREAD_LIMIT", "?")
         tune = (
             f"KMP_BLOCKTIME={os.environ.get('KMP_BLOCKTIME', '?')} "
-            f"KMP_AFFINITY={os.environ.get('KMP_AFFINITY', '?')}"
+            f"KMP_AFFINITY={os.environ.get('KMP_AFFINITY', '?')} "
+            f"KMP_DEVICE_THREAD_LIMIT={kmp_limit}"
         )
     else:
         tune = (
             f"OMP_WAIT_POLICY={os.environ.get('OMP_WAIT_POLICY', '?')} "
             f"GOMP_SPINCOUNT={os.environ.get('GOMP_SPINCOUNT', '?')}"
         )
+    dll_omp = _query_native_dll_omp()
+    dll_omp_s = str(dll_omp) if dll_omp is not None else "n/a"
+    im2col_cap = _query_native_im2col_cap()
+    im2col_cap_s = str(im2col_cap) if im2col_cap is not None else "n/a"
+    unified = _query_native_unified_omp()
+    unified_s = str(unified) if unified is not None else "n/a"
+    if shared and unified:
+        policy = "shared_omp"
+    elif shared:
+        policy = "conv_omp"
+    else:
+        policy = backend.value
     msg = (
         f"{prefix} platform={settings.platform} num_threads={settings.num_threads} "
-        f"backend={backend.value} blas_during_fit={blas} {tune}"
+        f"backend={backend.value} policy={policy} omp_during_fit={omp} "
+        f"openblas_during_fit={openblas_fit} scipy_blas_during_fit={1 if shared else blas} "
+        f"dll_omp={dll_omp_s} im2col_cap={im2col_cap_s} unified_omp={unified_s} {tune}"
     )
     print(msg)
     logger.info(msg)
@@ -200,16 +341,59 @@ def training_threadpool(
     backend: EngineBackend,
     *,
     blas_threads: Optional[int] = None,
+    omp_threads: Optional[int] = None,
 ) -> Iterator[None]:
-    """Scope BLAS/OpenMP pools for training; native keeps BLAS at 1 by default."""
-    omp = settings.num_threads
-    blas = settings.num_threads if blas_threads is not None else settings.blas_threads_for(backend)
-    if blas == omp:
-        with threadpool_limits(limits=omp):
-            yield
+    """Scope BLAS/OpenMP/Numba pools for training.
+
+    Policy (OMP_MAX_ACTIVE_LEVELS=1):
+      - native / im2col+gemm: shared LLVM OMP + bin/libopenblas; scipy wheel BLAS pinned to 1
+      - numpy: omp=blas=num_threads
+    """
+    omp = settings.omp_threads_for(backend) if omp_threads is None else int(omp_threads)
+    if backend in _CONV_BACKENDS:
+        from utils.conv_dispatch import bootstrap_im2col_gemm_runtime
+        bootstrap_im2col_gemm_runtime()
+    if blas_threads is not None:
+        blas = int(blas_threads)
     else:
-        with threadpool_limits(limits={"openblas": blas, "blas": blas, "openmp": omp}):
-            yield
+        blas = settings.blas_threads_for(backend)
+
+    prev_numba_threads: Optional[int] = None
+    if backend in _CONV_BACKENDS:
+        import numba
+
+        prev_numba_threads = numba.get_num_threads()
+        numba.set_num_threads(1)
+
+    prev_env = {key: os.environ.get(key) for key in _FIT_THREAD_ENV_KEYS}
+    _apply_fit_thread_env(settings, backend)
+    _sync_native_dll_threads(settings, backend)
+
+    try:
+        if backend in _CONV_BACKENDS:
+            from utils.conv_dispatch import sync_openblas_thread_policy
+
+            # Wheel scipy/numpy OpenBLAS — serial; conv/GEMM use shared DLL pool.
+            with threadpool_limits(limits={"openblas": 1, "blas": 1, "mkl": 1}):
+                _sync_native_dll_threads(settings, backend)
+                sync_openblas_thread_policy(omp)
+                yield
+        elif blas == omp:
+            with threadpool_limits(limits=omp):
+                yield
+        else:
+            with threadpool_limits(limits={"openblas": blas, "blas": blas, "openmp": omp}):
+                yield
+    finally:
+        for key, value in prev_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        if prev_numba_threads is not None:
+            import numba
+
+            numba.set_num_threads(prev_numba_threads)
 
 
 def configure_runtime(
@@ -229,6 +413,13 @@ def configure_runtime(
         num_threads=num_threads,
     )
     apply_process_env(settings, overwrite=overwrite_env, if_unset=if_unset_env)
+    if backend in _CONV_BACKENDS:
+        from utils.conv_dispatch import bootstrap_im2col_gemm_runtime
+        bootstrap_im2col_gemm_runtime()
+        import numba
+        numba.set_num_threads(1)
+    _apply_fit_thread_env(settings, backend)
+    _sync_native_dll_threads(settings, backend)
     if log:
         log_runtime_settings(settings, backend)
     return settings

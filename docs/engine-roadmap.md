@@ -5,7 +5,7 @@ and moving more ops to native. Goal: **separation**, **testable increments**, an
 path toward **parallel training workers** and **multi-request inference** without
 shared mutable globals.
 
-Last updated: 2026-09-01 (post stride-2 native parity commit `a358629`).
+Last updated: 2026-09-01 (Phase D in progress: `conv_dispatch.py` rename, native `im2col.cpp`).
 
 ---
 
@@ -21,12 +21,12 @@ Last updated: 2026-09-01 (post stride-2 native parity commit `a358629`).
 
 | Issue | Location | Risk |
 |-------|----------|------|
-| Global backend singleton | `utils/im2col.py` (`_active_backend`, `_native_lib`) | Races if two sessions use different backends |
+| Global backend singleton | `utils/conv_dispatch.py` (`_active_backend`, `_native_lib`) | Races if two sessions use different backends |
 | Layer-owned step scratch | `ConvBlock`, `Conv2D` (`col`, `x_cached`, gemm buffers) | Not serializable; blocks ledger/worker model |
 | `init_engine_backend()` at layer init | `spatial_layers.py` | Side effect on import/construct |
 | Dual weight storage | `CNNNetwork.weights` + `layer.W` | ES restore bugs (fixed once; structurally fragile) |
-| Shared ctypes BLAS scalars | `utils/im2col_fast.py` | Concurrent GEMM from multiple threads unsafe |
-| Implicit NATIVE→im2col fallback | `im2col.py` dispatch | Hard to reason about which backend ran |
+| Shared ctypes BLAS scalars | `utils/im2col_fast.py` | **Fixed D1** — stack-local per GEMM call; delete file after D-native |
+| Implicit NATIVE→im2col fallback | `conv_dispatch.py` dispatch | **Fixed D2** — strict unless `ML_ENGINE_NATIVE_FALLBACK=1` |
 
 ### Non-goals for early phases
 
@@ -85,14 +85,14 @@ Do not combine more than **one letter-group** (e.g. all of A) in a single PR unl
 | ID | Scope | Files (typical) | Done when |
 |----|--------|-------------------|-----------|
 | **A1** | Define `ConvOps` protocol (forward, backward_fused, conv_block_*) | `utils/engine_ops.py` (new) | Protocol + docstrings; no callers yet |
-| **A2** | `NativeConvOps` — delegate to existing ctypes paths in `im2col.py` | `engine_ops.py`, `im2col.py` | Native grad matrix still passes |
+| **A2** | `NativeConvOps` — delegate to existing ctypes paths in `conv_dispatch.py` | `engine_ops.py`, `conv_dispatch.py` | Native grad matrix still passes |
 | **A3** | `NumpyConvOps` — delegate to reference im2col path | `engine_ops.py` | Used only in tests |
 | **A4** | `Im2colGemmConvOps` — explicit class (same code as today’s IM2COL_GEMM path) | `engine_ops.py`, `im2col_fast.py` | No implicit fallback from NATIVE |
 | **A5** | `EngineContext(backend)` factory loads correct `ConvOps` + native handle | `engine_ops.py` | Unit test: ctx.native vs ctx.numpy |
-| **A6** | Add optional `ctx=` param to top-level `im2col` entrypoints; default = legacy global | `im2col.py` | All existing callers pass without change |
+| **A6** | Add optional `ctx=` param to top-level conv entrypoints; default = legacy global | `conv_dispatch.py` | All existing callers pass without change |
 | **A7** | `ConvBlock` stores `self._ctx`, removes `init_engine_backend()` from `__init__` | `spatial_layers.py` | Construct block with injected ctx |
 | **A8** | `ModelFactory` / `CNNNetwork` create one `EngineContext`, pass to layers | `model_factory.py`, `cnn_network.py` | Pipeline + benchmark unchanged numerically |
-| **A9** | Deprecate direct `init_engine_backend()` in app code; shim for tests only | `im2col.py`, `testing/*` | Grep shows no production init calls |
+| **A9** | Deprecate direct `init_engine_backend()` in app code; shim for tests only | `conv_dispatch.py`, `testing/*` | Grep shows no production init calls |
 
 **Exit criteria (Phase A):** 28-case native grad check; one `benchmark_cnn.py` run; no new globals.
 
@@ -135,17 +135,40 @@ Do not combine more than **one letter-group** (e.g. all of A) in a single PR unl
 
 ### Phase D — im2col/GEMM first-class & native expansion
 
-**Outcome:** Three backends are peers; im2col/GEMM not a silent fallback.
+**Outcome:** Three backends are peers; Python path is the grad-check oracle; native im2col+GEMM
+replaces Numba/ctypes for performance.
+
+#### D-py — Python peer backend (done)
+
+| ID | Scope | Files | Status |
+|----|--------|-------|--------|
+| **D1** | Thread-safe GEMM — stack-local ctypes scalars per BLAS call | `im2col_fast.py` | Done |
+| **D2** | Strict backend separation — `Im2colGemmConvOps` only; no silent native fallback | `engine_ops.py`, `conv_dispatch.py` | Done |
+| **D3** | Grad check: native vs im2col_gemm vs numpy conv matrix (28 cases) | `testing/test_gradient_check.py` | Done |
+| **D4** | ReLU/maxpool behind `ConvOps` protocol | `engine_ops.py`, `cnn_network.py` | Done |
+| **D-rename** | Rename `im2col.py` → `conv_dispatch.py` (dispatch layer, not the algorithm) | `utils/conv_dispatch.py` | Done |
+| **D-thread** | im2col+gemm: OpenBLAS=`num_threads`, OMP/Numba=1 (no dual pools) | `utils/runtime.py`, `config/runtime.yaml` | Done |
+
+#### D-native — C++ im2col+GEMM (in progress)
 
 | ID | Scope | Files | Done when |
 |----|--------|-------|-----------|
-| **D1** | Fix `im2col_fast.py` ctypes scalars — stack-local per GEMM call | `im2col_fast.py` | Thread-safe GEMM smoke test |
-| **D2** | Config/backend switch uses `Im2colGemmConvOps` only (no NATIVE fallback unless configured) | `engine_ops.py`, config | Benchmark both backends |
-| **D3** | Grad check: native vs im2col_gemm vs numpy for conv matrix | `testing/test_gradient_check.py` | Document tolerances |
-| **D4** | Move maxpool/ReLU behind ops protocol (optional split from conv) | `engine_ops.py`, native | Same pattern as conv |
+| **D6** | Native `im2col_avx2` / `col2im_avx2` primitives | `src/native/im2col.cpp` | Done |
+| **D7** | Wire native im2col/col2im into `IM2COL_GEMM` dispatch (fallback to Numba if DLL missing) | `conv_dispatch.py` | Done |
+| **D8** | Native fused conv fwd/bwd via OpenBLAS `sgemm` | `src/native/conv_im2col_gemm.cpp`, `blas_dynamic.cpp` | Grad-check parity vs Python path |
+| **D9** | BLAS via scipy capsule (`init_blas_sgemm_ptr`); ctypes exports in `conv_dispatch.py` | `build_native.ps1`, `conv_dispatch.py` | Benchmark win vs Python on k≥3 (pending AC rerun) |
+| **D10** | Port fuse-dout, maxpool, ReLU to native (or keep thin Python for cold ops) | `src/native/*` | `im2col_fast.py` deletable |
+| **D11** | Extract NumPy reference loops → `utils/conv_reference.py`; delete `im2col_fast.py` | `conv_reference.py` | Grep: zero `im2col_fast` imports |
 | **D5** | Port dense head hot paths to native (if/when needed) | `src/native/*` | Per-op decision |
 
-**Exit criteria (Phase D):** IM2COL_GEMM is selectable and correct; im2col path ready to shrink as native grows.
+**Threading policy (im2col+gemm backend):** OpenBLAS owns parallelism at `optimization.num_threads`;
+Numba/OpenMP pinned to 1 during `training_threadpool` — never both pools at full width.
+
+**Exit criteria (Phase D):** IM2COL_GEMM selectable and correct; native im2col+GEMM beats Python path
+on representative geometries; `im2col_fast.py` removed.
+
+**Not in scope yet:** Replacing `GENERIC_FALLBACK` tiled loops in `conv_fallback.cpp` with native
+im2col+GEMM routing — that is a separate dispatcher decision after D8–D9 are proven.
 
 ---
 
@@ -218,6 +241,7 @@ Run Phase B suite: `python testing/test_training_cache.py`
 | **C** | `test_c_two_training_sessions` | two `TrainingSession` instances, no shared globals |
 | **D** | `test_d_gemm_thread_safe` | concurrent GEMM smoke test passes |
 | **D** | `test_d_three_backend_grad_parity` | native vs im2col_gemm vs numpy matrix |
+| **D** | `test_native_im2col_matches_numpy_reference` | C++ im2col/col2im vs NumPy in `test_im2col.py` |
 | **E** | `test_e_two_worker_consolidator` | two workers → consolidator matches single-thread |
 
 Optional before Phase E: extend matrix sweep for regression timing.
@@ -229,24 +253,22 @@ Optional before Phase E: extend matrix sweep for regression timing.
 ```
 utils/
   engine_ops.py       # ConvOps, EngineContext, backend factories
-  im2col.py           # thin dispatch; ctx-aware; legacy shim
-  im2col_fast.py      # numba kernels (thread-safe after D1)
+  conv_dispatch.py    # backend routing, ctypes, conv2d_*, pool/ReLU (renamed from im2col.py)
+  conv_reference.py   # NumPy-only im2col/col2im loops (grad-check oracle) — extract from dispatch
+  im2col_fast.py      # TEMP: Numba+ctypes GEMM; delete after D-native (D10–D11)
+
+src/native/
+  conv_fallback.cpp   # tiled AVX2 direct conv (existing native path)
+  conv_dispatcher.cpp # ctypes exports for conv blocks
+  im2col.cpp          # im2col_avx2 / col2im_avx2 primitives (D6)
+  conv_im2col_gemm.cpp # OpenBLAS sgemm fwd/bwd (D8)
+  blas_dynamic.cpp     # scipy capsule / optional DLL load (D9)
 
 src/
   training_session.py
   training_cache.py
   scratch_arena.py
-  ledger.py
-  consolidator.py
-  weight_store.py
-  inference_session.py
-  spatial_layers.py   # params + forward/backward(ctx, cache, arena)
-  cnn_network.py      # topology + weights
-  controller.py       # thin wrapper
-
-docs/
-  engine-roadmap.md   # this file
-  distributed-training.md  # (Phase E7) wire format & VM ops runbook
+  ...
 ```
 
 ---
@@ -254,11 +276,13 @@ docs/
 ## 7. Suggested order of work
 
 ```
-A1 → A2 → A3 → A4 → A5 → A6 → A7 → A8 → A9
-  → B1 → B2 → B3 → B4 → B5 → B6 → B7
-  → C1 → C2 → C3 → C4 → C5 → C6
-  → D1 → D2 → D3 → …
-  → E1 → E2 → E3 → E4 → E5 → …
+A1 → … → A9
+  → B1 → … → B7
+  → C1 → … → C6
+  → D1 → D2 → D3 → D4 → D-rename → D-thread   # D-py (done)
+  → D6 → D7 → D8 → D9 → D10 → D11             # D-native (im2col.cpp → conv_im2col_gemm.cpp → delete im2col_fast.py)
+  → D5 (optional dense head)
+  → E1 → …
 ```
 
 **Stop and ship** after each sub-phase. If a sub-phase grows beyond ~300 lines changed, split it.
@@ -272,7 +296,9 @@ A1 → A2 → A3 → A4 → A5 → A6 → A7 → A8 → A9
 | Ledger stores grads or weight deltas? | TBD (recommend **grads**; consolidator owns Adam) | |
 | Queue technology for VMs? | TBD | |
 | Keep `ModelController` name vs rename to `TrainingSession` publicly? | TBD (recommend keep controller as facade) | |
-| im2col/GEMM parity required before native pool/ReLU port? | TBD | |
+| im2col/GEMM parity required before native pool/ReLU port? | **Yes** — Python path is oracle; native ports after D3 passes | 2026-09-01 |
+| Rename `im2col.py` → `conv_dispatch.py`? | **Done** — file is dispatch, not the algorithm | 2026-09-01 |
+| Kill `im2col_fast.py` when? | After D8–D11 (native GEMM + optional fuse/pool/ReLU) | |
 
 ---
 

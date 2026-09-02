@@ -91,10 +91,16 @@ class TrainingSession:
         )
 
     def train_and_apply(self, X: np.ndarray, y: np.ndarray, lr: float) -> float:
-        """Convenience: train_step + apply_step; matches legacy model.backward()."""
-        result = self.train_step(X, y, lr)
-        self.apply_step(result, lr)
-        return result.loss
+        """Forward + backward + apply on the same hot path as legacy model.backward()."""
+        if hasattr(self.model, "forward_train"):
+            _, cache = self.model.forward_train(X)
+            loss, gw, gb, m, gg, gbb = self.model._compute_grads_from_cache(cache, y)
+            self.model._apply_grads(gw, gb, m, lr, grad_gammas=gg, grad_betas=gbb)
+        else:
+            loss, gw, gb, m, gg, gbb = self.model._compute_grads(X, y)
+            self.model._apply_grads(gw, gb, m, lr, grad_gammas=gg, grad_betas=gbb)
+        self.step_id += 1
+        return loss
 
     def _set_train_batch_caps(self, model_type: ModelType) -> None:
         if model_type != ModelType.CNN:

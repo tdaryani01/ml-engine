@@ -3,6 +3,18 @@ import logging
 import sys
 
 from config.config_loader import load_production_config
+from config.constants import EngineBackend
+from utils.runtime import apply_process_env, configure_runtime, load_runtime_settings, training_threadpool
+
+from utils.perf_experiments import apply_im2col_gemm_perf_defaults, experiment_summary
+
+# Pin thread env + native OpenBLAS before NumPy/SciPy BLAS first touch.
+_cfg = load_production_config("config/config.yaml")
+if _cfg.architecture.backend == EngineBackend.IM2COL_GEMM:
+    apply_im2col_gemm_perf_defaults()
+apply_process_env(load_runtime_settings(), overwrite=True, if_unset=False)
+configure_runtime(_cfg.architecture.backend, log=False, overwrite_env=True)
+
 from config.constants import IngestionMode, ModelType, DataKeys
 from src.data.base_loader import BaseDataLoader
 from src.data.in_memory_provider import InMemoryDataProvider
@@ -10,9 +22,6 @@ from src.data.stream_provider import StreamDataProvider
 from src.controller import ModelController
 from utils.logger import initialize_global_logging
 from utils.diagnostics import NeuralNetworkDiagnostics
-from utils.runtime import apply_process_env, configure_runtime, load_runtime_settings, training_threadpool
-
-apply_process_env(load_runtime_settings(), if_unset=True)
 
 import numpy as np
 
@@ -29,7 +38,10 @@ def execute_training_pipeline():
     runtime = configure_runtime(
         cfg.architecture.backend,
         config_path="config/config.yaml",
+        overwrite_env=True,
+        if_unset_env=False,
     )
+    logging.warning(experiment_summary())
 
     is_cnn = (cfg.architecture.model_type == ModelType.CNN)
     source_mode = cfg.ingestion.source_mode
@@ -124,6 +136,10 @@ def execute_training_pipeline():
             patience=cfg.optimization.patience,
             min_delta=cfg.optimization.min_delta
         )
+
+        if cfg.architecture.backend == EngineBackend.IM2COL_GEMM:
+            from utils.conv_dispatch import log_im2col_telemetry
+            log_im2col_telemetry()
         
         NeuralNetworkDiagnostics.run_diagnostics(
             controller=controller,

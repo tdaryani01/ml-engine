@@ -12,7 +12,7 @@ from src.training_cache import (
     MaxPoolStepCache,
 )
 from utils.engine_ops import EngineContext, resolve_engine_context
-from utils.im2col import col2im
+from utils.conv_dispatch import col2im
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,6 @@ class ConvBlock:
         self.db = np.zeros_like(self.b)
         self.out_h = 0
         self.out_w = 0
-        self._bound_scratch = None
 
     def _compute_geometry(self, C: int, H: int, W_stride: int, W_logical: int):
         conv_out_h = (H + 2 * self.conv_pad - self.k_h) // self.conv_stride + 1
@@ -146,14 +145,14 @@ class ConvBlock:
             conv_stride=self.conv_stride, conv_pad=self.conv_pad,
             pool_size=self.pool_size, pool_stride=self.pool_stride,
             col_buf=col_buf, gemm_buf=gemm_buf,
+            w_gemm_fwd_buf=scratch.w_gemm_fwd_buffer,
             W_logical=w_log,
         )
 
         if cache is not None and not inference:
             cache.conv_blocks[layer_idx] = ConvBlockStepCache(
-                x=x, conv_act=out_conv, argmax=argmax, col=col,
+                x=x, conv_act=out_conv, argmax=argmax, col=col, scratch=scratch,
             )
-            self._bound_scratch = scratch
         return out_pool
 
     def backward(
@@ -177,7 +176,7 @@ class ConvBlock:
         w_log = W_logical if W_logical is not None else W_stride
         inv_m = 1.0 / float(N)
 
-        scratch = self._bound_scratch
+        scratch = step.scratch
         if scratch is None:
             scratch = arena.ensure_conv_block_train(
                 layer_idx,
@@ -218,7 +217,6 @@ class ConvBlock:
             dcol_buf=scratch.dcol_buffer,
             W_logical=w_log,
         )
-        self._bound_scratch = None
         return dx
 
 
@@ -297,6 +295,7 @@ class Conv2D:
             out_buf=scratch.fwd_out_buffer[:N],
             col_buf=scratch.col_buffer,
             gemm_buf=scratch.fwd_gemm_buffer,
+            w_gemm_fwd_buf=scratch.w_gemm_fwd_buffer,
             fuse_relu=False,
             W_logical=w_log,
         )
@@ -327,7 +326,8 @@ class Conv2D:
         N, C, H, W_stride = step.x.shape
         w_log = W_logical if W_logical is not None else W_stride
         inv_m = 1.0 / float(N)
-        total_rows = N * self.out_h * self.out_w_stride
+        total_rows = N * self.out_h * self.out_w
+        dout_logical = dout[:, :, :self.out_h, :self.out_w]
 
         scratch = self._bound_scratch
         if scratch is None:
@@ -347,10 +347,10 @@ class Conv2D:
                 dtype=dout.dtype,
             )
         active_dout_trans = scratch.dout_trans_buffer[:total_rows]
-        self._conv.fuse_dout_transpose_and_bias(dout, active_dout_trans, self.db)
+        self._conv.fuse_dout_transpose_and_bias(dout_logical, active_dout_trans, self.db)
 
         dx, self.dW = self._conv.conv2d_backward_fused(
-            dout=dout,
+            dout=dout_logical,
             x=step.x,
             W=self.W,
             dx_buf=scratch.dx_buffer[:N],

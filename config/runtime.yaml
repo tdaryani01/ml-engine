@@ -4,7 +4,13 @@
 # env:          shared across platforms
 # linux:        GNU libgomp (Docker + Linux native conv)
 # windows:      Intel OpenMP / MKL (PyTorch, NumPy wheels on Windows)
-# blas_threads: per-backend caps via threadpoolctl during fit (Python-side)
+# im2col+gemm unified: USE_OPENMP=1 OpenBLAS shares libomp with conv_kernels (/openmp:llvm).
+# Thread count: OMP_NUM_THREADS (not OPENBLAS_NUM_THREADS when USE_OPENMP=1). See OpenBLAS Makefile.
+# Build: scripts/build_openblas.ps1 (USE_OPENMP=1 NUM_THREADS from config.yaml)
+# numba pinned to 1 during fit for native / im2col+gemm.
+# native + im2col+gemm: shared LLVM OMP pool (conv + bin/libopenblas); scipy wheel BLAS = 1.
+# configure_native_threads() in conv_kernels.dll mirrors omp_during_fit (threadpoolctl
+# does not reach the DLL's LLVM OpenMP).
 # docker:       container benchmark paths only
 
 env:
@@ -23,11 +29,11 @@ windows:
   KMP_AFFINITY: "none"
   KMP_DUPLICATE_LIB_OK: "TRUE"
   OMP_WAIT_POLICY: "ACTIVE"
-
+  USE_OPENMP: "1"
 blas_threads:
-  native: 1
+  native: null         # null -> use optimization.num_threads (shared OMP pool)
   numpy: null          # null -> use optimization.num_threads
-  im2col_gemm: null
+  im2col_gemm: null    # null -> use optimization.num_threads (shared OMP pool)
 
 docker:
   benchmark_runner:

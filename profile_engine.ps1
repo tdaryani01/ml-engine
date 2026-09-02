@@ -56,10 +56,6 @@ function Test-NativeSymbolPair {
             Reason = "PDB/DLL timestamp mismatch - rerun .\build_native.ps1 (close Python first)"
         }
     }
-    $stageDll = Join-Path (Split-Path $DllPath -Parent) "conv_kernels_stage.dll"
-    if (Test-Path $stageDll) {
-        return @{ Ok = $false; Reason = "incomplete build - rerun .\build_native.ps1" }
-    }
     return @{ Ok = $true; Reason = "" }
 }
 
@@ -558,7 +554,7 @@ if ($AnalysisType -eq "BackwardDiag") {
     Write-Host "`nBACKWARD DIAG CHECKLIST:" -ForegroundColor Yellow
     Write-Host "  1. Sources tab -> conv_fallback.cpp: compare process_bwd_dx_tile vs process_dw_nci_task CPU_TIME"
     Write-Host "  2. Re-run with -AnalysisType Memory for core L1/L2/DRAM (not per-function)"
-    Write-Host "  3. Re-run with -EnableCProfile for Python vs native split in im2col.py"
+    Write-Host "  3. Re-run with -EnableCProfile for Python vs native split in conv_dispatch.py"
     Write-Host "  Detail report: $DetailCsv" -ForegroundColor DarkGray
 }
 

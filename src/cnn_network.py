@@ -7,7 +7,6 @@ from src.scratch_arena import ScratchArena
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten, ConvBlock
 from src.training_cache import ForwardCache, new_forward_cache
 from utils.engine_ops import create_engine_context
-from utils.im2col import relu_spatial_forward, relu_spatial_backward
 
 if 'profile' not in builtins.__dict__:
     builtins.__dict__['profile'] = lambda x: x
@@ -245,7 +244,7 @@ class CNNNetwork:
                 if training and cache is not None:
                     cache.spatial_inputs[layer_idx] = current_act
                     cache.spatial_logical_ws[layer_idx] = current_logical_w
-                current_act = relu_spatial_forward(current_act, backend=self.backend)
+                current_act = self.engine_ctx.conv.relu_forward(current_act)
             elif isinstance(layer, Flatten):
                 if training and cache is not None:
                     cache.spatial_inputs[layer_idx] = current_act
@@ -420,12 +419,13 @@ class CNNNetwork:
                 delta *= (act_in > 0.0)
 
         spatial_grad = delta
+        arena.zero_dx_buffers(m)
         for i in reversed(range(len(self.layers))):
             layer = self.layers[i]
             in_act = cache.spatial_inputs[i]
 
             if layer == "relu":
-                spatial_grad = relu_spatial_backward(spatial_grad, in_act, backend=self.backend)
+                spatial_grad = self.engine_ctx.conv.relu_backward(spatial_grad, in_act)
             elif isinstance(layer, ConvBlock):
                 w_log = cache.spatial_logical_ws[i]
                 spatial_grad = layer.backward(

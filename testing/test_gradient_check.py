@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from src.model_factory import ModelFactory
 from config.constants import EngineBackend
 from utils.engine_ops import create_engine_context
-from utils.im2col import conv2d_forward, conv2d_backward_fused, init_engine_backend
+from utils.conv_dispatch import conv2d_forward, conv2d_backward_fused, init_engine_backend
 
 
 CONV_KERNELS = tuple(range(1, 8))
@@ -281,6 +281,48 @@ def check_conv2d_gradients_native_vs_numpy(
     return dx_ok and dW_ok
 
 
+def check_conv2d_gradients_im2col_gemm_vs_numpy(
+    kernel: int,
+    stride: int,
+    pad: int,
+    *,
+    rtol: float = 1e-4,
+    atol: float = 1e-5,
+) -> bool:
+    """Compare im2col+GEMM conv backward against NumPy reference (dX and dW)."""
+    x, weight, bias, out, dout, stride, pad, _, _ = _make_conv_grad_fixture(
+        EngineBackend.IM2COL_GEMM, kernel, stride, pad, fuse_relu=False
+    )
+    inv_m = 1.0 / float(x.shape[0])
+
+    dx_ref = np.zeros_like(x)
+    dW_ref = np.zeros_like(weight)
+    numpy_ctx = create_engine_context(EngineBackend.NUMPY)
+    conv2d_backward_fused(
+        dout, x, weight, dx_ref, dW_ref, stride=stride, pad=pad, inv_m=inv_m, ctx=numpy_ctx
+    )
+
+    dx_gemm = np.zeros_like(x)
+    dW_gemm = np.zeros_like(weight)
+    gemm_ctx = create_engine_context(EngineBackend.IM2COL_GEMM)
+    conv2d_backward_fused(
+        dout, x, weight, dx_gemm, dW_gemm, stride=stride, pad=pad, inv_m=inv_m, ctx=gemm_ctx
+    )
+
+    dx_diff = float(np.max(np.abs(dx_gemm - dx_ref)))
+    dW_diff = float(np.max(np.abs(dW_gemm - dW_ref)))
+    dx_ok = np.allclose(dx_gemm, dx_ref, rtol=rtol, atol=atol)
+    dW_ok = np.allclose(dW_gemm, dW_ref, rtol=rtol, atol=atol)
+
+    for label, ok, diff in (("dX", dx_ok, dx_diff), ("dW", dW_ok, dW_diff)):
+        status = "PASSED" if ok else "FAILED"
+        print(
+            f"[{status}] conv2d {label} [im2col+gemm] k={kernel} s={stride} pad={pad} "
+            f"| Max Abs Error vs ref: {diff:.2e} (rtol={rtol:.0e}, atol={atol:.0e})"
+        )
+    return dx_ok and dW_ok
+
+
 def check_conv2d_gradients(
     backend: EngineBackend,
     kernel: int,
@@ -291,6 +333,8 @@ def check_conv2d_gradients(
 ) -> bool:
     if backend == EngineBackend.NATIVE:
         return check_conv2d_gradients_native_vs_numpy(kernel, stride, pad)
+    if backend == EngineBackend.IM2COL_GEMM:
+        return check_conv2d_gradients_im2col_gemm_vs_numpy(kernel, stride, pad)
     return (
         check_conv2d_input_gradient(
             backend, kernel, pad, stride=stride, fuse_relu=fuse_relu
@@ -314,6 +358,8 @@ def run_conv_gradient_check(
         f"| {len(cases)} cases (k=1..7, stride=1..2, pad=1..2)"
     )
     if backend == EngineBackend.NATIVE:
+        print(" Reference: NumPy im2col backward (not finite-difference)")
+    elif backend == EngineBackend.IM2COL_GEMM:
         print(" Reference: NumPy im2col backward (not finite-difference)")
     print("=" * 70)
 
@@ -592,13 +638,18 @@ def run_all_checks():
         if cnn_exit_code != 0:
             overall_status = 1
 
-    # Conv kernel matrix validates native DLL vs NumPy reference only.
+    # Conv kernel matrix: native vs NumPy; im2col+GEMM vs NumPy (Phase D3).
     conv_exit_code = run_conv_gradient_check(backend=EngineBackend.NATIVE)
     if conv_exit_code != 0:
         overall_status = 1
         print(
             "[HINT] Native conv grad check failed. Rebuild the DLL first: .\\build_native.ps1"
         )
+
+    conv_gemm_exit = run_conv_gradient_check(backend=EngineBackend.IM2COL_GEMM)
+    if conv_gemm_exit != 0:
+        overall_status = 1
+        print("[HINT] IM2COL+GEMM conv grad check failed vs NumPy reference.")
             
     print("\n" + "=" * 70)
     if overall_status == 0:

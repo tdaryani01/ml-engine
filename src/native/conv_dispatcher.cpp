@@ -119,10 +119,6 @@ void maxpool2d_backward_avx2(
 // -----------------------------------------------------------------------------
 extern "C" {
 
-__declspec(dllexport) int32_t get_omp_threads(void) {
-    return omp_get_max_threads();
-}
-
 __declspec(dllexport) void log_engine_runtime_diagnostics(
     void* p1, void* p2, void* p3,
     int64_t i1, int64_t i2, int64_t i3, int64_t i4,

@@ -36,6 +36,9 @@ uprof_reports/
 *.prof
 *.dat
 
+# Vendored sources and local CMake/make trees (not tracked)
+third_party/
+
 # Packaging / temp
 build/
 dist/

@@ -26,7 +26,7 @@ from utils.engine_ops import (
     NumpyConvOps,
     create_engine_context,
 )
-from utils.im2col import conv2d_forward, init_engine_backend
+from utils.conv_dispatch import conv2d_forward, init_engine_backend
 
 
 def _tiny_conv_fixture(stride: int = 1, pad: int = 1, kernel: int = 3):
@@ -54,6 +54,8 @@ def test_a1_conv_ops_protocol():
         "maxpool_forward",
         "maxpool_backward",
         "fuse_dout_transpose_and_bias",
+        "relu_forward",
+        "relu_backward",
     ):
         assert hasattr(ops, name), f"ConvOps missing {name}"
     print("[PASSED] A1: ConvOps protocol surface")
