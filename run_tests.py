@@ -19,6 +19,7 @@ _TIER_ORDER = [
     "testing/test_runtime.py",
     "testing/test_training_cache.py",
     "testing/test_training_session.py",
+    "testing/test_ledger.py",
     "testing/test_im2col_gemm.py",
     "testing/test_native_conv.py",
     "testing/test_benchmark_harness.py",

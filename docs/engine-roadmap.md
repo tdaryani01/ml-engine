@@ -172,21 +172,26 @@ im2col+GEMM routing — that is a separate dispatcher decision after D8–D9 are
 
 ---
 
-### Phase E — Ledger, consolidator, serving (local proof first)
+### Phase E — Ledger, training manager, serving (local proof first)
 
-**Outcome:** Command/result training model on one machine; then VMs.
+**Outcome:** Append-only training tape with replay/rewind/branch; SQL-style
+single-thread main loop; pluggable storage.
+
+**Start here:** [phase-e-reference.md](./phase-e-reference.md) · Details:
+[ledger-design.md](./ledger-design.md) · [ledger-record-model.md](./ledger-record-model.md)
 
 | ID | Scope | Files | Done when |
 |----|--------|-------|-----------|
-| **E1** | Define `TrainStepCommand` (base_version, batch ref, lr, step_id) | `src/ledger.py` (new) | JSON/msgpack schema |
+| **E1** | `LedgerStore` ABC + `TrainStepCommand` + record schemas | `src/ledger.py` (new) | Schema + interface tests |
 | **E2** | `TrainStepResult.to_bytes()` / `from_bytes()` | `ledger.py` | Round-trip test |
-| **E3** | In-memory queue + single `Consolidator` process/thread | `src/consolidator.py` (new) | Two worker threads → one model |
-| **E4** | `WeightStore`: versioned weights, `publish()` / `get(version)` | `src/weight_store.py` (new) | Inference reads vN while training writes vN+1 |
-| **E5** | `InferenceSession` — read-only weights + thread-local arena | `src/inference_session.py` (new) | Two concurrent forwards, same version |
-| **E6** | File-based ledger (append log) for crash recovery sketch | `ledger.py` | Replay last K steps |
-| **E7** | Document VM protocol (queue transport TBD: Redis/SQS/Kafka) | `docs/distributed-training.md` | No impl required yet |
+| **E3** | `TrainingLedger` + single-thread consolidator / main loop | `src/training_engine.py` (new) | N-step replay matches `train_and_apply` |
+| **E4** | `FileLedgerStore` + checkpoint sidecars | `ledger.py` | Rewind to checkpoint |
+| **E5** | Branch fork/freeze + read-only replay | `ledger.py` | Frozen branch + active fork test |
+| **E6** | Manager hooks: local best, last healthy, fork policy | `src/training_manager.py` (new) | Synthetic overfit → fork |
+| **E7** | Document VM protocol (queue transport TBD) | `docs/distributed-training.md` | No impl required yet |
 
-**Exit criteria (Phase E):** Local two-worker gradient pipeline matches single-thread training for N steps (same seed).
+**Exit criteria (Phase E):** Replay/rewind from checkpoint matches single-thread
+training for N steps; fork preserves bad-path tail on frozen branch.
 
 ---
 
@@ -196,7 +201,7 @@ im2col+GEMM routing — that is a separate dispatcher decision after D8–D9 are
 |-------|-------|-------|
 | Sequential two experiments | A | Two sessions, two models, different configs |
 | Thread-safe IM2COL GEMM | D1 | Required before any multi-thread compute |
-| Two training workers → consolidator | E3 | **Preferred** multi-core / multi-VM pattern |
+| Two training workers → consolidator | E3 (legacy) | **Replaced:** single-thread loop + optional multi-slot round-robin |
 | Two inference requests, same version | E5 | Read-only weights + thread-local scratch |
 | Shared-model multi-thread training (Hogwild) | — | **Not planned** unless ledger path insufficient |
 

@@ -42,6 +42,18 @@ class TrainStepResult:
             grad_betas=[np.copy(g) for g in self.grad_betas] if self.grad_betas else None,
         )
 
+    def to_bytes(self) -> bytes:
+        """E2: serialize for ledger step.result bodies."""
+        from src.ledger import train_step_result_to_body
+        import json
+        return json.dumps(train_step_result_to_body(self), separators=(",", ":")).encode("utf-8")
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> TrainStepResult:
+        from src.ledger import train_step_result_from_body
+        import json
+        return train_step_result_from_body(json.loads(data.decode("utf-8")))
+
 
 class TrainingSession:
     """
