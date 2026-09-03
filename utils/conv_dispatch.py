@@ -823,7 +823,7 @@ def _pack_w_gemm_fwd(W: np.ndarray, buf: np.ndarray | None = None) -> np.ndarray
 # -----------------------------------------------------------------------------
 # Composite Block Routines
 # -----------------------------------------------------------------------------
-# @profile
+# 
 def conv_block_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
                        out_conv_buf: np.ndarray, out_pool_buf: np.ndarray, argmax_buf: np.ndarray,
                        conv_stride: int = 1, conv_pad: int = 1,
@@ -881,7 +881,7 @@ def conv_block_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
     )
     return out_pool, out_conv, argmax, col
 
-# @profile
+# 
 def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
                         x: np.ndarray, W: np.ndarray, conv_act: np.ndarray,
                         d_conv_buf: np.ndarray, dx_buf: np.ndarray, dW_buf: np.ndarray, db_buf: np.ndarray,
@@ -960,7 +960,7 @@ def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
 # -----------------------------------------------------------------------------
 # Standalone Layer Routines
 # -----------------------------------------------------------------------------
-# @profile
+# 
 def conv2d_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
                    stride: int, pad: int, out_buf: np.ndarray,
                    col_buf: np.ndarray = None, gemm_buf: np.ndarray = None,

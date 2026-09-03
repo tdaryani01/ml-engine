@@ -11,6 +11,7 @@ LOG_FILE = "test_run.log"
 
 # Preferred tier order; any new test_*.py not listed here runs at the end.
 _TIER_ORDER = [
+    "testing/test_config.py",
     "testing/test_optimizers.py",
     "testing/test_schedulers.py",
     "testing/test_serializer.py",
@@ -118,7 +119,12 @@ def run_test_module(name: str, script_path: str) -> tuple[bool, list]:
 
     start_time = time.time()
     result = subprocess.run(
-        [sys.executable, script_path],
+        [
+            sys.executable,
+            "-c",
+            "import builtins; builtins.profile=getattr(builtins,'profile',lambda f:f); "
+            "import runpy; runpy.run_path(%r, run_name='__main__')" % script_path,
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

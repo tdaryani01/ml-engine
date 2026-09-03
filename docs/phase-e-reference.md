@@ -4,8 +4,7 @@
 planning decisions. Details in [ledger-design.md](./ledger-design.md) and
 [ledger-record-model.md](./ledger-record-model.md).
 
-**Status:** E1–E5 implemented · **Not wired to ModelController** · Production path still
-`TrainingSession.train_and_apply()` / `ModelController.fit()`.
+**Status:** E1–E5 implemented · **Wired to fit()** · Phase F design: [contract-list-architecture.md](./contract-list-architecture.md)
 
 **Last updated:** 2026-09-02
 

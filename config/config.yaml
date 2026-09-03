@@ -30,7 +30,7 @@ ingestion:
 # =====================================================================
 architecture:
   model_type: "cnn"                  # Options: "multi_class", "binary_classification", "regression", "cnn"
-  backend: "im2col+gemm"             # Options: "native" | "im2col+gemm" | "numpy"
+  backend: "native"                  # Options: "native" | "im2col+gemm" | "numpy"
   num_classes: 4                     # 4 Synthetic Classes: Circle, Square, Cross, Diamond
   hidden_layers: []                  # Dense MLP hidden layers (bypassed for CNN)
   p_dropout: 0.1                     # Regularization dropout rate
@@ -64,7 +64,7 @@ architecture:
         pool_size: 2
         stride: 2
       - type: "flatten"
-    dense_head: [64]                 # Hidden dense dims between Flatten and Output classes
+    dense_head: []                  # Contract path v1: single dense head (flat -> num_classes)
 
 # =====================================================================
 # OPTIMIZATION LOOP CONTROLS
@@ -101,6 +101,8 @@ ledger:
   branch_id: "main"
   checkpoint_every_steps: 50
   checkpoint_on_local_best: true
+  contract_list_enabled: true
+  store_backend: file_streaming
 
 # =====================================================================
 # REGULARIZATION STRAIN MATRIX

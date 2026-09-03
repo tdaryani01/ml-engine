@@ -147,6 +147,7 @@ class ModelController:
         min_delta: float = 1e-5,
         ledger_settings: LedgerSettings | None = None,
         output_dir: str = "diagnostics_output",
+        max_epochs: int | None = None,
     ) -> Tuple[List[float], List[float]]:
         """Executes the training loop via TrainingSession (Phase C boundary)."""
         if self.model is None:
@@ -181,6 +182,8 @@ class ModelController:
                 config=LedgerConfig(
                     checkpoint_every_steps=ledger_settings.checkpoint_every_steps,
                     checkpoint_on_local_best=ledger_settings.checkpoint_on_local_best,
+                    contract_list_enabled=ledger_settings.contract_list_enabled,
+                    store_backend=ledger_settings.store_backend,
                 ),
             )
             logging.info("[Model Controller] Training ledger enabled: %s", ledger_dir)
@@ -194,6 +197,7 @@ class ModelController:
             min_delta=min_delta,
             compute_r2_score=self.compute_r2_score,
             engine=engine,
+            max_epochs=max_epochs,
         )
         self.steps_completed = session.steps_completed
         return self.train_history, self.val_history

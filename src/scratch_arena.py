@@ -126,6 +126,7 @@ class ScratchArena:
             if scratch.dx_buffer is not None:
                 scratch.dx_buffer[:n].fill(0.0)
 
+    
     def conv_block(self, layer_idx: int) -> ConvBlockScratch:
         if layer_idx not in self.conv_blocks:
             self.conv_blocks[layer_idx] = ConvBlockScratch()
@@ -141,6 +142,7 @@ class ScratchArena:
             self.maxpool[layer_idx] = MaxPoolScratch()
         return self.maxpool[layer_idx]
 
+    
     def ensure_conv_block_train(
         self,
         layer_idx: int,

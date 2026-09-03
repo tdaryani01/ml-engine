@@ -1,15 +1,13 @@
 # src/cnn_network.py
-import builtins
 import logging
+from typing import Callable
+
 import numpy as np
 from config.constants import EngineBackend
 from src.scratch_arena import ScratchArena
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten, ConvBlock
 from src.training_cache import ForwardCache, new_forward_cache
 from utils.engine_ops import create_engine_context
-
-if 'profile' not in builtins.__dict__:
-    builtins.__dict__['profile'] = lambda x: x
 
 
 class CNNNetwork:
@@ -69,6 +67,101 @@ class CNNNetwork:
             if isinstance(layer, (ConvBlock, Conv2D)):
                 self._layer_param_idx[li] = self.param_layers.index(layer)
         self._train_cache: ForwardCache | None = None
+        self.contract_list_enabled = bool(kwargs.pop("contract_list_enabled", False))
+        self._contract_runtime = None
+        if self.contract_list_enabled:
+            self._init_contract_path()
+
+    def enable_contract_list(self) -> None:
+        """Opt-in contract path after construction (e.g. from training engine at fit time)."""
+        if self._contract_runtime is not None:
+            return
+        self.contract_list_enabled = True
+        self._init_contract_path()
+
+    def _init_contract_path(self) -> None:
+        from src.contract import compile_cnn_training_step
+        from src.contract_runtime import ContractRuntime
+        from src.spatial_layers import ConvBlock
+
+        if self.backend != EngineBackend.NATIVE:
+            raise ValueError("Contract list requires NATIVE backend")
+        if len(self._dense_w_indices) != 1:
+            raise ValueError("Contract path requires a single dense head (no hidden dense layers)")
+        for layer in self.layers:
+            if not isinstance(layer, (ConvBlock, Flatten)) and layer != "relu":
+                from src.spatial_layers import Conv2D, MaxPool2D
+                if isinstance(layer, (Conv2D, MaxPool2D)):
+                    raise ValueError("Contract path requires fused ConvBlock spatial stack")
+
+        contract = compile_cnn_training_step(
+            self.layers,
+            layer_param_idx=self._layer_param_idx,
+            dense_w_indices=self._dense_w_indices,
+        )
+        self._contract = contract
+        self._contract_runtime = ContractRuntime(self, contract)
+        logging.info("[CNN] Contract list enabled: %d ops", contract.op_count)
+
+    
+    def add_training_step(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        lr: float,
+        *,
+        apply_adam: bool = False,
+        step_token: int | None = None,
+    ) -> str:
+        """Manager handshake: OK if accepted, BUSY if native queue occupied."""
+        if self._contract_runtime is None:
+            raise RuntimeError("Contract path not initialized")
+        if self._contract_runtime.try_submit_step(
+            X, y, lr, apply_adam=apply_adam, step_token=step_token
+        ):
+            return "OK"
+        return "BUSY"
+
+    def contract_busy(self) -> bool:
+        if self._contract_runtime is None:
+            return False
+        return self._contract_runtime.is_busy()
+
+    def submit_contract_train_step(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        lr: float,
+        *,
+        apply_adam: bool = False,
+        step_token: int | None = None,
+    ) -> str:
+        return self.add_training_step(
+            X, y, lr, apply_adam=apply_adam, step_token=step_token
+        )
+
+    def try_reap_contract_train_step(
+        self,
+    ) -> tuple[float, list, list, int] | None:
+        if self._contract_runtime is None:
+            return None
+        return self._contract_runtime.try_reap_step()
+
+    def run_contract_train_step(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        lr: float,
+        *,
+        apply_adam: bool = False,
+        step_token: int | None = None,
+        tick_fn: Callable[[], None] | None = None,
+    ) -> tuple[float, list, list, int]:
+        if self._contract_runtime is None:
+            raise RuntimeError("Contract path not initialized")
+        return self._contract_runtime.run_step(
+            X, y, lr, apply_adam=apply_adam, step_token=step_token, tick_fn=tick_fn
+        )
 
     @property
     def layer_sizes(self) -> list:
@@ -363,6 +456,7 @@ class CNNNetwork:
             return float(-np.sum(y * np.log(clipped) + (1.0 - y) * np.log(1.0 - clipped)) / m)
         return float(np.sum((output - y) ** 2) / (2.0 * m))
 
+    
     def compute_total_loss(self, output: np.ndarray, y: np.ndarray) -> float:
         raw_cost = self.calculate_raw_cost(output, y)
         m = y.shape[0]
@@ -486,6 +580,7 @@ class CNNNetwork:
         loss = self.compute_total_loss(output, y)
         return loss, grad_weights, grad_biases, m, None, None
 
+    
     def _apply_grads(
         self,
         grad_weights,

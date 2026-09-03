@@ -195,6 +195,27 @@ training for N steps; fork preserves bad-path tail on frozen branch.
 
 ---
 
+### Phase F — Contract-list orchestration (OMP utilization)
+
+**Outcome:** Manager pushes work; CNN owns queue + compiled contract lists; native
+executes full steps without Python between ops. Version on success only.
+
+**Design:** [contract-list-architecture.md](./contract-list-architecture.md)
+
+| ID | Scope | Done when |
+|----|--------|-----------|
+| **F0** | Doc + remove Python worker thread path | Design landed |
+| **F1** | Contract IR + init compile | 2-conv graph compiles to op list |
+| **F2** | Native dumb executor | Op list parity vs sync ctypes |
+| **F3** | Buffer pool | No leak across N steps |
+| **F4** | Completion ring | Submit/drain event |
+| **F5** | CNN queue + pushback | BUSY when full |
+| **F6** | CNN defers compute | No per-layer conv_dispatch on hot path |
+| **F7** | TrainingManager loop | ES + version-on-success |
+| **F8** | Full step milestone | Grad check + benchmark |
+
+---
+
 ## 4. Parallelism models (what we support when)
 
 | Model | Phase | Notes |

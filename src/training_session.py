@@ -29,6 +29,7 @@ class TrainStepResult:
     m_samples: int
     grad_gammas: List[np.ndarray] | None = None
     grad_betas: List[np.ndarray] | None = None
+    weights_applied: bool = False
 
     def copy_grads(self) -> TrainStepResult:
         """Return a copy with detached numpy arrays."""
@@ -40,19 +41,20 @@ class TrainStepResult:
             m_samples=self.m_samples,
             grad_gammas=[np.copy(g) for g in self.grad_gammas] if self.grad_gammas else None,
             grad_betas=[np.copy(g) for g in self.grad_betas] if self.grad_betas else None,
+            weights_applied=self.weights_applied,
         )
 
     def to_bytes(self) -> bytes:
-        """E2: serialize for ledger step.result bodies."""
-        from src.ledger import train_step_result_to_body
-        import json
-        return json.dumps(train_step_result_to_body(self), separators=(",", ":")).encode("utf-8")
+        """E2: raw binary serialize for ledger step.result bodies."""
+        from src.ledger_wire import pack_step_result
+
+        return pack_step_result(self)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> TrainStepResult:
-        from src.ledger import train_step_result_from_body
-        import json
-        return train_step_result_from_body(json.loads(data.decode("utf-8")))
+        from src.ledger_wire import unpack_step_result
+
+        return unpack_step_result(data)
 
 
 class TrainingSession:
@@ -79,25 +81,125 @@ class TrainingSession:
         self.val_history: List[float] = []
         self.engine: Any = None  # TrainingEngine when ledger enabled
 
-    def train_step(self, X: np.ndarray, y: np.ndarray, lr: float) -> TrainStepResult:
+    
+    def reserve_step_id(self) -> int:
+        """Allocate the next step_id on the main thread (strict FIFO submit order)."""
+        self.step_id += 1
+        return self.step_id
+
+    
+    def train_step(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        lr: float,
+        *,
+        step_id: int | None = None,
+        tick_fn: Callable[[], None] | None = None,
+    ) -> TrainStepResult:
         """Forward + backward grad compute; does not mutate weights."""
-        if hasattr(self.model, "forward_train"):
+        gg: list[np.ndarray] | None = None
+        gbb: list[np.ndarray] | None = None
+        weights_applied = False
+        if getattr(self.model, "contract_list_enabled", False) and hasattr(
+            self.model, "run_contract_train_step"
+        ):
+            loss, gw, gb, m, gg, gbb = self._contract_compute_step(
+                X, y, lr, step_id=step_id, tick_fn=tick_fn
+            )
+            weights_applied = True
+        elif hasattr(self.model, "forward_train"):
             _, cache = self.model.forward_train(X)
             loss, gw, gb, m, gg, gbb = self.model._compute_grads_from_cache(cache, y)
         else:
             loss, gw, gb, m, gg, gbb = self.model._compute_grads(X, y)
 
-        self.step_id += 1
+        if step_id is None:
+            self.step_id += 1
+            step_id = self.step_id
+
+        return self._pack_train_step_result(
+            step_id, loss, gw, gb, m, gg, gbb, weights_applied=weights_applied
+        )
+
+    def submit_contract_step(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        lr: float,
+        *,
+        step_id: int,
+        apply_adam: bool = True,
+    ) -> bool:
+        """Returns True if CNN accepted step, False if BUSY."""
+        if not (
+            getattr(self.model, "contract_list_enabled", False)
+            and hasattr(self.model, "add_training_step")
+        ):
+            raise RuntimeError("submit_contract_step requires contract-list path")
+        return (
+            self.model.add_training_step(
+                X, y, lr, apply_adam=apply_adam, step_token=step_id
+            )
+            == "OK"
+        )
+
+    def contract_busy(self) -> bool:
+        if hasattr(self.model, "contract_busy"):
+            return bool(self.model.contract_busy())
+        return False
+
+    def try_reap_contract_step(
+        self,
+    ) -> tuple[float, list[np.ndarray], list[np.ndarray], int, None, None, bool] | None:
+        if not hasattr(self.model, "try_reap_contract_train_step"):
+            return None
+        out = self.model.try_reap_contract_train_step()
+        if out is None:
+            return None
+        loss, gw, gb, m = out
+        return loss, gw, gb, m, None, None, True
+
+    
+    def _contract_compute_step(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        lr: float,
+        *,
+        step_id: int | None = None,
+        tick_fn: Callable[[], None] | None = None,
+    ) -> tuple[float, list[np.ndarray], list[np.ndarray], int, None, None]:
+        loss, gw, gb, m = self.model.run_contract_train_step(
+            X, y, lr, apply_adam=True, step_token=step_id
+        )
+        return loss, gw, gb, m, None, None
+
+    
+    def _pack_train_step_result(
+        self,
+        step_id: int,
+        loss: float,
+        gw: list[np.ndarray],
+        gb: list[np.ndarray],
+        m: int,
+        gg: list[np.ndarray] | None,
+        gbb: list[np.ndarray] | None,
+        *,
+        weights_applied: bool = False,
+    ) -> TrainStepResult:
         return TrainStepResult(
-            step_id=self.step_id,
+            step_id=step_id,
             loss=loss,
             grad_weights=[np.copy(g) for g in gw],
             grad_biases=[np.copy(g) for g in gb],
             m_samples=m,
             grad_gammas=[np.copy(g) for g in gg] if gg else None,
             grad_betas=[np.copy(g) for g in gbb] if gbb else None,
+            weights_applied=weights_applied,
         )
 
+    
     def apply_step(self, result: TrainStepResult, lr: float) -> None:
         """Apply optimizer update from a prior train_step result."""
         self.model._apply_grads(
@@ -111,7 +213,11 @@ class TrainingSession:
 
     def train_and_apply(self, X: np.ndarray, y: np.ndarray, lr: float) -> float:
         """Forward + backward + apply on the same hot path as legacy model.backward()."""
-        if hasattr(self.model, "forward_train"):
+        if getattr(self.model, "contract_list_enabled", False) and hasattr(
+            self.model, "run_contract_train_step"
+        ):
+            loss, gw, gb, m = self.model.run_contract_train_step(X, y, lr, apply_adam=True)
+        elif hasattr(self.model, "forward_train"):
             _, cache = self.model.forward_train(X)
             loss, gw, gb, m, gg, gbb = self.model._compute_grads_from_cache(cache, y)
             self.model._apply_grads(gw, gb, m, lr, grad_gammas=gg, grad_betas=gbb)
@@ -140,18 +246,12 @@ class TrainingSession:
         min_delta: float = 1e-5,
         compute_r2_score: Callable[[np.ndarray, np.ndarray], float] | None = None,
         engine: Any = None,
+        max_epochs: int | None = None,
     ) -> Tuple[List[float], List[float]]:
         """Epoch training loop (extracted from ModelController)."""
         self.engine = engine
-        if engine is not None:
-            logging.info(
-                "[TrainingSession] Ledger active: branch=%s path=%s version=%d",
-                engine.ledger.branch_id,
-                getattr(engine.ledger.store, "root", "?"),
-                engine.ledger.version,
-            )
-            if engine.ledger.version == 0:
-                engine.ledger.push_checkpoint(self.model, version=0)
+        if self.engine is not None:
+            self.engine.on_fit_start()
         epoch = 0
         is_classification = model_type in (
             ModelType.BINARY_CLASSIFICATION,
@@ -214,14 +314,19 @@ class TrainingSession:
                     current_val_loss=current_val_loss,
                 ):
                     break
+            if max_epochs is not None and epoch + 1 >= max_epochs:
+                break
             epoch += 1
 
         self._generate_final_summary_report(
             X_val, y_val_target, source_mode, is_classification, model_type,
             es_state, early_stopping_enabled, compute_r2_score,
         )
+        if self.engine is not None:
+            self.engine.on_fit_end()
         return self.train_history, self.val_history
 
+    
     def _run_epoch_training_pass(
         self,
         active_lr: float,
@@ -237,45 +342,59 @@ class TrainingSession:
         from src.ledger import BatchRef
         from src.training_engine import StepInput
 
-        while self.data_provider.has_more_batches():
+        async_contract = (
+            self.engine is not None and self.engine.uses_async_contract()
+        )
+
+        if async_contract:
+            def _next_step() -> StepInput | None:
+                if not self.data_provider.has_more_batches():
+                    return None
+                X_b, y_b = self.data_provider.next_batch()
+                if X_b.size == 0:
+                    return None
+                X_b_norm = self.data_provider.normalize(X_b)
+                return StepInput(
+                    X=X_b_norm,
+                    y=y_b,
+                    batch_ref=BatchRef.new(epoch=epoch, batch_idx=batch_idx),
+                    lr=active_lr,
+                )
+
+            def _on_submitted(step: StepInput) -> None:
+                nonlocal batch_idx, forensic_data
+                if batch_idx == 0 and epoch % 10 == 0:
+                    forensic_data = self._forensic_batch_zero(step.y, is_classification)
+                batch_idx += 1
+                self.steps_completed += 1
+
+            batch_losses = self.engine.run_training_loop(
+                steps_budget=steps,
+                next_step=_next_step,
+                on_submitted=_on_submitted,
+            )
+            self.steps_completed = 0
+            return float(np.mean(batch_losses)) if batch_losses else 0.0, forensic_data
+
+        while True:
+            if not self.data_provider.has_more_batches():
+                break
+
             X_b, y_b = self.data_provider.next_batch()
             if X_b.size == 0:
                 break
 
             X_b_norm = self.data_provider.normalize(X_b)
+            batch_ref = BatchRef.new(epoch=epoch, batch_idx=batch_idx)
+            step = StepInput(X=X_b_norm, y=y_b, batch_ref=batch_ref, lr=active_lr)
+
             if self.engine is not None:
-                batch_ref = BatchRef.new(epoch=epoch, batch_idx=batch_idx)
-                step = StepInput(X=X_b_norm, y=y_b, batch_ref=batch_ref, lr=active_lr)
-                batch_loss = self.engine.run_step(step)
+                batch_losses.append(self.engine.run_step(step))
             else:
-                batch_loss = self.train_and_apply(X_b_norm, y_b, active_lr)
-            batch_losses.append(batch_loss)
+                batch_losses.append(self.train_and_apply(X_b_norm, y_b, active_lr))
 
             if batch_idx == 0 and epoch % 10 == 0:
-                if is_classification:
-                    y_classes = np.sum(y_b, axis=0) if len(y_b.shape) > 1 else np.unique(y_b, return_counts=True)[1]
-                else:
-                    y_classes = "N/A"
-
-                if hasattr(self.model, "activations") and len(self.model.activations) > 0:
-                    preds = self.model.activations[-1]
-                    if is_classification and hasattr(preds, "shape") and len(preds.shape) > 1:
-                        pred_classes = np.argmax(preds, axis=1)
-                        pred_spread = [int(np.sum(pred_classes == c)) for c in range(preds.shape[1])]
-                    else:
-                        pred_spread = "N/A"
-
-                    l1_act = self.model.activations[1] if len(self.model.activations) > 1 else None
-                    dead_pct = float(np.mean(l1_act <= 0.0) * 100) if l1_act is not None else 0.0
-                else:
-                    pred_spread = []
-                    dead_pct = 0.0
-
-                forensic_data = {
-                    "batch_target_dist": y_classes.tolist() if isinstance(y_classes, np.ndarray) else y_classes,
-                    "batch_pred_spread": pred_spread,
-                    "dead_zone_pct": dead_pct,
-                }
+                forensic_data = self._forensic_batch_zero(y_b, is_classification)
 
             batch_idx += 1
             self.steps_completed += 1
@@ -284,6 +403,40 @@ class TrainingSession:
                 break
 
         return float(np.mean(batch_losses)) if batch_losses else 0.0, forensic_data
+
+    def _forensic_batch_zero(
+        self, y_b: np.ndarray, is_classification: bool
+    ) -> Dict[str, Any]:
+        if is_classification:
+            y_classes = (
+                np.sum(y_b, axis=0)
+                if len(y_b.shape) > 1
+                else np.unique(y_b, return_counts=True)[1]
+            )
+        else:
+            y_classes = "N/A"
+
+        if hasattr(self.model, "activations") and len(self.model.activations) > 0:
+            preds = self.model.activations[-1]
+            if is_classification and hasattr(preds, "shape") and len(preds.shape) > 1:
+                pred_classes = np.argmax(preds, axis=1)
+                pred_spread = [int(np.sum(pred_classes == c)) for c in range(preds.shape[1])]
+            else:
+                pred_spread = "N/A"
+
+            l1_act = self.model.activations[1] if len(self.model.activations) > 1 else None
+            dead_pct = float(np.mean(l1_act <= 0.0) * 100) if l1_act is not None else 0.0
+        else:
+            pred_spread = []
+            dead_pct = 0.0
+
+        return {
+            "batch_target_dist": y_classes.tolist()
+            if isinstance(y_classes, np.ndarray)
+            else y_classes,
+            "batch_pred_spread": pred_spread,
+            "dead_zone_pct": dead_pct,
+        }
 
     def _evaluate_epoch_performance(
         self,
@@ -350,34 +503,24 @@ class TrainingSession:
             es_state["weights"] = copy.deepcopy(self.model.weights)
             es_state["biases"] = copy.deepcopy(self.model.biases)
             if self.engine is not None:
-                version = self.engine.ledger.version
-                self.engine.ledger.push_checkpoint(
-                    self.model,
-                    version=version,
-                    val_loss=current_val_loss,
-                    is_local_best=True,
-                )
-                es_state["best_version"] = version
-                logging.info(
-                    "[Early Stopping] New best epoch %d → ledger checkpoint version=%d",
-                    epoch,
-                    version,
+                es_state["best_version"] = self.engine.on_early_stopping_improved(
+                    epoch, current_val_loss
                 )
             return False
 
         es_state["patience_counter"] += 1
         if es_state["patience_counter"] >= patience:
-            logging.info(
-                f"[Early Stopping] Validation divergence at epoch {epoch}. "
-                f"Restoring best checkpoint from epoch {es_state['best_epoch']}."
-            )
             if self.engine is not None and es_state.get("best_version") is not None:
-                self.engine.ledger.restore_checkpoint(self.model, int(es_state["best_version"]))
-                logging.info(
-                    "[Early Stopping] Restored weights from ledger version=%s",
-                    es_state["best_version"],
+                self.engine.on_early_stopping_triggered(
+                    epoch,
+                    int(es_state["best_epoch"]),
+                    int(es_state["best_version"]),
                 )
             else:
+                logging.info(
+                    f"[Early Stopping] Validation divergence at epoch {epoch}. "
+                    f"Restoring best checkpoint from epoch {es_state['best_epoch']}."
+                )
                 self.model.weights = es_state["weights"]
                 self.model.biases = es_state["biases"]
                 if hasattr(self.model, "_sync_restored_weights"):

@@ -100,6 +100,8 @@ class LedgerSettings:
     branch_id: str = "main"
     checkpoint_every_steps: int = 50
     checkpoint_on_local_best: bool = True
+    contract_list_enabled: bool = False  # Phase F: CNN contract-list path (off until proven)
+    store_backend: str = "file_streaming"  # file_streaming | file_sync | redis (future)
 
 @dataclass(frozen=True)
 class DiagnosticsConfig:

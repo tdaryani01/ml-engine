@@ -1,5 +1,4 @@
 # src/spatial_layers.py
-import builtins
 import logging
 import numpy as np
 from config.constants import EngineBackend
@@ -15,9 +14,6 @@ from utils.engine_ops import EngineContext, resolve_engine_context
 from utils.conv_dispatch import col2im
 
 logger = logging.getLogger(__name__)
-
-if 'profile' not in builtins.__dict__:
-    builtins.__dict__['profile'] = lambda x: x
 
 
 def _round_up_simd(w: int, align: int = 8) -> int:
