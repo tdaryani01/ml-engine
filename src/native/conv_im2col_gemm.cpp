@@ -170,7 +170,7 @@ int32_t require_blas() {
 
 extern "C" {
 
-__declspec(dllexport) int32_t fuse_dout_transpose_bias_avx2(
+ML_ENGINE_EXPORT int32_t fuse_dout_transpose_bias_avx2(
     const float* dout,
     float* dout_trans,
     float* db,
@@ -189,7 +189,7 @@ __declspec(dllexport) int32_t fuse_dout_transpose_bias_avx2(
     return 0;
 }
 
-__declspec(dllexport) int32_t conv2d_forward_im2col_gemm_avx2(
+ML_ENGINE_EXPORT int32_t conv2d_forward_im2col_gemm_avx2(
     const float* x,
     const float* W_fwd,
     const float* bias,
@@ -259,7 +259,7 @@ __declspec(dllexport) int32_t conv2d_forward_im2col_gemm_avx2(
     return 0;
 }
 
-__declspec(dllexport) int32_t conv2d_backward_weight_im2col_gemm_avx2(
+ML_ENGINE_EXPORT int32_t conv2d_backward_weight_im2col_gemm_avx2(
     const float* dout,
     const float* x,
     float* dW,
@@ -310,7 +310,7 @@ __declspec(dllexport) int32_t conv2d_backward_weight_im2col_gemm_avx2(
     return 0;
 }
 
-__declspec(dllexport) int32_t conv2d_backward_input_im2col_gemm_avx2(
+ML_ENGINE_EXPORT int32_t conv2d_backward_input_im2col_gemm_avx2(
     const float* dout,
     const float* W,
     const float* in_act,

@@ -1,11 +1,6 @@
 #pragma once
 #include <cstdint>
-
-#ifdef _WIN32
-#define ML_IM2COL_EXPORT __declspec(dllexport)
-#else
-#define ML_IM2COL_EXPORT
-#endif
+#include "export.h"
 
 #ifdef __cplusplus
 extern "C" {

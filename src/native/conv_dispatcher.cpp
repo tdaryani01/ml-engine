@@ -1,3 +1,4 @@
+#include "export.h"
 #include "diagnostics.h"
 #include <omp.h>
 #include <immintrin.h>
@@ -119,7 +120,7 @@ void maxpool2d_backward_avx2(
 // -----------------------------------------------------------------------------
 extern "C" {
 
-__declspec(dllexport) void log_engine_runtime_diagnostics(
+ML_ENGINE_EXPORT void log_engine_runtime_diagnostics(
     void* p1, void* p2, void* p3,
     int64_t i1, int64_t i2, int64_t i3, int64_t i4,
     int64_t i5, int64_t i6, int64_t i7
@@ -129,7 +130,7 @@ __declspec(dllexport) void log_engine_runtime_diagnostics(
     (void)i5; (void)i6; (void)i7;
 }
 
-__declspec(dllexport) int32_t direct_conv_block_forward_avx2(
+ML_ENGINE_EXPORT int32_t direct_conv_block_forward_avx2(
     const float* x,
     const float* W,
     const float* bias,
@@ -243,7 +244,7 @@ __declspec(dllexport) int32_t direct_conv_block_forward_avx2(
     }
 }
 
-__declspec(dllexport) int32_t direct_conv_block_backward_avx2(
+ML_ENGINE_EXPORT int32_t direct_conv_block_backward_avx2(
     const float* dout_pool,
     const uint8_t* argmax_buf,
     const float* x,
@@ -316,7 +317,7 @@ __declspec(dllexport) int32_t direct_conv_block_backward_avx2(
     }
 }
 
-__declspec(dllexport) int32_t direct_conv2d_forward_avx2(
+ML_ENGINE_EXPORT int32_t direct_conv2d_forward_avx2(
     const float* x, const float* W, const float* bias, float* out,
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride, int64_t C_out,
     int64_t k_h, int64_t k_w, int64_t stride, int64_t pad, int64_t out_w_stride, int32_t fuse_relu
@@ -337,7 +338,7 @@ __declspec(dllexport) int32_t direct_conv2d_forward_avx2(
     }
 }
 
-__declspec(dllexport) int32_t direct_conv2d_backward_fused_avx2(
+ML_ENGINE_EXPORT int32_t direct_conv2d_backward_fused_avx2(
     const float* dout, const float* x, const float* W, const float* in_act,
     float* dx_buf, float* dW_buf,
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride, int64_t C_out,
@@ -361,7 +362,7 @@ __declspec(dllexport) int32_t direct_conv2d_backward_fused_avx2(
     }
 }
 
-__declspec(dllexport) int32_t direct_conv2d_backward_weight_avx2(
+ML_ENGINE_EXPORT int32_t direct_conv2d_backward_weight_avx2(
     const float* d_conv_buf, const float* x, float* dW,
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride, int64_t C_out,
     int64_t k_h, int64_t k_w, int64_t stride, int64_t pad, int64_t conv_out_w_stride, float inv_m
@@ -382,7 +383,7 @@ __declspec(dllexport) int32_t direct_conv2d_backward_weight_avx2(
     }
 }
 
-__declspec(dllexport) int32_t direct_conv2d_backward_input_avx2(
+ML_ENGINE_EXPORT int32_t direct_conv2d_backward_input_avx2(
     const float* d_conv_buf, const float* W, const float* in_act, float* dx,
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride, int64_t C_out,
     int64_t k_h, int64_t k_w, int64_t stride, int64_t pad, int64_t conv_out_w_stride, int32_t fuse_relu
@@ -404,7 +405,7 @@ __declspec(dllexport) int32_t direct_conv2d_backward_input_avx2(
     }
 }
 
-__declspec(dllexport) int32_t direct_relu_forward_avx2(float* x, int64_t size) {
+ML_ENGINE_EXPORT int32_t direct_relu_forward_avx2(float* x, int64_t size) {
     try {
         if (!x) return -1;
         const __m256 v_zero = _mm256_setzero_ps();
@@ -422,7 +423,7 @@ __declspec(dllexport) int32_t direct_relu_forward_avx2(float* x, int64_t size) {
     }
 }
 
-__declspec(dllexport) int32_t direct_relu_backward_avx2(float* dout, const float* in_act, int64_t size) {
+ML_ENGINE_EXPORT int32_t direct_relu_backward_avx2(float* dout, const float* in_act, int64_t size) {
     try {
         if (!dout || !in_act) return -1;
         int64_t i = 0;
@@ -441,7 +442,7 @@ __declspec(dllexport) int32_t direct_relu_backward_avx2(float* dout, const float
     }
 }
 
-__declspec(dllexport) int32_t direct_maxpool_forward_avx2(
+ML_ENGINE_EXPORT int32_t direct_maxpool_forward_avx2(
     const float* x, float* out_pool, uint8_t* argmax_buf,
     int64_t N, int64_t C, int64_t H, int64_t W,
     int64_t pool_size, int64_t pool_stride
@@ -485,7 +486,7 @@ __declspec(dllexport) int32_t direct_maxpool_forward_avx2(
     }
 }
 
-__declspec(dllexport) int32_t direct_maxpool_backward_avx2(
+ML_ENGINE_EXPORT int32_t direct_maxpool_backward_avx2(
     const float* dout_pool, const uint8_t* argmax_buf, float* dx_buf,
     int64_t N, int64_t C, int64_t out_h, int64_t out_w,
     int64_t in_h, int64_t in_w, int64_t pool_size, int64_t pool_stride
@@ -502,7 +503,7 @@ __declspec(dllexport) int32_t direct_maxpool_backward_avx2(
     }
 }
 
-__declspec(dllexport) int32_t direct_bias_backward_avx2(
+ML_ENGINE_EXPORT int32_t direct_bias_backward_avx2(
     const float* dout, float* db,
     int64_t N, int64_t C_out, int64_t out_h, int64_t out_w,
     float inv_m

@@ -1,4 +1,5 @@
 // contract_runner.cpp — Phase F: execute compiled contract list in one native call.
+#include "export.h"
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -490,7 +491,7 @@ void ensure_async_worker_started() {
 
 extern "C" {
 
-__declspec(dllexport) int32_t run_contract_training_step(
+ML_ENGINE_EXPORT int32_t run_contract_training_step(
     const ContractOpRow* ops,
     int32_t op_count,
     ContractExecCtx* ctx
@@ -499,14 +500,14 @@ __declspec(dllexport) int32_t run_contract_training_step(
 }
 
 // Optional: native worker invokes this when a submitted contract finishes (post-process in Python).
-__declspec(dllexport) void contract_register_completion_callback(
+ML_ENGINE_EXPORT void contract_register_completion_callback(
     ContractCompletionFn cb
 ) {
     g_completion_cb = cb;
 }
 
 // Returns 0 on accept, -2 if busy/running, -3 if completion must be reaped first.
-__declspec(dllexport) int32_t submit_contract_training_step(
+ML_ENGINE_EXPORT int32_t submit_contract_training_step(
     const ContractOpRow* ops,
     int32_t op_count,
     ContractExecCtx* ctx,
@@ -543,7 +544,7 @@ __declspec(dllexport) int32_t submit_contract_training_step(
 }
 
 // Returns 1 if a completion was reaped, 0 if not ready, -1 on bad args.
-__declspec(dllexport) int32_t try_reap_contract_completion(
+ML_ENGINE_EXPORT int32_t try_reap_contract_completion(
     int64_t* out_step_token,
     int32_t* out_status
 ) {
@@ -559,12 +560,12 @@ __declspec(dllexport) int32_t try_reap_contract_completion(
     return 1;
 }
 
-__declspec(dllexport) int32_t contract_async_in_flight() {
+ML_ENGINE_EXPORT int32_t contract_async_in_flight() {
     const int32_t state = g_async_state.load(std::memory_order_acquire);
     return (state == ASYNC_RUNNING) ? 1 : 0;
 }
 
-__declspec(dllexport) void contract_async_shutdown() {
+ML_ENGINE_EXPORT void contract_async_shutdown() {
     {
         std::lock_guard<std::mutex> lock(g_async_mtx);
         g_async_shutdown = true;
