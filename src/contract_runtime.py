@@ -119,7 +119,8 @@ class ContractExecCtx(ctypes.Structure):
         ("flat_dim", ctypes.c_int64),
         ("num_layers", ctypes.c_int32),
         ("layers", LayerBinding * 8),
-        ("dense", DenseBinding),
+        ("num_dense", ctypes.c_int32),
+        ("dense", DenseBinding * 8),
         ("adam", AdamBinding),
         ("loss_out", ctypes.c_void_p),
     ]
@@ -162,13 +163,19 @@ def _bind_runner(lib) -> None:
 
 
 @dataclass
+class DenseLayerBuffers:
+    z: np.ndarray
+    output: np.ndarray
+    delta: np.ndarray
+    dW: np.ndarray
+    db: np.ndarray
+    dx_flat: np.ndarray
+
+
+@dataclass
 class ContractBuffers:
-    dense_z: np.ndarray
-    dense_output: np.ndarray
-    dense_delta: np.ndarray
-    dense_dW: np.ndarray
-    dense_db: np.ndarray
-    dense_dx_flat: np.ndarray
+    dense_layers: list[DenseLayerBuffers]
+    batch_cap: int = 0
 
 
 @dataclass
@@ -198,8 +205,10 @@ class ContractRuntime:
             raise RuntimeError("conv_kernels.dll missing run_contract_training_step — rebuild native")
         _bind_runner(self._lib)
 
-        if len(model._dense_w_indices) != 1:
-            raise ValueError("Contract path requires exactly one dense head layer")
+        if len(model._dense_w_indices) < 1:
+            raise ValueError("Contract path requires at least one dense head layer")
+        if len(model._dense_w_indices) > 8:
+            raise ValueError("Contract path supports at most 8 dense layers")
 
         self._ops = (ContractOpRow * contract.op_count)(*self._build_op_rows())
         self._loss_scalar = np.zeros(1, dtype=np.float32)
@@ -234,12 +243,10 @@ class ContractRuntime:
     def _bindings_still_valid(self, m: int) -> bool:
         if not self._bindings_ready:
             return False
+        if self._buffers is None:
+            return False
         cap = getattr(self.model, "_train_batch_cap", 0) or m
-        return (
-            self._buffers is not None
-            and m <= self._buffers.dense_z.shape[0]
-            and m <= cap
-        )
+        return m <= self._buffers.batch_cap and m <= cap
 
     
     def _bind_conv_layers(self, X: np.ndarray, m: int) -> tuple[ContractExecCtx, list[tuple[int, Any]]]:
@@ -350,31 +357,35 @@ class ContractRuntime:
 
     
     def _bind_dense(self, ctx: ContractExecCtx, m: int, dtype) -> None:
-        """Wire dense head into ctx (once, or after batch cap bump)."""
+        """Wire dense head layers into ctx (once, or after batch cap bump)."""
         if self._dense_bindings_ready and self._bindings_still_valid(m):
             return
 
         bufs = self._ensure_buffers(m, dtype)
-        w_idx = self.model._dense_w_indices[0]
-        Wd = self.model.weights[w_idx]
-        bd = self.model.biases[w_idx].reshape(-1)
         opt = self.model.optimizer
+        num_dense = len(self.model._dense_w_indices)
+        ctx.num_dense = num_dense
 
-        d = ctx.dense
-        d.W = _ptr(Wd)
-        d.b = _ptr(bd)
-        d.dW = _ptr(bufs.dense_dW)
-        d.db = _ptr(bufs.dense_db)
-        d.z = _ptr(bufs.dense_z)
-        d.output = _ptr(bufs.dense_output)
-        d.delta = _ptr(bufs.dense_delta)
-        d.dx_flat = _ptr(bufs.dense_dx_flat)
-        d.fan_in = Wd.shape[0]
-        d.fan_out = Wd.shape[1]
-        d.ms_w = _ptr(opt.ms_w[w_idx])
-        d.vs_w = _ptr(opt.vs_w[w_idx])
-        d.ms_b = _ptr(opt.ms_b[w_idx].reshape(-1))
-        d.vs_b = _ptr(opt.vs_b[w_idx].reshape(-1))
+        for di, w_idx in enumerate(self.model._dense_w_indices):
+            Wd = self.model.weights[w_idx]
+            bd = self.model.biases[w_idx].reshape(-1)
+            layer_bufs = bufs.dense_layers[di]
+
+            d = ctx.dense[di]
+            d.W = _ptr(Wd)
+            d.b = _ptr(bd)
+            d.dW = _ptr(layer_bufs.dW)
+            d.db = _ptr(layer_bufs.db)
+            d.z = _ptr(layer_bufs.z)
+            d.output = _ptr(layer_bufs.output)
+            d.delta = _ptr(layer_bufs.delta)
+            d.dx_flat = _ptr(layer_bufs.dx_flat)
+            d.fan_in = Wd.shape[0]
+            d.fan_out = Wd.shape[1]
+            d.ms_w = _ptr(opt.ms_w[w_idx])
+            d.vs_w = _ptr(opt.vs_w[w_idx])
+            d.ms_b = _ptr(opt.ms_b[w_idx].reshape(-1))
+            d.vs_b = _ptr(opt.vs_b[w_idx].reshape(-1))
 
         ctx.loss_out = _ptr(self._loss_scalar)
         self._dense_bindings_ready = True
@@ -411,8 +422,9 @@ class ContractRuntime:
         ctx.adam.t = int(self.model.optimizer.t)
 
         if self._buffers is not None:
-            self._buffers.dense_dW.fill(0.0)
-            self._buffers.dense_db.fill(0.0)
+            for layer_bufs in self._buffers.dense_layers:
+                layer_bufs.dW.fill(0.0)
+                layer_bufs.db.fill(0.0)
         for _, layer in self._bound_layers:
             layer.dW.fill(0.0)
             layer.db.fill(0.0)
@@ -435,22 +447,26 @@ class ContractRuntime:
 
     
     def _ensure_buffers(self, m: int, dtype) -> ContractBuffers:
-        if self._buffers is not None:
+        cap = max(m, getattr(self.model, "_train_batch_cap", 0) or m)
+        if self._buffers is not None and cap <= self._buffers.batch_cap:
             return self._buffers
 
-        w_idx = self.model._dense_w_indices[0]
-        W = self.model.weights[w_idx]
-        fan_in, fan_out = W.shape
-        cap = max(m, getattr(self.model, "_train_batch_cap", 0) or m)
+        dense_layers: list[DenseLayerBuffers] = []
+        for w_idx in self.model._dense_w_indices:
+            W = self.model.weights[w_idx]
+            fan_in, fan_out = W.shape
+            dense_layers.append(
+                DenseLayerBuffers(
+                    z=np.empty((cap, fan_out), dtype=dtype),
+                    output=np.empty((cap, fan_out), dtype=dtype),
+                    delta=np.empty((cap, fan_out), dtype=dtype),
+                    dW=np.zeros((fan_in, fan_out), dtype=dtype),
+                    db=np.zeros((fan_out,), dtype=dtype),
+                    dx_flat=np.empty((cap, fan_in), dtype=dtype),
+                )
+            )
 
-        self._buffers = ContractBuffers(
-            dense_z=np.empty((cap, fan_out), dtype=dtype),
-            dense_output=np.empty((cap, fan_out), dtype=dtype),
-            dense_delta=np.empty((cap, fan_out), dtype=dtype),
-            dense_dW=np.zeros((fan_in, fan_out), dtype=dtype),
-            dense_db=np.zeros((fan_out,), dtype=dtype),
-            dense_dx_flat=np.empty((cap, fan_in), dtype=dtype),
-        )
+        self._buffers = ContractBuffers(dense_layers=dense_layers, batch_cap=cap)
         return self._buffers
 
     
@@ -689,12 +705,13 @@ class ContractRuntime:
             self.model.optimizer.t = int(ctx.adam.t)
 
         bufs = self._ensure_buffers(m, dtype)
-        w_idx_dense = self.model._dense_w_indices[0]
         grad_weights: list[np.ndarray | None] = [None] * len(self.model.weights)
         grad_biases: list[np.ndarray | None] = [None] * len(self.model.biases)
 
-        grad_weights[w_idx_dense] = np.copy(bufs.dense_dW)
-        grad_biases[w_idx_dense] = np.copy(bufs.dense_db).reshape(1, -1)
+        for di, w_idx in enumerate(self.model._dense_w_indices):
+            layer_bufs = bufs.dense_layers[di]
+            grad_weights[w_idx] = np.copy(layer_bufs.dW)
+            grad_biases[w_idx] = np.copy(layer_bufs.db).reshape(1, -1)
 
         for w_idx, layer in bound:
             grad_weights[w_idx] = np.copy(layer.dW)

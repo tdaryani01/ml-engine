@@ -232,7 +232,7 @@ def create_torch_model_class():
                 feat_out = self.features(dummy)
                 flattened_dim = feat_out.numel()
 
-            dense_hidden = cnn_config.get("dense_hidden", [64]) if cnn_config else [64]
+            dense_hidden = cnn_config.get("dense_head", [64]) if cnn_config else [64]
             if isinstance(dense_hidden, int):
                 dense_hidden = [dense_hidden]
 

@@ -32,15 +32,14 @@ def _tiny_cnn_config():
     }
 
 
-def _make_model(seed: int = 42):
-    rng = np.random.default_rng(seed)
+def _make_model(seed: int = 42, cnn_config: dict | None = None):
     np.random.seed(seed)
     return ModelFactory.create_model(
         model_type="cnn",
         layer_sizes=[4],
         backend=EngineBackend.NATIVE,
         optimizer="adam",
-        cnn_config=_tiny_cnn_config(),
+        cnn_config=cnn_config or _tiny_cnn_config(),
         lam_l1=0.0,
         lam_l2=0.0,
         max_norm=1e9,
@@ -62,6 +61,40 @@ def test_compile_synthetic_cnn_contract():
     blob = contract.to_bytes()
     assert len(blob) > 4
     print(f"[PASSED] compile contract: {contract.op_count} ops, {len(blob)} bytes")
+
+
+def test_contract_grad_parity_hidden_dense():
+    lib = _load_conv_dll()
+    if lib is None or not hasattr(lib, "run_contract_training_step"):
+        print("[SKIPPED] contract hidden dense parity: rebuild native (run_contract_training_step missing)")
+        return
+
+    cfg = _tiny_cnn_config()
+    cfg["dense_head"] = [8]
+
+    rng = np.random.default_rng(11)
+    X = rng.standard_normal((8, 1, 28, 32), dtype=np.float32)
+    y = np.zeros((8, 4), dtype=np.float32)
+    y[np.arange(8), rng.integers(0, 4, size=8)] = 1.0
+    lr = 0.01
+
+    sync = _make_model(seed=11, cnn_config=cfg)
+    contract = _make_model(seed=11, cnn_config=cfg)
+    contract.enable_contract_list()
+
+    sess_sync = TrainingSession(model=sync, data_provider=None, initial_lr=lr)
+    sess_contract = TrainingSession(model=contract, data_provider=None, initial_lr=lr)
+
+    res_sync = sess_sync.train_step(X, y, lr=lr)
+    sess_sync.apply_step(res_sync, lr)
+    sess_contract.train_step(X, y, lr=lr)
+
+    for i, (w_a, w_b) in enumerate(zip(sync.weights, contract.weights)):
+        np.testing.assert_allclose(w_a, w_b, rtol=1e-4, atol=1e-4, err_msg=f"weight[{i}]")
+    for i, (b_a, b_b) in enumerate(zip(sync.biases, contract.biases)):
+        np.testing.assert_allclose(b_a, b_b, rtol=1e-4, atol=1e-4, err_msg=f"bias[{i}]")
+
+    print("[PASSED] contract grad parity: hidden dense head matches sync path")
 
 
 def test_contract_grad_parity_one_step():
@@ -227,6 +260,7 @@ def test_contract_engine_finalize_skips_python_apply():
 if __name__ == "__main__":
     try:
         test_compile_synthetic_cnn_contract()
+        test_contract_grad_parity_hidden_dense()
         test_contract_grad_parity_one_step()
         test_contract_train_step_weights_applied_in_native()
         test_contract_async_submit_reaps()

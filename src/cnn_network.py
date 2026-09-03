@@ -86,8 +86,10 @@ class CNNNetwork:
 
         if self.backend != EngineBackend.NATIVE:
             raise ValueError("Contract list requires NATIVE backend")
-        if len(self._dense_w_indices) != 1:
-            raise ValueError("Contract path requires a single dense head (no hidden dense layers)")
+        if len(self._dense_w_indices) < 1:
+            raise ValueError("Contract path requires at least one dense head layer")
+        if len(self._dense_w_indices) > 8:
+            raise ValueError("Contract path supports at most 8 dense layers")
         for layer in self.layers:
             if not isinstance(layer, (ConvBlock, Flatten)) and layer != "relu":
                 from src.spatial_layers import Conv2D, MaxPool2D

@@ -64,7 +64,7 @@ architecture:
         pool_size: 2
         stride: 2
       - type: "flatten"
-    dense_head: []                  # Contract path v1: single dense head (flat -> num_classes)
+    dense_head: [64]                 # Hidden dense dims between Flatten and Output classes
 
 # =====================================================================
 # OPTIMIZATION LOOP CONTROLS
@@ -73,7 +73,7 @@ architecture:
 optimization:
   num_threads: 4
   optimizer: "adam"
-  epochs_full_dataset: 20
+  epochs_full_dataset: 100
   steps_streaming: 31
   batch_size: 32
   learning_rate: 0.001               # Initial learning rate for Adam

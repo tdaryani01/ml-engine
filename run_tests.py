@@ -21,6 +21,7 @@ _TIER_ORDER = [
     "testing/test_training_cache.py",
     "testing/test_training_session.py",
     "testing/test_ledger.py",
+    "testing/test_contract.py",
     "testing/test_im2col_gemm.py",
     "testing/test_native_conv.py",
     "testing/test_benchmark_harness.py",
@@ -28,6 +29,7 @@ _TIER_ORDER = [
     "testing/test_spatial_layers.py",
     "testing/test_pipeline_integration.py",
     "testing/test_cnn_pipeline.py",
+    "testing/test_cnn_param_count.py",
 ]
 
 

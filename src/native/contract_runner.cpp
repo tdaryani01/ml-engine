@@ -134,7 +134,8 @@ struct ContractExecCtx {
     int64_t flat_dim;
     int32_t num_layers;
     LayerBinding layers[8];
-    DenseBinding dense;
+    int32_t num_dense;
+    DenseBinding dense[8];
     AdamBinding adam;
     float* loss_out;
 };
@@ -157,13 +158,14 @@ static void softmax_cross_entropy_loss(
     *loss_out = (float)(-total / (double)N);
 }
 
-static void dense_forward(const ContractExecCtx* ctx) {
-    const DenseBinding* d = &ctx->dense;
+static void dense_linear_forward(
+    const ContractExecCtx* ctx, DenseBinding* d, const float* x_in
+) {
     const int64_t N = ctx->N;
     const int64_t fin = d->fan_in;
     const int64_t fout = d->fan_out;
     for (int64_t n = 0; n < N; ++n) {
-        const float* x = ctx->act + n * fin;
+        const float* x = x_in + n * fin;
         float* z = d->z + n * fout;
         for (int64_t j = 0; j < fout; ++j) {
             double sum = (double)d->b[j];
@@ -173,8 +175,12 @@ static void dense_forward(const ContractExecCtx* ctx) {
             z[j] = (float)sum;
         }
     }
+}
+
+static void dense_softmax_forward(DenseBinding* d, int64_t N) {
+    const int64_t fout = d->fan_out;
     for (int64_t n = 0; n < N; ++n) {
-        float* z = d->z + n * fout;
+        const float* z = d->z + n * fout;
         float* out = d->output + n * fout;
         float max_z = z[0];
         for (int64_t j = 1; j < fout; ++j) {
@@ -192,19 +198,69 @@ static void dense_forward(const ContractExecCtx* ctx) {
     }
 }
 
-static void dense_backward(ContractExecCtx* ctx) {
-    DenseBinding* d = &ctx->dense;
+static void dense_relu_forward(DenseBinding* d, int64_t N) {
+    const int64_t fout = d->fan_out;
+    for (int64_t n = 0; n < N; ++n) {
+        const float* z = d->z + n * fout;
+        float* out = d->output + n * fout;
+        for (int64_t j = 0; j < fout; ++j) {
+            out[j] = z[j] > 0.0f ? z[j] : 0.0f;
+        }
+    }
+}
+
+static void dense_forward_layer(ContractExecCtx* ctx, int32_t di, bool is_last) {
+    DenseBinding* d = &ctx->dense[di];
+    d->input_cache = ctx->act;
+    dense_linear_forward(ctx, d, ctx->act);
+    if (is_last) {
+        dense_softmax_forward(d, ctx->N);
+        if (ctx->loss_out) {
+            softmax_cross_entropy_loss(
+                d->output, ctx->y, ctx->N, d->fan_out, ctx->loss_out);
+        }
+    } else {
+        dense_relu_forward(d, ctx->N);
+    }
+    ctx->act = d->output;
+}
+
+static void dense_backward_layer(ContractExecCtx* ctx, int32_t di, bool is_last) {
+    DenseBinding* d = &ctx->dense[di];
     const int64_t N = ctx->N;
     const int64_t fin = d->fan_in;
     const int64_t fout = d->fan_out;
     const float inv_m = 1.0f / (float)N;
 
-    for (int64_t n = 0; n < N; ++n) {
-        const float* out = d->output + n * fout;
-        const float* t = ctx->y + n * fout;
-        float* delta = d->delta + n * fout;
-        for (int64_t j = 0; j < fout; ++j) {
-            delta[j] = out[j] - t[j];
+    if (is_last) {
+        for (int64_t n = 0; n < N; ++n) {
+            const float* out = d->output + n * fout;
+            const float* t = ctx->y + n * fout;
+            float* delta = d->delta + n * fout;
+            for (int64_t j = 0; j < fout; ++j) {
+                delta[j] = out[j] - t[j];
+            }
+        }
+    } else {
+        DenseBinding* d_next = &ctx->dense[di + 1];
+        const int64_t fout_next = d_next->fan_out;
+        for (int64_t n = 0; n < N; ++n) {
+            const float* delta_next = d_next->delta + n * fout_next;
+            float* delta = d->delta + n * fout;
+            for (int64_t j = 0; j < fout; ++j) {
+                double sum = 0.0;
+                for (int64_t k = 0; k < fout_next; ++k) {
+                    sum += (double)delta_next[k] * (double)d_next->W[j * fout_next + k];
+                }
+                delta[j] = (float)sum;
+            }
+        }
+        for (int64_t n = 0; n < N; ++n) {
+            float* delta = d->delta + n * fout;
+            const float* z = d->z + n * fout;
+            for (int64_t j = 0; j < fout; ++j) {
+                if (z[j] <= 0.0f) delta[j] = 0.0f;
+            }
         }
     }
 
@@ -262,7 +318,6 @@ static void adam_update_tensor(
 
 static void adam_apply_all(ContractExecCtx* ctx) {
     AdamBinding* a = &ctx->adam;
-    DenseBinding* d = &ctx->dense;
     a->t += 1;
     const float decay_factor = (ctx->lam_l2 > 0.0f)
         ? ctx->lr * (ctx->lam_l2 / (float)ctx->N)
@@ -275,7 +330,9 @@ static void adam_apply_all(ContractExecCtx* ctx) {
         adam_update_tensor(L->b, L->db, L->ms_b, L->vs_b, L->b_count, a, ctx->lr, 0.0f);
     }
 
-    if (d->ms_w) {
+    for (int32_t di = 0; di < ctx->num_dense; ++di) {
+        DenseBinding* d = &ctx->dense[di];
+        if (!d->ms_w) continue;
         adam_update_tensor(
             d->W, d->dW, d->ms_w, d->vs_w, d->fan_in * d->fan_out, a, ctx->lr, decay_factor);
         adam_update_tensor(d->b, d->db, d->ms_b, d->vs_b, d->fan_out, a, ctx->lr, 0.0f);
@@ -320,18 +377,19 @@ static int32_t run_contract_training_step_impl(
             }
             case OP_FLATTEN_FWD:
                 break;
-            case OP_DENSE_FWD:
-                ctx->dense.input_cache = ctx->act;
-                dense_forward(ctx);
-                if (ctx->loss_out) {
-                    softmax_cross_entropy_loss(
-                        ctx->dense.output, ctx->y, ctx->N, ctx->dense.fan_out, ctx->loss_out);
-                }
+            case OP_DENSE_FWD: {
+                if (op->layer_idx < 0 || op->layer_idx >= ctx->num_dense) return -4;
+                const bool is_last = (op->layer_idx == ctx->num_dense - 1);
+                dense_forward_layer(ctx, op->layer_idx, is_last);
                 break;
-            case OP_DENSE_BWD:
-                dense_backward(ctx);
-                ctx->act = ctx->dense.dx_flat;
+            }
+            case OP_DENSE_BWD: {
+                if (op->layer_idx < 0 || op->layer_idx >= ctx->num_dense) return -5;
+                const bool is_last = (op->layer_idx == ctx->num_dense - 1);
+                dense_backward_layer(ctx, op->layer_idx, is_last);
+                ctx->act = ctx->dense[op->layer_idx].dx_flat;
                 break;
+            }
             case OP_FLATTEN_BWD:
                 break;
             case OP_CONV_BLOCK_BWD: {
