@@ -216,7 +216,10 @@ class ContractRuntime:
         self._submitted: _SubmittedStep | None = None
         self._completed: tuple[float, list[np.ndarray], list[np.ndarray], int] | None = None
         self._completion_event = threading.Event()
+        self._subscriber_fn: Callable[[], None] | None = None
+        self._capacity_fn: Callable[[], None] | None = None
         self._completion_cb_ref = None
+        # Contract runner init registers the native → Python completion callback once.
         if self._async_enabled and hasattr(self._lib, "contract_register_completion_callback"):
             completion_fn_type = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int32)
             runtime = self
@@ -452,8 +455,16 @@ class ContractRuntime:
 
     
     def set_engine_driven(self, enabled: bool = True) -> None:
-        """When True, submit/reap are driven by TrainingEngine tick loop (no inline wait)."""
+        """When True, submit/reap are driven by TrainingEngine (subscriber)."""
         self._engine_driven = bool(enabled)
+
+    def subscribe_completion(self, on_complete: Callable[[], None]) -> None:
+        """Register on-event handler; invoked when native step completes."""
+        self._subscriber_fn = on_complete
+
+    def subscribe_capacity(self, on_capacity: Callable[[], None]) -> None:
+        """Register capacity handler; invoked when native slot is free again."""
+        self._capacity_fn = on_capacity
 
     def has_completed(self) -> bool:
         return self._completed is not None
@@ -466,8 +477,8 @@ class ContractRuntime:
             return True
         return bool(self._lib.contract_async_in_flight())
 
-    def wait_for_completion(self, timeout: float | None = 0.005) -> bool:
-        """Park until native callback posts a result (non-spin wait)."""
+    def wait_for_completion(self, timeout: float | None = None) -> bool:
+        """Test helper: block until native callback posts _completed."""
         if self._completed is not None:
             return True
         if timeout is None:
@@ -488,8 +499,15 @@ class ContractRuntime:
         return self._completed is not None
 
     def is_busy(self) -> bool:
-        """Queue full / native slot occupied — caller should push back BUSY."""
+        """Single in-flight slot occupied — caller should push back BUSY."""
         return self.native_in_flight()
+
+    def _publish_completion(self) -> None:
+        self._completion_event.set()
+        if self._subscriber_fn is not None:
+            self._subscriber_fn()
+        if self._capacity_fn is not None:
+            self._capacity_fn()
 
     def try_submit_step(
         self,
@@ -552,7 +570,7 @@ class ContractRuntime:
         return result
 
     def _on_native_complete(self, step_token: int, status: int) -> None:
-        """Native worker callback: post-contract grad collect (runs with GIL held)."""
+        """Native worker callback: pack result and publish to subscribers."""
         if self._submitted is None:
             raise RuntimeError(
                 f"native completion callback token={step_token} with no submitted step"
@@ -565,7 +583,7 @@ class ContractRuntime:
         self._submitted = None
         self._pending_token = None
         self._completed = self._finish_submitted(submitted)
-        self._completion_event.set()
+        self._publish_completion()
 
     def _finish_submitted(
         self, submitted: _SubmittedStep

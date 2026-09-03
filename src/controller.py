@@ -155,15 +155,6 @@ class ModelController:
         if self.data_provider is None:
             raise ValueError("[Model Controller] Execution Error: No data_provider bound to controller.")
 
-        session = TrainingSession(
-            model=self.model,
-            data_provider=self.data_provider,
-            initial_lr=self.initial_lr,
-            scheduler=self.scheduler,
-            predict_fn=self.predict,
-        )
-        session.steps_completed = self.steps_completed
-
         engine = None
         if ledger_settings is not None and ledger_settings.enabled:
             import os
@@ -174,7 +165,6 @@ class ModelController:
             ledger_dir = os.path.join(output_dir, ledger_settings.path)
             arch_id = model_type.name if hasattr(model_type, "name") else str(model_type)
             engine = create_training_engine(
-                session,
                 ledger_dir,
                 branch_id=ledger_settings.branch_id,
                 model_instance_id=ledger_settings.branch_id,
@@ -187,6 +177,36 @@ class ModelController:
                 ),
             )
             logging.info("[Model Controller] Training ledger enabled: %s", ledger_dir)
+            try:
+                self.train_history, self.val_history = engine.start_session(
+                    model=self.model,
+                    data_provider=self.data_provider,
+                    initial_lr=self.initial_lr,
+                    scheduler=self.scheduler,
+                    predict_fn=self.predict,
+                    steps_completed=self.steps_completed,
+                    steps=steps,
+                    source_mode=source_mode,
+                    model_type=model_type,
+                    early_stopping_enabled=early_stopping_enabled,
+                    patience=patience,
+                    min_delta=min_delta,
+                    compute_r2_score=self.compute_r2_score,
+                    max_epochs=max_epochs,
+                )
+                self.steps_completed = engine.session.steps_completed if engine.session else self.steps_completed
+            finally:
+                engine.close()
+            return self.train_history, self.val_history
+
+        session = TrainingSession(
+            model=self.model,
+            data_provider=self.data_provider,
+            initial_lr=self.initial_lr,
+            scheduler=self.scheduler,
+            predict_fn=self.predict,
+        )
+        session.steps_completed = self.steps_completed
 
         self.train_history, self.val_history = session.fit(
             steps=steps,
@@ -196,7 +216,7 @@ class ModelController:
             patience=patience,
             min_delta=min_delta,
             compute_r2_score=self.compute_r2_score,
-            engine=engine,
+            engine=None,
             max_epochs=max_epochs,
         )
         self.steps_completed = session.steps_completed

@@ -175,6 +175,10 @@ def test_contract_busy_pushback():
     assert model.add_training_step(X, y, lr, step_token=1) == "OK"
     assert model.contract_busy()
     assert model.add_training_step(X, y, lr, step_token=2) == "BUSY"
+    # Drain the in-flight step so the native worker is idle for later tests.
+    rt = model._contract_runtime
+    assert rt.wait_for_completion(timeout=5.0)
+    assert rt.try_reap_step() is not None
     print("[PASSED] contract busy: CNN pushback while native in flight")
 
 
@@ -195,8 +199,8 @@ def test_contract_engine_finalize_skips_python_apply():
         model.enable_contract_list()
         session = TrainingSession(model=model, data_provider=None, initial_lr=lr)
         engine = create_training_engine(
-            session,
             tmp,
+            session=session,
             config=LedgerConfig(
                 checkpoint_every_steps=100,
                 checkpoint_on_local_best=False,
@@ -215,9 +219,7 @@ def test_contract_engine_finalize_skips_python_apply():
             assert loss is not None
             apply_mock.assert_not_called()
 
-        close = getattr(engine.ledger.store, "close", None)
-        if close is not None:
-            close()
+        engine.close()
 
     print("[PASSED] contract engine: finalize skips Python apply_step")
 

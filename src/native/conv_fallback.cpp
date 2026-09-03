@@ -1774,7 +1774,7 @@ static void build_bwd_row_pad_buf(
     const int64_t dst_plane = nrows * row_stride;
     const __m256 z = _mm256_setzero_ps();
 
-    #pragma omp parallel for collapse(2) schedule(static)
+    #pragma omp parallel for collapse(2) schedule(dynamic, 8)
     for (int64_t nc = 0; nc < nplanes; ++nc) {
         for (int64_t row = 0; row < nrows; ++row) {
             float* __restrict dst_row = &dst[nc * dst_plane + row * row_stride];
@@ -5300,6 +5300,7 @@ static void stride2_dw_nci_dispatch(
 
 // ========================================================================
 // Forward Pass: Bias Init + Tiled Batch Dispatch + Optional ReLU
+// OMP: dynamic,8 on every parallel for in this file (native fallback hot path).
 // ========================================================================
 
 void conv2d_forward_fallback_avx2(
@@ -5318,8 +5319,8 @@ void conv2d_forward_fallback_avx2(
 
     const bool fwd_stats = fwd_queue_stats_enabled();
 
-    // Phase 1: bias broadcast (unchanged layout, cheap)
-    #pragma omp parallel for collapse(2) schedule(static)
+    // Phase 1: bias broadcast
+    #pragma omp parallel for collapse(2) schedule(dynamic, 8)
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t cout = 0; cout < C_out; ++cout) {
             float* __restrict out_ptr = &out[(n * C_out + cout) * spatial_out];
@@ -5435,7 +5436,7 @@ void conv2d_forward_fallback_avx2(
 
     // Phase 3: optional ReLU
     if (fuse_relu) {
-        #pragma omp parallel for collapse(2) schedule(static)
+        #pragma omp parallel for collapse(2) schedule(dynamic, 8)
         for (int64_t n = 0; n < N; ++n) {
             for (int64_t cout = 0; cout < C_out; ++cout) {
                 float* __restrict out_ptr = &out[(n * C_out + cout) * spatial_out];
@@ -5454,6 +5455,7 @@ void conv2d_forward_fallback_avx2(
 
 // ========================================================================
 // Backward Pass: spatial-tile dW (mirrors dX), interleaved omp dispatch when both run.
+// OMP: dynamic,8 for all dX/dW tile and N×C work queues (uneven); never static here.
 // ========================================================================
 static thread_local float* tls_dy_pad_buf = nullptr;
 static thread_local size_t tls_dy_pad_cap_floats = 0;

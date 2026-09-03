@@ -266,8 +266,8 @@ def test_e6_es_ledger_restore_matches_best_snapshot():
         model = _tiny_cnn()
         session = TrainingSession(model=model, data_provider=None, initial_lr=lr)
         engine = create_training_engine(
-            session,
             tmp,
+            session=session,
             config=LedgerConfig(checkpoint_every_steps=100, checkpoint_on_local_best=True),
         )
         session.engine = engine

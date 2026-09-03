@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import logging
+import threading
+from collections import deque
 from dataclasses import dataclass
-from enum import Enum, auto
 from typing import Any, Callable
 
 import numpy as np
@@ -35,34 +36,20 @@ class _InflightStep:
     base_version: int
 
 
-class LoopState(Enum):
-    """Single-thread main-loop states."""
-
-    FINALIZE = auto()  # completion signal posted → ledger finalize
-    SPIN = auto()  # inflight, spin until native callback signal
-    SUBMIT = auto()  # ask CNN add_training_step (OK|BUSY)
-    TICK = auto()  # ledger flush check-back only (no-op if idle)
-    EXIT = auto()  # no batches left and nothing in flight
-
-
 class TrainingEngine:
     """
-    SQL-style main loop owner.
+    Long-lived training manager: one engine, many sessions.
 
-    Loop states: FINALIZE → SPIN → SUBMIT → TICK → EXIT.
-
-    tick() = ledger flush check-back only; finalize if completion signal posted.
-    It is NOT one batch and is a no-op when nothing needs service.
-
-    Training loop: ask CNN add_training_step → OK|BUSY. On BUSY, TICK ledger and
-    retry. While waiting for callback signal, SPIN (not a blind per-iteration wait).
+    Train machine: submit → arm next StepInput → ledger push/flush only if
+    work pending → wait solely for native completion. Bind happens at submit
+    (single shared native ctx cannot bind while a job is in flight).
     """
 
     def __init__(
         self,
-        session: TrainingSession,
         ledger: TrainingLedger,
         config: LedgerConfig | None = None,
+        session: TrainingSession | None = None,
     ):
         self.session = session
         self.ledger = ledger
@@ -72,6 +59,158 @@ class TrainingEngine:
         self._flush_stall_count = 0
         self._inflight: _InflightStep | None = None
         self._async_contract = False
+        self._epoch_losses: list[float] = []
+        self._epoch_steps_done = 0
+        self._flag_step_done = False
+        self._flag_capacity = True
+        self._sessions_started = 0
+        self._prefetch: deque[StepInput] = deque()
+        self._prefetch_depth = int(getattr(config, "prefetch_depth", 4) or 4)
+        self._ledger_lock = threading.RLock()
+        self._deferred: deque[Callable[[], None]] = deque()
+
+    def create_session(
+        self,
+        *,
+        model: Any,
+        data_provider: Any,
+        initial_lr: float,
+        scheduler: Any = None,
+        predict_fn: Callable[..., Any] | None = None,
+        steps_completed: int = 0,
+    ) -> TrainingSession:
+        """Create a new TrainingSession owned by this engine."""
+        session = TrainingSession(
+            model=model,
+            data_provider=data_provider,
+            initial_lr=initial_lr,
+            scheduler=scheduler,
+            predict_fn=predict_fn,
+        )
+        session.steps_completed = steps_completed
+        return session
+
+    def start_session(
+        self,
+        session: TrainingSession | None = None,
+        *,
+        model: Any | None = None,
+        data_provider: Any | None = None,
+        initial_lr: float | None = None,
+        scheduler: Any = None,
+        predict_fn: Callable[..., Any] | None = None,
+        steps_completed: int = 0,
+        **fit_kwargs: Any,
+    ) -> tuple[list[float], list[float]]:
+        """Create/bind a session and run fit on the calling thread."""
+        if session is None:
+            if model is None or data_provider is None or initial_lr is None:
+                raise ValueError(
+                    "start_session requires session= or model+data_provider+initial_lr"
+                )
+            session = self.create_session(
+                model=model,
+                data_provider=data_provider,
+                initial_lr=initial_lr,
+                scheduler=scheduler,
+                predict_fn=predict_fn,
+                steps_completed=steps_completed,
+            )
+
+        self.session = session
+        self._sessions_started += 1
+        logging.info(
+            "[TrainingEngine] Session %d started (caller thread)",
+            self._sessions_started,
+        )
+        return session.fit(engine=self, **fit_kwargs)
+
+    def defer(self, fn: Callable[[], None]) -> None:
+        """Queue work to run during useful-work pass (e.g. contract build)."""
+        self._deferred.append(fn)
+
+    def _do_useful_work(self, *, fill_next: Callable[[], bool] | None = None) -> bool:
+        """Do non-wait work only: arm next / deferred / flush if pending. No sleep."""
+        did = False
+        if fill_next is not None:
+            did = fill_next() or did
+        while self._deferred:
+            fn = self._deferred.popleft()
+            fn()
+            did = True
+        if self._ledger_needs_work():
+            self._service_ledger()
+            did = True
+        did = self._ensure_contract_ready() or did
+        return did
+
+    def _ensure_contract_ready(self) -> bool:
+        """Compile/enable contract list if configured and not yet ready."""
+        if not self.config.contract_list_enabled or self.session is None:
+            return False
+        model = self.session.model
+        if not hasattr(model, "enable_contract_list"):
+            return False
+        if getattr(model, "_contract_runtime", None) is not None:
+            return False
+        model.enable_contract_list()
+        return True
+
+    def _fill_prefetch(
+        self,
+        next_step: Callable[[], StepInput | None],
+        *,
+        exhausted: bool,
+        steps_budget: int,
+    ) -> tuple[bool, bool]:
+        """Stage next StepInput(s) while native runs. Bind happens only at submit."""
+        did = False
+        steps_done = self._epoch_steps_done
+        in_flight = 1 if self._inflight is not None else 0
+        queued = len(self._prefetch)
+        while (
+            not exhausted
+            and queued < self._prefetch_depth
+            and steps_done + in_flight + queued < steps_budget
+        ):
+            step = next_step()
+            if step is None:
+                return did, True
+            step.X = np.ascontiguousarray(step.X)
+            step.y = np.ascontiguousarray(step.y)
+            self._prefetch.append(step)
+            queued += 1
+            did = True
+        return did, exhausted
+
+    def _arm_one(
+        self,
+        next_step: Callable[[], StepInput | None],
+        *,
+        exhausted: bool,
+        steps_budget: int,
+        pending: StepInput | None,
+    ) -> tuple[StepInput | None, bool, bool]:
+        """Ensure one armed step ready to submit. Returns (pending, exhausted, did)."""
+        if pending is not None:
+            return pending, exhausted, False
+        if self._prefetch:
+            return self._prefetch.popleft(), exhausted, True
+        did, exhausted = self._fill_prefetch(
+            next_step, exhausted=exhausted, steps_budget=steps_budget
+        )
+        if self._prefetch:
+            return self._prefetch.popleft(), exhausted, True
+        return None, exhausted, did
+
+    def _wait_native_done(self) -> None:
+        """Only wait point: native completion (after all useful work is done)."""
+        if self._flag_step_done or self._native_ready():
+            return
+        rt = self._contract_runtime()
+        if rt is None:
+            return
+        rt.wait_for_completion()
 
     @property
     def version(self) -> int:
@@ -81,7 +220,7 @@ class TrainingEngine:
         return self._async_contract
 
     def has_pending(self) -> bool:
-        if self._inflight is not None:
+        if self._inflight is not None or self._flag_step_done:
             return True
         rt = getattr(self.session.model, "_contract_runtime", None)
         if rt is None:
@@ -107,67 +246,42 @@ class TrainingEngine:
     def _native_ready(self) -> bool:
         return self._inflight is not None and self._completion_signaled()
 
-    def _awaiting_signal(self) -> bool:
-        if self._inflight is None or self._completion_signaled():
-            return False
-        rt = self._contract_runtime()
-        return rt is not None and rt.waiting_on_native_worker()
+    def on_contract_step_done(self) -> None:
+        """Native completion on-event — set flag only."""
+        self._flag_step_done = True
 
-    def _spin_wait_for_signal(self) -> None:
-        """Spin until native callback posts completion signal (not a ledger tick)."""
-        while self._awaiting_signal() and not self._completion_signaled():
-            pass
+    def on_capacity(self) -> None:
+        """Capacity on-event — slot free, producer may submit."""
+        self._flag_capacity = True
 
     def _finalize_if_ready(self) -> float | None:
         if not self._native_ready():
             return None
-        self._ledger_io_tick()
-        loss = self._try_finalize_inflight()
-        self._ledger_io_begin_flush()
-        return loss
+        with self._ledger_lock:
+            self._ledger_io_tick()
+            loss = self._try_finalize_inflight()
+            if self._ledger_needs_work():
+                self._ledger_io_begin_flush()
+            return loss
 
     def _service_ledger(self) -> None:
         if not self._ledger_needs_work():
             return
-        self._ledger_io_tick()
-        self._ledger_io_begin_flush()
-
-    def _resolve_loop_state(
-        self,
-        *,
-        steps_done: int,
-        steps_budget: int,
-        pending: StepInput | None,
-        drain_only: bool = False,
-    ) -> LoopState:
-        """Pick the next main-loop state from current conditions."""
-        if self._native_ready():
-            return LoopState.FINALIZE
-        if self._awaiting_signal():
-            return LoopState.SPIN
-        if not drain_only:
-            if steps_done >= steps_budget:
-                return LoopState.EXIT if not self.has_pending() else LoopState.SPIN
-            if pending is None:
-                return LoopState.SUBMIT
-            if not self.can_submit() or self.session.contract_busy():
-                return LoopState.TICK
-            return LoopState.SUBMIT
-        if not self.has_pending():
-            return LoopState.EXIT
-        return LoopState.TICK
+        with self._ledger_lock:
+            if not self._ledger_needs_work():
+                return
+            self._ledger_io_tick()
+            if self._ledger_needs_work():
+                self._ledger_io_begin_flush()
 
     @profile
     def tick(self) -> float | None:
-        """
-        Ledger maintenance pass — NOT a training batch.
-
-        Runs only when completion signal is posted (finalize) or journal I/O
-        needs check-back. Otherwise no-op (returns None).
-        """
-        loss = self._finalize_if_ready()
-        if loss is not None:
-            return loss
+        """Ledger maintenance pass — NOT a training batch."""
+        if self._flag_step_done or self._native_ready():
+            loss = self._finalize_if_ready()
+            self._flag_step_done = False
+            if loss is not None:
+                return loss
         self._service_ledger()
         return None
 
@@ -178,75 +292,98 @@ class TrainingEngine:
         next_step: Callable[[], StepInput | None],
         on_submitted: Callable[[StepInput], None] | None = None,
     ) -> list[float]:
-        losses: list[float] = []
-        steps_done = 0
+        """
+        Train machine: submit → arm next → push/flush if work → wait native only.
+
+        Next StepInput is staged while native runs (single ctx cannot bind ahead).
+        Bind+submit happens the instant capacity returns.
+        """
+        self._epoch_losses = []
+        self._epoch_steps_done = 0
+        self._flag_step_done = False
+        self._flag_capacity = True
+        self._prefetch.clear()
         pending: StepInput | None = None
-        state = self._resolve_loop_state(
-            steps_done=steps_done, steps_budget=steps_budget, pending=pending
-        )
+        exhausted = False
 
-        while state != LoopState.EXIT:
-            if state == LoopState.FINALIZE:
-                loss = self._finalize_if_ready()
-                if loss is not None:
-                    losses.append(loss)
-                    steps_done += 1
-            elif state == LoopState.SPIN:
-                self._service_ledger()
-                self._spin_wait_for_signal()
-            elif state == LoopState.SUBMIT:
-                if pending is None:
-                    pending = next_step()
-                    if pending is None:
-                        state = (
-                            LoopState.EXIT
-                            if not self.has_pending()
-                            else LoopState.SPIN
-                        )
-                        continue
-                if self.try_submit(pending):
-                    if on_submitted is not None:
-                        on_submitted(pending)
-                    pending = None
-                else:
-                    state = LoopState.TICK
-                    continue
-            elif state == LoopState.TICK:
-                self.tick()
-
-            state = self._resolve_loop_state(
-                steps_done=steps_done, steps_budget=steps_budget, pending=pending
+        while self._epoch_steps_done < steps_budget:
+            pending, exhausted, _ = self._arm_one(
+                next_step,
+                exhausted=exhausted,
+                steps_budget=steps_budget,
+                pending=pending,
             )
+            if pending is None:
+                break
 
-        return losses
+            if not self.can_submit() or self.session.contract_busy():
+                self._do_useful_work()
+                self._wait_native_done()
+                if self._flag_step_done or self._native_ready():
+                    loss = self._finalize_if_ready()
+                    self._flag_step_done = False
+                    if loss is not None:
+                        self._epoch_losses.append(loss)
+                        self._epoch_steps_done += 1
+                continue
+
+            if not self.try_submit(pending):
+                self._flag_capacity = False
+                self._do_useful_work()
+                self._wait_native_done()
+                continue
+
+            self._flag_capacity = False
+            if on_submitted is not None:
+                on_submitted(pending)
+            pending = None
+
+            # Native running: arm next + push previous docs / flush only if pending.
+            pending, exhausted, _ = self._arm_one(
+                next_step,
+                exhausted=exhausted,
+                steps_budget=steps_budget,
+                pending=pending,
+            )
+            if self._flag_step_done or self._native_ready():
+                loss = self._finalize_if_ready()
+                self._flag_step_done = False
+                if loss is not None:
+                    self._epoch_losses.append(loss)
+                    self._epoch_steps_done += 1
+            self._do_useful_work()
+
+            # Only wait: native free, with next step already armed when available.
+            if self._inflight is not None and not (
+                self._flag_step_done or self._native_ready()
+            ):
+                self._wait_native_done()
+
+            if self._flag_step_done or self._native_ready():
+                loss = self._finalize_if_ready()
+                self._flag_step_done = False
+                if loss is not None:
+                    self._epoch_losses.append(loss)
+                    self._epoch_steps_done += 1
+
+        self.drain_pending()
+        return list(self._epoch_losses)
 
     def drain_pending(self) -> list[float]:
-        """Finalize inflight work at epoch/fit end."""
-        losses: list[float] = []
-        state = self._resolve_loop_state(
-            steps_done=0, steps_budget=0, pending=None, drain_only=True
-        )
-        if state == LoopState.EXIT:
-            return losses
-
-        while state != LoopState.EXIT:
-            if state == LoopState.FINALIZE:
+        """Drain inflight: useful work first, then wait on native only."""
+        while self._inflight is not None or self._flag_step_done:
+            if self._flag_step_done or self._native_ready():
                 loss = self._finalize_if_ready()
+                self._flag_step_done = False
                 if loss is not None:
-                    losses.append(loss)
-            elif state == LoopState.SPIN:
-                self._spin_wait_for_signal()
-            elif state == LoopState.TICK:
-                self.tick()
-                if not self._awaiting_signal() and not self._native_ready():
-                    state = LoopState.EXIT
-                    continue
-
-            state = self._resolve_loop_state(
-                steps_done=0, steps_budget=0, pending=None, drain_only=True
-            )
-
-        return losses
+                    self._epoch_losses.append(loss)
+                    self._epoch_steps_done += 1
+                continue
+            self._do_useful_work()
+            if self._flag_step_done or self._native_ready():
+                continue
+            self._wait_native_done()
+        return list(self._epoch_losses)
 
     def try_submit(self, step: StepInput) -> bool:
         """Ask CNN to accept step. Returns False if BUSY (no train attempted)."""
@@ -261,7 +398,6 @@ class TrainingEngine:
         ):
             return False
         self._inflight = _InflightStep(step=step, step_id=step_id, base_version=base_version)
-        self._ledger_io_begin_flush()
         return True
 
     @profile
@@ -341,7 +477,20 @@ class TrainingEngine:
         step_id: int,
         base_version: int,
     ) -> float:
-        """Record step docs on the ledger (main-thread only, strict FIFO)."""
+        """Record step docs on the ledger (strict FIFO; serialized with RLock)."""
+        with self._ledger_lock:
+            return self._run_step_finalize_locked(
+                step, result, step_id=step_id, base_version=base_version
+            )
+
+    def _run_step_finalize_locked(
+        self,
+        step: StepInput,
+        result: TrainStepResult,
+        *,
+        step_id: int,
+        base_version: int,
+    ) -> float:
         if __debug__:
             if result.step_id != step_id:
                 raise RuntimeError(
@@ -427,10 +576,12 @@ class TrainingEngine:
             if cp is None:
                 self.ledger.push_checkpoint(self.session.model, version=target)
         child_ledger = self.ledger.fork_branch(new_branch_id, target, reason, settings_delta)
-        return TrainingEngine(session=self.session, ledger=child_ledger, config=self.config)
+        return TrainingEngine(ledger=child_ledger, config=self.config, session=self.session)
 
     def on_fit_start(self) -> None:
         """Ledger lifecycle: v0 checkpoint + optional contract path."""
+        if self.session is None:
+            raise RuntimeError("on_fit_start requires an active session")
         logging.info(
             "[TrainingEngine] Ledger active: branch=%s path=%s version=%d",
             self.ledger.branch_id,
@@ -438,19 +589,27 @@ class TrainingEngine:
             self.ledger.version,
         )
         if self.ledger.version == 0:
-            self.ledger.push_checkpoint(self.session.model, version=0)
+            with self._ledger_lock:
+                self.ledger.push_checkpoint(self.session.model, version=0)
         if self.config.contract_list_enabled and hasattr(self.session.model, "enable_contract_list"):
             self.session.model.enable_contract_list()
             rt = getattr(self.session.model, "_contract_runtime", None)
             if rt is not None and rt._async_enabled:
                 rt.set_engine_driven(True)
+                rt.subscribe_completion(self.on_contract_step_done)
+                rt.subscribe_capacity(self.on_capacity)
+                self._flag_capacity = True
                 self._async_contract = True
-                logging.info("[TrainingEngine] Contract-list async path enabled")
+                logging.info("[TrainingEngine] Contract-list async path enabled (flag subscriber)")
             else:
                 logging.info("[TrainingEngine] Contract-list training path enabled")
 
     def on_fit_end(self) -> None:
-        """Drain pending native work, block until journal durable, close store."""
+        """End of one session: drain inflight work (engine stays alive for more sessions)."""
+        self.drain_pending()
+
+    def close(self) -> None:
+        """Tear down native worker and ledger store (call when engine is done)."""
         self.drain_pending()
         from src.contract_runtime import shutdown_contract_async
 
@@ -464,17 +623,23 @@ class TrainingEngine:
             close()
 
     def save_best_checkpoint(self, val_loss: float | None) -> int:
+        if self.session is None:
+            raise RuntimeError("save_best_checkpoint requires an active session")
         version = self.ledger.version
-        self.ledger.push_checkpoint(
-            self.session.model,
-            version=version,
-            val_loss=val_loss,
-            is_local_best=True,
-        )
+        with self._ledger_lock:
+            self.ledger.push_checkpoint(
+                self.session.model,
+                version=version,
+                val_loss=val_loss,
+                is_local_best=True,
+            )
         return version
 
     def restore_best_checkpoint(self, version: int) -> None:
-        self.ledger.restore_checkpoint(self.session.model, version)
+        if self.session is None:
+            raise RuntimeError("restore_best_checkpoint requires an active session")
+        with self._ledger_lock:
+            self.ledger.restore_checkpoint(self.session.model, version)
 
     def on_early_stopping_improved(self, epoch: int, val_loss: float | None) -> int:
         version = self.save_best_checkpoint(val_loss)
@@ -500,15 +665,15 @@ class TrainingEngine:
 
 
 def create_training_engine(
-    session: TrainingSession,
     ledger_dir: str,
     *,
+    session: TrainingSession | None = None,
     branch_id: str = "main",
     model_instance_id: str = "default",
     architecture_id: str = "unknown",
     config: LedgerConfig | None = None,
 ) -> TrainingEngine:
-    """Open ledger store and return a TrainingEngine bound to session."""
+    """Open ledger store and return a TrainingEngine (session optional / attached later)."""
     from pathlib import Path
 
     from src.ledger_store import create_ledger_store
@@ -538,4 +703,4 @@ def create_training_engine(
         model_instance_id=model_instance_id,
         architecture_id=architecture_id,
     )
-    return TrainingEngine(session=session, ledger=ledger, config=config)
+    return TrainingEngine(ledger=ledger, config=config, session=session)

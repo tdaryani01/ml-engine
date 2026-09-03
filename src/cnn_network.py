@@ -113,7 +113,7 @@ class CNNNetwork:
         apply_adam: bool = False,
         step_token: int | None = None,
     ) -> str:
-        """Manager handshake: OK if accepted, BUSY if native queue occupied."""
+        """Manager handshake: OK if accepted, BUSY if single native slot occupied."""
         if self._contract_runtime is None:
             raise RuntimeError("Contract path not initialized")
         if self._contract_runtime.try_submit_step(
