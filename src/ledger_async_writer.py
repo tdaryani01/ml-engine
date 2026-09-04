@@ -29,7 +29,7 @@ class SyncJournalWriter:
         return True, lsn
 
     def has_pending(self) -> bool:
-        return False
+        return self._reap_lsn is not None
 
     def wait_pending(self) -> int | None:
         if self._reap_lsn is None:

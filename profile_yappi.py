@@ -8,6 +8,9 @@ import sys
 
 
 def main() -> int:
+    # Bracketed-paste end marker often sticks to the last token (e.g. cpu~ / wall~).
+    sys.argv = [a[:-1] if a in ("cpu~", "wall~") else a for a in sys.argv]
+
     parser = argparse.ArgumentParser(description="Profile run_pipeline with yappi")
     parser.add_argument(
         "-o",
