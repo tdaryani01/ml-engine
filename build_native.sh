@@ -8,6 +8,7 @@
 #   ./build_native.sh                 # release (default)
 #   ./build_native.sh release
 #   ./build_native.sh release-symbols  # -g + same opts (perf tools)
+#   ./build_native.sh release-noinline # -g + optimized, no inlining/LTO (uProf attribution)
 #   ./build_native.sh debug
 #   ./build_native.sh release --run-tests
 #
@@ -31,9 +32,9 @@ if [[ "${1:-}" == "--run-tests" ]]; then
 fi
 
 case "$MODE" in
-  debug|release|release-symbols) ;;
+  debug|release|release-symbols|release-noinline) ;;
   *)
-    echo "[build] unknown mode: $MODE (use debug|release|release-symbols)" >&2
+    echo "[build] unknown mode: $MODE (use debug|release|release-symbols|release-noinline)" >&2
     exit 1
     ;;
 esac
@@ -93,7 +94,7 @@ COMMON=(
 
 # Hot-path math: match MSVC /O2 /Oi /Ot /Ox /GL /fp:fast /arch:AVX2 intent.
 # -O3 + LTO ≈ /Ox+/GL+/LTCG; -ffast-math ≈ /fp:fast for FMADD-heavy conv.
-RELEASE_OPTS=(
+RELEASE_BASE_OPTS=(
   -O3
   -DNDEBUG
   -ffast-math
@@ -102,17 +103,38 @@ RELEASE_OPTS=(
   -ftree-vectorize
   -fomit-frame-pointer
   -fno-plt
+)
+
+RELEASE_OPTS=(
+  "${RELEASE_BASE_OPTS[@]}"
   -flto=auto
+)
+
+# Profiling artifact: optimized math, but no inlining/LTO so uProf can attribute
+# hot native helpers instead of collapsing them into callers.
+RELEASE_NOINLINE_OPTS=(
+  "${RELEASE_BASE_OPTS[@]}"
+  -DML_ENGINE_NO_FORCEINLINE=1
+  -fno-inline
+  -fno-inline-functions
+  -fno-inline-small-functions
+  -fno-inline-functions-called-once
+  -fno-ipa-cp
+  -fno-ipa-sra
 )
 
 case "$MODE" in
   release)
     CXXFLAGS=("${RELEASE_OPTS[@]}")
-    LABEL="Release (O3 LTO fast-math ${MARCH})"
+    LABEL="Release (O3 no-inline fast-math ${MARCH})"
     ;;
   release-symbols)
     CXXFLAGS=("${RELEASE_OPTS[@]}" -g -fno-omit-frame-pointer)
     LABEL="Release + symbols (O3 LTO fast-math ${MARCH})"
+    ;;
+  release-noinline)
+    CXXFLAGS=("${RELEASE_NOINLINE_OPTS[@]}" -g -fno-omit-frame-pointer)
+    LABEL="Release no-inline + symbols (O3 fast-math ${MARCH})"
     ;;
   debug)
     CXXFLAGS=(-O0 -g -D_DEBUG -fno-omit-frame-pointer)

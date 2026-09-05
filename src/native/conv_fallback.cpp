@@ -4,7 +4,11 @@
 #else
 #include <x86intrin.h>
 #ifndef __forceinline
+#ifdef ML_ENGINE_NO_FORCEINLINE
+#define __forceinline __attribute__((noinline))
+#else
 #define __forceinline inline __attribute__((always_inline))
+#endif
 #endif
 #endif
 #include <cstdint>
@@ -15,6 +19,7 @@
 #include <atomic>
 #include <chrono>
 #include <thread>
+#include <vector>
 #include <omp.h>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -5482,6 +5487,279 @@ static float* acquire_bwd_x_pad_buf(size_t need_floats) {
     return tls_x_pad_buf;
 }
 
+// --- Option B experiment: cin-blocked backward-dX for stride-1 K=7 -----------
+// Diagnostic-scoped, narrowly gated (stride==1 && k_h==k_w==7 && C_in%8==0).
+// Verified against a naive scalar reference in a standalone microbenchmark
+// (benchmark_diagnostics/scratch/option_b_microbench.cpp) and, before trusting
+// this in the real engine, against the existing crawl path on real inputs via
+// ML_ENGINE_FORCE_DX_CRAWL (see verify script). See summary discussion:
+// cin is the free axis for backward-dX (cout is reduced), so W is
+// pre-transposed to [cout][kh][kw][cin_block] and dY is read as a scalar
+// broadcast — this removes the sliding-window vector crawl entirely rather
+// than just reducing its instruction count (which Option A did, and which did
+// not move throughput).
+static bool force_dx_crawl_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = std::getenv("ML_ENGINE_FORCE_DX_CRAWL");
+        cached = (env && env[0] == '1' && env[1] == '\0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+template <int K>
+static void conv2d_backward_dx_cin_blocked_avx2(
+    const float* d_conv_buf, const float* W, float* dx,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t C_out, int64_t pad, int64_t conv_out_h, int64_t conv_out_w,
+    int64_t conv_out_w_stride
+) {
+    const int64_t cin_blocks = C_in / 8;
+    const int64_t conv_spatial = conv_out_h * conv_out_w_stride;
+
+    // Pre-transpose W [C_out][C_in][K][K] -> Wt [C_out][K][K][C_in] once per
+    // backward call (small: C_out*K*K*C_in floats; cheap vs. the O(N*H*W*
+    // C_in*C_out*K*K) accumulation below). loadu is used for Wt reads below,
+    // so no alignment requirement is placed on this buffer.
+    std::vector<float> Wt((size_t)(C_out * K * K * C_in));
+    for (int64_t cout = 0; cout < C_out; ++cout) {
+        for (int64_t kh = 0; kh < K; ++kh) {
+            for (int64_t kw = 0; kw < K; ++kw) {
+                float* __restrict dst = &Wt[((cout * K + kh) * K + kw) * C_in];
+                const float* __restrict src = &W[(cout * C_in) * (K * K) + kh * K + kw];
+                for (int64_t cin = 0; cin < C_in; ++cin) {
+                    dst[cin] = src[cin * K * K];
+                }
+            }
+        }
+    }
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t ih = 0; ih < H; ++ih) {
+            for (int64_t cb = 0; cb < cin_blocks; ++cb) {
+                for (int64_t iw = 0; iw < W_in; ++iw) {
+                    __m256 acc = _mm256_setzero_ps();
+                    for (int64_t cout = 0; cout < C_out; ++cout) {
+                        const float* __restrict dy_plane =
+                            &d_conv_buf[(n * C_out + cout) * conv_spatial];
+                        for (int64_t kh = 0; kh < K; ++kh) {
+                            const int64_t oh = ih - kh + pad;
+                            if (oh < 0 || oh >= conv_out_h) continue;
+                            const float* __restrict dy_row = &dy_plane[oh * conv_out_w_stride];
+                            const float* __restrict wt_tap = &Wt[((cout * K + kh) * K) * C_in + cb * 8];
+                            for (int64_t kw = 0; kw < K; ++kw) {
+                                const int64_t ow = iw - kw + pad;
+                                if (ow < 0 || ow >= conv_out_w) continue;
+                                const float dy = dy_row[ow];
+                                const __m256 wv = _mm256_loadu_ps(wt_tap + kw * C_in);
+                                acc = _mm256_fmadd_ps(_mm256_set1_ps(dy), wv, acc);
+                            }
+                        }
+                    }
+                    alignas(32) float lanes[8];
+                    _mm256_storeu_ps(lanes, acc);
+                    float* __restrict dx_base =
+                        &dx[(n * C_in + cb * 8) * H * W_in_stride + ih * W_in_stride + iw];
+                    const int64_t cin_plane = H * W_in_stride;
+                    for (int64_t c = 0; c < 8; ++c) {
+                        dx_base[c * cin_plane] = lanes[c];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Dispatch, mirroring stride1_specialist_k()/stride1_try_*_specialist(): only
+// K=5,6,7 are wired up (the sizes where the crawl was shown to fall behind
+// PyTorch); K<=4 keep using the existing tile-queue path untouched.
+static inline bool try_cin_blocked_dx(
+    int64_t k_h, int64_t k_w, int64_t stride, int64_t C_in,
+    const float* d_conv_buf, const float* W, float* dx,
+    int64_t N, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t C_out, int64_t pad, int64_t conv_out_h, int64_t conv_out_w,
+    int64_t conv_out_w_stride
+) {
+    if (stride != 1 || k_h != k_w || (C_in % 8) != 0) {
+        return false;
+    }
+    switch (k_h) {
+        case 5:
+            conv2d_backward_dx_cin_blocked_avx2<5>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 6:
+            conv2d_backward_dx_cin_blocked_avx2<6>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 7:
+            conv2d_backward_dx_cin_blocked_avx2<7>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        default:
+            return false;
+    }
+}
+// --- end Option B experiment --------------------------------------------------
+
+// --- Option D experiment: C_out-blocked backward-dX ---------------------------
+// For layers where C_in fails Option B's C_in%8==0 gate (e.g. layer 1: C_in=3)
+// but C_out is a clean AVX2 width (C_out%8==0), vectorize the reduction over
+// output channels at a fixed spatial position instead of over input channels.
+// Requires dY transposed to channel-last [N][H_out][W_out][C_out] and W
+// transposed to [C_in][K][K][C_out] (both done once per call, amortized).
+// Validated in benchmark_diagnostics: correct vs. naive reference, ~50% faster
+// in isolation for layer 1's exact dims (C_in=3, C_out=8, K=7, 28x28->24x24).
+// Gated behind ML_ENGINE_FORCE_DX_CRAWL like Option B for A/B testing.
+static bool dx_cout_blocked_disabled() {
+    static bool val = [] {
+        const char* v = std::getenv("ML_ENGINE_DISABLE_DX_COUT_BLOCKED");
+        return v && v[0] == '1';
+    }();
+    return val;
+}
+
+static thread_local float* tls_dx_cout_blocked_dy_b_buf = nullptr;
+static thread_local size_t tls_dx_cout_blocked_dy_b_cap = 0;
+static thread_local float* tls_dx_cout_blocked_wt_buf = nullptr;
+static thread_local size_t tls_dx_cout_blocked_wt_cap = 0;
+
+static float* acquire_dx_cout_blocked_dy_b_buf(size_t need_floats) {
+    if (need_floats == 0) return nullptr;
+    if (need_floats > tls_dx_cout_blocked_dy_b_cap) {
+        std::free(tls_dx_cout_blocked_dy_b_buf);
+        tls_dx_cout_blocked_dy_b_buf = (float*)std::malloc(need_floats * sizeof(float));
+        tls_dx_cout_blocked_dy_b_cap = tls_dx_cout_blocked_dy_b_buf ? need_floats : 0;
+    }
+    return tls_dx_cout_blocked_dy_b_buf;
+}
+
+static float* acquire_dx_cout_blocked_wt_buf(size_t need_floats) {
+    if (need_floats == 0) return nullptr;
+    if (need_floats > tls_dx_cout_blocked_wt_cap) {
+        std::free(tls_dx_cout_blocked_wt_buf);
+        tls_dx_cout_blocked_wt_buf = (float*)std::malloc(need_floats * sizeof(float));
+        tls_dx_cout_blocked_wt_cap = tls_dx_cout_blocked_wt_buf ? need_floats : 0;
+    }
+    return tls_dx_cout_blocked_wt_buf;
+}
+
+template <int K>
+static void conv2d_backward_dx_cout_blocked_avx2(
+    const float* d_conv_buf, const float* W, float* dx,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t C_out, int64_t pad, int64_t conv_out_h, int64_t conv_out_w,
+    int64_t conv_out_w_stride
+) {
+    // Only C_out==8 (a single 8-wide block) is implemented/validated; the
+    // dispatcher below enforces this exactly.
+    const int64_t conv_spatial = conv_out_h * conv_out_w_stride;
+
+    // dY_b: [N][conv_out_h][conv_out_w][C_out] (channel-last; contiguous 8-wide
+    // groups for aligned loads). Built once per call from d_conv_buf (NCHW).
+    // Reused thread_local buffer (same pattern as acquire_bwd_dy_pad_buf below)
+    // instead of a fresh std::vector/malloc every call.
+    const size_t dY_b_floats = (size_t)(N * conv_out_h * conv_out_w * C_out);
+    float* __restrict dY_b = acquire_dx_cout_blocked_dy_b_buf(dY_b_floats);
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t cout = 0; cout < C_out; ++cout) {
+            const float* __restrict src = &d_conv_buf[(n * C_out + cout) * conv_spatial];
+            for (int64_t oh = 0; oh < conv_out_h; ++oh) {
+                const float* __restrict src_row = src + oh * conv_out_w_stride;
+                float* __restrict dst_row =
+                    &dY_b[((n * conv_out_h + oh) * conv_out_w) * C_out + cout];
+                for (int64_t ow = 0; ow < conv_out_w; ++ow) {
+                    dst_row[ow * C_out] = src_row[ow];
+                }
+            }
+        }
+    }
+
+    // Wt: [C_in][K][K][C_out] (channel-last on C_out; contiguous 8-wide groups).
+    // Tiny (C_in*K*K*C_out floats); kept as a reused thread_local buffer too,
+    // but left serial -- not worth parallelizing at this size.
+    const size_t Wt_floats = (size_t)(C_in * K * K * C_out);
+    float* __restrict Wt = acquire_dx_cout_blocked_wt_buf(Wt_floats);
+    for (int64_t cin = 0; cin < C_in; ++cin) {
+        for (int64_t kh = 0; kh < K; ++kh) {
+            for (int64_t kw = 0; kw < K; ++kw) {
+                float* __restrict dst = &Wt[((cin * K + kh) * K + kw) * C_out];
+                for (int64_t cout = 0; cout < C_out; ++cout) {
+                    dst[cout] = W[((cout * C_in + cin) * K + kh) * K + kw];
+                }
+            }
+        }
+    }
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t ih = 0; ih < H; ++ih) {
+            for (int64_t cin = 0; cin < C_in; ++cin) {
+                const float* __restrict w_cin = &Wt[cin * K * K * C_out];
+                for (int64_t iw = 0; iw < W_in; ++iw) {
+                    __m256 acc = _mm256_setzero_ps();
+                    for (int64_t kh = 0; kh < K; ++kh) {
+                        const int64_t oh = ih - kh + pad;
+                        if (oh < 0 || oh >= conv_out_h) continue;
+                        const float* __restrict dy_row =
+                            &dY_b[(n * conv_out_h + oh) * conv_out_w * C_out];
+                        const float* __restrict w_kh = w_cin + kh * K * C_out;
+                        for (int64_t kw = 0; kw < K; ++kw) {
+                            const int64_t ow = iw - kw + pad;
+                            if (ow < 0 || ow >= conv_out_w) continue;
+                            const __m256 dyv = _mm256_loadu_ps(dy_row + ow * C_out);
+                            const __m256 wv = _mm256_loadu_ps(w_kh + kw * C_out);
+                            acc = _mm256_fmadd_ps(dyv, wv, acc);
+                        }
+                    }
+                    const __m128 lo = _mm256_castps256_ps128(acc);
+                    const __m128 hi = _mm256_extractf128_ps(acc, 1);
+                    __m128 s = _mm_add_ps(lo, hi);
+                    s = _mm_hadd_ps(s, s);
+                    s = _mm_hadd_ps(s, s);
+                    dx[(n * C_in + cin) * H * W_in_stride + ih * W_in_stride + iw] =
+                        _mm_cvtss_f32(s);
+                }
+            }
+        }
+    }
+}
+
+// Dispatch: only fires when Option B's C_in%8==0 gate fails (checked by the
+// caller ordering in conv2d_backward_fallback_avx2), C_out%8==0, and only
+// K==7 is validated so far (matches layer 1: C_in=3, C_out=8, K=7).
+static inline bool try_cout_blocked_dx(
+    int64_t k_h, int64_t k_w, int64_t stride, int64_t C_out,
+    const float* d_conv_buf, const float* W, float* dx,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t pad, int64_t conv_out_h, int64_t conv_out_w,
+    int64_t conv_out_w_stride
+) {
+    if (dx_cout_blocked_disabled()) {
+        return false;
+    }
+    if (stride != 1 || k_h != k_w || C_out != 8) {
+        return false; // only C_out==8 (single 8-wide block) is implemented
+    }
+    if (k_h != 7) {
+        return false; // only K=7 validated so far
+    }
+    conv2d_backward_dx_cout_blocked_avx2<7>(
+        d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+        C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+    );
+    return true;
+}
+// --- end Option D experiment ---------------------------------------------------
+
 void conv2d_backward_fallback_avx2(
     const float* d_conv_buf, const float* x, const float* W,
     float* dx, float* dW,
@@ -5495,7 +5773,7 @@ void conv2d_backward_fallback_avx2(
     const int64_t spatial_in   = H * W_in_stride;
     const int64_t k_spatial    = k_h * k_w;
 
-    const bool do_dx = (dx && W);
+    bool do_dx = (dx && W);
     const bool do_dw = (dW && x);
 
     if (do_dx) {
@@ -5506,6 +5784,24 @@ void conv2d_backward_fallback_avx2(
     }
     if (do_dw) {
         std::memset(dW, 0, (size_t)(C_out * C_in * k_spatial) * sizeof(float));
+    }
+
+    if (do_dx && !force_dx_crawl_enabled() &&
+        try_cin_blocked_dx(
+            k_h, k_w, stride, C_in,
+            d_conv_buf, W, dx,
+            N, H, W_in, W_in_stride,
+            C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+        )) {
+        do_dx = false; // handled above; skip the existing tile-queue dx path
+    } else if (do_dx && !force_dx_crawl_enabled() &&
+        try_cout_blocked_dx(
+            k_h, k_w, stride, C_out,
+            d_conv_buf, W, dx,
+            N, C_in, H, W_in, W_in_stride,
+            pad, conv_out_h, conv_out_w, conv_out_w_stride
+        )) {
+        do_dx = false; // handled above (Option D); skip the existing tile-queue dx path
     }
 
     const int64_t dw_count = C_out * C_in * k_spatial;

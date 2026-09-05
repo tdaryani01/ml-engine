@@ -16,6 +16,7 @@
 #   ./profile_engine.sh --analysis Hotspots --python-bpf
 #   ./profile_engine.sh --analysis MemAlloc
 #   ./profile_engine.sh --cprofile --target run_pipeline.py
+#   ./profile_engine.sh --repeatable --analysis BackwardDiag --target run_pipeline.py
 #   ./profile_engine.sh -- -- .venv/bin/python benchmarks/benchmark_cnn.py
 set -euo pipefail
 
@@ -29,9 +30,12 @@ CONFIG_DIR="${UPROF_ROOT}/bin/Data/Config"
 
 TARGET_SCRIPT="${TARGET_SCRIPT:-run_pipeline.py}"
 ANALYSIS="${ANALYSIS:-Memory}"
-OUTPUT_DIR="${OUTPUT_DIR:-$HOME/.AMDuProf/AMDuProf}"
+OUTPUT_BASE="${OUTPUT_DIR:-$ROOT/uprof_sessions}"
 REPORT_DIR="${REPORT_DIR:-$ROOT/uprof_reports}"
 ACTIVE_CORES="${ACTIVE_CORES:-4}"
+AFFINITY="${AFFINITY:-}"
+START_DELAY="${START_DELAY:-0}"
+SAMPLE_DURATION="${SAMPLE_DURATION:-0}"
 PCM_DURATION="${PCM_DURATION:-30}"
 CPROFILE_OUT="${CPROFILE_OUT:-train.prof}"
 
@@ -41,6 +45,7 @@ ENABLE_CPROFILE=0
 CHECK_CONTIGUITY=0
 MOCK_DX_EDGES=0
 PYTHON_BPF=0
+REPEATABLE=0
 TARGET_CMD=()
 
 PYTHON="${PYTHON:-}"
@@ -65,10 +70,14 @@ while [[ $# -gt 0 ]]; do
     --analysis|-a) ANALYSIS="$2"; shift 2 ;;
     --target|-t) TARGET_SCRIPT="$2"; shift 2 ;;
     --python) PYTHON="$2"; shift 2 ;;
-    --output-dir|-o) OUTPUT_DIR="$2"; shift 2 ;;
+    --output-dir|-o) OUTPUT_BASE="$2"; shift 2 ;;
     --report-dir) REPORT_DIR="$2"; shift 2 ;;
     --pcm-duration) PCM_DURATION="$2"; shift 2 ;;
     --cores) ACTIVE_CORES="$2"; shift 2 ;;
+    --affinity) AFFINITY="$2"; shift 2 ;;
+    --start-delay) START_DELAY="$2"; shift 2 ;;
+    --duration|-d) SAMPLE_DURATION="$2"; shift 2 ;;
+    --repeatable) REPEATABLE=1; shift ;;
     --system-wide) SYSTEM_WIDE=1; shift ;;
     --disasm|--include-disasm) INCLUDE_DISASM=1; shift ;;
     --cprofile) ENABLE_CPROFILE=1; shift ;;
@@ -101,6 +110,17 @@ BIN_DIR="$ROOT/bin"
 SRC_DIR="$ROOT/src/native"
 SO_PATH="$BIN_DIR/conv_kernels.so"
 ZEN3_CFG="$ROOT/uprof_configs/0x19_0x5.conf"
+
+if [[ -z "$AFFINITY" ]]; then
+  AFFINITY="0-$((ACTIVE_CORES - 1))"
+fi
+if [[ "$REPEATABLE" -eq 1 ]]; then
+  # Stable collection window and isolated output. Override with explicit flags.
+  [[ "$START_DELAY" == "0" ]] && START_DELAY=3
+  [[ "$SAMPLE_DURATION" == "0" ]] && SAMPLE_DURATION=12
+fi
+RUN_ID="$(date +%Y%m%d_%H%M%S)_${ANALYSIS}_$$"
+SESSION_OUTPUT_DIR="$OUTPUT_BASE/$RUN_ID"
 
 if [[ ! -x "$UPROF_CLI" ]]; then
   echo "[ERROR] AMDuProfCLI not found: $UPROF_CLI" >&2
@@ -135,12 +155,22 @@ check_native_so() {
 ensure_zen3_pcm_config
 
 EXEC_ARGS=()
+LAUNCH_CMD=()
 if ((${#TARGET_CMD[@]} > 0)); then
-  EXEC_ARGS=("${TARGET_CMD[@]}")
+  if [[ "${TARGET_CMD[0]}" == "--" ]]; then
+    TARGET_CMD=("${TARGET_CMD[@]:1}")
+  fi
+  if ((${#TARGET_CMD[@]} == 0)); then
+    echo "[ERROR] empty target command after --" >&2
+    exit 1
+  fi
+  LAUNCH_CMD=("${TARGET_CMD[@]}")
 elif [[ "$ENABLE_CPROFILE" -eq 1 ]]; then
   EXEC_ARGS=(-m cProfile -o "$CPROFILE_OUT" "$TARGET_SCRIPT")
+  LAUNCH_CMD=("$PYTHON" "${EXEC_ARGS[@]}")
 else
   EXEC_ARGS=("$TARGET_SCRIPT")
+  LAUNCH_CMD=("$PYTHON" "${EXEC_ARGS[@]}")
 fi
 
 echo "=================================================================="
@@ -152,9 +182,11 @@ else
   echo "  Scope:              Target Application Only"
 fi
 echo "  Python:             $PYTHON"
-echo "  Executing:          $PYTHON ${EXEC_ARGS[*]}"
-echo "  Active Cores hint:  $ACTIVE_CORES"
-echo "  Output dir:         $OUTPUT_DIR"
+echo "  Executing:          ${LAUNCH_CMD[*]}"
+echo "  Affinity:           $AFFINITY"
+echo "  Start delay:        ${START_DELAY}s"
+echo "  Duration:           $([[ "$SAMPLE_DURATION" == "0" ]] && echo app-lifetime || echo "${SAMPLE_DURATION}s")"
+echo "  Output dir:         $SESSION_OUTPUT_DIR"
 echo "  Report dir:         $REPORT_DIR"
 check_native_so
 if [[ "$MOCK_DX_EDGES" -eq 1 ]]; then
@@ -165,7 +197,7 @@ echo "=================================================================="
 echo
 
 rm -rf "$REPORT_DIR"
-mkdir -p "$REPORT_DIR" "$OUTPUT_DIR"
+mkdir -p "$REPORT_DIR" "$SESSION_OUTPUT_DIR"
 
 if [[ "$CHECK_CONTIGUITY" -eq 1 ]]; then
   echo "[PRE-CHECK] NumPy / contiguity smoke..."
@@ -197,7 +229,7 @@ if [[ "$ANALYSIS" == "Memory" ]]; then
     -O "$REPORT_DIR" \
     -w "$ROOT" \
     -- \
-    "$PYTHON" "${EXEC_ARGS[@]}"
+    "${LAUNCH_CMD[@]}"
   pcm_rc=$?
   set -e
   if [[ $pcm_rc -ne 0 ]]; then
@@ -349,6 +381,13 @@ COLLECT_ARGS=(collect --config "$COLLECT_PRESET")
 if [[ "$SYSTEM_WIDE" -eq 1 ]]; then
   COLLECT_ARGS+=(--system-wide)
 fi
+COLLECT_ARGS+=(--affinity "$AFFINITY")
+if [[ "$START_DELAY" != "0" ]]; then
+  COLLECT_ARGS+=(--start-delay "$START_DELAY")
+fi
+if [[ "$SAMPLE_DURATION" != "0" ]]; then
+  COLLECT_ARGS+=(--terminate -d "$SAMPLE_DURATION")
+fi
 if [[ "$COLLECT_PRESET" == "hotspots" || "$COLLECT_PRESET" == "threading" ]]; then
   COLLECT_ARGS+=(-g)
 fi
@@ -359,7 +398,7 @@ if [[ "$PYTHON_BPF" -eq 1 ]]; then
     COLLECT_ARGS+=(--sampling-mode bpf --python)
   fi
 fi
-COLLECT_ARGS+=(-w "$ROOT" -o "$OUTPUT_DIR" "$PYTHON" "${EXEC_ARGS[@]}")
+COLLECT_ARGS+=(-w "$ROOT" -o "$SESSION_OUTPUT_DIR" "${LAUNCH_CMD[@]}")
 
 echo "[1/4] Running AMDuProf Collection ($COLLECT_PRESET)..."
 echo "  ${UPROF_CLI} ${COLLECT_ARGS[*]}"
@@ -376,9 +415,13 @@ if [[ $collect_rc -ne 0 ]]; then
   exit "$collect_rc"
 fi
 
-SESSION_DIR="$(find "$OUTPUT_DIR" -maxdepth 1 -type d -name 'AMDuProf-*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2- || true)"
+if [[ -f "$SESSION_OUTPUT_DIR/session.uprof" ]]; then
+  SESSION_DIR="$SESSION_OUTPUT_DIR"
+else
+  SESSION_DIR="$(find "$SESSION_OUTPUT_DIR" -maxdepth 1 -type d -name 'AMDuProf-*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2- || true)"
+fi
 if [[ -z "${SESSION_DIR:-}" || ! -d "$SESSION_DIR" ]]; then
-  echo "[ERROR] no AMDuProf-* session under $OUTPUT_DIR" >&2
+  echo "[ERROR] no uProf session under $SESSION_OUTPUT_DIR" >&2
   exit 1
 fi
 

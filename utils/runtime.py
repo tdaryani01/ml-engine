@@ -81,6 +81,13 @@ class RuntimeSettings:
     env: Dict[str, str] = field(default_factory=dict)
     blas_threads: Dict[str, Optional[int]] = field(default_factory=dict)
     docker: Dict[str, object] = field(default_factory=dict)
+    omp_thread_limit: Optional[int] = None
+
+    def effective_omp_thread_limit(self) -> int:
+        """Hard OpenMP cap (OMP_THREAD_LIMIT). Defaults to num_threads."""
+        if self.omp_thread_limit is not None:
+            return int(self.omp_thread_limit)
+        return self.num_threads
 
     def blas_threads_for(self, backend: EngineBackend) -> int:
         key_map = {
@@ -106,8 +113,10 @@ class RuntimeSettings:
         """
         merged = dict(self.env)
         n = str(self.num_threads)
+        limit = str(self.effective_omp_thread_limit())
+        # Caller/runtime.yaml may already have set these; only fill gaps.
         merged.setdefault("OMP_NUM_THREADS", n)
-        merged.setdefault("OMP_THREAD_LIMIT", n)
+        merged.setdefault("OMP_THREAD_LIMIT", limit)
         merged.setdefault("OPENBLAS_NUM_THREADS", n)
         serial = "1"
         for key in (
@@ -127,15 +136,75 @@ def _load_yaml(path: Path) -> dict:
         return yaml.safe_load(handle) or {}
 
 
+def _parse_positive_int(raw: object, *, field_name: str) -> int:
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{field_name} must be >= 1, got {value}")
+    return value
+
+
+def _optional_positive_int(raw: object, *, field_name: str) -> Optional[int]:
+    if raw is None:
+        return None
+    return _parse_positive_int(raw, field_name=field_name)
+
+
 def _resolve_num_threads(
     config_path: Path,
+    runtime_raw: Mapping[str, object],
+    env: Mapping[str, str],
     *,
     num_threads: Optional[int] = None,
 ) -> int:
+    """Resolve OMP/worker thread count.
+
+    Priority:
+      1. explicit load_runtime_settings(num_threads=...) / CLI --threads
+      2. runtime.yaml top-level num_threads (if provided)
+      3. runtime.yaml env/platform OMP_NUM_THREADS (if provided)
+      4. config.yaml optimization.num_threads (default 4)
+    """
     if num_threads is not None:
-        return int(num_threads)
+        return _parse_positive_int(num_threads, field_name="num_threads")
+
+    rt_threads = _optional_positive_int(
+        runtime_raw.get("num_threads"),
+        field_name="runtime.num_threads",
+    )
+    if rt_threads is not None:
+        return rt_threads
+
+    env_omp = env.get("OMP_NUM_THREADS")
+    if env_omp is not None and str(env_omp).strip() != "":
+        return _parse_positive_int(env_omp, field_name="runtime env OMP_NUM_THREADS")
+
     cfg = _load_yaml(config_path)
-    return int(cfg.get("optimization", {}).get("num_threads", 4))
+    return _parse_positive_int(
+        cfg.get("optimization", {}).get("num_threads", 4),
+        field_name="optimization.num_threads",
+    )
+
+
+def _resolve_omp_thread_limit(
+    runtime_raw: Mapping[str, object],
+    env: Mapping[str, str],
+) -> Optional[int]:
+    """Optional OMP_THREAD_LIMIT override; None means mirror num_threads."""
+    rt_limit = _optional_positive_int(
+        runtime_raw.get("omp_thread_limit"),
+        field_name="runtime.omp_thread_limit",
+    )
+    if rt_limit is not None:
+        return rt_limit
+
+    env_limit = env.get("OMP_THREAD_LIMIT")
+    if env_limit is not None and str(env_limit).strip() != "":
+        return _parse_positive_int(env_limit, field_name="runtime env OMP_THREAD_LIMIT")
+
+    return None
 
 
 def _merge_env_sections(raw: Mapping[str, object], platform: str) -> Dict[str, str]:
@@ -167,8 +236,12 @@ def load_runtime_settings(
     cfg_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
     rt_path = Path(runtime_path) if runtime_path else DEFAULT_RUNTIME_PATH
     raw = _load_yaml(rt_path)
-    threads = _resolve_num_threads(cfg_path, num_threads=num_threads)
     resolved_platform = platform or detect_platform()
+    env = _merge_env_sections(raw, resolved_platform)
+    threads = _resolve_num_threads(
+        cfg_path, raw, env, num_threads=num_threads
+    )
+    omp_limit = _resolve_omp_thread_limit(raw, env)
 
     blas_section = raw.get("blas_threads") or {}
     if not isinstance(blas_section, Mapping):
@@ -178,12 +251,20 @@ def load_runtime_settings(
     if not isinstance(docker_section, Mapping):
         raise ValueError("runtime.docker must be a mapping")
 
+    # Keep resolved values in env so process_env / fit scope agree.
+    env = dict(env)
+    env["OMP_NUM_THREADS"] = str(threads)
+    env["OMP_THREAD_LIMIT"] = str(
+        omp_limit if omp_limit is not None else threads
+    )
+
     return RuntimeSettings(
         num_threads=threads,
         platform=resolved_platform,
-        env=_merge_env_sections(raw, resolved_platform),
+        env=env,
         blas_threads={str(k): (None if v is None else int(v)) for k, v in blas_section.items()},
         docker=dict(docker_section),
+        omp_thread_limit=omp_limit,
     )
 
 
@@ -212,11 +293,12 @@ def _shared_omp_fit(backend: EngineBackend) -> bool:
 def _apply_fit_thread_env(settings: RuntimeSettings, backend: EngineBackend) -> Dict[str, str]:
     """Backend-specific thread caps during fit."""
     omp = settings.omp_threads_for(backend)
+    omp_limit = settings.effective_omp_thread_limit()
     shared = _shared_omp_fit(backend)
     serial = "1"
     overrides = {
         "OMP_NUM_THREADS": str(omp),
-        "OMP_THREAD_LIMIT": str(omp),
+        "OMP_THREAD_LIMIT": str(omp_limit),
         "OPENBLAS_NUM_THREADS": str(omp if shared else settings.blas_threads_for(backend)),
     }
     if omp > 1:

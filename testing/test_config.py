@@ -83,6 +83,81 @@ def test_runtime_settings_load_default_paths() -> None:
     print(f"[PASSED] load_runtime_settings: {settings.num_threads} threads, platform={settings.platform}")
 
 
+def test_runtime_threads_fallback_to_config_when_unset() -> None:
+    """No OMP_* / num_threads in runtime.yaml => use config.yaml optimization.num_threads."""
+    import tempfile
+
+    cfg = yaml.safe_load((CONFIG_DIR / "config.yaml").read_text(encoding="utf-8"))
+    expected = int(cfg["optimization"]["num_threads"])
+
+    with tempfile.TemporaryDirectory() as td:
+        rt_path = Path(td) / "runtime.yaml"
+        rt_path.write_text(
+            "\n".join(
+                [
+                    "env:",
+                    '  OMP_DYNAMIC: "false"',
+                    "blas_threads:",
+                    "  native: null",
+                    "  numpy: null",
+                    "  im2col_gemm: null",
+                    "linux: {}",
+                    "windows: {}",
+                    "docker: {}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        settings = load_runtime_settings(runtime_path=rt_path)
+        assert settings.num_threads == expected
+        assert settings.effective_omp_thread_limit() == expected
+        assert settings.env["OMP_NUM_THREADS"] == str(expected)
+        assert settings.env["OMP_THREAD_LIMIT"] == str(expected)
+    print(f"[PASSED] runtime threads fallback: num_threads={expected}")
+
+
+def test_runtime_threads_override_from_runtime_yaml() -> None:
+    """When runtime.yaml sets num_threads / omp_thread_limit, those win over config.yaml."""
+    import tempfile
+
+    cfg = yaml.safe_load((CONFIG_DIR / "config.yaml").read_text(encoding="utf-8"))
+    config_threads = int(cfg["optimization"]["num_threads"])
+    override_threads = config_threads + 3
+    override_limit = config_threads + 1
+
+    with tempfile.TemporaryDirectory() as td:
+        rt_path = Path(td) / "runtime.yaml"
+        rt_path.write_text(
+            "\n".join(
+                [
+                    f"num_threads: {override_threads}",
+                    f"omp_thread_limit: {override_limit}",
+                    "env:",
+                    '  OMP_DYNAMIC: "false"',
+                    "blas_threads:",
+                    "  native: null",
+                    "  numpy: null",
+                    "  im2col_gemm: null",
+                    "linux: {}",
+                    "windows: {}",
+                    "docker: {}",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        settings = load_runtime_settings(runtime_path=rt_path)
+        assert settings.num_threads == override_threads
+        assert settings.effective_omp_thread_limit() == override_limit
+        assert settings.env["OMP_NUM_THREADS"] == str(override_threads)
+        assert settings.env["OMP_THREAD_LIMIT"] == str(override_limit)
+    print(
+        f"[PASSED] runtime threads override: "
+        f"num_threads={override_threads} limit={override_limit}"
+    )
+
+
 CONFIG_TESTS = [
     test_production_yaml_files_parse,
     test_production_config_hydrates,
@@ -90,6 +165,8 @@ CONFIG_TESTS = [
     test_production_config_ledger_section,
     test_runtime_yaml_parses,
     test_runtime_settings_load_default_paths,
+    test_runtime_threads_fallback_to_config_when_unset,
+    test_runtime_threads_override_from_runtime_yaml,
 ]
 
 
