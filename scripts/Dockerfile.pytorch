@@ -8,8 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Inline PyTorch and pipeline data ingestion stack
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --extra-index-url https://download.pytorch.org/whl/cpu \
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
     torch \
     numpy \
     scipy \
@@ -19,9 +18,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     "pyyaml>=6.0" \
     "threadpoolctl>=3.4.0"
 
-# Copy source repository (includes config/runtime.yaml)
-COPY . .
-
+# Python-only copy (config/data usually bind-mounted at run; kept as fallback)
+COPY config/ config/
+COPY src/ src/
+COPY utils/ utils/
+COPY benchmarks/ benchmarks/
+COPY scripts/docker_bench_entrypoint.sh scripts/docker_bench_entrypoint.sh
 RUN sed -i 's/\r$//' scripts/docker_bench_entrypoint.sh && chmod +x scripts/docker_bench_entrypoint.sh
 
 ENTRYPOINT ["/workspace/scripts/docker_bench_entrypoint.sh"]

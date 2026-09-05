@@ -69,17 +69,18 @@ class CNNNetwork:
         self._train_cache: ForwardCache | None = None
         self.contract_list_enabled = bool(kwargs.pop("contract_list_enabled", False))
         self._contract_runtime = None
+        native_async_submit = bool(kwargs.pop("native_async_submit", False))
         if self.contract_list_enabled:
-            self._init_contract_path()
+            self._init_contract_path(native_async_submit=native_async_submit)
 
-    def enable_contract_list(self) -> None:
+    def enable_contract_list(self, *, native_async_submit: bool = False) -> None:
         """Opt-in contract path after construction (e.g. from training engine at fit time)."""
         if self._contract_runtime is not None:
             return
         self.contract_list_enabled = True
-        self._init_contract_path()
+        self._init_contract_path(native_async_submit=native_async_submit)
 
-    def _init_contract_path(self) -> None:
+    def _init_contract_path(self, *, native_async_submit: bool = False) -> None:
         from src.contract import compile_cnn_training_step
         from src.contract_runtime import ContractRuntime
         from src.spatial_layers import ConvBlock
@@ -102,8 +103,14 @@ class CNNNetwork:
             dense_w_indices=self._dense_w_indices,
         )
         self._contract = contract
-        self._contract_runtime = ContractRuntime(self, contract)
-        logging.info("[CNN] Contract list enabled: %d ops", contract.op_count)
+        self._contract_runtime = ContractRuntime(
+            self, contract, native_async_submit=native_async_submit
+        )
+        logging.info(
+            "[CNN] Contract list enabled: %d ops (native_async_submit=%s)",
+            contract.op_count,
+            native_async_submit,
+        )
 
     
     def add_training_step(

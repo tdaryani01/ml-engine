@@ -104,6 +104,7 @@ class LedgerConfig:
     checkpoint_on_fork: bool = True
     keep_last_k_checkpoints: int = 20
     contract_list_enabled: bool = False  # Phase F: off until grad/benchmark parity
+    native_async_submit: bool = False  # Independent of ledger I/O; see config.yaml ledger
     store_backend: str = "file_streaming"
     flush_stall_threshold: int = 64
 

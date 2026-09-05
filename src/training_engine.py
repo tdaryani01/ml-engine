@@ -153,7 +153,7 @@ class TrainingEngine:
             return False
         if getattr(model, "_contract_runtime", None) is not None:
             return False
-        model.enable_contract_list()
+        model.enable_contract_list(native_async_submit=self.config.native_async_submit)
         return True
 
     def _fill_prefetch(
@@ -592,7 +592,9 @@ class TrainingEngine:
             with self._ledger_lock:
                 self.ledger.push_checkpoint(self.session.model, version=0)
         if self.config.contract_list_enabled and hasattr(self.session.model, "enable_contract_list"):
-            self.session.model.enable_contract_list()
+            self.session.model.enable_contract_list(
+                native_async_submit=self.config.native_async_submit
+            )
             rt = getattr(self.session.model, "_contract_runtime", None)
             if rt is not None and rt._async_enabled:
                 rt.set_engine_driven(True)

@@ -597,14 +597,10 @@ def run_custom_engine_benchmark(
     native_lib = engine_ctx.native_lib or (
         load_native_telemetry_lib() if backend == EngineBackend.NATIVE else None
     )
-    verified_threads = num_threads
-    if native_lib and hasattr(native_lib, "get_omp_threads"):
-        try:
-            verified_threads = native_lib.get_omp_threads()
-        except Exception:
-            pass
+    settings = load_runtime_settings(num_threads=num_threads)
+    planned_threads = settings.omp_threads_for(backend)
 
-    print(f"[2/2] Setting up and executing Custom Engine [{backend.value}] benchmark run ({verified_threads} Threads active)...")
+    print(f"[2/2] Setting up and executing Custom Engine [{backend.value}] benchmark run ({planned_threads} Threads configured)...")
     
     if native_lib and hasattr(native_lib, "reset_thread_execution_stats"):
         native_lib.reset_thread_execution_stats()
@@ -666,10 +662,8 @@ def run_custom_engine_benchmark(
 
     custom_total_params = extract_custom_engine_param_count(controller)
 
-    settings = load_runtime_settings(num_threads=num_threads)
-    log_runtime_settings(settings, backend, prefix="[Benchmark Custom]")
-
     with training_threadpool(settings, backend):
+        log_runtime_settings(settings, backend, prefix="[Benchmark Custom]")
         t0_train = time.perf_counter()
         train_history, val_history = controller.fit(
             steps=data_provider.recomment_steps(),
@@ -713,7 +707,7 @@ def run_custom_engine_benchmark(
 
     return {
         "params": custom_total_params,
-        "threads_verified": verified_threads,
+        "threads_verified": planned_threads,
         "epochs_completed": custom_epochs_completed,
         "best_epoch": custom_best_epoch,
         "early_stopped": custom_early_stopped,

@@ -101,6 +101,9 @@ class LedgerSettings:
     checkpoint_every_steps: int = 50
     checkpoint_on_local_best: bool = True
     contract_list_enabled: bool = False  # Phase F: CNN contract-list path (off until proven)
+    # Independent of ledger I/O: native async submit for contract steps.
+    # Keep false on Linux for strict OMP thread caps unless measured.
+    native_async_submit: bool = False
     store_backend: str = "file_streaming"  # file_streaming | file_sync | redis (future)
 
 @dataclass(frozen=True)

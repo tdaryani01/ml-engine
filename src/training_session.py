@@ -149,6 +149,15 @@ class TrainingSession:
             return bool(self.model.contract_busy())
         return False
 
+    def _predict_with_thread_policy(self, X: np.ndarray) -> np.ndarray:
+        """Keep async contract's native worker as the only parallel OMP owner."""
+        if self.engine is not None and self.engine.uses_async_contract():
+            from utils.runtime import current_thread_omp_threads
+
+            with current_thread_omp_threads(1):
+                return self.predict_fn(X)
+        return self.predict_fn(X)
+
     def try_reap_contract_step(
         self,
     ) -> tuple[float, list[np.ndarray], list[np.ndarray], int, None, None, bool] | None:
@@ -297,7 +306,7 @@ class TrainingSession:
                 break
             self.train_history.append(epoch_train_loss)
 
-            val_preds = self.predict_fn(X_val)
+            val_preds = self._predict_with_thread_policy(X_val)
             current_val_loss = self.model.compute_total_loss(val_preds, y_val_target)
             current_val_raw_cost = self.model.calculate_raw_cost(val_preds, y_val_target)
 
@@ -457,7 +466,7 @@ class TrainingSession:
 
             if hasattr(self.data_provider, "splits") and DataKeys.X_TRAIN in self.data_provider.splits:
                 X_train = self.data_provider.splits[DataKeys.X_TRAIN]
-                train_preds = self.predict_fn(X_train)
+                train_preds = self._predict_with_thread_policy(X_train)
                 y_train_target = self.data_provider.y_train_processed
 
                 if is_classification:
@@ -539,13 +548,13 @@ class TrainingSession:
         es_enabled: bool,
         compute_r2_score: Callable[[np.ndarray, np.ndarray], float] | None,
     ) -> None:
-        final_val_preds = self.predict_fn(X_val_raw)
+        final_val_preds = self._predict_with_thread_policy(X_val_raw)
         val_loss = self.val_history[-1] if self.val_history else float("inf")
         r2 = compute_r2_score or (lambda a, b: 0.0)
 
         if hasattr(self.data_provider, "splits") and DataKeys.X_TRAIN in self.data_provider.splits:
             X_train = self.data_provider.splits[DataKeys.X_TRAIN]
-            final_train_preds = self.predict_fn(X_train)
+            final_train_preds = self._predict_with_thread_policy(X_train)
             y_train_target = self.data_provider.y_train_processed
 
             train_acc = np.mean(np.argmax(final_train_preds, axis=1) == np.argmax(y_train_target, axis=1))

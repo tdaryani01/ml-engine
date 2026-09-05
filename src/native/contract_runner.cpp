@@ -4,8 +4,10 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -431,7 +433,8 @@ enum AsyncState : int32_t {
 };
 
 std::mutex g_async_mtx;
-std::condition_variable g_async_cv;
+std::condition_variable g_async_job_cv;
+std::condition_variable g_async_completion_cv;
 std::thread g_async_worker;
 bool g_async_worker_started = false;
 bool g_async_shutdown = false;
@@ -446,13 +449,44 @@ std::atomic<int32_t> g_async_state{ASYNC_IDLE};
 int64_t g_async_ready_token = 0;
 int32_t g_async_ready_status = 0;
 
-typedef void (*ContractCompletionFn)(int64_t step_token, int32_t status);
-ContractCompletionFn g_completion_cb = nullptr;
+bool mailbox_trace_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("ML_ENGINE_MAILBOX_TRACE");
+        return value && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+void trace_mailbox_invariant_locked(const char* where) {
+    if (!mailbox_trace_enabled()) {
+        return;
+    }
+    const int32_t state = g_async_state.load(std::memory_order_relaxed);
+    const bool bad_job_state = g_async_has_job && state != ASYNC_RUNNING;
+    const bool bad_idle_job = state == ASYNC_IDLE && g_async_has_job;
+    const bool bad_ready_job = state == ASYNC_READY && g_async_has_job;
+    const bool bad_running_worker = state == ASYNC_RUNNING && !g_async_worker_started;
+    if (bad_job_state || bad_idle_job || bad_ready_job || bad_running_worker) {
+        std::fprintf(
+            stderr,
+            "[MAILBOX_DESYNC][native] where=%s state=%d has_job=%d "
+            "worker_started=%d shutdown=%d submit_token=%lld ready_token=%lld\n",
+            where,
+            state,
+            g_async_has_job ? 1 : 0,
+            g_async_worker_started ? 1 : 0,
+            g_async_shutdown ? 1 : 0,
+            static_cast<long long>(g_async_submit_token),
+            static_cast<long long>(g_async_ready_token)
+        );
+        std::fflush(stderr);
+    }
+}
 
 void contract_async_worker_loop() {
     for (;;) {
         std::unique_lock<std::mutex> lock(g_async_mtx);
-        g_async_cv.wait(lock, [] {
+        g_async_job_cv.wait(lock, [] {
             return g_async_shutdown || g_async_has_job;
         });
         if (g_async_shutdown) {
@@ -464,18 +498,19 @@ void contract_async_worker_loop() {
         ContractExecCtx* ctx = g_async_ctx;
         const int64_t token = g_async_submit_token;
         g_async_has_job = false;
+        trace_mailbox_invariant_locked("worker_take");
         lock.unlock();
 
         const int32_t status = run_contract_training_step_impl(ops, op_count, ctx);
 
-        if (g_completion_cb) {
-            g_completion_cb(token, status);
-            g_async_state.store(ASYNC_IDLE, std::memory_order_release);
-        } else {
+        {
+            std::lock_guard<std::mutex> ready_lock(g_async_mtx);
             g_async_ready_token = token;
             g_async_ready_status = status;
             g_async_state.store(ASYNC_READY, std::memory_order_release);
+            trace_mailbox_invariant_locked("worker_ready");
         }
+        g_async_completion_cv.notify_one();
     }
 }
 
@@ -499,11 +534,12 @@ ML_ENGINE_EXPORT int32_t run_contract_training_step(
     return run_contract_training_step_impl(ops, op_count, ctx);
 }
 
-// Optional: native worker invokes this when a submitted contract finishes (post-process in Python).
+// Deprecated compatibility export. Completion is reaped by the submitting
+// Python thread; the native worker must never call into Python.
+typedef void (*ContractCompletionFn)(int64_t step_token, int32_t status);
 ML_ENGINE_EXPORT void contract_register_completion_callback(
-    ContractCompletionFn cb
+    ContractCompletionFn
 ) {
-    g_completion_cb = cb;
 }
 
 // Returns 0 on accept, -2 if busy/running, -3 if completion must be reaped first.
@@ -538,8 +574,9 @@ ML_ENGINE_EXPORT int32_t submit_contract_training_step(
         g_async_submit_token = step_token;
         g_async_has_job = true;
         g_async_state.store(ASYNC_RUNNING, std::memory_order_release);
+        trace_mailbox_invariant_locked("submit");
     }
-    g_async_cv.notify_one();
+    g_async_job_cv.notify_one();
     return 0;
 }
 
@@ -551,13 +588,75 @@ ML_ENGINE_EXPORT int32_t try_reap_contract_completion(
     if (!out_step_token || !out_status) {
         return -1;
     }
+    std::lock_guard<std::mutex> lock(g_async_mtx);
     if (g_async_state.load(std::memory_order_acquire) != ASYNC_READY) {
         return 0;
     }
     *out_step_token = g_async_ready_token;
     *out_status = g_async_ready_status;
     g_async_state.store(ASYNC_IDLE, std::memory_order_release);
+    trace_mailbox_invariant_locked("try_reap");
     return 1;
+}
+
+// Block without spinning until READY, then reap it. timeout_ms < 0 waits
+// indefinitely; timeout_ms == 0 is non-blocking.
+ML_ENGINE_EXPORT int32_t wait_contract_completion(
+    int64_t* out_step_token,
+    int32_t* out_status,
+    int64_t timeout_ms
+) {
+    if (!out_step_token || !out_status) {
+        return -1;
+    }
+
+    std::unique_lock<std::mutex> lock(g_async_mtx);
+    const auto ready_or_shutdown = [] {
+        return g_async_shutdown ||
+            g_async_state.load(std::memory_order_acquire) == ASYNC_READY;
+    };
+    bool signaled = true;
+    if (timeout_ms < 0) {
+        g_async_completion_cv.wait(lock, ready_or_shutdown);
+    } else {
+        signaled = g_async_completion_cv.wait_for(
+            lock, std::chrono::milliseconds(timeout_ms), ready_or_shutdown);
+    }
+    if (!signaled ||
+        g_async_state.load(std::memory_order_acquire) != ASYNC_READY) {
+        return 0;
+    }
+
+    *out_step_token = g_async_ready_token;
+    *out_status = g_async_ready_status;
+    g_async_state.store(ASYNC_IDLE, std::memory_order_release);
+    trace_mailbox_invariant_locked("wait_reap");
+    return 1;
+}
+
+// Diagnostic-only snapshot used by the Python-side cross-mailbox invariant
+// checker when ML_ENGINE_MAILBOX_TRACE is enabled.
+ML_ENGINE_EXPORT int32_t contract_async_debug_snapshot(
+    int32_t* out_state,
+    int32_t* out_has_job,
+    int32_t* out_worker_started,
+    int32_t* out_shutdown,
+    int64_t* out_submit_token,
+    int64_t* out_ready_token
+) {
+    if (!out_state || !out_has_job || !out_worker_started || !out_shutdown ||
+        !out_submit_token || !out_ready_token) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(g_async_mtx);
+    *out_state = g_async_state.load(std::memory_order_relaxed);
+    *out_has_job = g_async_has_job ? 1 : 0;
+    *out_worker_started = g_async_worker_started ? 1 : 0;
+    *out_shutdown = g_async_shutdown ? 1 : 0;
+    *out_submit_token = g_async_submit_token;
+    *out_ready_token = g_async_ready_token;
+    trace_mailbox_invariant_locked("python_snapshot");
+    return 0;
 }
 
 ML_ENGINE_EXPORT int32_t contract_async_in_flight() {
@@ -569,8 +668,10 @@ ML_ENGINE_EXPORT void contract_async_shutdown() {
     {
         std::lock_guard<std::mutex> lock(g_async_mtx);
         g_async_shutdown = true;
+        trace_mailbox_invariant_locked("shutdown");
     }
-    g_async_cv.notify_all();
+    g_async_job_cv.notify_all();
+    g_async_completion_cv.notify_all();
     if (g_async_worker.joinable()) {
         g_async_worker.join();
     }

@@ -173,6 +173,7 @@ class ModelController:
                     checkpoint_every_steps=ledger_settings.checkpoint_every_steps,
                     checkpoint_on_local_best=ledger_settings.checkpoint_on_local_best,
                     contract_list_enabled=ledger_settings.contract_list_enabled,
+                    native_async_submit=ledger_settings.native_async_submit,
                     store_backend=ledger_settings.store_backend,
                 ),
             )

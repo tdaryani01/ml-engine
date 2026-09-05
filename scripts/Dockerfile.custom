@@ -2,30 +2,29 @@ FROM python:3.13-slim
 
 WORKDIR /workspace
 
-# Native build toolchain & OpenMP runtime
+# Native build toolchain & OpenMP runtime (same family as host build_native.sh)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Slim deps for native-backend benchmark (no numba/scipy/llvmlite)
+# Slim deps for native-backend benchmark (no numba/scipy/torch — torch lives in the pytorch image)
 COPY requirements-docker-custom.txt .
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements-docker-custom.txt && \
-    pip install --extra-index-url https://download.pytorch.org/whl/cpu torch
+RUN pip install --no-cache-dir -r requirements-docker-custom.txt
 
-# Copy source repository (includes config/runtime.yaml)
-COPY . .
+# --- Native layer (invalidates only when C++/build script/OpenBLAS change) ---
+COPY build_native.sh .
+COPY src/native/ src/native/
+COPY bin/libopenblas.so bin/openblas_build.json bin/
+RUN sed -i 's/\r$//' build_native.sh && chmod +x build_native.sh && \
+    ./build_native.sh release
 
-# Compile native kernels
-RUN mkdir -p bin && \
-    sh -c 'g++ -O3 -mavx2 -mfma -fopenmp -shared -fPIC -std=c++17 \
-    -D"__declspec(x)=" \
-    -Wl,--allow-multiple-definition \
-    $(find src/native -type f -name "*.cpp") \
-    -Isrc/native \
-    -o bin/conv_kernels.so'
-
+# --- Python / bench layer (Python-only edits skip native rebuild) ---
+COPY config/ config/
+COPY src/ src/
+COPY utils/ utils/
+COPY benchmarks/ benchmarks/
+COPY scripts/docker_bench_entrypoint.sh scripts/docker_bench_entrypoint.sh
 RUN sed -i 's/\r$//' scripts/docker_bench_entrypoint.sh && chmod +x scripts/docker_bench_entrypoint.sh
 
 ENTRYPOINT ["/workspace/scripts/docker_bench_entrypoint.sh"]

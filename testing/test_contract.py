@@ -167,7 +167,7 @@ def test_contract_async_submit_reaps():
 
     sync = _make_model(seed=31)
     async_model = _make_model(seed=31)
-    async_model.enable_contract_list()
+    async_model.enable_contract_list(native_async_submit=True)
 
     sess_sync = TrainingSession(model=sync, data_provider=None, initial_lr=lr)
     sess_async = TrainingSession(model=async_model, data_provider=None, initial_lr=lr)
@@ -202,7 +202,7 @@ def test_contract_busy_pushback():
     lr = 0.01
 
     model = _make_model(seed=41)
-    model.enable_contract_list()
+    model.enable_contract_list(native_async_submit=True)
     model._contract_runtime.set_engine_driven(True)
 
     assert model.add_training_step(X, y, lr, step_token=1) == "OK"
@@ -229,7 +229,6 @@ def test_contract_engine_finalize_skips_python_apply():
 
     with tempfile.TemporaryDirectory() as tmp:
         model = _make_model(seed=77)
-        model.enable_contract_list()
         session = TrainingSession(model=model, data_provider=None, initial_lr=lr)
         engine = create_training_engine(
             tmp,
@@ -238,6 +237,7 @@ def test_contract_engine_finalize_skips_python_apply():
                 checkpoint_every_steps=100,
                 checkpoint_on_local_best=False,
                 contract_list_enabled=True,
+                native_async_submit=True,
                 store_backend="file_streaming",
             ),
         )

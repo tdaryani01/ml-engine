@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import ctypes
-import threading
+import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -151,15 +152,32 @@ def _bind_runner(lib) -> None:
             ctypes.POINTER(ctypes.c_int64),
             ctypes.POINTER(ctypes.c_int32),
         ]
+        if hasattr(lib, "wait_contract_completion"):
+            lib.wait_contract_completion.restype = ctypes.c_int32
+            lib.wait_contract_completion.argtypes = [
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_int32),
+                ctypes.c_int64,
+            ]
+        if hasattr(lib, "contract_async_debug_snapshot"):
+            lib.contract_async_debug_snapshot.restype = ctypes.c_int32
+            lib.contract_async_debug_snapshot.argtypes = [
+                ctypes.POINTER(ctypes.c_int32),
+                ctypes.POINTER(ctypes.c_int32),
+                ctypes.POINTER(ctypes.c_int32),
+                ctypes.POINTER(ctypes.c_int32),
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_int64),
+            ]
         lib.contract_async_in_flight.restype = ctypes.c_int32
         lib.contract_async_in_flight.argtypes = []
         lib.contract_async_shutdown.restype = None
         lib.contract_async_shutdown.argtypes = []
+        # Optional native API: must stay NULL. Python must never register a
+        # worker→Python completion callback (GIL deadlock with the trainer).
         if hasattr(lib, "contract_register_completion_callback"):
             lib.contract_register_completion_callback.restype = None
-            lib.contract_register_completion_callback.argtypes = [
-                ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int32),
-            ]
+            lib.contract_register_completion_callback.argtypes = [ctypes.c_void_p]
 
 
 @dataclass
@@ -197,7 +215,7 @@ def shutdown_contract_async() -> None:
 class ContractRuntime:
     """Binds a compiled ContractList to live CNN weights + scratch arena."""
 
-    def __init__(self, model: Any, contract: ContractList):
+    def __init__(self, model: Any, contract: ContractList, *, native_async_submit: bool = False):
         self.model = model
         self.contract = contract
         self._lib = _load_conv_dll()
@@ -219,26 +237,24 @@ class ContractRuntime:
         self._conv_bindings_ready = False
         self._dense_bindings_ready = False
         self._input_logical_w: int | None = getattr(model, "input_logical_w", None)
-        self._async_enabled = hasattr(self._lib, "submit_contract_training_step")
+        self._async_enabled = (
+            bool(native_async_submit)
+            and hasattr(self._lib, "submit_contract_training_step")
+            and hasattr(self._lib, "wait_contract_completion")
+        )
         self._pending_token: int | None = None
         self._engine_driven = False
         self._submitted: _SubmittedStep | None = None
         self._completed: tuple[float, list[np.ndarray], list[np.ndarray], int] | None = None
-        self._completion_event = threading.Event()
         self._subscriber_fn: Callable[[], None] | None = None
         self._capacity_fn: Callable[[], None] | None = None
-        self._completion_cb_ref = None
-        # Contract runner init registers the native → Python completion callback once.
+        self._mailbox_trace_enabled = os.environ.get(
+            "ML_ENGINE_MAILBOX_TRACE", ""
+        ).strip().lower() not in ("", "0", "false", "no")
+        # Native worker posts ASYNC_READY only; this thread reaps + finishes under the GIL.
         if self._async_enabled and hasattr(self._lib, "contract_register_completion_callback"):
-            completion_fn_type = ctypes.CFUNCTYPE(None, ctypes.c_int64, ctypes.c_int32)
-            runtime = self
-
-            @completion_fn_type
-            def _native_completion_cb(step_token: int, status: int) -> None:
-                runtime._on_native_complete(int(step_token), int(status))
-
-            self._completion_cb_ref = _native_completion_cb
-            self._lib.contract_register_completion_callback(self._completion_cb_ref)
+            self._lib.contract_register_completion_callback(None)
+        self._trace_mailbox("init")
 
     def _bindings_still_valid(self, m: int) -> bool:
         if not self._bindings_ready:
@@ -485,23 +501,124 @@ class ContractRuntime:
     def has_completed(self) -> bool:
         return self._completed is not None
 
+    def _trace_mailbox(self, where: str) -> None:
+        """Diagnostic-only cross-check of stable Python/native mailbox state."""
+        if not (
+            self._mailbox_trace_enabled
+            and self._async_enabled
+            and hasattr(self._lib, "contract_async_debug_snapshot")
+        ):
+            return
+
+        state = ctypes.c_int32()
+        has_job = ctypes.c_int32()
+        worker_started = ctypes.c_int32()
+        shutdown = ctypes.c_int32()
+        submit_token = ctypes.c_int64()
+        ready_token = ctypes.c_int64()
+        rc = self._lib.contract_async_debug_snapshot(
+            ctypes.byref(state),
+            ctypes.byref(has_job),
+            ctypes.byref(worker_started),
+            ctypes.byref(shutdown),
+            ctypes.byref(submit_token),
+            ctypes.byref(ready_token),
+        )
+        if rc != 0:
+            print(
+                f"[MAILBOX_DESYNC][python] where={where} snapshot_rc={rc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return
+
+        submitted = self._submitted is not None
+        completed = self._completed is not None
+        pending = self._pending_token
+        native_state = int(state.value)
+        valid = True
+        reasons: list[str] = []
+
+        if submitted:
+            if native_state not in (1, 2):
+                valid = False
+                reasons.append("submitted_requires_RUNNING_or_READY")
+            native_token = ready_token.value if native_state == 2 else submit_token.value
+            if pending is None or native_token != pending:
+                valid = False
+                reasons.append("submitted_token_mismatch")
+        elif completed:
+            if native_state != 0 or pending is not None:
+                valid = False
+                reasons.append("completed_requires_native_IDLE")
+        elif native_state != 0 or pending is not None:
+            valid = False
+            reasons.append("empty_python_requires_native_IDLE")
+
+        if has_job.value and native_state != 1:
+            valid = False
+            reasons.append("has_job_requires_RUNNING")
+
+        if not valid:
+            print(
+                "[MAILBOX_DESYNC][python] "
+                f"where={where} reasons={'+'.join(reasons)} "
+                f"native_state={native_state} has_job={has_job.value} "
+                f"worker_started={worker_started.value} shutdown={shutdown.value} "
+                f"native_submit_token={submit_token.value} "
+                f"native_ready_token={ready_token.value} "
+                f"py_submitted={int(submitted)} py_completed={int(completed)} "
+                f"py_pending_token={pending}",
+                file=sys.stderr,
+                flush=True,
+            )
+
     def waiting_on_native_worker(self) -> bool:
-        """True while native contract runs and callback has not fired yet."""
+        """True while a submitted step is not yet finished on this thread."""
         if not self._async_enabled or self._completed is not None:
             return False
         if self._submitted is not None:
             return True
         return bool(self._lib.contract_async_in_flight())
 
-    def wait_for_completion(self, timeout: float | None = None) -> bool:
-        """Test helper: block until native callback posts _completed."""
+    def _poll_complete_on_main(self) -> bool:
+        """Non-blocking: reap ASYNC_READY on this thread, finish grads, publish.
+
+        Must run on the Python trainer thread (holds/reacquires GIL around numpy).
+        Native worker never calls into Python.
+        """
         if self._completed is not None:
             return True
-        if timeout is None:
-            return self._completion_event.wait()
-        if timeout <= 0:
-            return self._completion_event.is_set()
-        return self._completion_event.wait(timeout)
+        if self._submitted is None:
+            return False
+        if not self._try_reap_native():
+            self._trace_mailbox("poll_not_ready")
+            return False
+        submitted = self._submitted
+        self._submitted = None
+        self._completed = self._finish_submitted(submitted)
+        self._publish_completion()
+        self._trace_mailbox("poll_completed")
+        return True
+
+    def wait_for_completion(self, timeout: float | None = None) -> bool:
+        """Block until native READY is reaped and finished on this thread."""
+        if self._poll_complete_on_main():
+            return True
+        if timeout is not None and timeout <= 0:
+            return False
+        if self._submitted is None:
+            return False
+        timeout_ms = -1 if timeout is None else max(1, int(float(timeout) * 1000 + 0.999))
+        if not self._wait_reap_native(timeout_ms):
+            self._trace_mailbox("wait_not_ready")
+            return False
+        submitted = self._submitted
+        self._submitted = None
+        self._completed = self._finish_submitted(submitted)
+        self._publish_completion()
+        self._trace_mailbox("wait_completed")
+        return True
 
     def native_in_flight(self) -> bool:
         if not self._async_enabled:
@@ -511,7 +628,8 @@ class ContractRuntime:
         return bool(self._lib.contract_async_in_flight())
 
     def completion_signaled(self) -> bool:
-        """True when native callback has posted _completed (non-blocking check)."""
+        """True when this thread has finished a native step into `_completed`."""
+        self._poll_complete_on_main()
         return self._completed is not None
 
     def is_busy(self) -> bool:
@@ -519,7 +637,6 @@ class ContractRuntime:
         return self.native_in_flight()
 
     def _publish_completion(self) -> None:
-        self._completion_event.set()
         if self._subscriber_fn is not None:
             self._subscriber_fn()
         if self._capacity_fn is not None:
@@ -549,9 +666,9 @@ class ContractRuntime:
         self._refresh_step_bindings(X, y, m, lr, apply_adam=apply_adam)
 
         token = int(step_token if step_token is not None else self.model.optimizer.t + 1)
-        self._completion_event.clear()
         self._submit_native(ctx, token)
         self._submitted = _SubmittedStep(m, X.dtype, y, bound, apply_adam)
+        self._trace_mailbox("submitted")
         return True
 
     def submit_step(
@@ -572,34 +689,14 @@ class ContractRuntime:
     def try_reap_step(
         self,
     ) -> tuple[float, list[np.ndarray], list[np.ndarray], int] | None:
-        """Non-blocking: return post-contract result if native callback finished."""
+        """Non-blocking: return post-contract result if native READY was reaped."""
+        self._poll_complete_on_main()
         if self._completed is None:
-            if self._submitted is None:
-                return None
-            if not self._try_reap_native():
-                return None
-            submitted = self._submitted
-            self._submitted = None
-            self._completed = self._finish_submitted(submitted)
+            return None
         result = self._completed
         self._completed = None
+        self._trace_mailbox("result_consumed")
         return result
-
-    def _on_native_complete(self, step_token: int, status: int) -> None:
-        """Native worker callback: pack result and publish to subscribers."""
-        if self._submitted is None:
-            raise RuntimeError(
-                f"native completion callback token={step_token} with no submitted step"
-            )
-        if status != 0:
-            raise RuntimeError(
-                f"async contract step token={step_token} failed with status {status}"
-            )
-        submitted = self._submitted
-        self._submitted = None
-        self._pending_token = None
-        self._completed = self._finish_submitted(submitted)
-        self._publish_completion()
 
     def _finish_submitted(
         self, submitted: _SubmittedStep
@@ -681,6 +778,31 @@ class ContractRuntime:
         if out_status.value != 0:
             raise RuntimeError(
                 f"async contract step token={out_token.value} failed with status {out_status.value}"
+            )
+        self._pending_token = None
+        return True
+
+    def _wait_reap_native(self, timeout_ms: int) -> bool:
+        out_token = ctypes.c_int64()
+        out_status = ctypes.c_int32()
+        rc = self._lib.wait_contract_completion(
+            ctypes.byref(out_token),
+            ctypes.byref(out_status),
+            ctypes.c_int64(timeout_ms),
+        )
+        if rc == 0:
+            return False
+        if rc != 1:
+            raise RuntimeError(f"wait_contract_completion failed with status {rc}")
+        if self._pending_token is not None and out_token.value != self._pending_token:
+            raise RuntimeError(
+                f"async completion token mismatch: expected {self._pending_token}, "
+                f"got {out_token.value}"
+            )
+        if out_status.value != 0:
+            raise RuntimeError(
+                f"async contract step token={out_token.value} failed with status "
+                f"{out_status.value}"
             )
         self._pending_token = None
         return True

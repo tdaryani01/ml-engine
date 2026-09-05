@@ -64,6 +64,7 @@ def test_production_config_ledger_section() -> None:
     assert cfg.ledger.path
     assert cfg.ledger.branch_id
     assert cfg.ledger.checkpoint_every_steps >= 1
+    assert isinstance(cfg.ledger.native_async_submit, bool)
     print("[PASSED] config.yaml: ledger section hydrates")
 
 
@@ -158,6 +159,24 @@ def test_runtime_threads_override_from_runtime_yaml() -> None:
     )
 
 
+def test_ledger_native_async_submit_from_config() -> None:
+    """native_async_submit lives under config.yaml ledger, not runtime/env.
+
+    Unit-tests both states on LedgerSettings directly; does not assert a
+    specific value for the current config.yaml, since that's a deployment
+    choice, not a schema invariant.
+    """
+    from config.schema import LedgerSettings
+
+    disabled = LedgerSettings(native_async_submit=False)
+    assert disabled.native_async_submit is False
+    enabled = LedgerSettings(native_async_submit=True)
+    assert enabled.native_async_submit is True
+    default = LedgerSettings()
+    assert default.native_async_submit is False  # schema default, not config.yaml
+    print("[PASSED] ledger native_async_submit: both states hydrate via schema")
+
+
 CONFIG_TESTS = [
     test_production_yaml_files_parse,
     test_production_config_hydrates,
@@ -167,6 +186,7 @@ CONFIG_TESTS = [
     test_runtime_settings_load_default_paths,
     test_runtime_threads_fallback_to_config_when_unset,
     test_runtime_threads_override_from_runtime_yaml,
+    test_ledger_native_async_submit_from_config,
 ]
 
 

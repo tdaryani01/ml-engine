@@ -102,6 +102,9 @@ ledger:
   checkpoint_every_steps: 50
   checkpoint_on_local_best: true
   contract_list_enabled: true
+  # Native async contract submit (independent of ledger I/O). false = sync native
+  # on the caller thread (strict OMP team). true = persistent native worker.
+  native_async_submit: true
   store_backend: file_streaming
 
 # =====================================================================
