@@ -131,6 +131,22 @@ class CNNNetwork:
             return "OK"
         return "BUSY"
 
+    def prepare_training_step(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        lr: float,
+        *,
+        apply_adam: bool = False,
+        step_token: int | None = None,
+    ) -> bool:
+        """Prepare the inactive async slot without submitting it."""
+        if self._contract_runtime is None:
+            raise RuntimeError("Contract path not initialized")
+        return self._contract_runtime.prepare_step(
+            X, y, lr, apply_adam=apply_adam, step_token=step_token
+        )
+
     def contract_busy(self) -> bool:
         if self._contract_runtime is None:
             return False
@@ -619,4 +635,9 @@ class CNNNetwork:
         return self._backward_from_cache(cache, y, active_lr)
 
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
+        if (
+            self._contract_runtime is not None
+            and self._contract_runtime.uses_async_forward()
+        ):
+            return self._contract_runtime.run_async_forward(processed_data)
         return self._forward(processed_data, training=False)

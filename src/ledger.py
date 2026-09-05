@@ -174,12 +174,12 @@ def document_from_bytes(data: bytes) -> LedgerDocument:
 
 
 def capture_model_checkpoint(model: Any, version: int, val_loss: float | None = None) -> dict[str, Any]:
-    """Build checkpoint document body from a live model (raw ndarray lists)."""
+    """Capture an owned checkpoint snapshot safe from later bank reuse."""
     opt = model.optimizer
     body: dict[str, Any] = {
         "version": version,
-        "weights": list(model.weights),
-        "biases": list(model.biases),
+        "weights": [np.copy(a) for a in model.weights],
+        "biases": [np.copy(a) for a in model.biases],
         "gammas": None,
         "betas": None,
         "optimizer": {
@@ -188,22 +188,44 @@ def capture_model_checkpoint(model: Any, version: int, val_loss: float | None = 
             "beta1": float(getattr(opt, "beta1", 0.9)),
             "beta2": float(getattr(opt, "beta2", 0.999)),
             "eps": float(getattr(opt, "eps", 1e-8)),
-            "ms_w": getattr(opt, "ms_w", None),
-            "vs_w": getattr(opt, "vs_w", None),
-            "ms_b": getattr(opt, "ms_b", None),
-            "vs_b": getattr(opt, "vs_b", None),
-            "ms_g": getattr(opt, "ms_g", None),
-            "vs_g": getattr(opt, "vs_g", None),
-            "ms_beta": getattr(opt, "ms_beta", None),
-            "vs_beta": getattr(opt, "vs_beta", None),
+            "ms_w": (
+                [np.copy(a) for a in opt.ms_w] if getattr(opt, "ms_w", None) else None
+            ),
+            "vs_w": (
+                [np.copy(a) for a in opt.vs_w] if getattr(opt, "vs_w", None) else None
+            ),
+            "ms_b": (
+                [np.copy(a) for a in opt.ms_b] if getattr(opt, "ms_b", None) else None
+            ),
+            "vs_b": (
+                [np.copy(a) for a in opt.vs_b] if getattr(opt, "vs_b", None) else None
+            ),
+            "ms_g": (
+                [np.copy(a) for a in opt.ms_g] if getattr(opt, "ms_g", None) else None
+            ),
+            "vs_g": (
+                [np.copy(a) for a in opt.vs_g] if getattr(opt, "vs_g", None) else None
+            ),
+            "ms_beta": (
+                [np.copy(a) for a in opt.ms_beta]
+                if getattr(opt, "ms_beta", None)
+                else None
+            ),
+            "vs_beta": (
+                [np.copy(a) for a in opt.vs_beta]
+                if getattr(opt, "vs_beta", None)
+                else None
+            ),
         },
         "val_loss": val_loss,
         "is_local_best": False,
     }
     if hasattr(model, "gammas"):
-        body["gammas"] = getattr(model, "gammas", None)
+        values = getattr(model, "gammas", None)
+        body["gammas"] = [np.copy(a) for a in values] if values else None
     if hasattr(model, "betas"):
-        body["betas"] = getattr(model, "betas", None)
+        values = getattr(model, "betas", None)
+        body["betas"] = [np.copy(a) for a in values] if values else None
     return body
 
 

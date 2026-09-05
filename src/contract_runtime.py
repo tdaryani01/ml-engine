@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import ctypes
-import os
 import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
 
-from src.contract import ContractList
+from src.contract import ContractList, ContractOp
 from utils.conv_dispatch import _load_conv_dll
 
 
@@ -46,6 +45,8 @@ class LayerBinding(ctypes.Structure):
     _fields_ = [
         ("W", ctypes.c_void_p),
         ("b", ctypes.c_void_p),
+        ("W_next", ctypes.c_void_p),
+        ("b_next", ctypes.c_void_p),
         ("dW", ctypes.c_void_p),
         ("db", ctypes.c_void_p),
         ("out_conv", ctypes.c_void_p),
@@ -59,6 +60,10 @@ class LayerBinding(ctypes.Structure):
         ("vs_w", ctypes.c_void_p),
         ("ms_b", ctypes.c_void_p),
         ("vs_b", ctypes.c_void_p),
+        ("ms_w_next", ctypes.c_void_p),
+        ("vs_w_next", ctypes.c_void_p),
+        ("ms_b_next", ctypes.c_void_p),
+        ("vs_b_next", ctypes.c_void_p),
         ("w_count", ctypes.c_int64),
         ("b_count", ctypes.c_int64),
         ("C_in", ctypes.c_int64),
@@ -82,6 +87,8 @@ class DenseBinding(ctypes.Structure):
     _fields_ = [
         ("W", ctypes.c_void_p),
         ("b", ctypes.c_void_p),
+        ("W_next", ctypes.c_void_p),
+        ("b_next", ctypes.c_void_p),
         ("dW", ctypes.c_void_p),
         ("db", ctypes.c_void_p),
         ("z", ctypes.c_void_p),
@@ -93,6 +100,10 @@ class DenseBinding(ctypes.Structure):
         ("vs_w", ctypes.c_void_p),
         ("ms_b", ctypes.c_void_p),
         ("vs_b", ctypes.c_void_p),
+        ("ms_w_next", ctypes.c_void_p),
+        ("vs_w_next", ctypes.c_void_p),
+        ("ms_b_next", ctypes.c_void_p),
+        ("vs_b_next", ctypes.c_void_p),
         ("fan_in", ctypes.c_int64),
         ("fan_out", ctypes.c_int64),
     ]
@@ -197,12 +208,56 @@ class ContractBuffers:
 
 
 @dataclass
-class _SubmittedStep:
+class _ParameterBank:
+    weights: list[np.ndarray]
+    biases: list[np.ndarray]
+    ms_w: list[np.ndarray]
+    vs_w: list[np.ndarray]
+    ms_b: list[np.ndarray]
+    vs_b: list[np.ndarray]
+
+
+@dataclass
+class _ExecutionSlot:
+    ctx: ContractExecCtx
+    buffers: ContractBuffers
+    conv_grads: list[tuple[int, np.ndarray, np.ndarray]]
+    loss_scalar: np.ndarray
+    owners: list[Any]
+
+
+@dataclass
+class _EvalSlot:
+    ctx: ContractExecCtx
+    output: np.ndarray
+    batch_cap: int
+    dtype: Any
+    owners: list[Any]
+
+
+@dataclass
+class _PreparedStep:
+    slot_idx: int
+    input_bank_idx: int
+    output_bank_idx: int
     m: int
     dtype: Any
+    X: np.ndarray
     y: np.ndarray
-    bound: list[tuple[int, Any]]
     apply_adam: bool
+    step_token: int
+
+
+@dataclass
+class _SubmittedStep:
+    slot_idx: int
+    output_bank_idx: int
+    m: int
+    dtype: Any
+    X: np.ndarray
+    y: np.ndarray
+    apply_adam: bool
+    step_token: int
 
 
 def shutdown_contract_async() -> None:
@@ -245,12 +300,31 @@ class ContractRuntime:
         self._pending_token: int | None = None
         self._engine_driven = False
         self._submitted: _SubmittedStep | None = None
-        self._completed: tuple[float, list[np.ndarray], list[np.ndarray], int] | None = None
+        self._completed: _SubmittedStep | None = None
+        self._prepared: _PreparedStep | None = None
+        self._parameter_banks: list[_ParameterBank] = []
+        self._published_bank_idx = 0
+        self._slots: list[_ExecutionSlot] = []
+        self._eval_slot: _EvalSlot | None = None
+        self._forward_op_count = next(
+            (
+                i
+                for i, op in enumerate(self.contract.ops)
+                if op.opcode
+                in (
+                    ContractOp.CONV2D_BWD,
+                    ContractOp.RELU_BWD,
+                    ContractOp.MAXPOOL_BWD,
+                    ContractOp.FLATTEN_BWD,
+                    ContractOp.DENSE_BWD,
+                    ContractOp.ADAM_APPLY,
+                    ContractOp.CONV_BLOCK_BWD,
+                )
+            ),
+            self.contract.op_count,
+        )
         self._subscriber_fn: Callable[[], None] | None = None
         self._capacity_fn: Callable[[], None] | None = None
-        self._mailbox_trace_enabled = os.environ.get(
-            "ML_ENGINE_MAILBOX_TRACE", ""
-        ).strip().lower() not in ("", "0", "false", "no")
         # Native worker posts ASYNC_READY only; this thread reaps + finishes under the GIL.
         if self._async_enabled and hasattr(self._lib, "contract_register_completion_callback"):
             self._lib.contract_register_completion_callback(None)
@@ -485,6 +559,368 @@ class ContractRuntime:
         self._buffers = ContractBuffers(dense_layers=dense_layers, batch_cap=cap)
         return self._buffers
 
+    def _make_async_slot(self, X: np.ndarray, m: int) -> _ExecutionSlot:
+        """Allocate one independently owned contract execution/result slot."""
+        from src.scratch_arena import ScratchArena
+        from src.spatial_layers import ConvBlock
+
+        cap = max(m, getattr(self.model, "_train_batch_cap", 0) or m)
+        arena = ScratchArena(self.model.backend)
+        arena.set_train_batch_cap(cap)
+        ctx = ContractExecCtx()
+        ctx.lam_l2 = float(self.model.lam_l2)
+        ctx.max_norm = float(self.model.max_norm)
+        ctx.adam.beta1 = float(self.model.optimizer.beta1)
+        ctx.adam.beta2 = float(self.model.optimizer.beta2)
+        ctx.adam.eps = float(self.model.optimizer.eps)
+
+        w_logical = self._input_logical_w
+        if w_logical is None:
+            w_logical = 28 if X.ndim == 4 and X.shape[3] == 32 else X.shape[3]
+            self._input_logical_w = w_logical
+
+        conv_grads: list[tuple[int, np.ndarray, np.ndarray]] = []
+        owners: list[Any] = [arena]
+        max_layer_idx = -1
+        cur_c, cur_h = X.shape[1], X.shape[2]
+        cur_w_log, cur_w_stride = w_logical, X.shape[3]
+
+        for li, layer in enumerate(self.model.layers):
+            if not isinstance(layer, ConvBlock):
+                continue
+            if li >= 8:
+                raise ValueError("Contract path supports at most 8 ConvBlock layers")
+            w_idx = self.model._layer_param_idx[li]
+            W = self.model.weights[w_idx]
+            scratch = arena.ensure_conv_block_train(
+                li,
+                out_channels=layer.out_channels,
+                in_channels=layer.in_channels,
+                k_h=layer.k_h,
+                k_w=layer.k_w,
+                conv_stride=layer.conv_stride,
+                conv_pad=layer.conv_pad,
+                pool_size=layer.pool_size,
+                pool_stride=layer.pool_stride,
+                N=cap,
+                C=cur_c,
+                H=cur_h,
+                W_stride=cur_w_stride,
+                W_logical=cur_w_log,
+                dtype=X.dtype,
+            )
+            dW = np.zeros_like(W)
+            db = np.zeros_like(self.model.biases[w_idx])
+            owners.extend((dW, db))
+            conv_grads.append((w_idx, dW, db))
+
+            lb = ctx.layers[li]
+            lb.dW = _ptr(dW)
+            lb.db = _ptr(db.reshape(-1))
+            lb.out_conv = _ptr(scratch.out_conv_buffer)
+            lb.out_pool = _ptr(scratch.out_pool_buffer)
+            lb.argmax = _ptr(scratch.argmax_buffer)
+            lb.dx = _ptr(scratch.dx_buffer)
+            lb.d_conv = _ptr(scratch.d_conv_buffer)
+            lb.w_count = int(W.size)
+            lb.b_count = int(db.size)
+            lb.C_in = layer.in_channels
+            lb.C_out = layer.out_channels
+            lb.H = cur_h
+            lb.W_in = cur_w_log
+            lb.W_stride = cur_w_stride
+            lb.k_h = layer.k_h
+            lb.k_w = layer.k_w
+            lb.conv_stride = layer.conv_stride
+            lb.conv_pad = layer.conv_pad
+            lb.pool_size = layer.pool_size
+            lb.pool_stride = layer.pool_stride
+
+            conv_out_h = (
+                cur_h + 2 * layer.conv_pad - layer.k_h
+            ) // layer.conv_stride + 1
+            conv_out_w = (
+                cur_w_log + 2 * layer.conv_pad - layer.k_w
+            ) // layer.conv_stride + 1
+            lb.conv_out_w_stride = _round_up_simd(conv_out_w)
+            lb.pool_out_h = (
+                conv_out_h - layer.pool_size
+            ) // layer.pool_stride + 1
+            lb.pool_out_w = (
+                conv_out_w - layer.pool_size
+            ) // layer.pool_stride + 1
+            max_layer_idx = li
+            cur_c, cur_h, cur_w_log, cur_w_stride = _conv_block_output_geom(
+                cur_c, cur_h, cur_w_log, layer
+            )
+
+        ctx.num_layers = max_layer_idx + 1 if max_layer_idx >= 0 else 0
+
+        dense_layers: list[DenseLayerBuffers] = []
+        for di, w_idx in enumerate(self.model._dense_w_indices):
+            W = self.model.weights[w_idx]
+            fan_in, fan_out = W.shape
+            layer_bufs = DenseLayerBuffers(
+                z=np.empty((cap, fan_out), dtype=X.dtype),
+                output=np.empty((cap, fan_out), dtype=X.dtype),
+                delta=np.empty((cap, fan_out), dtype=X.dtype),
+                dW=np.zeros((fan_in, fan_out), dtype=X.dtype),
+                db=np.zeros((fan_out,), dtype=X.dtype),
+                dx_flat=np.empty((cap, fan_in), dtype=X.dtype),
+            )
+            dense_layers.append(layer_bufs)
+            d = ctx.dense[di]
+            d.dW = _ptr(layer_bufs.dW)
+            d.db = _ptr(layer_bufs.db)
+            d.z = _ptr(layer_bufs.z)
+            d.output = _ptr(layer_bufs.output)
+            d.delta = _ptr(layer_bufs.delta)
+            d.dx_flat = _ptr(layer_bufs.dx_flat)
+            d.fan_in = fan_in
+            d.fan_out = fan_out
+
+        ctx.num_dense = len(dense_layers)
+        loss_scalar = np.zeros(1, dtype=np.float32)
+        ctx.loss_out = _ptr(loss_scalar)
+        return _ExecutionSlot(
+            ctx=ctx,
+            buffers=ContractBuffers(dense_layers=dense_layers, batch_cap=cap),
+            conv_grads=conv_grads,
+            loss_scalar=loss_scalar,
+            owners=owners,
+        )
+
+    def _ensure_async_resources(self, X: np.ndarray, m: int) -> None:
+        opt = self.model.optimizer
+        if not opt._setup_done:
+            opt.setup(self.model.weights, self.model.biases)
+
+        if not self._parameter_banks:
+            bank0 = _ParameterBank(
+                weights=list(self.model.weights),
+                biases=list(self.model.biases),
+                ms_w=list(opt.ms_w),
+                vs_w=list(opt.vs_w),
+                ms_b=list(opt.ms_b),
+                vs_b=list(opt.vs_b),
+            )
+            bank1 = _ParameterBank(
+                weights=[np.empty_like(a) for a in bank0.weights],
+                biases=[np.empty_like(a) for a in bank0.biases],
+                ms_w=[np.empty_like(a) for a in bank0.ms_w],
+                vs_w=[np.empty_like(a) for a in bank0.vs_w],
+                ms_b=[np.empty_like(a) for a in bank0.ms_b],
+                vs_b=[np.empty_like(a) for a in bank0.vs_b],
+            )
+            self._parameter_banks = [bank0, bank1]
+
+        cap = max(m, getattr(self.model, "_train_batch_cap", 0) or m)
+        if self._slots and cap <= self._slots[0].buffers.batch_cap:
+            return
+        if self._submitted is not None or self._completed is not None:
+            raise RuntimeError("cannot resize async slots while a result is owned")
+        self._slots = [self._make_async_slot(X, cap), self._make_async_slot(X, cap)]
+
+    def _bind_slot_parameter_banks(
+        self, slot: _ExecutionSlot, input_bank_idx: int, output_bank_idx: int
+    ) -> None:
+        from src.spatial_layers import ConvBlock
+
+        src = self._parameter_banks[input_bank_idx]
+        dst = self._parameter_banks[output_bank_idx]
+        ctx = slot.ctx
+        for li, layer in enumerate(self.model.layers):
+            if not isinstance(layer, ConvBlock):
+                continue
+            w_idx = self.model._layer_param_idx[li]
+            lb = ctx.layers[li]
+            lb.W = _ptr(src.weights[w_idx])
+            lb.b = _ptr(src.biases[w_idx].reshape(-1))
+            lb.W_next = _ptr(dst.weights[w_idx])
+            lb.b_next = _ptr(dst.biases[w_idx].reshape(-1))
+            lb.ms_w = _ptr(src.ms_w[w_idx])
+            lb.vs_w = _ptr(src.vs_w[w_idx])
+            lb.ms_b = _ptr(src.ms_b[w_idx].reshape(-1))
+            lb.vs_b = _ptr(src.vs_b[w_idx].reshape(-1))
+            lb.ms_w_next = _ptr(dst.ms_w[w_idx])
+            lb.vs_w_next = _ptr(dst.vs_w[w_idx])
+            lb.ms_b_next = _ptr(dst.ms_b[w_idx].reshape(-1))
+            lb.vs_b_next = _ptr(dst.vs_b[w_idx].reshape(-1))
+
+        for di, w_idx in enumerate(self.model._dense_w_indices):
+            d = ctx.dense[di]
+            d.W = _ptr(src.weights[w_idx])
+            d.b = _ptr(src.biases[w_idx].reshape(-1))
+            d.W_next = _ptr(dst.weights[w_idx])
+            d.b_next = _ptr(dst.biases[w_idx].reshape(-1))
+            d.ms_w = _ptr(src.ms_w[w_idx])
+            d.vs_w = _ptr(src.vs_w[w_idx])
+            d.ms_b = _ptr(src.ms_b[w_idx].reshape(-1))
+            d.vs_b = _ptr(src.vs_b[w_idx].reshape(-1))
+            d.ms_w_next = _ptr(dst.ms_w[w_idx])
+            d.vs_w_next = _ptr(dst.vs_w[w_idx])
+            d.ms_b_next = _ptr(dst.ms_b[w_idx].reshape(-1))
+            d.vs_b_next = _ptr(dst.vs_b[w_idx].reshape(-1))
+
+    def _publish_parameter_bank(self, bank_idx: int, adam_t: int) -> None:
+        bank = self._parameter_banks[bank_idx]
+        self._published_bank_idx = bank_idx
+        self.model.weights = bank.weights
+        self.model.biases = bank.biases
+        opt = self.model.optimizer
+        opt.ms_w = bank.ms_w
+        opt.vs_w = bank.vs_w
+        opt.ms_b = bank.ms_b
+        opt.vs_b = bank.vs_b
+        opt.t = int(adam_t)
+
+    def uses_async_forward(self) -> bool:
+        return self._async_enabled
+
+    def _make_eval_slot(self, X: np.ndarray, m: int) -> _EvalSlot:
+        """Bind a forward-only context with evaluation-sized private buffers."""
+        from src.scratch_arena import ScratchArena
+        from src.spatial_layers import ConvBlock
+
+        arena = ScratchArena(self.model.backend)
+        ctx = ContractExecCtx()
+        owners: list[Any] = [arena]
+        w_logical = self._input_logical_w
+        if w_logical is None:
+            w_logical = 28 if X.ndim == 4 and X.shape[3] == 32 else X.shape[3]
+            self._input_logical_w = w_logical
+
+        max_layer_idx = -1
+        cur_c, cur_h = X.shape[1], X.shape[2]
+        cur_w_log, cur_w_stride = w_logical, X.shape[3]
+        for li, layer in enumerate(self.model.layers):
+            if not isinstance(layer, ConvBlock):
+                continue
+            if li >= 8:
+                raise ValueError("Contract path supports at most 8 ConvBlock layers")
+            scratch = arena.ensure_conv_block_eval(
+                li,
+                out_channels=layer.out_channels,
+                k_h=layer.k_h,
+                k_w=layer.k_w,
+                conv_stride=layer.conv_stride,
+                conv_pad=layer.conv_pad,
+                pool_size=layer.pool_size,
+                pool_stride=layer.pool_stride,
+                N=m,
+                C=cur_c,
+                H=cur_h,
+                W_logical=cur_w_log,
+                dtype=X.dtype,
+            )
+            lb = ctx.layers[li]
+            lb.out_conv = _ptr(scratch.eval_out_conv_buffer)
+            lb.out_pool = _ptr(scratch.eval_out_pool_buffer)
+            lb.argmax = _ptr(scratch.eval_argmax_buffer)
+            lb.C_in = layer.in_channels
+            lb.C_out = layer.out_channels
+            lb.H = cur_h
+            lb.W_in = cur_w_log
+            lb.W_stride = cur_w_stride
+            lb.k_h = layer.k_h
+            lb.k_w = layer.k_w
+            lb.conv_stride = layer.conv_stride
+            lb.conv_pad = layer.conv_pad
+            lb.pool_size = layer.pool_size
+            lb.pool_stride = layer.pool_stride
+
+            conv_out_h = (
+                cur_h + 2 * layer.conv_pad - layer.k_h
+            ) // layer.conv_stride + 1
+            conv_out_w = (
+                cur_w_log + 2 * layer.conv_pad - layer.k_w
+            ) // layer.conv_stride + 1
+            lb.conv_out_w_stride = _round_up_simd(conv_out_w)
+            lb.pool_out_h = (
+                conv_out_h - layer.pool_size
+            ) // layer.pool_stride + 1
+            lb.pool_out_w = (
+                conv_out_w - layer.pool_size
+            ) // layer.pool_stride + 1
+            max_layer_idx = li
+            cur_c, cur_h, cur_w_log, cur_w_stride = _conv_block_output_geom(
+                cur_c, cur_h, cur_w_log, layer
+            )
+        ctx.num_layers = max_layer_idx + 1 if max_layer_idx >= 0 else 0
+
+        output: np.ndarray | None = None
+        for di, w_idx in enumerate(self.model._dense_w_indices):
+            W = self.model.weights[w_idx]
+            fan_in, fan_out = W.shape
+            z = np.empty((m, fan_out), dtype=X.dtype)
+            out = np.empty((m, fan_out), dtype=X.dtype)
+            owners.extend((z, out))
+            d = ctx.dense[di]
+            d.z = _ptr(z)
+            d.output = _ptr(out)
+            d.fan_in = fan_in
+            d.fan_out = fan_out
+            output = out
+        if output is None:
+            raise RuntimeError("forward contract requires at least one dense output")
+        ctx.num_dense = len(self.model._dense_w_indices)
+        ctx.loss_out = None
+        return _EvalSlot(ctx, output, m, X.dtype, owners)
+
+    def _bind_eval_weights(self, slot: _EvalSlot) -> None:
+        from src.spatial_layers import ConvBlock
+
+        for li, layer in enumerate(self.model.layers):
+            if not isinstance(layer, ConvBlock):
+                continue
+            w_idx = self.model._layer_param_idx[li]
+            slot.ctx.layers[li].W = _ptr(self.model.weights[w_idx])
+            slot.ctx.layers[li].b = _ptr(self.model.biases[w_idx].reshape(-1))
+        for di, w_idx in enumerate(self.model._dense_w_indices):
+            slot.ctx.dense[di].W = _ptr(self.model.weights[w_idx])
+            slot.ctx.dense[di].b = _ptr(self.model.biases[w_idx].reshape(-1))
+
+    def run_async_forward(self, X: np.ndarray) -> np.ndarray:
+        """Execute the compiled contract's forward prefix on the native worker."""
+        if not self._async_enabled:
+            raise RuntimeError("async forward requires native_async_submit")
+        if (
+            self._submitted is not None
+            or self._completed is not None
+            or self._prepared is not None
+            or self._lib.contract_async_in_flight()
+        ):
+            raise RuntimeError("async forward requires a drained training pipeline")
+
+        X = np.ascontiguousarray(X)
+        m = int(X.shape[0])
+        if (
+            self._eval_slot is None
+            or m > self._eval_slot.batch_cap
+            or self._eval_slot.dtype != X.dtype
+        ):
+            self._eval_slot = self._make_eval_slot(X, m)
+        slot = self._eval_slot
+        self._bind_eval_weights(slot)
+        slot.ctx.N = m
+        slot.ctx.X = _ptr(X)
+        slot.ctx.y = None
+        slot.ctx.act = None
+
+        token = -(int(self.model.optimizer.t) + 1)
+        status = self._lib.submit_contract_training_step(
+            ctypes.cast(self._ops, ctypes.POINTER(ContractOpRow)),
+            ctypes.c_int32(self._forward_op_count),
+            ctypes.byref(slot.ctx),
+            ctypes.c_int64(token),
+        )
+        if status != 0:
+            raise RuntimeError(f"submit async forward failed with status {status}")
+        self._pending_token = token
+        if not self._wait_reap_native(-1):
+            raise RuntimeError("async forward wait returned without completion")
+        return np.copy(slot.output[:m])
+
     
     def set_engine_driven(self, enabled: bool = True) -> None:
         """When True, submit/reap are driven by TrainingEngine (subscriber)."""
@@ -504,8 +940,7 @@ class ContractRuntime:
     def _trace_mailbox(self, where: str) -> None:
         """Diagnostic-only cross-check of stable Python/native mailbox state."""
         if not (
-            self._mailbox_trace_enabled
-            and self._async_enabled
+            self._async_enabled
             and hasattr(self._lib, "contract_async_debug_snapshot")
         ):
             return
@@ -575,7 +1010,7 @@ class ContractRuntime:
 
     def waiting_on_native_worker(self) -> bool:
         """True while a submitted step is not yet finished on this thread."""
-        if not self._async_enabled or self._completed is not None:
+        if not self._async_enabled:
             return False
         if self._submitted is not None:
             return True
@@ -596,7 +1031,12 @@ class ContractRuntime:
             return False
         submitted = self._submitted
         self._submitted = None
-        self._completed = self._finish_submitted(submitted)
+        if submitted.apply_adam:
+            self._publish_parameter_bank(
+                submitted.output_bank_idx,
+                self._slots[submitted.slot_idx].ctx.adam.t,
+            )
+        self._completed = submitted
         self._publish_completion()
         self._trace_mailbox("poll_completed")
         return True
@@ -615,7 +1055,12 @@ class ContractRuntime:
             return False
         submitted = self._submitted
         self._submitted = None
-        self._completed = self._finish_submitted(submitted)
+        if submitted.apply_adam:
+            self._publish_parameter_bank(
+                submitted.output_bank_idx,
+                self._slots[submitted.slot_idx].ctx.adam.t,
+            )
+        self._completed = submitted
         self._publish_completion()
         self._trace_mailbox("wait_completed")
         return True
@@ -623,7 +1068,7 @@ class ContractRuntime:
     def native_in_flight(self) -> bool:
         if not self._async_enabled:
             return False
-        if self._submitted is not None or self._completed is not None:
+        if self._submitted is not None:
             return True
         return bool(self._lib.contract_async_in_flight())
 
@@ -633,7 +1078,7 @@ class ContractRuntime:
         return self._completed is not None
 
     def is_busy(self) -> bool:
-        """Single in-flight slot occupied — caller should push back BUSY."""
+        """Native worker occupied — a prepared step may not commit yet."""
         return self.native_in_flight()
 
     def _publish_completion(self) -> None:
@@ -656,19 +1101,97 @@ class ContractRuntime:
             raise RuntimeError("try_submit_step is only valid in engine-driven async mode")
         if self.is_busy():
             return False
+        if self._prepared is None:
+            if not self.prepare_step(
+                X, y, lr, apply_adam=apply_adam, step_token=step_token
+            ):
+                return False
+        prepared = self._prepared
+        if prepared is None:
+            return False
+        if prepared.X is not X or prepared.y is not y:
+            raise RuntimeError("prepared step does not match committed batch")
+
+        slot = self._slots[prepared.slot_idx]
+        slot.ctx.adam.t = int(self.model.optimizer.t)
+        self._submit_native(slot.ctx, prepared.step_token)
+        self._submitted = _SubmittedStep(
+            slot_idx=prepared.slot_idx,
+            output_bank_idx=prepared.output_bank_idx,
+            m=prepared.m,
+            dtype=prepared.dtype,
+            X=prepared.X,
+            y=prepared.y,
+            apply_adam=prepared.apply_adam,
+            step_token=prepared.step_token,
+        )
+        self._prepared = None
+        self._trace_mailbox("submitted")
+        return True
+
+    def prepare_step(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        lr: float,
+        *,
+        apply_adam: bool = False,
+        step_token: int | None = None,
+    ) -> bool:
+        """Prepare the inactive execution slot while the current job runs."""
+        if not (self._async_enabled and self._engine_driven):
+            raise RuntimeError("prepare_step is only valid in engine-driven async mode")
+        if self._prepared is not None:
+            return self._prepared.X is X and self._prepared.y is y
 
         X = np.ascontiguousarray(X)
         y = np.ascontiguousarray(y)
         m = int(X.shape[0])
+        self._ensure_async_resources(X, m)
 
-        ctx, bound = self._bind_conv_layers(X, m)
-        self._bind_dense(ctx, m, X.dtype)
-        self._refresh_step_bindings(X, y, m, lr, apply_adam=apply_adam)
+        occupied = {
+            step.slot_idx
+            for step in (self._submitted, self._completed)
+            if step is not None
+        }
+        free_slots = [i for i in range(2) if i not in occupied]
+        if not free_slots:
+            return False
+        slot_idx = free_slots[0]
+        input_bank_idx = (
+            self._submitted.output_bank_idx
+            if self._submitted is not None
+            else self._published_bank_idx
+        )
+        output_bank_idx = 1 - input_bank_idx if apply_adam else input_bank_idx
+        slot = self._slots[slot_idx]
+        self._bind_slot_parameter_banks(slot, input_bank_idx, output_bank_idx)
+        slot.ctx.N = m
+        slot.ctx.lr = float(lr)
+        slot.ctx.skip_adam = 0 if apply_adam else 1
+        slot.ctx.X = _ptr(X)
+        slot.ctx.y = _ptr(y)
+        slot.ctx.adam.t = int(self.model.optimizer.t)
+
+        for layer_bufs in slot.buffers.dense_layers:
+            layer_bufs.dW.fill(0.0)
+            layer_bufs.db.fill(0.0)
+        for _, dW, db in slot.conv_grads:
+            dW.fill(0.0)
+            db.fill(0.0)
 
         token = int(step_token if step_token is not None else self.model.optimizer.t + 1)
-        self._submit_native(ctx, token)
-        self._submitted = _SubmittedStep(m, X.dtype, y, bound, apply_adam)
-        self._trace_mailbox("submitted")
+        self._prepared = _PreparedStep(
+            slot_idx=slot_idx,
+            input_bank_idx=input_bank_idx,
+            output_bank_idx=output_bank_idx,
+            m=m,
+            dtype=X.dtype,
+            X=X,
+            y=y,
+            apply_adam=apply_adam,
+            step_token=token,
+        )
         return True
 
     def submit_step(
@@ -693,22 +1216,35 @@ class ContractRuntime:
         self._poll_complete_on_main()
         if self._completed is None:
             return None
-        result = self._completed
+        submitted = self._completed
         self._completed = None
+        result = self._finish_submitted(submitted)
         self._trace_mailbox("result_consumed")
         return result
 
     def _finish_submitted(
         self, submitted: _SubmittedStep
     ) -> tuple[float, list[np.ndarray], list[np.ndarray], int]:
-        loss, gw, gb = self._collect_grads(
-            submitted.m,
-            submitted.dtype,
-            submitted.y,
-            submitted.bound,
-            apply_adam=submitted.apply_adam,
-            ctx=self._ctx,
-        )
+        slot = self._slots[submitted.slot_idx]
+        grad_weights: list[np.ndarray | None] = [None] * len(self.model.weights)
+        grad_biases: list[np.ndarray | None] = [None] * len(self.model.biases)
+        for di, w_idx in enumerate(self.model._dense_w_indices):
+            layer_bufs = slot.buffers.dense_layers[di]
+            grad_weights[w_idx] = np.copy(layer_bufs.dW)
+            grad_biases[w_idx] = np.copy(layer_bufs.db).reshape(1, -1)
+        for w_idx, dW, db in slot.conv_grads:
+            grad_weights[w_idx] = np.copy(dW)
+            grad_biases[w_idx] = np.copy(db)
+
+        loss = float(slot.loss_scalar[0])
+        if self.model.lam_l2 > 0.0:
+            l2_sum = sum(float(np.sum(w * w)) for w in self.model.weights)
+            loss += (self.model.lam_l2 / (2.0 * submitted.m)) * l2_sum
+        if self.model.lam_l1 > 0.0:
+            l1_sum = sum(float(np.sum(np.abs(w))) for w in self.model.weights)
+            loss += (self.model.lam_l1 / submitted.m) * l1_sum
+        gw = grad_weights
+        gb = grad_biases
         return loss, gw, gb, submitted.m
 
     def run_step(

@@ -36,6 +36,12 @@ class _InflightStep:
     base_version: int
 
 
+@dataclass
+class _CommittedStep:
+    inflight: _InflightStep
+    version: int
+
+
 class TrainingEngine:
     """
     Long-lived training manager: one engine, many sessions.
@@ -68,6 +74,7 @@ class TrainingEngine:
         self._prefetch_depth = int(getattr(config, "prefetch_depth", 4) or 4)
         self._ledger_lock = threading.RLock()
         self._deferred: deque[Callable[[], None]] = deque()
+        self._prepared: _InflightStep | None = None
 
     def create_session(
         self,
@@ -292,12 +299,7 @@ class TrainingEngine:
         next_step: Callable[[], StepInput | None],
         on_submitted: Callable[[StepInput], None] | None = None,
     ) -> list[float]:
-        """
-        Train machine: submit → arm next → push/flush if work → wait native only.
-
-        Next StepInput is staged while native runs (single ctx cannot bind ahead).
-        Bind+submit happens the instant capacity returns.
-        """
+        """Two-slot pipeline: submit → publish previous → prepare next → wait."""
         self._epoch_losses = []
         self._epoch_steps_done = 0
         self._flag_step_done = False
@@ -306,83 +308,71 @@ class TrainingEngine:
         pending: StepInput | None = None
         exhausted = False
 
-        while self._epoch_steps_done < steps_budget:
+        pending, exhausted, _ = self._arm_one(
+            next_step,
+            exhausted=exhausted,
+            steps_budget=steps_budget,
+            pending=None,
+        )
+        if pending is None:
+            return []
+        if not self.try_submit(pending):
+            raise RuntimeError("initial async contract submit was rejected")
+        self._flag_capacity = False
+        if on_submitted is not None:
+            on_submitted(pending)
+        pending = None
+
+        while self._inflight is not None:
             pending, exhausted, _ = self._arm_one(
                 next_step,
                 exhausted=exhausted,
                 steps_budget=steps_budget,
                 pending=pending,
             )
-            if pending is None:
-                break
+            if pending is not None:
+                self.prepare_submit(pending)
 
-            if not self.can_submit() or self.session.contract_busy():
-                self._do_useful_work()
-                self._wait_native_done()
-                if self._flag_step_done or self._native_ready():
-                    loss = self._finalize_if_ready()
-                    self._flag_step_done = False
-                    if loss is not None:
-                        self._epoch_losses.append(loss)
-                        self._epoch_steps_done += 1
-                continue
-
-            if not self.try_submit(pending):
-                self._flag_capacity = False
-                self._do_useful_work()
-                self._wait_native_done()
-                continue
-
-            self._flag_capacity = False
-            if on_submitted is not None:
-                on_submitted(pending)
-            pending = None
-
-            # Native running: arm next + push previous docs / flush only if pending.
-            pending, exhausted, _ = self._arm_one(
-                next_step,
-                exhausted=exhausted,
-                steps_budget=steps_budget,
-                pending=pending,
-            )
-            if self._flag_step_done or self._native_ready():
-                loss = self._finalize_if_ready()
-                self._flag_step_done = False
-                if loss is not None:
-                    self._epoch_losses.append(loss)
-                    self._epoch_steps_done += 1
             self._do_useful_work()
+            self._wait_native_done()
+            if not self._native_ready():
+                raise RuntimeError("native wait returned without a completed contract")
 
-            # Only wait: native free, with next step already armed when available.
-            if self._inflight is not None and not (
-                self._flag_step_done or self._native_ready()
-            ):
-                self._wait_native_done()
+            finished = self._inflight
+            self._inflight = None
+            committed = self._commit_completed_version(finished)
+            self._flag_step_done = False
 
-            if self._flag_step_done or self._native_ready():
-                loss = self._finalize_if_ready()
-                self._flag_step_done = False
-                if loss is not None:
-                    self._epoch_losses.append(loss)
-                    self._epoch_steps_done += 1
+            if pending is not None:
+                if not self.try_submit(pending):
+                    raise RuntimeError("prepared async contract submit was rejected")
+                self._flag_capacity = False
+                if on_submitted is not None:
+                    on_submitted(pending)
+                pending = None
 
-        self.drain_pending()
+            loss = self._finalize_committed(committed)
+            self._epoch_losses.append(loss)
+            self._epoch_steps_done += 1
+            if self._ledger_needs_work():
+                self._ledger_io_begin_flush()
+
         return list(self._epoch_losses)
 
     def drain_pending(self) -> list[float]:
-        """Drain inflight: useful work first, then wait on native only."""
-        while self._inflight is not None or self._flag_step_done:
-            if self._flag_step_done or self._native_ready():
-                loss = self._finalize_if_ready()
-                self._flag_step_done = False
-                if loss is not None:
-                    self._epoch_losses.append(loss)
-                    self._epoch_steps_done += 1
-                continue
+        """Drain one externally submitted async step."""
+        while self._inflight is not None:
             self._do_useful_work()
-            if self._flag_step_done or self._native_ready():
-                continue
             self._wait_native_done()
+            if not self._native_ready():
+                continue
+            finished = self._inflight
+            self._inflight = None
+            committed = self._commit_completed_version(finished)
+            loss = self._finalize_committed(committed)
+            self._flag_step_done = False
+            self._epoch_losses.append(loss)
+            self._epoch_steps_done += 1
         return list(self._epoch_losses)
 
     def try_submit(self, step: StepInput) -> bool:
@@ -391,14 +381,74 @@ class TrainingEngine:
             return False
         if self.session.contract_busy():
             return False
-        step_id = self.session.reserve_step_id()
-        base_version = self.ledger.version
+        prepared = self._prepared
+        if prepared is not None:
+            if prepared.step is not step:
+                raise RuntimeError("prepared engine step does not match submitted batch")
+            step_id = prepared.step_id
+            base_version = prepared.base_version
+        else:
+            step_id = self.session.reserve_step_id()
+            base_version = self.ledger.version
         if not self.session.submit_contract_step(
             step.X, step.y, step.lr, step_id=step_id, apply_adam=True
         ):
             return False
         self._inflight = _InflightStep(step=step, step_id=step_id, base_version=base_version)
+        self._prepared = None
         return True
+
+    def prepare_submit(self, step: StepInput) -> bool:
+        """Prepare a future submit in the inactive runtime slot."""
+        if self._prepared is not None:
+            return self._prepared.step is step
+        step_id = self.session.reserve_step_id()
+        base_version = (
+            self._inflight.base_version + 1
+            if self._inflight is not None
+            else self.ledger.version
+        )
+        if not self.session.prepare_contract_step(
+            step.X, step.y, step.lr, step_id=step_id, apply_adam=True
+        ):
+            raise RuntimeError("inactive contract slot unavailable during prepare")
+        self._prepared = _InflightStep(step, step_id, base_version)
+        return True
+
+    def _commit_completed_version(self, inflight: _InflightStep) -> _CommittedStep:
+        if self.ledger.version != inflight.base_version:
+            raise RuntimeError(
+                f"ledger version order violation: expected base={inflight.base_version}, "
+                f"actual={self.ledger.version}"
+            )
+        version = inflight.base_version + 1
+        self.ledger.version = version
+        return _CommittedStep(inflight, version)
+
+    def _finalize_committed(self, committed: _CommittedStep) -> float:
+        inflight = committed.inflight
+        packed = self.session.try_reap_contract_step()
+        if packed is None:
+            raise RuntimeError("native completion disappeared before finalize")
+        loss, gw, gb, m, gg, gbb, weights_applied = packed
+        result = self.session._pack_train_step_result(
+            inflight.step_id,
+            loss,
+            gw,
+            gb,
+            m,
+            gg,
+            gbb,
+            weights_applied=weights_applied,
+            gradients_owned=True,
+        )
+        return self.run_step_finalize(
+            inflight.step,
+            result,
+            step_id=inflight.step_id,
+            base_version=inflight.base_version,
+            committed_version=committed.version,
+        )
 
     @profile
     def run_step(self, step: StepInput) -> float:
@@ -476,11 +526,16 @@ class TrainingEngine:
         *,
         step_id: int,
         base_version: int,
+        committed_version: int | None = None,
     ) -> float:
         """Record step docs on the ledger (strict FIFO; serialized with RLock)."""
         with self._ledger_lock:
             return self._run_step_finalize_locked(
-                step, result, step_id=step_id, base_version=base_version
+                step,
+                result,
+                step_id=step_id,
+                base_version=base_version,
+                committed_version=committed_version,
             )
 
     def _run_step_finalize_locked(
@@ -490,22 +545,32 @@ class TrainingEngine:
         *,
         step_id: int,
         base_version: int,
+        committed_version: int | None = None,
     ) -> float:
         if __debug__:
             if result.step_id != step_id:
                 raise RuntimeError(
                     f"finalize step_id mismatch: expected={step_id}, result={result.step_id}"
                 )
-            if self.ledger.version != base_version:
+            expected_version = (
+                base_version if committed_version is None else committed_version
+            )
+            if self.ledger.version != expected_version:
                 raise RuntimeError(
-                    f"ledger version order violation: expected base={base_version}, "
+                    f"ledger version order violation: expected={expected_version}, "
                     f"actual={self.ledger.version}"
                 )
 
         if not result.weights_applied:
             self.session.apply_step(result, step.lr)
         new_version = base_version + 1
-        self.ledger.version = new_version
+        if committed_version is None:
+            self.ledger.version = new_version
+        elif committed_version != new_version:
+            raise RuntimeError(
+                f"committed version mismatch: expected={new_version}, "
+                f"actual={committed_version}"
+            )
         optimizer_t = int(getattr(self.session.model.optimizer, "t", new_version))
 
         verdict = VERDICT_HEALTHY

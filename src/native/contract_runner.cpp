@@ -69,6 +69,8 @@ struct ContractOpRow {
 struct LayerBinding {
     float* W;
     float* b;
+    float* W_next;
+    float* b_next;
     float* dW;
     float* db;
     float* out_conv;
@@ -82,6 +84,10 @@ struct LayerBinding {
     float* vs_w;
     float* ms_b;
     float* vs_b;
+    float* ms_w_next;
+    float* vs_w_next;
+    float* ms_b_next;
+    float* vs_b_next;
     int64_t w_count;
     int64_t b_count;
     int64_t C_in;
@@ -103,6 +109,8 @@ struct LayerBinding {
 struct DenseBinding {
     float* W;
     float* b;
+    float* W_next;
+    float* b_next;
     float* dW;
     float* db;
     float* z;
@@ -114,6 +122,10 @@ struct DenseBinding {
     float* vs_w;
     float* ms_b;
     float* vs_b;
+    float* ms_w_next;
+    float* vs_w_next;
+    float* ms_b_next;
+    float* vs_b_next;
     int64_t fan_in;
     int64_t fan_out;
 };
@@ -299,7 +311,8 @@ static void dense_backward_layer(ContractExecCtx* ctx, int32_t di, bool is_last)
 }
 
 static void adam_update_tensor(
-    float* param, const float* grad, float* ms, float* vs,
+    const float* param, const float* grad, const float* ms, const float* vs,
+    float* param_next, float* ms_next, float* vs_next,
     int64_t count, const AdamBinding* a, float lr, float decay_factor
 ) {
     const float t = (float)a->t;
@@ -309,13 +322,18 @@ static void adam_update_tensor(
     const float eps_c = a->eps * std::sqrt(bc2);
     const float one_minus_beta1 = 1.0f - a->beta1;
     const float one_minus_beta2 = 1.0f - a->beta2;
+    if (!param_next) param_next = const_cast<float*>(param);
+    if (!ms_next) ms_next = const_cast<float*>(ms);
+    if (!vs_next) vs_next = const_cast<float*>(vs);
     for (int64_t i = 0; i < count; ++i) {
-        ms[i] = a->beta1 * ms[i] + one_minus_beta1 * grad[i];
-        vs[i] = a->beta2 * vs[i] + one_minus_beta2 * grad[i] * grad[i];
-        if (decay_factor > 0.0f) {
-            param[i] -= decay_factor * param[i];
-        }
-        param[i] -= step_scale * ms[i] / (std::sqrt(vs[i]) + eps_c);
+        const float next_m = a->beta1 * ms[i] + one_minus_beta1 * grad[i];
+        const float next_v = a->beta2 * vs[i] + one_minus_beta2 * grad[i] * grad[i];
+        float next_param = param[i];
+        if (decay_factor > 0.0f) next_param -= decay_factor * param[i];
+        next_param -= step_scale * next_m / (std::sqrt(next_v) + eps_c);
+        ms_next[i] = next_m;
+        vs_next[i] = next_v;
+        param_next[i] = next_param;
     }
 }
 
@@ -329,16 +347,27 @@ static void adam_apply_all(ContractExecCtx* ctx) {
     for (int32_t li = 0; li < ctx->num_layers; ++li) {
         LayerBinding* L = &ctx->layers[li];
         if (L->w_count <= 0 || !L->ms_w) continue;
-        adam_update_tensor(L->W, L->dW, L->ms_w, L->vs_w, L->w_count, a, ctx->lr, decay_factor);
-        adam_update_tensor(L->b, L->db, L->ms_b, L->vs_b, L->b_count, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->W, L->dW, L->ms_w, L->vs_w,
+            L->W_next, L->ms_w_next, L->vs_w_next,
+            L->w_count, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            L->b, L->db, L->ms_b, L->vs_b,
+            L->b_next, L->ms_b_next, L->vs_b_next,
+            L->b_count, a, ctx->lr, 0.0f);
     }
 
     for (int32_t di = 0; di < ctx->num_dense; ++di) {
         DenseBinding* d = &ctx->dense[di];
         if (!d->ms_w) continue;
         adam_update_tensor(
-            d->W, d->dW, d->ms_w, d->vs_w, d->fan_in * d->fan_out, a, ctx->lr, decay_factor);
-        adam_update_tensor(d->b, d->db, d->ms_b, d->vs_b, d->fan_out, a, ctx->lr, 0.0f);
+            d->W, d->dW, d->ms_w, d->vs_w,
+            d->W_next, d->ms_w_next, d->vs_w_next,
+            d->fan_in * d->fan_out, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            d->b, d->db, d->ms_b, d->vs_b,
+            d->b_next, d->ms_b_next, d->vs_b_next,
+            d->fan_out, a, ctx->lr, 0.0f);
     }
 }
 
@@ -449,18 +478,7 @@ std::atomic<int32_t> g_async_state{ASYNC_IDLE};
 int64_t g_async_ready_token = 0;
 int32_t g_async_ready_status = 0;
 
-bool mailbox_trace_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("ML_ENGINE_MAILBOX_TRACE");
-        return value && value[0] != '\0' && value[0] != '0';
-    }();
-    return enabled;
-}
-
 void trace_mailbox_invariant_locked(const char* where) {
-    if (!mailbox_trace_enabled()) {
-        return;
-    }
     const int32_t state = g_async_state.load(std::memory_order_relaxed);
     const bool bad_job_state = g_async_has_job && state != ASYNC_RUNNING;
     const bool bad_idle_job = state == ASYNC_IDLE && g_async_has_job;
@@ -635,7 +653,7 @@ ML_ENGINE_EXPORT int32_t wait_contract_completion(
 }
 
 // Diagnostic-only snapshot used by the Python-side cross-mailbox invariant
-// checker when ML_ENGINE_MAILBOX_TRACE is enabled.
+// checker whenever native async submit is enabled.
 ML_ENGINE_EXPORT int32_t contract_async_debug_snapshot(
     int32_t* out_state,
     int32_t* out_has_job,

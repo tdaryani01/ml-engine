@@ -189,6 +189,20 @@ def test_contract_async_submit_reaps():
     print("[PASSED] contract async: submit/reap matches sync path")
 
 
+def test_contract_async_forward_matches_direct_predict():
+    """Async-enabled predict executes the forward contract with matching output."""
+    rng = np.random.default_rng(29)
+    X = rng.standard_normal((8, 1, 28, 32), dtype=np.float32)
+    model = _make_model(seed=37)
+    expected = model._forward(X, training=False).copy()
+    model.enable_contract_list(native_async_submit=True)
+
+    actual = model.predict(X)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+    print("[PASSED] contract async forward: predict matches direct path")
+
+
 def test_contract_busy_pushback():
     lib = _load_conv_dll()
     if lib is None or not hasattr(lib, "submit_contract_training_step"):
@@ -264,6 +278,7 @@ if __name__ == "__main__":
         test_contract_grad_parity_one_step()
         test_contract_train_step_weights_applied_in_native()
         test_contract_async_submit_reaps()
+        test_contract_async_forward_matches_direct_predict()
         test_contract_busy_pushback()
         test_contract_engine_finalize_skips_python_apply()
     finally:

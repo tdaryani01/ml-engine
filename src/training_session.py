@@ -144,6 +144,24 @@ class TrainingSession:
             == "OK"
         )
 
+    def prepare_contract_step(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        lr: float,
+        *,
+        step_id: int,
+        apply_adam: bool = True,
+    ) -> bool:
+        """Prepare the model's inactive async slot without submitting it."""
+        if not hasattr(self.model, "prepare_training_step"):
+            return False
+        return bool(
+            self.model.prepare_training_step(
+                X, y, lr, apply_adam=apply_adam, step_token=step_id
+            )
+        )
+
     def contract_busy(self) -> bool:
         if hasattr(self.model, "contract_busy"):
             return bool(self.model.contract_busy())
@@ -196,12 +214,13 @@ class TrainingSession:
         gbb: list[np.ndarray] | None,
         *,
         weights_applied: bool = False,
+        gradients_owned: bool = False,
     ) -> TrainStepResult:
         return TrainStepResult(
             step_id=step_id,
             loss=loss,
-            grad_weights=[np.copy(g) for g in gw],
-            grad_biases=[np.copy(g) for g in gb],
+            grad_weights=list(gw) if gradients_owned else [np.copy(g) for g in gw],
+            grad_biases=list(gb) if gradients_owned else [np.copy(g) for g in gb],
             m_samples=m,
             grad_gammas=[np.copy(g) for g in gg] if gg else None,
             grad_betas=[np.copy(g) for g in gbb] if gbb else None,
