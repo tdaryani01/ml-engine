@@ -100,6 +100,28 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
+# Active shells keep the group set from when they started. If docker.sock is
+# group-writable and this session lacks docker, re-exec under sg docker so the
+# caller still only runs one command.
+if [[ -z "${ML_ENGINE_DOCKER_SG:-}" ]] && ! docker info >/dev/null 2>&1; then
+  _docker_err="$(docker info 2>&1 || true)"
+  if printf '%s' "$_docker_err" | grep -qi 'permission denied'; then
+    _have_docker_group=0
+    if id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+      _have_docker_group=1
+    fi
+    if (( _have_docker_group == 0 )) && getent group docker 2>/dev/null | grep -Eq "(^|:)${USER}(,|$)"; then
+      echo "[!] docker group is configured but inactive in this shell; re-running under sg docker" >&2
+      export ML_ENGINE_DOCKER_SG=1
+      _quoted=()
+      for _a in "$@"; do
+        _quoted+=("$(printf %q "$_a")")
+      done
+      exec sg docker -c "cd $(printf %q "$ROOT") && exec $(printf %q "$0") ${_quoted[*]}"
+    fi
+  fi
+fi
+
 CPUSET="0-$((CORES - 1))"
 
 if [[ ! -f "$RUNTIME_SCRIPT" ]]; then
@@ -134,17 +156,32 @@ if (( VERBOSE_TRACING == 1 && VERBOSE_LEVEL == 0 )); then
 fi
 
 test_docker_endpoint() {
-  if ! docker info >/dev/null 2>&1; then
-    echo "[!] Docker daemon unresponsive. Re-evaluating default context..." >&2
-    docker context use default >/dev/null 2>&1 || true
+  if docker info >/dev/null 2>&1; then
+    return 0
   fi
-  if ! docker info >/dev/null 2>&1; then
-    echo "[ERROR] Docker daemon is not reachable." >&2
-    echo "  Is the service running, and is your user in the docker group?" >&2
-    echo "    sudo systemctl start docker" >&2
-    echo "    sudo usermod -aG docker \"\$USER\" && newgrp docker" >&2
+  local err
+  err="$(docker info 2>&1 || true)"
+  echo "[!] Docker daemon unresponsive. Re-evaluating default context..." >&2
+  docker context use default >/dev/null 2>&1 || true
+  if docker info >/dev/null 2>&1; then
+    return 0
+  fi
+  err="$(docker info 2>&1 || true)"
+  if printf '%s' "$err" | grep -qi 'permission denied'; then
+    echo "[ERROR] permission denied talking to docker.sock" >&2
+    echo "  Your account is likely missing an active docker group in this shell." >&2
+    echo "  Fix once: newgrp docker   OR open a new terminal after usermod -aG docker" >&2
     exit 1
   fi
+  if printf '%s' "$err" | grep -qi 'no such file or directory\|Cannot connect\|Is the docker daemon running'; then
+    echo "[ERROR] Docker daemon is not running." >&2
+    echo "  Start it with: sudo systemctl start docker" >&2
+    exit 1
+  fi
+  echo "[ERROR] Docker daemon is not reachable." >&2
+  echo "  docker info said:" >&2
+  printf '%s\n' "$err" >&2
+  exit 1
 }
 
 stop_existing_benchmark_containers() {

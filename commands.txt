@@ -1,0 +1,63 @@
+cd /home/tdaryani/Projects/ml-engine
+
+source .venv/bin/activate
+
+./build_native.sh
+
+./build_native.sh release-symbols
+
+.venv/bin/python testing/test_contract.py
+
+.venv/bin/python run_pipeline.py
+
+.venv/bin/python benchmarks/benchmark_cnn.py
+
+.venv/bin/python profile_yappi.py -o yappi.pstat --clock cpu
+
+.venv/bin/snakeviz yappi.pstat
+
+./profile_engine.sh --analysis Assess
+
+./profile_engine.sh --analysis Cache
+
+./profile_engine.sh --analysis Memory
+
+./profile_engine.sh --analysis MemAlloc
+
+./profile_engine.sh --analysis Hotspots
+
+./profile_engine.sh --repeatable --analysis Hotspots --target run_pipeline.py
+
+./profile_engine.sh --repeatable --analysis BackwardDiag --target run_pipeline.py
+
+.venv/bin/python scripts/uprof_report_summary.py uprof_reports/summary_report.csv --analysis Assess --share-out /tmp/uProf_ASSESS_SHARE.txt
+
+.venv/bin/python scripts/uprof_report_summary.py uprof_reports/summary_report.csv --analysis Cache --share-out /tmp/uProf_SHARE.txt
+
+cat /tmp/uProf_ASSESS_SHARE.txt
+
+cat /tmp/uProf_SHARE.txt
+
+sudo chown -R tdaryani:tdaryani uprof_reports
+
+./run_docker_benchmark.sh
+
+./run_docker_benchmark.sh build
+
+./run_docker_benchmark.sh build-custom
+
+./run_docker_benchmark.sh run
+
+./run_docker_benchmark.sh clean
+
+./run_docker_benchmark.sh sweep
+
+./run_docker_benchmark.sh matrix
+
+./run_docker_benchmark.sh sample
+
+docker images
+
+docker ps -a
+
+docker system df
