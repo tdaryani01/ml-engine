@@ -170,6 +170,27 @@ on representative geometries; `im2col_fast.py` removed.
 **Not in scope yet:** Replacing `GENERIC_FALLBACK` tiled loops in `conv_fallback.cpp` with native
 im2col+GEMM routing — that is a separate dispatcher decision after D8–D9 are proven.
 
+#### Channel-blocked backward-dX coverage (`conv_fallback.cpp`)
+
+Two layouts beat the sliding-window crawl by keeping spatial steps SIMD-aligned. Both are
+gated narrowly to the geometries that were measured and verified; everything else still
+takes the tile-queue crawl. Together they measured ~+25% end-to-end vs the crawl baseline.
+
+| Path | Gate today | Verified by |
+|------|------------|-------------|
+| Option B — `cin`-blocked | `stride==1`, `k_h==k_w`, `C_in%8==0`, `K∈{5,6,7}` | `option_b_verify/verify_dx.py` |
+| Option D — `cout`-blocked | `stride==1`, `k_h==k_w`, `C_out==8`, `K==7` only | `option_b_verify/verify_dx_option_d.py` |
+
+**TODO — widen the gates.** The kernels are templated on `K` but only partially wired up:
+
+- Option D is K=7-only; extend the dispatch to K=5 and K=6 (and K≤4 / K≥8 if they show a win).
+- Option D requires `C_out==8` exactly (one 8-wide block). Generalize to `C_out%8==0` with
+  multi-block accumulation so layer 2 (`C_out=16`) can use it instead of falling back.
+- Option B skips `K≤4` and `K≥8`, and any layer with `C_in%8!=0`.
+
+Verify each `K` separately before widening — set `ML_ENGINE_FORCE_DX_CRAWL=1` to A/B against
+the crawl path, and treat a bit-close NumPy match as the correctness gate.
+
 ---
 
 ### Phase E — Ledger, training manager, serving (local proof first)
