@@ -9,6 +9,7 @@
 #   ./build_native.sh release
 #   ./build_native.sh release-symbols  # -g + same opts (perf tools)
 #   ./build_native.sh release-noinline # -g + optimized, no inlining/LTO (uProf attribution)
+#   ./build_native.sh release-contract-profile # diagnostic per-OMP-thread contract timing
 #   ./build_native.sh debug
 #   ./build_native.sh release --run-tests
 #
@@ -32,7 +33,7 @@ if [[ "${1:-}" == "--run-tests" ]]; then
 fi
 
 case "$MODE" in
-  debug|release|release-symbols|release-noinline) ;;
+  debug|release|release-symbols|release-noinline|release-contract-profile) ;;
   *)
     echo "[build] unknown mode: $MODE (use debug|release|release-symbols|release-noinline)" >&2
     exit 1
@@ -135,6 +136,10 @@ case "$MODE" in
   release-noinline)
     CXXFLAGS=("${RELEASE_NOINLINE_OPTS[@]}" -g -fno-omit-frame-pointer)
     LABEL="Release no-inline + symbols (O3 fast-math ${MARCH})"
+    ;;
+  release-contract-profile)
+    CXXFLAGS=("${RELEASE_OPTS[@]}" -DML_ENGINE_PROFILE_CONTRACT_THREADS=1)
+    LABEL="Release + diagnostic per-thread contract timing (O3 LTO fast-math ${MARCH})"
     ;;
   debug)
     CXXFLAGS=(-O0 -g -D_DEBUG -fno-omit-frame-pointer)

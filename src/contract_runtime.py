@@ -80,6 +80,9 @@ class LayerBinding(ctypes.Structure):
         ("pool_out_h", ctypes.c_int64),
         ("pool_out_w", ctypes.c_int64),
         ("conv_out_w_stride", ctypes.c_int64),
+        ("d_conv_prezeroed", ctypes.c_int64),
+        ("dx_prezeroed", ctypes.c_int64),
+        ("dw_prezeroed", ctypes.c_int64),
     ]
 
 
@@ -189,6 +192,38 @@ def _bind_runner(lib) -> None:
         if hasattr(lib, "contract_register_completion_callback"):
             lib.contract_register_completion_callback.restype = None
             lib.contract_register_completion_callback.argtypes = [ctypes.c_void_p]
+    if hasattr(lib, "stage_conv_x_pad"):
+        # Main-thread setup: build layer 0's padded input for the next step
+        # while the worker owns the OMP team for the current one.
+        lib.stage_conv_x_pad.restype = ctypes.c_int32
+        lib.stage_conv_x_pad.argtypes = [
+            ctypes.c_int32,
+            ctypes.c_void_p,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+        ]
+        lib.invalidate_conv_x_pad_stage.restype = None
+        lib.invalidate_conv_x_pad_stage.argtypes = [ctypes.c_int32]
+    if hasattr(lib, "stage_dx_cin_blocked_wt"):
+        # Main-thread setup: rebuild the transposed-W buffer for the
+        # cin-blocked backward-dX kernel right before submit, once Adam has
+        # applied the weights the upcoming job will read.
+        lib.stage_dx_cin_blocked_wt.restype = ctypes.c_int32
+        lib.stage_dx_cin_blocked_wt.argtypes = [
+            ctypes.c_int32,
+            ctypes.c_void_p,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+        ]
+        lib.invalidate_dx_cin_blocked_wt_stage.restype = None
+        lib.invalidate_dx_cin_blocked_wt_stage.argtypes = [ctypes.c_int32]
 
 
 @dataclass
@@ -224,6 +259,9 @@ class _ExecutionSlot:
     conv_grads: list[tuple[int, np.ndarray, np.ndarray]]
     loss_scalar: np.ndarray
     owners: list[Any]
+    # Zeroed by the main thread during prepare; native skips its own memset.
+    d_conv_buffers: list[np.ndarray]
+    dx_buffers: list[np.ndarray]
 
 
 @dataclass
@@ -415,6 +453,10 @@ class ContractRuntime:
             lb.argmax = _ptr(scratch.argmax_buffer)
             lb.dx = _ptr(scratch.dx_buffer)
             lb.d_conv = _ptr(scratch.d_conv_buffer)
+            # Sync path has no main-thread prepare phase: native still zeroes.
+            lb.d_conv_prezeroed = 0
+            lb.dx_prezeroed = 0
+            lb.dw_prezeroed = 0
             lb.w_count = int(W.size)
             lb.b_count = int(b.size)
             lb.C_in = layer.in_channels
@@ -580,6 +622,8 @@ class ContractRuntime:
             self._input_logical_w = w_logical
 
         conv_grads: list[tuple[int, np.ndarray, np.ndarray]] = []
+        d_conv_buffers: list[np.ndarray] = []
+        dx_buffers: list[np.ndarray] = []
         owners: list[Any] = [arena]
         max_layer_idx = -1
         cur_c, cur_h = X.shape[1], X.shape[2]
@@ -622,6 +666,18 @@ class ContractRuntime:
             lb.argmax = _ptr(scratch.argmax_buffer)
             lb.dx = _ptr(scratch.dx_buffer)
             lb.d_conv = _ptr(scratch.d_conv_buffer)
+            lb.d_conv_prezeroed = 1
+            # prepare_step's conv_grads loop (dW.fill(0.0)) already zeroes
+            # this every step before submission; skip native's duplicate memset.
+            lb.dw_prezeroed = 1
+            d_conv_buffers.append(scratch.d_conv_buffer)
+            if li != 0:
+                # Layer 0's dx has no consumer (input image); backward skips it
+                # entirely (nullptr), so nothing to prezero there.
+                lb.dx_prezeroed = 1
+                dx_buffers.append(scratch.dx_buffer)
+            else:
+                lb.dx_prezeroed = 0
             lb.w_count = int(W.size)
             lb.b_count = int(db.size)
             lb.C_in = layer.in_channels
@@ -688,6 +744,8 @@ class ContractRuntime:
             conv_grads=conv_grads,
             loss_scalar=loss_scalar,
             owners=owners,
+            d_conv_buffers=d_conv_buffers,
+            dx_buffers=dx_buffers,
         )
 
     def _ensure_async_resources(self, X: np.ndarray, m: int) -> None:
@@ -719,6 +777,12 @@ class ContractRuntime:
             return
         if self._submitted is not None or self._completed is not None:
             raise RuntimeError("cannot resize async slots while a result is owned")
+        # Slot buffers are about to be replaced; drop staged pads keyed on the
+        # old input pointers so a recycled address cannot produce a false hit.
+        self._invalidate_input_pad_stage()
+        drop_wt = getattr(self._lib, "invalidate_dx_cin_blocked_wt_stage", None)
+        if drop_wt is not None:
+            drop_wt(ctypes.c_int32(-1))
         self._slots = [self._make_async_slot(X, cap), self._make_async_slot(X, cap)]
 
     def _bind_slot_parameter_banks(
@@ -1114,6 +1178,7 @@ class ContractRuntime:
 
         slot = self._slots[prepared.slot_idx]
         slot.ctx.adam.t = int(self.model.optimizer.t)
+        self._stage_dx_wt(prepared.slot_idx, slot)
         self._submit_native(slot.ctx, prepared.step_token)
         self._submitted = _SubmittedStep(
             slot_idx=prepared.slot_idx,
@@ -1179,6 +1244,18 @@ class ContractRuntime:
         for _, dW, db in slot.conv_grads:
             dW.fill(0.0)
             db.fill(0.0)
+        # This slot's d_conv is dirty from the step it last ran; the maxpool
+        # backward scatters into it, so it must start at zero. The other slot is
+        # in flight right now, so this thread is otherwise idle.
+        for d_conv in slot.d_conv_buffers:
+            d_conv.fill(0.0)
+        # Same reasoning as d_conv: dx's shape depends only on (N, C_in, H,
+        # W_in_stride), which are fixed for this slot, so it can be zeroed
+        # here in the overlap window instead of via memset on the OMP worker.
+        for dx in slot.dx_buffers:
+            dx.fill(0.0)
+
+        self._stage_input_pad(slot_idx, slot, X)
 
         token = int(step_token if step_token is not None else self.model.optimizer.t + 1)
         self._prepared = _PreparedStep(
@@ -1193,6 +1270,69 @@ class ContractRuntime:
             step_token=token,
         )
         return True
+
+    def _stage_input_pad(
+        self, slot_idx: int, slot: "_ExecutionSlot", X: np.ndarray
+    ) -> None:
+        """Build conv layer 0's padded input on the main thread.
+
+        Layer 0's input is the batch itself, so its padded copy is known before
+        the step runs. Native otherwise rebuilds it twice per step (stride-1
+        forward and backward dW) on the OMP team. Staging is best-effort: on any
+        miss the native side rebuilds exactly as before.
+        """
+        stage = getattr(self._lib, "stage_conv_x_pad", None)
+        if stage is None or slot.ctx.num_layers <= 0:
+            return
+        lb = slot.ctx.layers[0]
+        if lb.conv_stride != 1:
+            return
+        conv_out_w = (
+            lb.W_in + 2 * lb.conv_pad - lb.k_w
+        ) // lb.conv_stride + 1
+        stage(
+            ctypes.c_int32(slot_idx),
+            ctypes.c_void_p(_ptr(X)),
+            ctypes.c_int64(int(slot.ctx.N)),
+            ctypes.c_int64(int(lb.C_in)),
+            ctypes.c_int64(int(lb.H)),
+            ctypes.c_int64(int(lb.W_in)),
+            ctypes.c_int64(int(lb.W_stride)),
+            ctypes.c_int64(int(lb.k_w)),
+            ctypes.c_int64(int(lb.conv_pad)),
+            ctypes.c_int64(int(conv_out_w)),
+        )
+
+    def _invalidate_input_pad_stage(self, slot_idx: int = -1) -> None:
+        drop = getattr(self._lib, "invalidate_conv_x_pad_stage", None)
+        if drop is not None:
+            drop(ctypes.c_int32(slot_idx))
+
+    def _stage_dx_wt(self, slot_idx: int, slot: "_ExecutionSlot") -> None:
+        """Rebuild the cin-blocked backward-dX transposed-W buffer on main.
+
+        Called right before submit, when W for this slot's input bank is
+        guaranteed final: the Adam apply that wrote it happened inside the
+        native call we just reaped, before this submit could be reached.
+        Mirrors native's try_cin_blocked_dx gate exactly; on any mismatch
+        native falls back to rebuilding it itself.
+        """
+        stage = getattr(self._lib, "stage_dx_cin_blocked_wt", None)
+        if stage is None:
+            return
+        for li in range(slot.ctx.num_layers):
+            if li == 0:
+                continue  # layer 0's dx is never computed; nothing to stage
+            lb = slot.ctx.layers[li]
+            if lb.conv_stride != 1 or lb.k_h != lb.k_w or (lb.C_in % 8) != 0:
+                continue
+            stage(
+                ctypes.c_int32(slot_idx),
+                ctypes.c_void_p(lb.W),
+                ctypes.c_int64(int(lb.C_out)),
+                ctypes.c_int64(int(lb.C_in)),
+                ctypes.c_int64(int(lb.k_h)),
+            )
 
     def submit_step(
         self,

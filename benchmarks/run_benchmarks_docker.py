@@ -14,6 +14,9 @@ from benchmarks.benchmark_cnn import (
     load_benchmark_data,
     run_pytorch_benchmark,
     run_custom_engine_benchmark,
+    run_benchmark_child,
+    pytorch_benchmark_child,
+    custom_benchmark_child,
     resolve_model_type,
     resolve_backend,
     extract_layer_specs,
@@ -175,50 +178,62 @@ def main():
     y_val_classes = np.argmax(y_val, axis=1) if y_val.ndim > 1 else y_val.ravel()
 
     results = load_existing_results(args.output)
+    config_path = args.config if hasattr(args, "config") else None
 
-    if args.target in ["pytorch", "both"]:
-        print("\n[Docker Runner] Running PyTorch Baseline Benchmark...")
-        pt_metrics = run_pytorch_benchmark(
-            X_train=X_train,
-            y_train_classes=y_train_classes,
-            X_val=X_val,
-            y_val_classes=y_val_classes,
-            num_classes=num_classes,
-            batch_size=batch_size,
-            epochs=epochs,
-            lr_init=lr_init,
-            lam_l2=lam_l2,
-            early_stopping_enabled=early_stopping_enabled,
-            patience=patience,
-            min_delta=min_delta,
-            cnn_dict=cnn_dict,
-            num_threads=num_threads,
+    # When both engines run in one container invocation, isolate them in separate
+    # spawned processes so torch/OpenBLAS pools cannot leak into custom (and vice versa).
+    # Single-target runs stay in-process — nothing else to contaminate.
+    if args.target == "both":
+        print("\n[Docker Runner] Running PyTorch Baseline Benchmark (isolated process)...")
+        results["pytorch"] = run_benchmark_child(
+            pytorch_benchmark_child, config_path, "docker-pytorch"
         )
-        results["pytorch"] = pt_metrics
+        print("\n[Docker Runner] Running Custom ML Engine Benchmark (isolated process)...")
+        results["custom"] = run_benchmark_child(
+            custom_benchmark_child, config_path, "docker-custom"
+        )
+    else:
+        if args.target == "pytorch":
+            print("\n[Docker Runner] Running PyTorch Baseline Benchmark...")
+            results["pytorch"] = run_pytorch_benchmark(
+                X_train=X_train,
+                y_train_classes=y_train_classes,
+                X_val=X_val,
+                y_val_classes=y_val_classes,
+                num_classes=num_classes,
+                batch_size=batch_size,
+                epochs=epochs,
+                lr_init=lr_init,
+                lam_l2=lam_l2,
+                early_stopping_enabled=early_stopping_enabled,
+                patience=patience,
+                min_delta=min_delta,
+                cnn_dict=cnn_dict,
+                num_threads=num_threads,
+            )
 
-    if args.target in ["custom", "both"]:
-        print("\n[Docker Runner] Running Custom ML Engine Benchmark...")
-        custom_metrics = run_custom_engine_benchmark(
-            data_provider=data_provider,
-            X_train=X_train,
-            y_train=y_train,
-            X_val=X_val,
-            y_val=y_val,
-            y_val_classes=y_val_classes,
-            cnn_dict=cnn_dict,
-            num_classes=num_classes,
-            task_type=task_type,
-            epochs=epochs,
-            lr_init=lr_init,
-            lam_l1=lam_l1,
-            lam_l2=lam_l2,
-            early_stopping_enabled=early_stopping_enabled,
-            patience=patience,
-            min_delta=min_delta,
-            backend=backend,
-            num_threads=num_threads,
-        )
-        results["custom"] = custom_metrics
+        if args.target == "custom":
+            print("\n[Docker Runner] Running Custom ML Engine Benchmark...")
+            results["custom"] = run_custom_engine_benchmark(
+                data_provider=data_provider,
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                y_val_classes=y_val_classes,
+                cnn_dict=cnn_dict,
+                num_classes=num_classes,
+                task_type=task_type,
+                epochs=epochs,
+                lr_init=lr_init,
+                lam_l1=lam_l1,
+                lam_l2=lam_l2,
+                early_stopping_enabled=early_stopping_enabled,
+                patience=patience,
+                min_delta=min_delta,
+                backend=backend,
+                num_threads=num_threads,
+            )
 
     save_results(args.output, results)
     print(f"[Docker Runner] Benchmark metrics saved to: {args.output}")

@@ -28,7 +28,7 @@ void conv2d_backward_fallback_avx2(
     float* dx, float* dW,
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
     int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride, int64_t pad,
-    int64_t conv_out_w_stride, float inv_m
+    int64_t conv_out_w_stride, float inv_m, int64_t dx_prezeroed, int64_t dw_prezeroed
 );
 
 // -----------------------------------------------------------------------------
@@ -66,14 +66,15 @@ static inline void dispatch_backward(
     const float* dout, const float* x, const float* W,
     float* dx, float* dW,
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride, int64_t C_out,
-    int64_t k_h, int64_t k_w, int64_t stride, int64_t pad, int64_t conv_out_w_stride, float inv_m
+    int64_t k_h, int64_t k_w, int64_t stride, int64_t pad, int64_t conv_out_w_stride, float inv_m,
+    int64_t dx_prezeroed, int64_t dw_prezeroed
 ) {
     log_routing_decision("BWD", "GENERIC_FALLBACK", k_h, k_w, stride, pad);
     conv2d_backward_fallback_avx2(
         dout, x, W, dx, dW,
         N, C_in, H, W_in, W_in_stride,
         C_out, k_h, k_w, stride, pad,
-        conv_out_w_stride, inv_m
+        conv_out_w_stride, inv_m, dx_prezeroed, dw_prezeroed
     );
 }
 
@@ -81,7 +82,8 @@ void maxpool2d_backward_avx2(
     const float* dout_pool, const uint8_t* argmax_buf, float* d_conv_buf,
     int64_t N, int64_t C, int64_t pool_h, int64_t pool_w,
     int64_t conv_h, int64_t conv_w, int64_t conv_w_stride,
-    int64_t pool_size, int64_t pool_stride
+    int64_t pool_size, int64_t pool_stride,
+    bool d_conv_prezeroed
 ) {
     const int64_t conv_spatial = conv_h * conv_w_stride;
     const int64_t pool_spatial = pool_h * pool_w;
@@ -93,7 +95,9 @@ void maxpool2d_backward_avx2(
             const float* __restrict dout_p = &dout_pool[(n * C + c) * pool_spatial];
             const uint8_t* __restrict arg_p = &argmax_buf[(n * C + c) * pool_spatial];
 
-            std::memset(dp, 0, conv_spatial * sizeof(float));
+            if (!d_conv_prezeroed) {
+                std::memset(dp, 0, conv_spatial * sizeof(float));
+            }
 
             for (int64_t ph = 0; ph < pool_h; ++ph) {
                 for (int64_t pw = 0; pw < pool_w; ++pw) {
@@ -259,7 +263,10 @@ ML_ENGINE_EXPORT int32_t direct_conv_block_backward_avx2(
     int64_t conv_stride, int64_t conv_pad, int64_t conv_out_w_stride,
     int64_t pool_size, int64_t pool_stride,
     int64_t pool_out_h, int64_t pool_out_w,
-    float inv_m
+    float inv_m,
+    int64_t d_conv_prezeroed,
+    int64_t dx_prezeroed,
+    int64_t dw_prezeroed
 ) {
     try {
         const int64_t conv_out_h = (H + 2 * conv_pad - k_h) / conv_stride + 1;
@@ -271,7 +278,8 @@ ML_ENGINE_EXPORT int32_t direct_conv_block_backward_avx2(
                 dout_pool, argmax_buf, d_conv_buf,
                 N, C_out, pool_out_h, pool_out_w,
                 conv_out_h, conv_out_w, conv_out_w_stride,
-                pool_size, pool_stride
+                pool_size, pool_stride,
+                d_conv_prezeroed != 0
             );
         }
 
@@ -305,7 +313,7 @@ ML_ENGINE_EXPORT int32_t direct_conv_block_backward_avx2(
         dispatch_backward(
             d_conv_buf, x, W, dx_buf, dW_buf,
             N, C_in, H, W_in, W_in_stride, C_out, k_h, k_w,
-            conv_stride, conv_pad, conv_out_w_stride, inv_m
+            conv_stride, conv_pad, conv_out_w_stride, inv_m, dx_prezeroed, dw_prezeroed
         );
         return 0;
     } catch (const std::exception& e) {
@@ -350,7 +358,7 @@ ML_ENGINE_EXPORT int32_t direct_conv2d_backward_fused_avx2(
         dispatch_backward(
             dout, x, W, dx_buf, dW_buf,
             N, C_in, H, W_in, W_in_stride, C_out,
-            k_h, k_w, stride, pad, conv_out_w_stride, inv_m
+            k_h, k_w, stride, pad, conv_out_w_stride, inv_m, 0, 0
         );
         return 0;
     } catch (const std::exception& e) {
@@ -371,7 +379,7 @@ ML_ENGINE_EXPORT int32_t direct_conv2d_backward_weight_avx2(
         dispatch_backward(
             d_conv_buf, x, nullptr, nullptr, dW,
             N, C_in, H, W_in, W_in_stride, C_out,
-            k_h, k_w, stride, pad, conv_out_w_stride, inv_m
+            k_h, k_w, stride, pad, conv_out_w_stride, inv_m, 0, 0
         );
         return 0;
     } catch (const std::exception& e) {
@@ -393,7 +401,7 @@ ML_ENGINE_EXPORT int32_t direct_conv2d_backward_input_avx2(
         dispatch_backward(
             d_conv_buf, nullptr, W, dx, nullptr,
             N, C_in, H, W_in, W_in_stride, C_out,
-            k_h, k_w, stride, pad, conv_out_w_stride, 1.0f
+            k_h, k_w, stride, pad, conv_out_w_stride, 1.0f, 0, 0
         );
         return 0;
     } catch (const std::exception& e) {
@@ -495,7 +503,8 @@ ML_ENGINE_EXPORT int32_t direct_maxpool_backward_avx2(
         if (!dout_pool || !argmax_buf || !dx_buf) return -1;
         maxpool2d_backward_avx2(
             dout_pool, argmax_buf, dx_buf,
-            N, C, out_h, out_w, in_h, in_w, in_w, pool_size, pool_stride
+            N, C, out_h, out_w, in_h, in_w, in_w, pool_size, pool_stride,
+            /*d_conv_prezeroed=*/false
         );
         return 0;
     } catch (...) {

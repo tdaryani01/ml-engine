@@ -7,6 +7,7 @@ import ctypes
 import getpass
 import platform
 import warnings
+import multiprocessing as mp
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
@@ -839,9 +840,71 @@ def print_head_to_head_report(*args, **kwargs) -> str:
     return report
 
 
-def run_cnn_benchmark(config_path: str = None):
+def format_single_engine_report(
+    res: dict,
+    *,
+    engine: str,
+    epochs: int,
+    n_train: int,
+    n_val: int,
+    backend,
+) -> str:
+    backend_value = backend.value if hasattr(backend, "value") else str(backend)
+    if engine == "pytorch":
+        col = f"PyTorch CNN ({res['threads_verified']}T)"
+        title = "PYTORCH-ONLY BENCHMARK REPORT"
+    else:
+        col = f"Custom [{backend_value}] ({res['threads_verified']}T)"
+        title = "CUSTOM-ONLY BENCHMARK REPORT"
+    throughput = (n_train * res["epochs_completed"]) / res["train_time"]
+    lines = [
+        "",
+        "=" * 80,
+        title.center(80),
+        "=" * 80,
+        f"{'Performance Metric':<32} | {col:<20}",
+        "-" * 80,
+        f"{'Active Hardware Threads':<32} | {res['threads_verified']:<20d}",
+        f"{'Total Trainable Parameters':<32} | {res['params']:<20,d}",
+        f"{'Target Epochs':<32} | {epochs:<20d}",
+        f"{'Epochs Completed':<32} | {res['epochs_completed']:<20d}",
+        f"{'Best Validation Epoch':<32} | {res['best_epoch']:<20d}",
+        f"{'Early Stopping Triggered':<32} | {str(res['early_stopped']):<20}",
+        f"{'Forward Pass Count':<32} | {res['forward_counts']:<20,d}",
+        f"{'Backward Pass Count':<32} | {res['backward_counts']:<20,d}",
+        f"{'Final Training Loss':<32} | {res['train_loss']:<20.6f}",
+        f"{'Final Validation Loss':<32} | {res['val_loss']:<20.6f}",
+        f"{'Final Validation Accuracy':<32} | {res['val_acc'] * 100:>19.2f}%",
+        "-" * 80,
+        f"{'Total Training Time':<32} | {res['train_time']:>18.3f} s",
+        f"{'Training Throughput':<32} | {throughput:>14.1f} smp/s",
+        (
+            f"{'Time per Epoch':<32} | "
+            f"{(res['train_time'] / res['epochs_completed']) * 1000:>16.2f} ms"
+        ),
+        (
+            f"{'Val Inference Latency (Batch)':<32} | "
+            f"{res['inf_time'] * 1000:>16.3f} ms"
+        ),
+        (
+            f"{'Per-Sample Inference Latency':<32} | "
+            f"{(res['inf_time'] / n_val) * 1000:>16.4f} ms"
+        ),
+        "=" * 80,
+    ]
+    return "\n".join(lines)
+
+
+def print_single_engine_report(*args, **kwargs) -> str:
+    report = format_single_engine_report(*args, **kwargs)
+    print(report)
+    return report
+
+
+def _benchmark_common_from_config(config_path: str = None):
+    """Load config + data once per process. Used by parent (banner) and engine children."""
     data_provider, cfg_dict = load_benchmark_data(config_path)
-    
+
     data_path = cfg_dict["ingestion"]["data_file_path"]
     raw_model_type = cfg_dict["architecture"]["model_type"]
     task_type = resolve_model_type(raw_model_type)
@@ -872,75 +935,158 @@ def run_cnn_benchmark(config_path: str = None):
             bench_input_shape = raw_shape
         validate_cnn_spatial_geometry(bench_input_shape, specs)
 
-    print(format_system_banner(
-        data_path=data_path,
-        backend=backend,
-        epochs=epochs,
-        batch_size=batch_size,
-        lr_init=lr_init,
-        lam_l2=lam_l2,
-        lam_l1=lam_l1,
-        lr_scheduler_type=lr_scheduler_type,
-        early_stopping_enabled=early_stopping_enabled,
-        patience=patience,
-        min_delta=min_delta,
-        num_threads=num_threads,
-        specs=specs,
-    ))
-
     X_train = data_provider.splits[DataKeys.X_TRAIN]
     y_train = data_provider.splits[DataKeys.Y_TRAIN]
     X_val, y_val = data_provider.get_validation_set()
-
     y_train_classes = np.argmax(y_train, axis=1) if y_train.ndim > 1 else y_train.ravel()
     y_val_classes = np.argmax(y_val, axis=1) if y_val.ndim > 1 else y_val.ravel()
 
-    t_res = run_pytorch_benchmark(
-        X_train=X_train,
-        y_train_classes=y_train_classes,
-        X_val=X_val,
-        y_val_classes=y_val_classes,
-        num_classes=num_classes,
-        batch_size=batch_size,
-        epochs=epochs,
-        lr_init=lr_init,
-        lam_l2=lam_l2,
-        early_stopping_enabled=early_stopping_enabled,
-        patience=patience,
-        min_delta=min_delta,
-        cnn_dict=cnn_dict,
-        num_threads=num_threads
-    )
+    return {
+        "data_provider": data_provider,
+        "data_path": data_path,
+        "task_type": task_type,
+        "backend": backend,
+        "num_classes": num_classes,
+        "batch_size": batch_size,
+        "lr_init": lr_init,
+        "epochs": epochs,
+        "num_threads": num_threads,
+        "lam_l2": lam_l2,
+        "lam_l1": lam_l1,
+        "cnn_dict": cnn_dict,
+        "early_stopping_enabled": early_stopping_enabled,
+        "patience": patience,
+        "min_delta": min_delta,
+        "lr_scheduler_type": lr_scheduler_type,
+        "specs": specs,
+        "X_train": X_train,
+        "y_train": y_train,
+        "X_val": X_val,
+        "y_val": y_val,
+        "y_train_classes": y_train_classes,
+        "y_val_classes": y_val_classes,
+    }
 
-    c_res = run_custom_engine_benchmark(
-        data_provider=data_provider,
-        X_train=X_train,
-        y_train=y_train,
-        X_val=X_val,
-        y_val=y_val,
-        y_val_classes=y_val_classes,
-        cnn_dict=cnn_dict,
-        num_classes=num_classes,
-        task_type=task_type,
-        epochs=epochs,
-        lr_init=lr_init,
-        lam_l1=lam_l1,
-        lam_l2=lam_l2,
-        early_stopping_enabled=early_stopping_enabled,
-        patience=patience,
-        min_delta=min_delta,
-        backend=backend,
-        num_threads=num_threads
-    )
 
-    n_val_samples = len(X_val)
-    print_head_to_head_report(
-        t_res, c_res,
-        epochs=epochs,
-        n_train=len(X_train),
-        n_val=n_val_samples,
-        backend=backend,
-    )
+def pytorch_benchmark_child(config_path, result_queue) -> None:
+    """Fresh process: load data, run PyTorch only, exit. No custom native state."""
+    try:
+        c = _benchmark_common_from_config(config_path)
+        t_res = run_pytorch_benchmark(
+            X_train=c["X_train"],
+            y_train_classes=c["y_train_classes"],
+            X_val=c["X_val"],
+            y_val_classes=c["y_val_classes"],
+            num_classes=c["num_classes"],
+            batch_size=c["batch_size"],
+            epochs=c["epochs"],
+            lr_init=c["lr_init"],
+            lam_l2=c["lam_l2"],
+            early_stopping_enabled=c["early_stopping_enabled"],
+            patience=c["patience"],
+            min_delta=c["min_delta"],
+            cnn_dict=c["cnn_dict"],
+            num_threads=c["num_threads"],
+        )
+        result_queue.put(("ok", t_res))
+    except Exception as exc:
+        result_queue.put(("err", f"{type(exc).__name__}: {exc}"))
+
+
+def custom_benchmark_child(config_path, result_queue) -> None:
+    """Fresh process: load data, run custom only. Never imports torch training path."""
+    try:
+        c = _benchmark_common_from_config(config_path)
+        c_res = run_custom_engine_benchmark(
+            data_provider=c["data_provider"],
+            X_train=c["X_train"],
+            y_train=c["y_train"],
+            X_val=c["X_val"],
+            y_val=c["y_val"],
+            y_val_classes=c["y_val_classes"],
+            cnn_dict=c["cnn_dict"],
+            num_classes=c["num_classes"],
+            task_type=c["task_type"],
+            epochs=c["epochs"],
+            lr_init=c["lr_init"],
+            lam_l1=c["lam_l1"],
+            lam_l2=c["lam_l2"],
+            early_stopping_enabled=c["early_stopping_enabled"],
+            patience=c["patience"],
+            min_delta=c["min_delta"],
+            backend=c["backend"],
+            num_threads=c["num_threads"],
+        )
+        result_queue.put(("ok", c_res))
+    except Exception as exc:
+        result_queue.put(("err", f"{type(exc).__name__}: {exc}"))
+
+
+def run_benchmark_child(target, config_path, label: str):
+    """Spawn an isolated interpreter for one engine; wait until it fully exits."""
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=target, args=(config_path, result_queue), name=label)
+    proc.start()
+    status, payload = result_queue.get()
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f"{label} exited with code {proc.exitcode}")
+    if status != "ok":
+        raise RuntimeError(f"{label} failed: {payload}")
+    return payload
+
+
+def run_cnn_benchmark(config_path: str = None, target: str = "both"):
+    # Parent only prints the banner. Each engine runs in its own spawned process so
+    # torch / wheel-OpenBLAS / MKL thread pools cannot leak into the custom run
+    # (and vice versa).
+    if target not in ("pytorch", "custom", "both"):
+        raise ValueError(f"target must be pytorch|custom|both, got {target!r}")
+
+    c = _benchmark_common_from_config(config_path)
+
+    print(format_system_banner(
+        data_path=c["data_path"],
+        backend=c["backend"],
+        epochs=c["epochs"],
+        batch_size=c["batch_size"],
+        lr_init=c["lr_init"],
+        lam_l2=c["lam_l2"],
+        lam_l1=c["lam_l1"],
+        lr_scheduler_type=c["lr_scheduler_type"],
+        early_stopping_enabled=c["early_stopping_enabled"],
+        patience=c["patience"],
+        min_delta=c["min_delta"],
+        num_threads=c["num_threads"],
+        specs=c["specs"],
+    ))
+    print(f"[Benchmark] target={target} (each engine in its own spawned process)")
+
+    t_res = None
+    c_res = None
+    if target in ("pytorch", "both"):
+        t_res = run_benchmark_child(pytorch_benchmark_child, config_path, "benchmark-pytorch")
+    if target in ("custom", "both"):
+        c_res = run_benchmark_child(custom_benchmark_child, config_path, "benchmark-custom")
+
+    if t_res is not None and c_res is not None:
+        print_head_to_head_report(
+            t_res, c_res,
+            epochs=c["epochs"],
+            n_train=len(c["X_train"]),
+            n_val=len(c["X_val"]),
+            backend=c["backend"],
+        )
+    else:
+        print_single_engine_report(
+            t_res if t_res is not None else c_res,
+            engine="pytorch" if t_res is not None else "custom",
+            epochs=c["epochs"],
+            n_train=len(c["X_train"]),
+            n_val=len(c["X_val"]),
+            backend=c["backend"],
+        )
 
 
 if __name__ == "__main__":
@@ -952,5 +1098,11 @@ if __name__ == "__main__":
         default=None,
         help="Path to YAML config (default: config/config.yaml)",
     )
+    parser.add_argument(
+        "--target",
+        choices=("pytorch", "custom", "both"),
+        default="both",
+        help="Which engine to run (default: both, each in a separate process)",
+    )
     args = parser.parse_args()
-    run_cnn_benchmark(config_path=args.config)
+    run_cnn_benchmark(config_path=args.config, target=args.target)

@@ -46,7 +46,7 @@ architecture:
       - type: "conv"
         in_channels: 3
         out_channels: 8
-        kernel_size: 6
+        kernel_size: 7
         stride: 1
         pad: 1
       - type: "relu"
@@ -85,7 +85,7 @@ optimization:
   scheduler_drop_ratio: 0.5
 
   # Early Stopping Monitor
-  early_stopping_enabled: true
+  early_stopping_enabled: false
   patience: 10
   min_delta: 1.0e-04
 

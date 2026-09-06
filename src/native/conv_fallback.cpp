@@ -11,6 +11,7 @@
 #endif
 #endif
 #endif
+#include "export.h"
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -1285,13 +1286,26 @@ struct Stride1Specialist<7> {
                 }
 
                 const float* __restrict in_row = xp + ih * x_row_stride;
-                const __m256 vx0 = _mm256_loadu_ps(in_row + iw0 + 0);
-                const __m256 vx1 = _mm256_loadu_ps(in_row + iw0 + 1);
-                const __m256 vx2 = _mm256_loadu_ps(in_row + iw0 + 2);
-                const __m256 vx3 = _mm256_loadu_ps(in_row + iw0 + 3);
-                const __m256 vx4 = _mm256_loadu_ps(in_row + iw0 + 4);
-                const __m256 vx5 = _mm256_loadu_ps(in_row + iw0 + 5);
-                const __m256 vx6 = _mm256_loadu_ps(in_row + iw0 + 6);
+
+                // The seven kw taps are sub-spans of in_row[iw0 .. iw0+13], so
+                // two aligned vector loads cover all of them and the shifted
+                // views come from register shuffles; the old seven
+                // consecutive-offset loads could never be more than one-in-seven
+                // aligned.
+                const __m256 xa   = _mm256_loadu_ps(in_row + iw0);
+                const __m256 xb   = _mm256_loadu_ps(in_row + iw0 + FWD_TILE_OW);
+                const __m256 xmid = _mm256_permute2f128_ps(xa, xb, 0x21);
+                const __m256i ia   = _mm256_castps_si256(xa);
+                const __m256i ib   = _mm256_castps_si256(xb);
+                const __m256i imid = _mm256_castps_si256(xmid);
+
+                const __m256 vx0 = xa;
+                const __m256 vx1 = _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 4));
+                const __m256 vx2 = _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 8));
+                const __m256 vx3 = _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 12));
+                const __m256 vx4 = xmid;
+                const __m256 vx5 = _mm256_castsi256_ps(_mm256_alignr_epi8(ib, imid, 4));
+                const __m256 vx6 = _mm256_castsi256_ps(_mm256_alignr_epi8(ib, imid, 8));
 
                 const float* __restrict w0 = wp0 + kh * K;
                 vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
@@ -1766,20 +1780,36 @@ static inline int64_t bwd_x_row_stride(
     const int64_t max_iw = (conv_out_w - 1) - pad + (k_w - 1) + (FWD_TILE_OW - 1);
     const int64_t need = pad_l + max_iw + 1;
     const int64_t min_stride = pad_l + W_in;
-    return need > min_stride ? need : min_stride;
+    int64_t stride = need > min_stride ? need : min_stride;
+
+    // The stride-1 dW kernels read a tile's whole 2-vector span (tile base
+    // .. base + 15) and derive the k_w sliding windows from those two vectors,
+    // so a row has to hold that span even when k_w leaves it short.
+    const int64_t ow_last =
+        ((conv_out_w + FWD_TILE_OW - 1) / FWD_TILE_OW - 1) * FWD_TILE_OW;
+    const int64_t dw_span = pad_l + ow_last - pad + 2 * FWD_TILE_OW;
+    if (dw_span > stride) stride = dw_span;
+
+    // Rounding to a whole vector keeps every row start 32B-aligned (the buffer
+    // base is, and a tile base is pad_l + ow - pad == ow), which takes the tile
+    // loads off split cache lines.
+    return (stride + FWD_TILE_OW - 1) & ~(FWD_TILE_OW - 1);
 }
 
 // Zero-padded rows: logical index i -> padded[i + pad_l].
+// parallel=false is used when the Python main thread stages this ahead of the
+// step that consumes it; the OMP team is busy with the previous step then.
 static void build_bwd_row_pad_buf(
     const float* __restrict src, float* __restrict dst,
     int64_t nplanes, int64_t nrows, int64_t row_w,
-    int64_t src_row_stride, int64_t pad_l, int64_t row_stride
+    int64_t src_row_stride, int64_t pad_l, int64_t row_stride,
+    bool parallel = true
 ) {
     const int64_t src_plane = nrows * src_row_stride;
     const int64_t dst_plane = nrows * row_stride;
     const __m256 z = _mm256_setzero_ps();
 
-    #pragma omp parallel for collapse(2) schedule(dynamic, 8)
+    #pragma omp parallel for collapse(2) schedule(dynamic, 8) if(parallel)
     for (int64_t nc = 0; nc < nplanes; ++nc) {
         for (int64_t row = 0; row < nrows; ++row) {
             float* __restrict dst_row = &dst[nc * dst_plane + row * row_stride];
@@ -1832,6 +1862,108 @@ static inline void build_x_pad_buf(
         src, dst, N * C_in, H, W_in,
         src_row_stride, x_pad_l, x_row_stride
     );
+}
+
+// ---------------------------------------------------------------------------
+// Main-thread staged x_pad
+//
+// A conv layer's padded input depends only on that layer's input tensor, so it
+// can be built before the step that consumes it. The OMP team currently builds
+// it twice per step (stride-1 forward, then backward dW) while the Python main
+// thread sits blocked waiting on the native worker. Staging moves that copy to
+// the main thread.
+//
+// One entry per pipeline slot: the main thread writes the slot it is filling
+// while the worker reads the slot that is in flight, so entries never alias.
+// ---------------------------------------------------------------------------
+constexpr int32_t STAGED_X_PAD_MAX_SLOTS = 4;
+
+struct StagedXPad {
+    const float* src = nullptr;
+    int64_t N = 0;
+    int64_t C_in = 0;
+    int64_t H = 0;
+    int64_t W_in = 0;
+    int64_t src_row_stride = 0;
+    int64_t pad_l = 0;
+    int64_t row_stride = 0;
+    float* buf = nullptr;
+    size_t cap_floats = 0;
+    bool valid = false;
+};
+
+static StagedXPad g_staged_x_pad[STAGED_X_PAD_MAX_SLOTS];
+
+static float* staged_x_pad_alloc(StagedXPad& slot, size_t need_floats) {
+    if (slot.buf && need_floats <= slot.cap_floats) {
+        return slot.buf;
+    }
+    std::free(slot.buf);
+    // 64B-aligned rows keep the sliding loads in the consumers off split lines.
+    const size_t bytes = ((need_floats * sizeof(float)) + 63u) & ~(size_t)63u;
+    slot.buf = (float*)std::aligned_alloc(64, bytes);
+    slot.cap_floats = slot.buf ? (bytes / sizeof(float)) : 0;
+    return slot.buf;
+}
+
+// Returns a staged buffer only on an exact match of source pointer + geometry.
+static float* staged_x_pad_lookup(
+    const float* src, int64_t N, int64_t C_in, int64_t H, int64_t W_in,
+    int64_t src_row_stride, int64_t pad_l, int64_t row_stride
+) {
+    for (int32_t i = 0; i < STAGED_X_PAD_MAX_SLOTS; ++i) {
+        const StagedXPad& s = g_staged_x_pad[i];
+        if (!s.valid || !s.buf || s.src != src) continue;
+        if (s.N != N || s.C_in != C_in || s.H != H || s.W_in != W_in) continue;
+        if (s.src_row_stride != src_row_stride || s.pad_l != pad_l ||
+            s.row_stride != row_stride) continue;
+        return s.buf;
+    }
+    return nullptr;
+}
+
+// Called from Python on the main thread, before submitting the step that uses x.
+extern "C" ML_ENGINE_EXPORT int32_t stage_conv_x_pad(
+    int32_t slot_idx, const float* x,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t k_w, int64_t pad, int64_t conv_out_w
+) {
+    if (slot_idx < 0 || slot_idx >= STAGED_X_PAD_MAX_SLOTS) return -1;
+    StagedXPad& slot = g_staged_x_pad[slot_idx];
+    slot.valid = false;
+    if (!x || N <= 0 || C_in <= 0 || H <= 0 || W_in <= 0) return -2;
+
+    const int64_t pad_l = bwd_x_pad_l(pad);
+    const int64_t row_stride = bwd_x_row_stride(k_w, pad, W_in, conv_out_w);
+    const size_t need = (size_t)(N * C_in * H * row_stride);
+    float* buf = staged_x_pad_alloc(slot, need);
+    if (!buf) return -3;
+
+    build_bwd_row_pad_buf(
+        x, buf, N * C_in, H, W_in, W_in_stride, pad_l, row_stride,
+        /*parallel=*/false
+    );
+
+    slot.src = x;
+    slot.N = N;
+    slot.C_in = C_in;
+    slot.H = H;
+    slot.W_in = W_in;
+    slot.src_row_stride = W_in_stride;
+    slot.pad_l = pad_l;
+    slot.row_stride = row_stride;
+    slot.valid = true;
+    return 0;
+}
+
+extern "C" ML_ENGINE_EXPORT void invalidate_conv_x_pad_stage(int32_t slot_idx) {
+    if (slot_idx < 0) {
+        for (int32_t i = 0; i < STAGED_X_PAD_MAX_SLOTS; ++i) {
+            g_staged_x_pad[i].valid = false;
+        }
+    } else if (slot_idx < STAGED_X_PAD_MAX_SLOTS) {
+        g_staged_x_pad[slot_idx].valid = false;
+    }
 }
 
 // 8-wide dY strip has no valid ow → padded column is all zero; skip loads/FMA.
@@ -4012,13 +4144,30 @@ void Stride1Specialist<7>::dw_nci(
                 const int64_t ow = t * FWD_TILE_OW;
                 const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
                 const int64_t iw0 = x_pad_l + ow - pad;
-                v_acc0 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 0), v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 1), v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 2), v_acc2);
-                v_acc3 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 3), v_acc3);
-                v_acc4 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 4), v_acc4);
-                v_acc5 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 5), v_acc5);
-                v_acc6 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 6), v_acc6);
+
+                // The seven kw windows are sub-spans of x_row[iw0 .. iw0+13],
+                // so two vector loads cover all of them; the shifted views come
+                // from register shuffles instead of seven consecutive-offset
+                // loads, six of which can never be 32B-aligned.
+                const __m256 xa = _mm256_loadu_ps(x_row + iw0);
+                const __m256 xb = _mm256_loadu_ps(x_row + iw0 + FWD_TILE_OW);
+                const __m256 xmid = _mm256_permute2f128_ps(xa, xb, 0x21);
+                const __m256i ia = _mm256_castps_si256(xa);
+                const __m256i ib = _mm256_castps_si256(xb);
+                const __m256i imid = _mm256_castps_si256(xmid);
+
+                v_acc0 = _mm256_fmadd_ps(dy8, xa, v_acc0);
+                v_acc1 = _mm256_fmadd_ps(
+                    dy8, _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 4)), v_acc1);
+                v_acc2 = _mm256_fmadd_ps(
+                    dy8, _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 8)), v_acc2);
+                v_acc3 = _mm256_fmadd_ps(
+                    dy8, _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 12)), v_acc3);
+                v_acc4 = _mm256_fmadd_ps(dy8, xmid, v_acc4);
+                v_acc5 = _mm256_fmadd_ps(
+                    dy8, _mm256_castsi256_ps(_mm256_alignr_epi8(ib, imid, 4)), v_acc5);
+                v_acc6 = _mm256_fmadd_ps(
+                    dy8, _mm256_castsi256_ps(_mm256_alignr_epi8(ib, imid, 8)), v_acc6);
             }
         }
         const int64_t base = kh * K;
@@ -5357,14 +5506,19 @@ void conv2d_forward_fallback_avx2(
         if (stride1_fwd_builds_x_pad(k_h, k_w)) {
             x_pad_l = bwd_x_pad_l(pad);
             x_row_stride = bwd_x_row_stride(k_w, pad, W_in, out_w);
-            const size_t x_pad_floats = (size_t)(N * C_in * H * x_row_stride);
-            x_pad_buf = acquire_bwd_x_pad_buf(x_pad_floats);
-            if (x_pad_buf) {
-                build_x_pad_buf(
-                    x, x_pad_buf,
-                    N, C_in, H, W_in,
-                    W_in_stride, x_pad_l, x_row_stride
-                );
+            x_pad_buf = staged_x_pad_lookup(
+                x, N, C_in, H, W_in, W_in_stride, x_pad_l, x_row_stride
+            );
+            if (!x_pad_buf) {
+                const size_t x_pad_floats = (size_t)(N * C_in * H * x_row_stride);
+                x_pad_buf = acquire_bwd_x_pad_buf(x_pad_floats);
+                if (x_pad_buf) {
+                    build_x_pad_buf(
+                        x, x_pad_buf,
+                        N, C_in, H, W_in,
+                        W_in_stride, x_pad_l, x_row_stride
+                    );
+                }
             }
         }
 
@@ -5481,10 +5635,132 @@ static float* acquire_bwd_x_pad_buf(size_t need_floats) {
     if (need_floats == 0) return nullptr;
     if (need_floats > tls_x_pad_cap_floats) {
         std::free(tls_x_pad_buf);
-        tls_x_pad_buf = (float*)std::malloc(need_floats * sizeof(float));
-        tls_x_pad_cap_floats = tls_x_pad_buf ? need_floats : 0;
+        // 64B-aligned base: with an 8-float row stride this puts every padded
+        // row start on a 32B boundary, matching the staged buffer.
+        const size_t bytes = ((need_floats * sizeof(float)) + 63u) & ~(size_t)63u;
+        tls_x_pad_buf = (float*)std::aligned_alloc(64, bytes);
+        tls_x_pad_cap_floats = tls_x_pad_buf ? (bytes / sizeof(float)) : 0;
     }
     return tls_x_pad_buf;
+}
+
+// ---------------------------------------------------------------------------
+// cin-blocked backward-dX: transposed-W staging (32B aligned)
+//
+// conv2d_backward_dx_cin_blocked_avx2 reads Wt in contiguous 8-wide (C_in)
+// groups. Because the gate requires C_in % 8 == 0, every group is exactly
+// 32 bytes, so once the buffer base is 32B-aligned every read in the kernel
+// lands on a 32B boundary -- loadu was only there because std::vector /
+// malloc don't guarantee that alignment. aligned_alloc(32, ...) here plus
+// _mm256_load_ps at the call site removes those misaligned loads.
+//
+// W only changes when Adam applies it, which happens inside the native call
+// that just completed -- by the time Python reaches try_submit_step for the
+// next job, that Adam apply is done and W is final. Staging here lets the
+// (otherwise idle) main thread build Wt instead of the calling thread doing
+// it serially inside the OMP call.
+// ---------------------------------------------------------------------------
+static thread_local float* tls_dx_cin_blocked_wt_buf = nullptr;
+static thread_local size_t tls_dx_cin_blocked_wt_cap = 0;
+
+static float* acquire_dx_cin_blocked_wt_buf(size_t need_floats) {
+    if (need_floats == 0) return nullptr;
+    if (need_floats > tls_dx_cin_blocked_wt_cap) {
+        std::free(tls_dx_cin_blocked_wt_buf);
+        const size_t bytes = ((need_floats * sizeof(float)) + 31u) & ~(size_t)31u;
+        tls_dx_cin_blocked_wt_buf = (float*)std::aligned_alloc(32, bytes);
+        tls_dx_cin_blocked_wt_cap = tls_dx_cin_blocked_wt_buf ? (bytes / sizeof(float)) : 0;
+    }
+    return tls_dx_cin_blocked_wt_buf;
+}
+
+static void transpose_dx_cin_blocked_wt(
+    const float* __restrict W, float* __restrict dst,
+    int64_t C_out, int64_t C_in, int64_t K
+) {
+    for (int64_t cout = 0; cout < C_out; ++cout) {
+        for (int64_t kh = 0; kh < K; ++kh) {
+            for (int64_t kw = 0; kw < K; ++kw) {
+                float* __restrict d = &dst[((cout * K + kh) * K + kw) * C_in];
+                const float* __restrict s = &W[(cout * C_in) * (K * K) + kh * K + kw];
+                for (int64_t cin = 0; cin < C_in; ++cin) {
+                    d[cin] = s[cin * K * K];
+                }
+            }
+        }
+    }
+}
+
+constexpr int32_t STAGED_DX_WT_MAX_SLOTS = 4;
+
+struct StagedDxWt {
+    const float* w_src = nullptr;
+    int64_t C_out = 0;
+    int64_t C_in = 0;
+    int64_t K = 0;
+    float* buf = nullptr;
+    size_t cap_floats = 0;
+    bool valid = false;
+};
+
+static StagedDxWt g_staged_dx_wt[STAGED_DX_WT_MAX_SLOTS];
+
+static float* staged_dx_wt_alloc(StagedDxWt& slot, size_t need_floats) {
+    if (slot.buf && need_floats <= slot.cap_floats) {
+        return slot.buf;
+    }
+    std::free(slot.buf);
+    const size_t bytes = ((need_floats * sizeof(float)) + 31u) & ~(size_t)31u;
+    slot.buf = (float*)std::aligned_alloc(32, bytes);
+    slot.cap_floats = slot.buf ? (bytes / sizeof(float)) : 0;
+    return slot.buf;
+}
+
+static float* staged_dx_wt_lookup(
+    const float* w_src, int64_t C_out, int64_t C_in, int64_t K
+) {
+    for (int32_t i = 0; i < STAGED_DX_WT_MAX_SLOTS; ++i) {
+        const StagedDxWt& s = g_staged_dx_wt[i];
+        if (!s.valid || !s.buf || s.w_src != w_src) continue;
+        if (s.C_out != C_out || s.C_in != C_in || s.K != K) continue;
+        return s.buf;
+    }
+    return nullptr;
+}
+
+// Called from Python's main thread, right before submitting the job that
+// will read this layer's W. At that point Adam has already applied W for
+// the job that just completed, so its contents are final.
+extern "C" ML_ENGINE_EXPORT int32_t stage_dx_cin_blocked_wt(
+    int32_t slot_idx, const float* W, int64_t C_out, int64_t C_in, int64_t K
+) {
+    if (slot_idx < 0 || slot_idx >= STAGED_DX_WT_MAX_SLOTS) return -1;
+    StagedDxWt& slot = g_staged_dx_wt[slot_idx];
+    slot.valid = false;
+    if (!W || C_out <= 0 || C_in <= 0 || K <= 0) return -2;
+
+    const size_t need = (size_t)(C_out * K * K * C_in);
+    float* buf = staged_dx_wt_alloc(slot, need);
+    if (!buf) return -3;
+
+    transpose_dx_cin_blocked_wt(W, buf, C_out, C_in, K);
+
+    slot.w_src = W;
+    slot.C_out = C_out;
+    slot.C_in = C_in;
+    slot.K = K;
+    slot.valid = true;
+    return 0;
+}
+
+extern "C" ML_ENGINE_EXPORT void invalidate_dx_cin_blocked_wt_stage(int32_t slot_idx) {
+    if (slot_idx < 0) {
+        for (int32_t i = 0; i < STAGED_DX_WT_MAX_SLOTS; ++i) {
+            g_staged_dx_wt[i].valid = false;
+        }
+    } else if (slot_idx < STAGED_DX_WT_MAX_SLOTS) {
+        g_staged_dx_wt[slot_idx].valid = false;
+    }
 }
 
 // --- Option B experiment: cin-blocked backward-dX for stride-1 K=7 -----------
@@ -5519,19 +5795,14 @@ static void conv2d_backward_dx_cin_blocked_avx2(
 
     // Pre-transpose W [C_out][C_in][K][K] -> Wt [C_out][K][K][C_in] once per
     // backward call (small: C_out*K*K*C_in floats; cheap vs. the O(N*H*W*
-    // C_in*C_out*K*K) accumulation below). loadu is used for Wt reads below,
-    // so no alignment requirement is placed on this buffer.
-    std::vector<float> Wt((size_t)(C_out * K * K * C_in));
-    for (int64_t cout = 0; cout < C_out; ++cout) {
-        for (int64_t kh = 0; kh < K; ++kh) {
-            for (int64_t kw = 0; kw < K; ++kw) {
-                float* __restrict dst = &Wt[((cout * K + kh) * K + kw) * C_in];
-                const float* __restrict src = &W[(cout * C_in) * (K * K) + kh * K + kw];
-                for (int64_t cin = 0; cin < C_in; ++cin) {
-                    dst[cin] = src[cin * K * K];
-                }
-            }
-        }
+    // C_in*C_out*K*K) accumulation below). The main thread may have already
+    // staged this from the finalized weights (see stage_dx_cin_blocked_wt);
+    // on a miss it's rebuilt here into the same 32B-aligned buffer kind, so
+    // the aligned loads below are safe either way.
+    float* Wt = staged_dx_wt_lookup(W, C_out, C_in, K);
+    if (!Wt) {
+        Wt = acquire_dx_cin_blocked_wt_buf((size_t)(C_out * K * K * C_in));
+        transpose_dx_cin_blocked_wt(W, Wt, C_out, C_in, K);
     }
 
     #pragma omp parallel for collapse(2) schedule(static)
@@ -5540,19 +5811,32 @@ static void conv2d_backward_dx_cin_blocked_avx2(
             for (int64_t cb = 0; cb < cin_blocks; ++cb) {
                 for (int64_t iw = 0; iw < W_in; ++iw) {
                     __m256 acc = _mm256_setzero_ps();
+
+                    // oh/ow run backwards over kh/kw, so the taps that land in
+                    // range form one contiguous window per (ih, iw). Those
+                    // bounds do not depend on cout or cb, so they are derived
+                    // once here instead of re-testing every tap in the innermost
+                    // loop.
+                    int64_t kh_lo, kh_hi;
+                    bwd_dx_k_kh_bounds<K>(ih, pad, conv_out_h, kh_lo, kh_hi);
+                    int64_t kw_lo = iw + pad - conv_out_w + 1;
+                    if (kw_lo < 0) kw_lo = 0;
+                    int64_t kw_hi = iw + pad + 1;
+                    if (kw_hi > K) kw_hi = K;
+
                     for (int64_t cout = 0; cout < C_out; ++cout) {
                         const float* __restrict dy_plane =
                             &d_conv_buf[(n * C_out + cout) * conv_spatial];
-                        for (int64_t kh = 0; kh < K; ++kh) {
+                        for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
                             const int64_t oh = ih - kh + pad;
-                            if (oh < 0 || oh >= conv_out_h) continue;
                             const float* __restrict dy_row = &dy_plane[oh * conv_out_w_stride];
                             const float* __restrict wt_tap = &Wt[((cout * K + kh) * K) * C_in + cb * 8];
-                            for (int64_t kw = 0; kw < K; ++kw) {
-                                const int64_t ow = iw - kw + pad;
-                                if (ow < 0 || ow >= conv_out_w) continue;
-                                const float dy = dy_row[ow];
-                                const __m256 wv = _mm256_loadu_ps(wt_tap + kw * C_in);
+                            for (int64_t kw = kw_lo; kw < kw_hi; ++kw) {
+                                const float dy = dy_row[iw - kw + pad];
+                                // Safe as an aligned load: C_in % 8 == 0 (gate
+                                // below) and Wt is 32B-aligned, so every
+                                // kw*C_in-float offset lands on a 32B boundary.
+                                const __m256 wv = _mm256_load_ps(wt_tap + kw * C_in);
                                 acc = _mm256_fmadd_ps(_mm256_set1_ps(dy), wv, acc);
                             }
                         }
@@ -5702,24 +5986,51 @@ static void conv2d_backward_dx_cout_blocked_avx2(
     #pragma omp parallel for collapse(2) schedule(static)
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t ih = 0; ih < H; ++ih) {
+            // oh = ih - kh + pad must land in [0, conv_out_h): solve for kh once.
+            const int64_t kh_lo = std::max<int64_t>(0, ih + pad - (conv_out_h - 1));
+            const int64_t kh_hi = std::min<int64_t>(K - 1, ih + pad);
             for (int64_t cin = 0; cin < C_in; ++cin) {
                 const float* __restrict w_cin = &Wt[cin * K * K * C_out];
                 for (int64_t iw = 0; iw < W_in; ++iw) {
-                    __m256 acc = _mm256_setzero_ps();
-                    for (int64_t kh = 0; kh < K; ++kh) {
+                    const int64_t kw_lo =
+                        std::max<int64_t>(0, iw + pad - (conv_out_w - 1));
+                    const int64_t kw_hi = std::min<int64_t>(K - 1, iw + pad);
+                    // Four accumulators: one dependent FMA chain runs at latency,
+                    // four interleaved chains run at throughput.
+                    __m256 acc0 = _mm256_setzero_ps();
+                    __m256 acc1 = _mm256_setzero_ps();
+                    __m256 acc2 = _mm256_setzero_ps();
+                    __m256 acc3 = _mm256_setzero_ps();
+                    for (int64_t kh = kh_lo; kh <= kh_hi; ++kh) {
                         const int64_t oh = ih - kh + pad;
-                        if (oh < 0 || oh >= conv_out_h) continue;
                         const float* __restrict dy_row =
                             &dY_b[(n * conv_out_h + oh) * conv_out_w * C_out];
                         const float* __restrict w_kh = w_cin + kh * K * C_out;
-                        for (int64_t kw = 0; kw < K; ++kw) {
+                        int64_t kw = kw_lo;
+                        for (; kw + 3 <= kw_hi; kw += 4) {
                             const int64_t ow = iw - kw + pad;
-                            if (ow < 0 || ow >= conv_out_w) continue;
-                            const __m256 dyv = _mm256_loadu_ps(dy_row + ow * C_out);
-                            const __m256 wv = _mm256_loadu_ps(w_kh + kw * C_out);
-                            acc = _mm256_fmadd_ps(dyv, wv, acc);
+                            acc0 = _mm256_fmadd_ps(
+                                _mm256_loadu_ps(dy_row + ow * C_out),
+                                _mm256_loadu_ps(w_kh + kw * C_out), acc0);
+                            acc1 = _mm256_fmadd_ps(
+                                _mm256_loadu_ps(dy_row + (ow - 1) * C_out),
+                                _mm256_loadu_ps(w_kh + (kw + 1) * C_out), acc1);
+                            acc2 = _mm256_fmadd_ps(
+                                _mm256_loadu_ps(dy_row + (ow - 2) * C_out),
+                                _mm256_loadu_ps(w_kh + (kw + 2) * C_out), acc2);
+                            acc3 = _mm256_fmadd_ps(
+                                _mm256_loadu_ps(dy_row + (ow - 3) * C_out),
+                                _mm256_loadu_ps(w_kh + (kw + 3) * C_out), acc3);
+                        }
+                        for (; kw <= kw_hi; ++kw) {
+                            const int64_t ow = iw - kw + pad;
+                            acc0 = _mm256_fmadd_ps(
+                                _mm256_loadu_ps(dy_row + ow * C_out),
+                                _mm256_loadu_ps(w_kh + kw * C_out), acc0);
                         }
                     }
+                    const __m256 acc = _mm256_add_ps(
+                        _mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
                     const __m128 lo = _mm256_castps256_ps128(acc);
                     const __m128 hi = _mm256_extractf128_ps(acc, 1);
                     __m128 s = _mm_add_ps(lo, hi);
@@ -5765,7 +6076,7 @@ void conv2d_backward_fallback_avx2(
     float* dx, float* dW,
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
     int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride, int64_t pad,
-    int64_t conv_out_w_stride, float inv_m
+    int64_t conv_out_w_stride, float inv_m, int64_t dx_prezeroed, int64_t dw_prezeroed
 ) {
     const int64_t conv_out_h   = (H + 2 * pad - k_h) / stride + 1;
     const int64_t conv_out_w   = (W_in + 2 * pad - k_w) / stride + 1;
@@ -5777,12 +6088,14 @@ void conv2d_backward_fallback_avx2(
     const bool do_dw = (dW && x);
 
     if (do_dx) {
-        std::memset(dx, 0, (size_t)(N * C_in * spatial_in) * sizeof(float));
+        if (!dx_prezeroed) {
+            std::memset(dx, 0, (size_t)(N * C_in * spatial_in) * sizeof(float));
+        }
         if (bwd_dx_mock_edges_enabled()) {
             log_bwd_dx_mock_edges_once();
         }
     }
-    if (do_dw) {
+    if (do_dw && !dw_prezeroed) {
         std::memset(dW, 0, (size_t)(C_out * C_in * k_spatial) * sizeof(float));
     }
 
@@ -5848,14 +6161,19 @@ void conv2d_backward_fallback_avx2(
     if (stride == 1 && do_dw && x) {
         x_pad_l = bwd_x_pad_l(pad);
         x_row_stride = bwd_x_row_stride(k_w, pad, W_in, conv_out_w);
-        const size_t x_pad_floats = (size_t)(N * C_in * H * x_row_stride);
-        x_pad_buf = acquire_bwd_x_pad_buf(x_pad_floats);
-        if (x_pad_buf) {
-            build_x_pad_buf(
-                x, x_pad_buf,
-                N, C_in, H, W_in,
-                W_in_stride, x_pad_l, x_row_stride
-            );
+        x_pad_buf = staged_x_pad_lookup(
+            x, N, C_in, H, W_in, W_in_stride, x_pad_l, x_row_stride
+        );
+        if (!x_pad_buf) {
+            const size_t x_pad_floats = (size_t)(N * C_in * H * x_row_stride);
+            x_pad_buf = acquire_bwd_x_pad_buf(x_pad_floats);
+            if (x_pad_buf) {
+                build_x_pad_buf(
+                    x, x_pad_buf,
+                    N, C_in, H, W_in,
+                    W_in_stride, x_pad_l, x_row_stride
+                );
+            }
         }
     }
     if (stride == 2 && stride2_specialist_k(k_h, k_w) != 0 && (do_dx || do_dw)) {

@@ -597,7 +597,10 @@ def init_engine_backend(backend: EngineBackend = EngineBackend.NATIVE):
             ctypes.c_int64,   # 22. pool_stride
             ctypes.c_int64,   # 23. pool_out_h
             ctypes.c_int64,   # 24. pool_out_w
-            ctypes.c_float    # 25. inv_m
+            ctypes.c_float,   # 25. inv_m
+            ctypes.c_int64,   # 26. d_conv_prezeroed
+            ctypes.c_int64,   # 27. dx_prezeroed
+            ctypes.c_int64,   # 28. dw_prezeroed
         ]
 
         # 3. Direct Conv2D Standalone Primitives
@@ -922,7 +925,10 @@ def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
                 int(conv_stride), int(conv_pad), int(conv_out_w_stride),
                 int(pool_size), int(pool_stride),
                 int(pool_out_h), int(pool_out_w),
-                ctypes.c_float(inv_m)
+                ctypes.c_float(inv_m),
+                0,  # d_conv_prezeroed (sync path zeros in native)
+                0,  # dx_prezeroed
+                0,  # dw_prezeroed
             )
             if status == 0:
                 return dx_buf, dW_buf, db_buf
