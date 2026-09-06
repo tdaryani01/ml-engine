@@ -170,6 +170,51 @@ on representative geometries; `im2col_fast.py` removed.
 **Not in scope yet:** Replacing `GENERIC_FALLBACK` tiled loops in `conv_fallback.cpp` with native
 im2col+GEMM routing — that is a separate dispatcher decision after D8–D9 are proven.
 
+#### Move setup out of the conv kernels (planned)
+
+Goal: `conv_fallback.cpp` does computation only. All staging moves host-side and runs
+*after* `ContractRuntime._submit_native` (`contract_runtime.py:553`), preparing the next
+submit while native computes the current one. The contract is the only training-path
+caller — `direct_conv2d_backward_*` in `conv_dispatch.py` is the legacy per-layer path,
+and the 204 `conv_block_forward` calls in profiles are validation inference.
+
+Setup currently inside the backward kernel:
+
+| line | work | layer 1 size |
+|------|------|--------------|
+| 5780 | `memset(dx, ...)` | 301KB |
+| 5786 | `memset(dW, ...)` | small |
+| 5839/5866 | `acquire_bwd_dy_pad_buf` + pad copy | ~590KB |
+| 5852/5879 | `acquire_bwd_x_pad_buf` + pad copy | ~345KB |
+| 5670 | Option D `dY_b` NCHW→channel-last transpose | 590KB |
+| 5690 | Option D `Wt` transpose | 4.7KB |
+| 5901 | per-thread `tls_priv_dW` zeroing | small |
+
+Three facts to establish before removing any clear — each one can silently corrupt
+gradients rather than fail loudly:
+
+1. Does `L->W_stride == W_in`? `round_up_simd` (`contract_runner.cpp:17`, multiple of 4)
+   is applied to `conv_out_w_stride` only, and gives 24→24 / 8→8 for the two layers, so
+   the *output* stride has no gap. The *input* row stride is bound from Python and looks
+   like a plain contiguous numpy row, but it is unconfirmed. If `W_in_stride > W_in`, the
+   columns in `[W_in, W_in_stride)` are never written by the Option B/D loops and the
+   `memset` is the only thing keeping them clean.
+2. Does Option B assign or accumulate into `dx`? Option D assigns
+   (`dx[...] = _mm_cvtss_f32(s)`), so its `memset` is dead weight. Option B is unchecked.
+3. Is `L->dW` the same buffer the host already zeros? `_refresh_step_bindings` does
+   `layer.dW.fill(0.0)` (`contract_runtime.py:429`) before every submit, which would make
+   the native `memset(dW)` at 5786 pure duplication. Note native also reduces per-thread
+   `tls_priv_dW` into `dW`, so the accumulation start value matters.
+
+Order of work: (a) `dW` clear, once fact 3 holds — no stride hazard; (b) `dx` clear, once
+facts 1 and 2 hold; (c) pad buffers and `dY_b`, which need **double-buffering** to stage
+ahead, since they are `thread_local` singletons the in-flight step is still reading.
+
+Prior measurement to respect: deleting the largest clear outright
+(`BWD_SKIP_TOP_MEMSET_CLEARS`) moved throughput 8326 → 7453 smp/s, i.e. no win, though
+that A/B was contaminated by host drift. So treat the clears as a correctness cleanup with
+a small expected payoff, and put the throughput hopes on (c).
+
 #### Channel-blocked backward-dX coverage (`conv_fallback.cpp`)
 
 Two layouts beat the sliding-window crawl by keeping spatial steps SIMD-aligned. Both are
@@ -184,9 +229,15 @@ takes the tile-queue crawl. Together they measured ~+25% end-to-end vs the crawl
 **TODO — widen the gates.** The kernels are templated on `K` but only partially wired up:
 
 - Option D is K=7-only; extend the dispatch to K=5 and K=6 (and K≤4 / K≥8 if they show a win).
-- Option D requires `C_out==8` exactly (one 8-wide block). Generalize to `C_out%8==0` with
-  multi-block accumulation so layer 2 (`C_out=16`) can use it instead of falling back.
+- Option D requires `C_out==8` exactly (one 8-wide block); generalize to `C_out%8==0` with
+  multi-block accumulation.
 - Option B skips `K≤4` and `K≥8`, and any layer with `C_in%8!=0`.
+
+Note on the current config: both conv layers already take a fast path — layer 2 (`C_in=8`)
+matches Option B, and layer 1 (`C_in=3`) fails that gate but matches Option D, which is why
+Option D exists. So widening the gates is about *other* kernel sizes and channel counts, not
+about rescuing a layer that falls back today. Whether Option D also beats Option B where both
+apply (`C_in%8==0` and `C_out%8==0`) is untested — Option B wins by dispatch order.
 
 Verify each `K` separately before widening — set `ML_ENGINE_FORCE_DX_CRAWL=1` to A/B against
 the crawl path, and treat a bit-close NumPy match as the correctness gate.
