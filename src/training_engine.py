@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import logging
 import threading
+from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -42,13 +43,167 @@ class _CommittedStep:
     version: int
 
 
+# ---------------------------------------------------------------------------
+# Async training pipeline state machine (run_training_loop).
+# Each phase owns its transition; the driver is only `while state: state=...`.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _TrainLoopContext:
+    engine: "TrainingEngine"
+    steps_budget: int
+    next_step: Callable[[], StepInput | None]
+    on_submitted: Callable[[StepInput], None] | None = None
+    pending: StepInput | None = None
+    exhausted: bool = False
+    committed: _CommittedStep | None = None
+
+
+class _TrainLoopState(ABC):
+    """One pipeline phase; return the next phase or None when the epoch is done."""
+
+    @abstractmethod
+    def advance(self, ctx: _TrainLoopContext) -> Optional["_TrainLoopState"]:
+        raise NotImplementedError
+
+
+class _Bootstrap(_TrainLoopState):
+    """Prime prefetch and submit the first contract step."""
+
+    def advance(self, ctx: _TrainLoopContext) -> Optional[_TrainLoopState]:
+        eng = ctx.engine
+        eng._epoch_losses = []
+        eng._epoch_steps_done = 0
+        eng._flag_step_done = False
+        eng._flag_capacity = True
+        eng._prefetch.clear()
+        ctx.pending = None
+        ctx.exhausted = False
+        ctx.committed = None
+
+        ctx.pending, ctx.exhausted, _ = eng._arm_one(
+            ctx.next_step,
+            exhausted=ctx.exhausted,
+            steps_budget=ctx.steps_budget,
+            pending=None,
+        )
+        if ctx.pending is None:
+            return None
+        if not eng.try_submit(ctx.pending):
+            raise RuntimeError("initial async contract submit was rejected")
+        eng._flag_capacity = False
+        if ctx.on_submitted is not None:
+            ctx.on_submitted(ctx.pending)
+        ctx.pending = None
+        return _ARM
+
+
+class _Arm(_TrainLoopState):
+    """While a step is in flight, arm the next StepInput (prefetch / producer)."""
+
+    def advance(self, ctx: _TrainLoopContext) -> Optional[_TrainLoopState]:
+        if ctx.engine._inflight is None:
+            return None
+        ctx.pending, ctx.exhausted, _ = ctx.engine._arm_one(
+            ctx.next_step,
+            exhausted=ctx.exhausted,
+            steps_budget=ctx.steps_budget,
+            pending=ctx.pending,
+        )
+        return _PREPARE
+
+
+class _Prepare(_TrainLoopState):
+    """Prepare the inactive slot for the armed next step (overlap with native)."""
+
+    def advance(self, ctx: _TrainLoopContext) -> Optional[_TrainLoopState]:
+        if ctx.pending is not None:
+            ctx.engine.prepare_submit(ctx.pending)
+        return _OVERLAP
+
+
+class _Overlap(_TrainLoopState):
+    """Main-thread useful work: deferred, ledger flush, contract ensure."""
+
+    def advance(self, ctx: _TrainLoopContext) -> Optional[_TrainLoopState]:
+        ctx.engine._do_useful_work()
+        return _WAIT
+
+
+class _Wait(_TrainLoopState):
+    """Block only for native completion; then hand off to commit."""
+
+    def advance(self, ctx: _TrainLoopContext) -> Optional[_TrainLoopState]:
+        eng = ctx.engine
+        eng._wait_native_done()
+        if not eng._native_ready():
+            raise RuntimeError("native wait returned without a completed contract")
+        return _COMMIT
+
+
+class _Commit(_TrainLoopState):
+    """Advance ledger version for the finished inflight step."""
+
+    def advance(self, ctx: _TrainLoopContext) -> Optional[_TrainLoopState]:
+        eng = ctx.engine
+        finished = eng._inflight
+        eng._inflight = None
+        if finished is None:
+            raise RuntimeError("commit without an inflight step")
+        ctx.committed = eng._commit_completed_version(finished)
+        eng._flag_step_done = False
+        return _SUBMIT
+
+
+class _Submit(_TrainLoopState):
+    """Submit the prepared next step now that capacity is free."""
+
+    def advance(self, ctx: _TrainLoopContext) -> Optional[_TrainLoopState]:
+        eng = ctx.engine
+        if ctx.pending is not None:
+            if not eng.try_submit(ctx.pending):
+                raise RuntimeError("prepared async contract submit was rejected")
+            eng._flag_capacity = False
+            if ctx.on_submitted is not None:
+                ctx.on_submitted(ctx.pending)
+            ctx.pending = None
+        return _FINALIZE
+
+
+class _Finalize(_TrainLoopState):
+    """Reap grads, ledger step docs, optional flush; then arm again or stop."""
+
+    def advance(self, ctx: _TrainLoopContext) -> Optional[_TrainLoopState]:
+        eng = ctx.engine
+        committed = ctx.committed
+        ctx.committed = None
+        if committed is None:
+            raise RuntimeError("finalize without a committed step")
+        loss = eng._finalize_committed(committed)
+        eng._epoch_losses.append(loss)
+        eng._epoch_steps_done += 1
+        if eng._ledger_needs_work():
+            eng._ledger_io_begin_flush()
+        return _ARM
+
+
+_BOOTSTRAP = _Bootstrap()
+_ARM = _Arm()
+_PREPARE = _Prepare()
+_OVERLAP = _Overlap()
+_WAIT = _Wait()
+_COMMIT = _Commit()
+_SUBMIT = _Submit()
+_FINALIZE = _Finalize()
+
+
 class TrainingEngine:
     """
     Long-lived training manager: one engine, many sessions.
 
-    Train machine: submit → arm next StepInput → ledger push/flush only if
-    work pending → wait solely for native completion. Bind happens at submit
-    (single shared native ctx cannot bind while a job is in flight).
+    Async train pipeline (state machine): Bootstrap → Arm → Prepare → Overlap →
+    Wait → Commit → Submit → Finalize → Arm… until no inflight work remains.
     """
 
     def __init__(
@@ -299,64 +454,16 @@ class TrainingEngine:
         next_step: Callable[[], StepInput | None],
         on_submitted: Callable[[StepInput], None] | None = None,
     ) -> list[float]:
-        """Two-slot pipeline: submit → publish previous → prepare next → wait."""
-        self._epoch_losses = []
-        self._epoch_steps_done = 0
-        self._flag_step_done = False
-        self._flag_capacity = True
-        self._prefetch.clear()
-        pending: StepInput | None = None
-        exhausted = False
-
-        pending, exhausted, _ = self._arm_one(
-            next_step,
-            exhausted=exhausted,
+        """Two-slot pipeline driven by phase state classes (arm→prep→wait→…)."""
+        ctx = _TrainLoopContext(
+            engine=self,
             steps_budget=steps_budget,
-            pending=None,
+            next_step=next_step,
+            on_submitted=on_submitted,
         )
-        if pending is None:
-            return []
-        if not self.try_submit(pending):
-            raise RuntimeError("initial async contract submit was rejected")
-        self._flag_capacity = False
-        if on_submitted is not None:
-            on_submitted(pending)
-        pending = None
-
-        while self._inflight is not None:
-            pending, exhausted, _ = self._arm_one(
-                next_step,
-                exhausted=exhausted,
-                steps_budget=steps_budget,
-                pending=pending,
-            )
-            if pending is not None:
-                self.prepare_submit(pending)
-
-            self._do_useful_work()
-            self._wait_native_done()
-            if not self._native_ready():
-                raise RuntimeError("native wait returned without a completed contract")
-
-            finished = self._inflight
-            self._inflight = None
-            committed = self._commit_completed_version(finished)
-            self._flag_step_done = False
-
-            if pending is not None:
-                if not self.try_submit(pending):
-                    raise RuntimeError("prepared async contract submit was rejected")
-                self._flag_capacity = False
-                if on_submitted is not None:
-                    on_submitted(pending)
-                pending = None
-
-            loss = self._finalize_committed(committed)
-            self._epoch_losses.append(loss)
-            self._epoch_steps_done += 1
-            if self._ledger_needs_work():
-                self._ledger_io_begin_flush()
-
+        state: _TrainLoopState | None = _BOOTSTRAP
+        while state is not None:
+            state = state.advance(ctx)
         return list(self._epoch_losses)
 
     def drain_pending(self) -> list[float]:
