@@ -1,10 +1,14 @@
-# Threading / pool policy (single source of truth for desktop, tests, Docker).
+# Thread / BLAS / OMP policy: config/runtime.yaml (see utils/runtime.py)
 #
-# Thread count resolution (first match wins):
+# Thread budget (num_threads / default OMP_THREAD_LIMIT):
 #   1. CLI / load_runtime_settings(num_threads=...)
 #   2. runtime.yaml top-level num_threads / omp_thread_limit (if set)
-#   3. runtime.yaml env OMP_NUM_THREADS / OMP_THREAD_LIMIT (if set)
-#   4. else config.yaml optimization.num_threads (current default path)
+#   3. else config.yaml optimization.num_threads
+#
+# OpenMP team (OMP_NUM_THREADS in runtime env): "auto" | positive int
+#   - unset or "auto": async → num_threads-1; sync → num_threads
+#   - normal int N: OMP team = N (async does not subtract)
+# OMP_THREAD_LIMIT / threadpoolctl stay at the full budget unless overridden.
 #
 # Omit the optional keys below to keep today's behavior.
 # num_threads: 4
@@ -27,9 +31,9 @@ env:
   OMP_MAX_ACTIVE_LEVELS: "1"
   PYTHONUNBUFFERED: "1"
   ONEDNN_VERBOSE: "0"
-  # Optional overrides (uncomment to pin; otherwise falls back to config.yaml):
+  # OpenMP team: "auto" (async => N-1) or a pin like "4".
   OMP_NUM_THREADS: "4"
-  OMP_THREAD_LIMIT: "4"
+  # OMP_THREAD_LIMIT: "4"
 
 linux:
   OMP_PROC_BIND: "false"

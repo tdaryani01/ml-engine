@@ -104,6 +104,8 @@ ledger:
   contract_list_enabled: true
   # Native async contract submit (independent of ledger I/O). false = sync native
   # on the caller thread (strict OMP team). true = persistent native worker.
+  # With async, OMP_NUM_THREADS defaults to auto (num_threads-1) unless runtime
+  # yaml sets a normal int. OMP_THREAD_LIMIT stays at the full budget.
   native_async_submit: true
   store_backend: file_streaming
 

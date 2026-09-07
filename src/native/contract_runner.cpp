@@ -47,6 +47,14 @@ int32_t direct_conv_block_backward_avx2(
     int64_t pool_out_h, int64_t pool_out_w, float inv_m,
     int64_t d_conv_prezeroed, int64_t dx_prezeroed, int64_t dw_prezeroed);
 
+// BRGEMM dW x-pack: worker posts; Python main packs (see conv_fallback).
+int32_t request_brgemm_dw_x_pack(
+    const float* x,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride, int64_t pad);
+
+void reset_brgemm_dw_x_pack_request(void);
+
 }  // extern "C"
 
 enum ContractOpcode : int32_t {
@@ -669,6 +677,7 @@ static int32_t run_contract_training_step_impl(
     if (!ops || !ctx || op_count <= 0 || ctx->N <= 0) {
         return -1;
     }
+    reset_brgemm_dw_x_pack_request();
 
 #if defined(ML_ENGINE_PROFILE_CONTRACT_THREADS) && defined(__linux__) && defined(_OPENMP)
     ContractThreadProfileScope thread_profile(is_training_contract(ops, op_count));
@@ -706,6 +715,16 @@ static int32_t run_contract_training_step_impl(
                 L->conv_act_cache = L->out_conv;
                 ctx->act = L->out_pool;
                 ctx->flat_dim = L->C_out * L->pool_out_h * L->pool_out_w;
+                // Hand L1 (next) BRGEMM x-pack to Python main: pool output is
+                // ready now; worker continues L1 fwd/dense while main packs.
+                // Do not pack on this thread — that was serial on the OMP path.
+                if (op->layer_idx + 1 < ctx->num_layers) {
+                    LayerBinding* Nxt = &ctx->layers[op->layer_idx + 1];
+                    (void)request_brgemm_dw_x_pack(
+                        ctx->act, ctx->N, Nxt->C_in, Nxt->H, Nxt->W_in,
+                        Nxt->W_stride, Nxt->C_out, Nxt->k_h, Nxt->k_w,
+                        Nxt->conv_stride, Nxt->conv_pad);
+                }
                 break;
             }
             case OP_FLATTEN_FWD:

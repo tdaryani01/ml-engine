@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -224,6 +225,27 @@ def _bind_runner(lib) -> None:
         ]
         lib.invalidate_dx_cin_blocked_wt_stage.restype = None
         lib.invalidate_dx_cin_blocked_wt_stage.argtypes = [ctypes.c_int32]
+    if hasattr(lib, "stage_brgemm_dw_x_pack"):
+        # Main-thread: pack BRGEMM dW x panels for layer 0 when Cin%8==0 while
+        # the worker owns the OMP team. L1's x is requested after L0 fwd; main
+        # drains via service_brgemm_dw_x_pack_requests during wait.
+        lib.stage_brgemm_dw_x_pack.restype = ctypes.c_int32
+        lib.stage_brgemm_dw_x_pack.argtypes = [
+            ctypes.c_int32,
+            ctypes.c_void_p,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+            ctypes.c_int64,
+        ]
+        lib.invalidate_brgemm_dw_x_pack.restype = None
+        lib.invalidate_brgemm_dw_x_pack.argtypes = [ctypes.c_int32]
+    if hasattr(lib, "service_brgemm_dw_x_pack_requests"):
+        lib.service_brgemm_dw_x_pack_requests.restype = ctypes.c_int32
+        lib.service_brgemm_dw_x_pack_requests.argtypes = []
 
 
 @dataclass
@@ -783,6 +805,9 @@ class ContractRuntime:
         drop_wt = getattr(self._lib, "invalidate_dx_cin_blocked_wt_stage", None)
         if drop_wt is not None:
             drop_wt(ctypes.c_int32(-1))
+        drop_brg = getattr(self._lib, "invalidate_brgemm_dw_x_pack", None)
+        if drop_brg is not None:
+            drop_brg(ctypes.c_int32(-1))
         self._slots = [self._make_async_slot(X, cap), self._make_async_slot(X, cap)]
 
     def _bind_slot_parameter_banks(
@@ -1106,28 +1131,51 @@ class ContractRuntime:
         return True
 
     def wait_for_completion(self, timeout: float | None = None) -> bool:
-        """Block until native READY is reaped and finished on this thread."""
+        """Block until native READY is reaped and finished on this thread.
+
+        Polls with a short wait so this thread can drain mid-step BRGEMM x-pack
+        requests while the OMP team runs L1/dense (the reserved main core).
+        """
         if self._poll_complete_on_main():
             return True
         if timeout is not None and timeout <= 0:
             return False
         if self._submitted is None:
             return False
-        timeout_ms = -1 if timeout is None else max(1, int(float(timeout) * 1000 + 0.999))
-        if not self._wait_reap_native(timeout_ms):
-            self._trace_mailbox("wait_not_ready")
-            return False
-        submitted = self._submitted
-        self._submitted = None
-        if submitted.apply_adam:
-            self._publish_parameter_bank(
-                submitted.output_bank_idx,
-                self._slots[submitted.slot_idx].ctx.adam.t,
-            )
-        self._completed = submitted
-        self._publish_completion()
-        self._trace_mailbox("wait_completed")
-        return True
+
+        service = getattr(self._lib, "service_brgemm_dw_x_pack_requests", None)
+
+        def _drain_pack() -> None:
+            if service is None:
+                return
+            for _ in range(8):
+                if int(service()) <= 0:
+                    break
+
+        deadline = None if timeout is None else (time.perf_counter() + float(timeout))
+        while True:
+            _drain_pack()
+            if self._poll_complete_on_main():
+                return True
+            if deadline is not None and time.perf_counter() >= deadline:
+                self._trace_mailbox("wait_not_ready")
+                return False
+            # Short park so we wake often enough to service packs; still avoids
+            # a pure spin when the worker has not posted a request yet.
+            if not self._wait_reap_native(1):
+                continue
+            _drain_pack()
+            submitted = self._submitted
+            self._submitted = None
+            if submitted.apply_adam:
+                self._publish_parameter_bank(
+                    submitted.output_bank_idx,
+                    self._slots[submitted.slot_idx].ctx.adam.t,
+                )
+            self._completed = submitted
+            self._publish_completion()
+            self._trace_mailbox("wait_completed")
+            return True
 
     def native_in_flight(self) -> bool:
         if not self._async_enabled:
@@ -1256,6 +1304,7 @@ class ContractRuntime:
             dx.fill(0.0)
 
         self._stage_input_pad(slot_idx, slot, X)
+        self._stage_brgemm_dw_x(slot_idx, slot, X)
 
         token = int(step_token if step_token is not None else self.model.optimizer.t + 1)
         self._prepared = _PreparedStep(
@@ -1307,6 +1356,41 @@ class ContractRuntime:
         drop = getattr(self._lib, "invalidate_conv_x_pad_stage", None)
         if drop is not None:
             drop(ctypes.c_int32(slot_idx))
+        drop_brg = getattr(self._lib, "invalidate_brgemm_dw_x_pack", None)
+        if drop_brg is not None:
+            drop_brg(ctypes.c_int32(slot_idx))
+
+    def _stage_brgemm_dw_x(
+        self, slot_idx: int, slot: "_ExecutionSlot", X: np.ndarray
+    ) -> None:
+        """Pack layer-0 BRGEMM dW x panels on the main thread when eligible.
+
+        Same overlap window as stage_conv_x_pad. Only fires when Cin/Cout are
+        multiples of 8 (current CNN L0 Cin=3 skips; L1 is published after fwd).
+        """
+        stage = getattr(self._lib, "stage_brgemm_dw_x_pack", None)
+        if stage is None or slot.ctx.num_layers <= 0:
+            return
+        lb = slot.ctx.layers[0]
+        if (
+            lb.conv_stride != 1
+            or lb.k_h != 7
+            or lb.k_w != 7
+            or (lb.C_in % 8) != 0
+            or (lb.C_out % 8) != 0
+        ):
+            return
+        stage(
+            ctypes.c_int32(slot_idx),
+            ctypes.c_void_p(_ptr(X)),
+            ctypes.c_int64(int(slot.ctx.N)),
+            ctypes.c_int64(int(lb.C_in)),
+            ctypes.c_int64(int(lb.H)),
+            ctypes.c_int64(int(lb.W_in)),
+            ctypes.c_int64(int(lb.W_stride)),
+            ctypes.c_int64(int(lb.k_w)),
+            ctypes.c_int64(int(lb.conv_pad)),
+        )
 
     def _stage_dx_wt(self, slot_idx: int, slot: "_ExecutionSlot") -> None:
         """Rebuild the cin-blocked backward-dX transposed-W buffer on main.

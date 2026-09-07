@@ -491,7 +491,9 @@ def run_pytorch_benchmark(
     torch_forward_counts = 0
     torch_backward_counts = 0
 
-    settings = load_runtime_settings(num_threads=num_threads)
+    settings = load_runtime_settings(
+        num_threads=num_threads, native_async_submit=False
+    )
     log_runtime_settings(settings, EngineBackend.NUMPY, prefix="[Benchmark PyTorch]")
 
     with training_threadpool(settings, EngineBackend.NUMPY):
@@ -591,14 +593,17 @@ def run_custom_engine_benchmark(
     patience: int,
     min_delta: float,
     backend: EngineBackend = EngineBackend.NATIVE,
-    num_threads: int = 4
+    num_threads: int = 4,
+    config_path: str | None = None,
 ) -> dict:
     engine_ctx = create_engine_context(backend)
 
     native_lib = engine_ctx.native_lib or (
         load_native_telemetry_lib() if backend == EngineBackend.NATIVE else None
     )
-    settings = load_runtime_settings(num_threads=num_threads)
+    settings = load_runtime_settings(
+        config_path=config_path, num_threads=num_threads
+    )
     planned_threads = settings.omp_threads_for(backend)
 
     print(f"[2/2] Setting up and executing Custom Engine [{backend.value}] benchmark run ({planned_threads} Threads configured)...")
@@ -1016,6 +1021,7 @@ def custom_benchmark_child(config_path, result_queue) -> None:
             min_delta=c["min_delta"],
             backend=c["backend"],
             num_threads=c["num_threads"],
+            config_path=config_path,
         )
         result_queue.put(("ok", c_res))
     except Exception as exc:

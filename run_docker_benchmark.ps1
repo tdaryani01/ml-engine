@@ -20,7 +20,47 @@ $env:DOCKER_BUILDKIT = 1
 
 $PyTorchImg = "ml-engine-pytorch-bench:latest"
 $CustomImg  = "ml-engine-custom-bench:latest"
-$CpuSet     = "0-$($Cores - 1)"
+$CpuSet = & python -c @"
+import os
+need = max(1, int($Cores))
+base = '/sys/devices/system/cpu'
+def parse_siblings(text):
+    out = set()
+    for part in text.strip().split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            a, b = part.split('-', 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out
+try:
+    present = sorted(int(n[3:]) for n in os.listdir(base) if n.startswith('cpu') and n[3:].isdigit())
+except OSError:
+    present = list(range(need))
+chosen, seen = [], set()
+for cpu in present:
+    path = f'{base}/cpu{cpu}/topology/thread_siblings_list'
+    try:
+        with open(path, encoding='utf-8') as fh:
+            sibs = frozenset(parse_siblings(fh.read()))
+    except OSError:
+        sibs = frozenset([cpu])
+    if sibs in seen:
+        continue
+    seen.add(sibs)
+    chosen.append(min(sibs))
+    if len(chosen) >= need:
+        break
+if len(chosen) < need:
+    chosen = list(range(need))
+print(','.join(str(c) for c in chosen))
+"@
+if (-not $CpuSet) {
+    $CpuSet = "0-$($Cores - 1)"
+}
 $ConfigPath = Join-Path $ScriptDir "config\config.yaml"
 $RuntimeScript = Join-Path $ScriptDir "utils\runtime.py"
 

@@ -15,7 +15,9 @@
 #   ./run_docker_benchmark.sh sample             # sampled kernels only
 #
 # Options:
-#   --cores N              dedicated cores -> --cpuset-cpus=0-(N-1)   (default 4)
+#   --cores N              N physical cores for --cpuset-cpus (default 4).
+#                          Picks one logical CPU per core (e.g. 0,2,4,6), not
+#                          SMT siblings 0-(N-1) which are only N/2 real cores.
 #   --onednn-verbose N     ONEDNN_VERBOSE override (0..2)             (default 0)
 #   --verbose-tracing      shorthand for --onednn-verbose 1
 #   --no-cache             docker build --no-cache
@@ -122,7 +124,58 @@ if [[ -z "${ML_ENGINE_DOCKER_SG:-}" ]] && ! docker info >/dev/null 2>&1; then
   fi
 fi
 
-CPUSET="0-$((CORES - 1))"
+# One logical CPU per physical core (SMT-aware). "0-3" on this Ryzen is only
+# two cores (siblings 0-1 and 2-3); we want e.g. 0,2,4,6 for --cores 4.
+CPUSET="$("$PYTHON" - "$CORES" <<'PY'
+import os
+import sys
+
+def parse_siblings(text: str) -> set[int]:
+    out: set[int] = set()
+    for part in text.strip().split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+need = max(1, int(sys.argv[1]))
+base = "/sys/devices/system/cpu"
+try:
+    present = sorted(
+        int(name[3:])
+        for name in os.listdir(base)
+        if name.startswith("cpu") and name[3:].isdigit()
+    )
+except OSError:
+    present = list(range(need))
+
+chosen: list[int] = []
+seen_cores: set[frozenset[int]] = set()
+for cpu in present:
+    path = f"{base}/cpu{cpu}/topology/thread_siblings_list"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            sibs = frozenset(parse_siblings(fh.read()))
+    except OSError:
+        sibs = frozenset([cpu])
+    if sibs in seen_cores:
+        continue
+    seen_cores.add(sibs)
+    chosen.append(min(sibs))
+    if len(chosen) >= need:
+        break
+
+if len(chosen) < need:
+    # Topology incomplete; fall back to contiguous logical CPUs.
+    chosen = list(range(need))
+print(",".join(str(c) for c in chosen))
+PY
+)"
 
 if [[ ! -f "$RUNTIME_SCRIPT" ]]; then
   echo "[ERROR] Missing runtime loader: $RUNTIME_SCRIPT" >&2

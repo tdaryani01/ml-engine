@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <vector>
 #include <omp.h>
@@ -6071,6 +6072,553 @@ static inline bool try_cout_blocked_dx(
 }
 // --- end Option D experiment ---------------------------------------------------
 
+// --- BRGEMM-style dW (oneDNN bwd_w loop shape, AVX2, no full im2col) ----------
+// Matches MKL-DNN brgemm_convolution_bwd_weights structure for our shapes:
+//   1) pack src / diff_dst so channel blocks are contiguous
+//   2) for each (kh,kw): C[ic_block,oc_block] += Σ_{n,oh} A(oh) @ B(oh)
+//      where spatial width is the GEMM K and (n,oh) is the BRGEMM batch
+// Gates: stride-1, K=7, Cin%8==0, Cout%8==0 (layer-1 on the CNN bench).
+// Layer-0 (Cin=3) keeps the existing specialist path.
+// ---------------------------------------------------------------------------
+static constexpr int64_t BRG_DW_IC = 8;
+static constexpr int64_t BRG_DW_OC = 8;
+static constexpr int32_t BRG_DW_X_STAGE_MAX = 8;
+
+struct BrgDwXStage {
+    const float* src = nullptr;
+    int64_t N = 0;
+    int64_t C_in = 0;
+    int64_t H = 0;
+    int64_t W_in = 0;
+    int64_t src_row_stride = 0;
+    int64_t x_pad_l = 0;
+    int64_t W_ext = 0;
+    float* buf = nullptr;
+    size_t cap_floats = 0;
+    bool valid = false;
+};
+
+static BrgDwXStage g_brg_dw_x_stage[BRG_DW_X_STAGE_MAX];
+
+static thread_local float* tls_brg_dy_pack = nullptr;
+static thread_local size_t tls_brg_dy_cap = 0;
+static thread_local float* tls_brg_x_pack = nullptr;
+static thread_local size_t tls_brg_x_cap = 0;
+
+static float* brg_dw_alloc(float*& slot, size_t& cap, size_t need) {
+    if (need <= cap && slot) return slot;
+    std::free(slot);
+    const size_t bytes = ((need * sizeof(float)) + 63u) & ~(size_t)63u;
+    slot = (float*)std::aligned_alloc(64, bytes);
+    cap = slot ? (bytes / sizeof(float)) : 0;
+    return slot;
+}
+
+static float* brg_dw_stage_alloc(BrgDwXStage& slot, size_t need) {
+    if (slot.buf && need <= slot.cap_floats) return slot.buf;
+    std::free(slot.buf);
+    const size_t bytes = ((need * sizeof(float)) + 63u) & ~(size_t)63u;
+    slot.buf = (float*)std::aligned_alloc(64, bytes);
+    slot.cap_floats = slot.buf ? (bytes / sizeof(float)) : 0;
+    return slot.buf;
+}
+
+static bool brg_dw_x_geom_ok(
+    int64_t C_in, int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride
+) {
+    return stride == 1 && k_h == 7 && k_w == 7
+        && (C_in % BRG_DW_IC) == 0 && (C_out % BRG_DW_OC) == 0;
+}
+
+// x: NCHW -> [N][nb_ic][H][W_ext][8]. parallel=true uses OMP team; false = main/serial.
+static void brg_pack_x_blocked(
+    const float* __restrict x,
+    float* __restrict out,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t x_pad_l, int64_t W_ext,
+    bool parallel
+) {
+    const int64_t nb_ic = C_in / BRG_DW_IC;
+    const int64_t plane = H * W_ext * BRG_DW_IC;
+    if (parallel) {
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t ib = 0; ib < nb_ic; ++ib) {
+                for (int64_t ih = 0; ih < H; ++ih) {
+                    float* __restrict dst =
+                        &out[(n * nb_ic + ib) * plane
+                             + ih * W_ext * BRG_DW_IC];
+                    std::memset(
+                        dst, 0, (size_t)W_ext * BRG_DW_IC * sizeof(float));
+                    for (int64_t iw = 0; iw < W_in; ++iw) {
+                        float* __restrict d = &dst[(x_pad_l + iw) * BRG_DW_IC];
+                        for (int64_t c = 0; c < BRG_DW_IC; ++c) {
+                            const int64_t cin = ib * BRG_DW_IC + c;
+                            d[c] = x[(n * C_in + cin) * H * W_in_stride
+                                     + ih * W_in_stride + iw];
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for (int64_t n = 0; n < N; ++n) {
+            for (int64_t ib = 0; ib < nb_ic; ++ib) {
+                for (int64_t ih = 0; ih < H; ++ih) {
+                    float* __restrict dst =
+                        &out[(n * nb_ic + ib) * plane
+                             + ih * W_ext * BRG_DW_IC];
+                    std::memset(
+                        dst, 0, (size_t)W_ext * BRG_DW_IC * sizeof(float));
+                    for (int64_t iw = 0; iw < W_in; ++iw) {
+                        float* __restrict d = &dst[(x_pad_l + iw) * BRG_DW_IC];
+                        for (int64_t c = 0; c < BRG_DW_IC; ++c) {
+                            const int64_t cin = ib * BRG_DW_IC + c;
+                            d[c] = x[(n * C_in + cin) * H * W_in_stride
+                                     + ih * W_in_stride + iw];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static float* brg_dw_x_stage_lookup(
+    const float* src, int64_t N, int64_t C_in, int64_t H, int64_t W_in,
+    int64_t src_row_stride, int64_t x_pad_l, int64_t W_ext
+) {
+    for (int32_t i = 0; i < BRG_DW_X_STAGE_MAX; ++i) {
+        const BrgDwXStage& s = g_brg_dw_x_stage[i];
+        if (!s.valid || !s.buf || s.src != src) continue;
+        if (s.N != N || s.C_in != C_in || s.H != H || s.W_in != W_in) continue;
+        if (s.src_row_stride != src_row_stride || s.x_pad_l != x_pad_l
+            || s.W_ext != W_ext) {
+            continue;
+        }
+        return s.buf;
+    }
+    return nullptr;
+}
+
+// Fill a durable slot (main-thread prepare, or publish after fwd). Serial pack.
+static int32_t brg_dw_x_stage_store(
+    int32_t slot_idx, const float* x,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t k_w, int64_t pad
+) {
+    if (slot_idx < 0 || slot_idx >= BRG_DW_X_STAGE_MAX) return -1;
+    if (!x || N <= 0 || (C_in % BRG_DW_IC) != 0) return -2;
+    BrgDwXStage& slot = g_brg_dw_x_stage[slot_idx];
+    slot.valid = false;
+    const int64_t x_pad_l = pad;
+    const int64_t W_ext = x_pad_l + W_in + (k_w - 1);
+    const int64_t nb_ic = C_in / BRG_DW_IC;
+    const size_t need = (size_t)N * (size_t)nb_ic * (size_t)H
+        * (size_t)W_ext * (size_t)BRG_DW_IC;
+    float* buf = brg_dw_stage_alloc(slot, need);
+    if (!buf) return -3;
+    brg_pack_x_blocked(
+        x, buf, N, C_in, H, W_in, W_in_stride, x_pad_l, W_ext,
+        /*parallel=*/false
+    );
+    slot.src = x;
+    slot.N = N;
+    slot.C_in = C_in;
+    slot.H = H;
+    slot.W_in = W_in;
+    slot.src_row_stride = W_in_stride;
+    slot.x_pad_l = x_pad_l;
+    slot.W_ext = W_ext;
+    slot.valid = true;
+    return 0;
+}
+
+// Main thread: prepare_step overlap (layer-0 when Cin%8==0).
+extern "C" ML_ENGINE_EXPORT int32_t stage_brgemm_dw_x_pack(
+    int32_t slot_idx, const float* x,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t k_w, int64_t pad
+) {
+    return brg_dw_x_stage_store(
+        slot_idx, x, N, C_in, H, W_in, W_in_stride, k_w, pad
+    );
+}
+
+// After conv fwd: publish this layer's x pack for its upcoming dW (L1 path).
+extern "C" ML_ENGINE_EXPORT int32_t publish_brgemm_dw_x_pack(
+    const float* x,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride, int64_t pad
+) {
+    if (!brg_dw_x_geom_ok(C_in, C_out, k_h, k_w, stride)) return 1; // skip
+    // Prefer an existing entry for this src, else first free, else slot 0.
+    int32_t slot_i = -1;
+    int32_t free_i = -1;
+    for (int32_t i = 0; i < BRG_DW_X_STAGE_MAX; ++i) {
+        if (g_brg_dw_x_stage[i].src == x) {
+            slot_i = i;
+            break;
+        }
+        if (free_i < 0 && !g_brg_dw_x_stage[i].valid) free_i = i;
+    }
+    if (slot_i < 0) slot_i = (free_i >= 0) ? free_i : 0;
+    return brg_dw_x_stage_store(
+        slot_i, x, N, C_in, H, W_in, W_in_stride, k_w, pad
+    );
+}
+
+extern "C" ML_ENGINE_EXPORT void invalidate_brgemm_dw_x_pack(int32_t slot_idx) {
+    if (slot_idx < 0) {
+        for (int32_t i = 0; i < BRG_DW_X_STAGE_MAX; ++i) {
+            g_brg_dw_x_stage[i].valid = false;
+        }
+    } else if (slot_idx < BRG_DW_X_STAGE_MAX) {
+        g_brg_dw_x_stage[slot_idx].valid = false;
+    }
+}
+
+// Mid-step pack handoff: async worker posts; Python main packs while OMP runs.
+enum : int32_t {
+    BRG_PACK_IDLE = 0,
+    BRG_PACK_PENDING = 1,
+};
+
+struct BrgPackRequest {
+    int32_t state = BRG_PACK_IDLE;
+    const float* x = nullptr;
+    int64_t N = 0;
+    int64_t C_in = 0;
+    int64_t H = 0;
+    int64_t W_in = 0;
+    int64_t W_in_stride = 0;
+    int64_t C_out = 0;
+    int64_t k_h = 0;
+    int64_t k_w = 0;
+    int64_t stride = 0;
+    int64_t pad = 0;
+};
+
+static BrgPackRequest g_brg_pack_req;
+static std::mutex g_brg_pack_mtx;
+
+// Worker: ask main to pack this x for upcoming BRGEMM dW. Non-blocking.
+// Returns 0 if queued/already staged, 1 if geometry skips, <0 on error.
+extern "C" ML_ENGINE_EXPORT int32_t request_brgemm_dw_x_pack(
+    const float* x,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride, int64_t pad
+) {
+    if (!brg_dw_x_geom_ok(C_in, C_out, k_h, k_w, stride) || !x || N <= 0) {
+        return 1;
+    }
+    const int64_t x_pad_l = pad;
+    const int64_t W_ext = x_pad_l + W_in + (k_w - 1);
+    if (brg_dw_x_stage_lookup(
+            x, N, C_in, H, W_in, W_in_stride, x_pad_l, W_ext
+        )) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_brg_pack_mtx);
+    if (g_brg_pack_req.state == BRG_PACK_PENDING) {
+        if (g_brg_pack_req.x == x) return 0;
+        return -2; // prior request still waiting on main
+    }
+    g_brg_pack_req.x = x;
+    g_brg_pack_req.N = N;
+    g_brg_pack_req.C_in = C_in;
+    g_brg_pack_req.H = H;
+    g_brg_pack_req.W_in = W_in;
+    g_brg_pack_req.W_in_stride = W_in_stride;
+    g_brg_pack_req.C_out = C_out;
+    g_brg_pack_req.k_h = k_h;
+    g_brg_pack_req.k_w = k_w;
+    g_brg_pack_req.stride = stride;
+    g_brg_pack_req.pad = pad;
+    g_brg_pack_req.state = BRG_PACK_PENDING;
+    return 0;
+}
+
+// Main/Python: drain one pending pack request (serial pack into durable stage).
+// Returns 1 if packed, 0 if nothing pending, <0 on failure.
+extern "C" ML_ENGINE_EXPORT int32_t service_brgemm_dw_x_pack_requests(void) {
+    const float* x = nullptr;
+    int64_t N = 0, C_in = 0, H = 0, W_in = 0, W_in_stride = 0;
+    int64_t C_out = 0, k_h = 0, k_w = 0, stride = 0, pad = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_brg_pack_mtx);
+        if (g_brg_pack_req.state != BRG_PACK_PENDING) return 0;
+        x = g_brg_pack_req.x;
+        N = g_brg_pack_req.N;
+        C_in = g_brg_pack_req.C_in;
+        H = g_brg_pack_req.H;
+        W_in = g_brg_pack_req.W_in;
+        W_in_stride = g_brg_pack_req.W_in_stride;
+        C_out = g_brg_pack_req.C_out;
+        k_h = g_brg_pack_req.k_h;
+        k_w = g_brg_pack_req.k_w;
+        stride = g_brg_pack_req.stride;
+        pad = g_brg_pack_req.pad;
+    }
+    const int32_t rc = publish_brgemm_dw_x_pack(
+        x, N, C_in, H, W_in, W_in_stride, C_out, k_h, k_w, stride, pad
+    );
+    {
+        std::lock_guard<std::mutex> lock(g_brg_pack_mtx);
+        // Only clear if this is still the same pending request.
+        if (g_brg_pack_req.state == BRG_PACK_PENDING && g_brg_pack_req.x == x) {
+            g_brg_pack_req.state = BRG_PACK_IDLE;
+        }
+    }
+    return (rc < 0) ? rc : 1;
+}
+
+extern "C" ML_ENGINE_EXPORT void reset_brgemm_dw_x_pack_request(void) {
+    std::lock_guard<std::mutex> lock(g_brg_pack_mtx);
+    g_brg_pack_req.state = BRG_PACK_IDLE;
+}
+
+// dy: NCHW planar cout -> [N][OH][nb_oc][OW][8]  (ow-major, then oc in block)
+static void brg_pack_dy_blocked(
+    const float* __restrict d_conv,
+    float* __restrict out,
+    int64_t N, int64_t C_out, int64_t OH, int64_t OW,
+    int64_t conv_out_w_stride, int64_t conv_spatial
+) {
+    const int64_t nb_oc = C_out / BRG_DW_OC;
+    #pragma omp parallel for collapse(3) schedule(static)
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t oh = 0; oh < OH; ++oh) {
+            for (int64_t ob = 0; ob < nb_oc; ++ob) {
+                float* __restrict dst =
+                    &out[(((n * OH + oh) * nb_oc + ob) * OW) * BRG_DW_OC];
+                for (int64_t ow = 0; ow < OW; ++ow) {
+                    for (int64_t c = 0; c < BRG_DW_OC; ++c) {
+                        const int64_t cout = ob * BRG_DW_OC + c;
+                        dst[ow * BRG_DW_OC + c] = d_conv[
+                            (n * C_out + cout) * conv_spatial
+                            + oh * conv_out_w_stride + ow];
+                    }
+                }
+            }
+        }
+    }
+}
+
+// C[8][8] += A[8][OW] * B[OW][8]  (A: ic x ow, B: ow x oc)
+static inline void brg_dw_gemm_ic8_oc8(
+    const float* __restrict A, // ic-major: A[ci * OW + ow]
+    const float* __restrict B, // ow-major: B[ow * 8 + co]
+    int64_t OW,
+    __m256* __restrict Crow // 8 accumulators, one per ic lane, each holds 8 oc
+) {
+    for (int64_t ow = 0; ow < OW; ++ow) {
+        const __m256 bv = _mm256_loadu_ps(B + ow * BRG_DW_OC);
+        for (int64_t ci = 0; ci < BRG_DW_IC; ++ci) {
+            Crow[ci] = _mm256_fmadd_ps(
+                _mm256_set1_ps(A[ci * OW + ow]), bv, Crow[ci]);
+        }
+    }
+}
+
+static bool try_brgemm_style_dw(
+    const float* d_conv_buf, const float* x, float* dW,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride, int64_t pad,
+    int64_t conv_out_w_stride, float inv_m, int64_t dw_prezeroed,
+    float* dy_pack_opt
+) {
+    if (!brg_dw_x_geom_ok(C_in, C_out, k_h, k_w, stride)) return false;
+    if (!dW || !x || !d_conv_buf || N <= 0) return false;
+
+    const int64_t OH = (H + 2 * pad - k_h) / stride + 1;
+    const int64_t OW = (W_in + 2 * pad - k_w) / stride + 1;
+    if (OH <= 0 || OW <= 0 || OW > 64) return false;
+
+    const int64_t conv_spatial = OH * conv_out_w_stride;
+    const int64_t k_spatial = k_h * k_w;
+    const int64_t nb_ic = C_in / BRG_DW_IC;
+    const int64_t nb_oc = C_out / BRG_DW_OC;
+    const int64_t x_pad_l = pad;
+    const int64_t W_ext = x_pad_l + W_in + (k_w - 1);
+
+    float* dy_pack = dy_pack_opt;
+    if (!dy_pack) {
+        const size_t dy_need = (size_t)N * (size_t)OH * (size_t)nb_oc
+            * (size_t)OW * (size_t)BRG_DW_OC;
+        dy_pack = brg_dw_alloc(tls_brg_dy_pack, tls_brg_dy_cap, dy_need);
+        if (!dy_pack) return false;
+        brg_pack_dy_blocked(
+            d_conv_buf, dy_pack, N, C_out, OH, OW, conv_out_w_stride,
+            conv_spatial);
+    }
+
+    // Prefer prepare/fwd-published pack (main-thread or post-fwd overlap).
+    float* x_pack = brg_dw_x_stage_lookup(
+        x, N, C_in, H, W_in, W_in_stride, x_pad_l, W_ext
+    );
+    if (!x_pack) {
+        const size_t x_need = (size_t)N * (size_t)nb_ic * (size_t)H
+            * (size_t)W_ext * (size_t)BRG_DW_IC;
+        x_pack = brg_dw_alloc(tls_brg_x_pack, tls_brg_x_cap, x_need);
+        if (!x_pack) return false;
+        brg_pack_x_blocked(
+            x, x_pack, N, C_in, H, W_in, W_in_stride, x_pad_l, W_ext,
+            /*parallel=*/true
+        );
+    }
+
+    if (!dw_prezeroed) {
+        std::memset(dW, 0, (size_t)(C_out * C_in * k_spatial) * sizeof(float));
+    }
+
+    // Parallel over channel tiles; each (ic_b,oc_b) owns a disjoint dW slice.
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t ic_b = 0; ic_b < nb_ic; ++ic_b) {
+        for (int64_t oc_b = 0; oc_b < nb_oc; ++oc_b) {
+            for (int64_t kh = 0; kh < k_h; ++kh) {
+                for (int64_t kw = 0; kw < k_w; ++kw) {
+                    __m256 Crow[BRG_DW_IC];
+                    for (int64_t ci = 0; ci < BRG_DW_IC; ++ci) {
+                        Crow[ci] = _mm256_setzero_ps();
+                    }
+
+                    for (int64_t n = 0; n < N; ++n) {
+                        for (int64_t oh = 0; oh < OH; ++oh) {
+                            const int64_t ih = oh - pad + kh;
+                            if (ih < 0 || ih >= H) continue;
+
+                            const float* __restrict x_base =
+                                &x_pack[((n * nb_ic + ic_b) * H + ih) * W_ext
+                                        * BRG_DW_IC];
+                            const float* __restrict B =
+                                &dy_pack[(((n * OH + oh) * nb_oc + oc_b) * OW)
+                                         * BRG_DW_OC];
+                            // Direct outer-product over OW — no A_row gather.
+                            for (int64_t ow = 0; ow < OW; ++ow) {
+                                const __m256 bv =
+                                    _mm256_loadu_ps(B + ow * BRG_DW_OC);
+                                const float* __restrict xp =
+                                    &x_base[(ow + kw) * BRG_DW_IC];
+                                for (int64_t ci = 0; ci < BRG_DW_IC; ++ci) {
+                                    Crow[ci] = _mm256_fmadd_ps(
+                                        _mm256_set1_ps(xp[ci]), bv, Crow[ci]);
+                                }
+                            }
+                        }
+                    }
+
+                    alignas(32) float Cstore[BRG_DW_IC][BRG_DW_OC];
+                    for (int64_t ci = 0; ci < BRG_DW_IC; ++ci) {
+                        _mm256_store_ps(Cstore[ci], Crow[ci]);
+                    }
+                    for (int64_t co = 0; co < BRG_DW_OC; ++co) {
+                        for (int64_t ci = 0; ci < BRG_DW_IC; ++ci) {
+                            const int64_t cout = oc_b * BRG_DW_OC + co;
+                            const int64_t cin = ic_b * BRG_DW_IC + ci;
+                            dW[((cout * C_in + cin) * k_spatial) + kh * k_w + kw]
+                                += Cstore[ci][co] * inv_m;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// BRGEMM-style dX: pack dy to oc-blocks; for each spatial dx pixel, reduce
+// over (kh,kw,oc_b) with 8-wide dy × 8-wide W rows (same grads as cin-blocked).
+static bool try_brgemm_style_dx(
+    const float* d_conv_buf, const float* W, float* dx,
+    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
+    int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride, int64_t pad,
+    int64_t conv_out_h, int64_t conv_out_w, int64_t conv_out_w_stride,
+    float* dy_pack_opt
+) {
+    if (!brg_dw_x_geom_ok(C_in, C_out, k_h, k_w, stride)) return false;
+    if (!dx || !W || !d_conv_buf || N <= 0) return false;
+    if (k_h != 7 || k_w != 7) return false;
+
+    const int64_t OH = conv_out_h;
+    const int64_t OW = conv_out_w;
+    if (OH <= 0 || OW <= 0 || OW > 64) return false;
+
+    const int64_t conv_spatial = OH * conv_out_w_stride;
+    const int64_t nb_ic = C_in / BRG_DW_IC;
+    const int64_t nb_oc = C_out / BRG_DW_OC;
+    const int64_t spatial_in = H * W_in_stride;
+
+    float* dy_pack = dy_pack_opt;
+    if (!dy_pack) {
+        const size_t dy_need = (size_t)N * (size_t)OH * (size_t)nb_oc
+            * (size_t)OW * (size_t)BRG_DW_OC;
+        dy_pack = brg_dw_alloc(tls_brg_dy_pack, tls_brg_dy_cap, dy_need);
+        if (!dy_pack) return false;
+        brg_pack_dy_blocked(
+            d_conv_buf, dy_pack, N, C_out, OH, OW, conv_out_w_stride,
+            conv_spatial);
+    }
+
+    float* Wt = staged_dx_wt_lookup(W, C_out, C_in, k_h);
+    if (!Wt) {
+        Wt = acquire_dx_cin_blocked_wt_buf((size_t)(C_out * k_h * k_w * C_in));
+        if (!Wt) return false;
+        transpose_dx_cin_blocked_wt(W, Wt, C_out, C_in, k_h);
+    }
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int64_t n = 0; n < N; ++n) {
+        for (int64_t ic_b = 0; ic_b < nb_ic; ++ic_b) {
+            // Own this (n, ic_b) dx slab: accumulate over all (oh,ow,kh,kw,oc).
+            float* __restrict dx_slab =
+                &dx[(n * C_in + ic_b * BRG_DW_IC) * spatial_in];
+            for (int64_t kh = 0; kh < k_h; ++kh) {
+                for (int64_t kw = 0; kw < k_w; ++kw) {
+                    for (int64_t oc_b = 0; oc_b < nb_oc; ++oc_b) {
+                        alignas(32) __m256 w_oc[BRG_DW_OC];
+                        for (int64_t o = 0; o < BRG_DW_OC; ++o) {
+                            const int64_t cout = oc_b * BRG_DW_OC + o;
+                            w_oc[o] = _mm256_load_ps(
+                                &Wt[(((cout * k_h + kh) * k_w + kw) * C_in)
+                                    + ic_b * BRG_DW_IC]);
+                        }
+                        for (int64_t oh = 0; oh < OH; ++oh) {
+                            const int64_t ih = oh - pad + kh;
+                            if (ih < 0 || ih >= H) continue;
+                            const float* __restrict dy_row =
+                                &dy_pack[(((n * OH + oh) * nb_oc + oc_b) * OW)
+                                         * BRG_DW_OC];
+                            float* __restrict dx_row =
+                                &dx_slab[ih * W_in_stride];
+                            for (int64_t ow = 0; ow < OW; ++ow) {
+                                const int64_t iw = ow - pad + kw;
+                                if (iw < 0 || iw >= W_in) continue;
+                                const float* __restrict dy =
+                                    dy_row + ow * BRG_DW_OC;
+                                __m256 acc = _mm256_setzero_ps();
+                                for (int64_t o = 0; o < BRG_DW_OC; ++o) {
+                                    acc = _mm256_fmadd_ps(
+                                        _mm256_set1_ps(dy[o]), w_oc[o], acc);
+                                }
+                                float* __restrict dst = dx_row + iw;
+                                // Planar cin: lane c at dst[c * spatial_in]
+                                alignas(32) float lanes[8];
+                                _mm256_store_ps(lanes, acc);
+                                for (int64_t c = 0; c < BRG_DW_IC; ++c) {
+                                    dst[c * spatial_in] += lanes[c];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+// --- end BRGEMM-style dW/dX ----------------------------------------------------
+
 void conv2d_backward_fallback_avx2(
     const float* d_conv_buf, const float* x, const float* W,
     float* dx, float* dW,
@@ -6085,7 +6633,7 @@ void conv2d_backward_fallback_avx2(
     const int64_t k_spatial    = k_h * k_w;
 
     bool do_dx = (dx && W);
-    const bool do_dw = (dW && x);
+    bool do_dw = (dW && x);
 
     if (do_dx) {
         if (!dx_prezeroed) {
@@ -6099,7 +6647,47 @@ void conv2d_backward_fallback_avx2(
         std::memset(dW, 0, (size_t)(C_out * C_in * k_spatial) * sizeof(float));
     }
 
+    // Prefer BRGEMM-style dW/dX when geometry matches (before pad/nci spray).
+    float* shared_dy_pack = nullptr;
+    if ((do_dw || do_dx) &&
+        brg_dw_x_geom_ok(C_in, C_out, k_h, k_w, stride)) {
+        const int64_t OH = conv_out_h;
+        const int64_t OW = conv_out_w;
+        if (OH > 0 && OW > 0 && OW <= 64) {
+            const int64_t nb_oc = C_out / BRG_DW_OC;
+            const size_t dy_need = (size_t)N * (size_t)OH * (size_t)nb_oc
+                * (size_t)OW * (size_t)BRG_DW_OC;
+            shared_dy_pack =
+                brg_dw_alloc(tls_brg_dy_pack, tls_brg_dy_cap, dy_need);
+            if (shared_dy_pack) {
+                brg_pack_dy_blocked(
+                    d_conv_buf, shared_dy_pack, N, C_out, OH, OW,
+                    conv_out_w_stride, conv_spatial);
+            }
+        }
+    }
+
+    if (do_dw &&
+        try_brgemm_style_dw(
+            d_conv_buf, x, dW,
+            N, C_in, H, W_in, W_in_stride,
+            C_out, k_h, k_w, stride, pad,
+            conv_out_w_stride, inv_m, /*dw_prezeroed=*/1,
+            shared_dy_pack
+        )) {
+        do_dw = false;
+    }
+
     if (do_dx && !force_dx_crawl_enabled() &&
+        try_brgemm_style_dx(
+            d_conv_buf, W, dx,
+            N, C_in, H, W_in, W_in_stride,
+            C_out, k_h, k_w, stride, pad,
+            conv_out_h, conv_out_w, conv_out_w_stride,
+            shared_dy_pack
+        )) {
+        do_dx = false;
+    } else if (do_dx && !force_dx_crawl_enabled() &&
         try_cin_blocked_dx(
             k_h, k_w, stride, C_in,
             d_conv_buf, W, dx,
