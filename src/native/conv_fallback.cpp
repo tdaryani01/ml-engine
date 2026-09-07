@@ -5856,9 +5856,11 @@ static void conv2d_backward_dx_cin_blocked_avx2(
     }
 }
 
-// Dispatch, mirroring stride1_specialist_k()/stride1_try_*_specialist(): only
-// K=5,6,7 are wired up (the sizes where the crawl was shown to fall behind
-// PyTorch); K<=4 keep using the existing tile-queue path untouched.
+// Dispatch, mirroring stride1_specialist_k()/stride1_try_*_specialist().
+// Square K in [1, DX_BLOCKED_K_MAX] for Cin%8==0 layers (fallback when BRGEMM
+// does not take the call). K>7 without a Stride1Specialist still land here.
+static constexpr int64_t DX_BLOCKED_K_MAX = 11;
+
 static inline bool try_cin_blocked_dx(
     int64_t k_h, int64_t k_w, int64_t stride, int64_t C_in,
     const float* d_conv_buf, const float* W, float* dx,
@@ -5869,7 +5871,34 @@ static inline bool try_cin_blocked_dx(
     if (stride != 1 || k_h != k_w || (C_in % 8) != 0) {
         return false;
     }
+    if (k_h < 1 || k_h > DX_BLOCKED_K_MAX) {
+        return false;
+    }
     switch (k_h) {
+        case 1:
+            conv2d_backward_dx_cin_blocked_avx2<1>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 2:
+            conv2d_backward_dx_cin_blocked_avx2<2>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 3:
+            conv2d_backward_dx_cin_blocked_avx2<3>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 4:
+            conv2d_backward_dx_cin_blocked_avx2<4>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
         case 5:
             conv2d_backward_dx_cin_blocked_avx2<5>(
                 d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
@@ -5888,6 +5917,30 @@ static inline bool try_cin_blocked_dx(
                 C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
             );
             return true;
+        case 8:
+            conv2d_backward_dx_cin_blocked_avx2<8>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 9:
+            conv2d_backward_dx_cin_blocked_avx2<9>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 10:
+            conv2d_backward_dx_cin_blocked_avx2<10>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 11:
+            conv2d_backward_dx_cin_blocked_avx2<11>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
         default:
             return false;
     }
@@ -5895,13 +5948,12 @@ static inline bool try_cin_blocked_dx(
 // --- end Option B experiment --------------------------------------------------
 
 // --- Option D experiment: C_out-blocked backward-dX ---------------------------
-// For layers where C_in fails Option B's C_in%8==0 gate (e.g. layer 1: C_in=3)
+// For layers where C_in fails Option B's C_in%8==0 gate (e.g. layer 0: C_in=3)
 // but C_out is a clean AVX2 width (C_out%8==0), vectorize the reduction over
 // output channels at a fixed spatial position instead of over input channels.
 // Requires dY transposed to channel-last [N][H_out][W_out][C_out] and W
 // transposed to [C_in][K][K][C_out] (both done once per call, amortized).
-// Validated in benchmark_diagnostics: correct vs. naive reference, ~50% faster
-// in isolation for layer 1's exact dims (C_in=3, C_out=8, K=7, 28x28->24x24).
+// Template is K-generic; dispatch covers square K in [1, DX_BLOCKED_K_MAX].
 // Gated behind ML_ENGINE_FORCE_DX_CRAWL like Option B for A/B testing.
 static bool dx_cout_blocked_disabled() {
     static bool val = [] {
@@ -5992,62 +6044,33 @@ static void conv2d_backward_dx_cout_blocked_avx2(
             const int64_t kh_hi = std::min<int64_t>(K - 1, ih + pad);
             for (int64_t cin = 0; cin < C_in; ++cin) {
                 const float* __restrict w_cin = &Wt[cin * K * K * C_out];
+                float* __restrict dx_row =
+                    &dx[(n * C_in + cin) * H * W_in_stride + ih * W_in_stride];
                 for (int64_t iw = 0; iw < W_in; ++iw) {
-                    const int64_t kw_lo =
-                        std::max<int64_t>(0, iw + pad - (conv_out_w - 1));
+                    const int64_t kw_lo = std::max<int64_t>(0, iw + pad - (conv_out_w - 1));
                     const int64_t kw_hi = std::min<int64_t>(K - 1, iw + pad);
-                    // Four accumulators: one dependent FMA chain runs at latency,
-                    // four interleaved chains run at throughput.
-                    __m256 acc0 = _mm256_setzero_ps();
-                    __m256 acc1 = _mm256_setzero_ps();
-                    __m256 acc2 = _mm256_setzero_ps();
-                    __m256 acc3 = _mm256_setzero_ps();
+                    __m256 acc = _mm256_setzero_ps();
                     for (int64_t kh = kh_lo; kh <= kh_hi; ++kh) {
                         const int64_t oh = ih - kh + pad;
-                        const float* __restrict dy_row =
-                            &dY_b[(n * conv_out_h + oh) * conv_out_w * C_out];
-                        const float* __restrict w_kh = w_cin + kh * K * C_out;
-                        int64_t kw = kw_lo;
-                        for (; kw + 3 <= kw_hi; kw += 4) {
+                        for (int64_t kw = kw_lo; kw <= kw_hi; ++kw) {
                             const int64_t ow = iw - kw + pad;
-                            acc0 = _mm256_fmadd_ps(
-                                _mm256_loadu_ps(dy_row + ow * C_out),
-                                _mm256_loadu_ps(w_kh + kw * C_out), acc0);
-                            acc1 = _mm256_fmadd_ps(
-                                _mm256_loadu_ps(dy_row + (ow - 1) * C_out),
-                                _mm256_loadu_ps(w_kh + (kw + 1) * C_out), acc1);
-                            acc2 = _mm256_fmadd_ps(
-                                _mm256_loadu_ps(dy_row + (ow - 2) * C_out),
-                                _mm256_loadu_ps(w_kh + (kw + 2) * C_out), acc2);
-                            acc3 = _mm256_fmadd_ps(
-                                _mm256_loadu_ps(dy_row + (ow - 3) * C_out),
-                                _mm256_loadu_ps(w_kh + (kw + 3) * C_out), acc3);
-                        }
-                        for (; kw <= kw_hi; ++kw) {
-                            const int64_t ow = iw - kw + pad;
-                            acc0 = _mm256_fmadd_ps(
-                                _mm256_loadu_ps(dy_row + ow * C_out),
-                                _mm256_loadu_ps(w_kh + kw * C_out), acc0);
+                            const float* __restrict dy =
+                                &dY_b[((n * conv_out_h + oh) * conv_out_w + ow) * C_out];
+                            const float* __restrict ww =
+                                &w_cin[(kh * K + kw) * C_out];
+                            acc = _mm256_fmadd_ps(
+                                _mm256_loadu_ps(dy), _mm256_loadu_ps(ww), acc);
                         }
                     }
-                    const __m256 acc = _mm256_add_ps(
-                        _mm256_add_ps(acc0, acc1), _mm256_add_ps(acc2, acc3));
-                    const __m128 lo = _mm256_castps256_ps128(acc);
-                    const __m128 hi = _mm256_extractf128_ps(acc, 1);
-                    __m128 s = _mm_add_ps(lo, hi);
-                    s = _mm_hadd_ps(s, s);
-                    s = _mm_hadd_ps(s, s);
-                    dx[(n * C_in + cin) * H * W_in_stride + ih * W_in_stride + iw] =
-                        _mm_cvtss_f32(s);
+                    dx_row[iw] += _mm256_reduce_add_ps(acc);
                 }
             }
         }
     }
 }
 
-// Dispatch: only fires when Option B's C_in%8==0 gate fails (checked by the
-// caller ordering in conv2d_backward_fallback_avx2), C_out%8==0, and only
-// K==7 is validated so far (matches layer 1: C_in=3, C_out=8, K=7).
+// Dispatch: Option B miss (C_in%8!=0) + C_out==8 + square K in [1, DX_BLOCKED_K_MAX].
+// This is the L0 (Cin=3) fast path; K=7-only was why K=6 crawled.
 static inline bool try_cout_blocked_dx(
     int64_t k_h, int64_t k_w, int64_t stride, int64_t C_out,
     const float* d_conv_buf, const float* W, float* dx,
@@ -6061,14 +6084,79 @@ static inline bool try_cout_blocked_dx(
     if (stride != 1 || k_h != k_w || C_out != 8) {
         return false; // only C_out==8 (single 8-wide block) is implemented
     }
-    if (k_h != 7) {
-        return false; // only K=7 validated so far
+    if (k_h < 1 || k_h > DX_BLOCKED_K_MAX) {
+        return false;
     }
-    conv2d_backward_dx_cout_blocked_avx2<7>(
-        d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
-        C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
-    );
-    return true;
+    switch (k_h) {
+        case 1:
+            conv2d_backward_dx_cout_blocked_avx2<1>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 2:
+            conv2d_backward_dx_cout_blocked_avx2<2>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 3:
+            conv2d_backward_dx_cout_blocked_avx2<3>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 4:
+            conv2d_backward_dx_cout_blocked_avx2<4>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 5:
+            conv2d_backward_dx_cout_blocked_avx2<5>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 6:
+            conv2d_backward_dx_cout_blocked_avx2<6>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 7:
+            conv2d_backward_dx_cout_blocked_avx2<7>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 8:
+            conv2d_backward_dx_cout_blocked_avx2<8>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 9:
+            conv2d_backward_dx_cout_blocked_avx2<9>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 10:
+            conv2d_backward_dx_cout_blocked_avx2<10>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        case 11:
+            conv2d_backward_dx_cout_blocked_avx2<11>(
+                d_conv_buf, W, dx, N, C_in, H, W_in, W_in_stride,
+                C_out, pad, conv_out_h, conv_out_w, conv_out_w_stride
+            );
+            return true;
+        default:
+            return false;
+    }
 }
 // --- end Option D experiment ---------------------------------------------------
 
@@ -6077,12 +6165,13 @@ static inline bool try_cout_blocked_dx(
 //   1) pack src / diff_dst so channel blocks are contiguous
 //   2) for each (kh,kw): C[ic_block,oc_block] += Σ_{n,oh} A(oh) @ B(oh)
 //      where spatial width is the GEMM K and (n,oh) is the BRGEMM batch
-// Gates: stride-1, K=7, Cin%8==0, Cout%8==0 (layer-1 on the CNN bench).
+// Gates: stride-1, square K in [1, 11], Cin%8==0, Cout%8==0 (L1-style layers).
 // Layer-0 (Cin=3) keeps the existing specialist path.
 // ---------------------------------------------------------------------------
 static constexpr int64_t BRG_DW_IC = 8;
 static constexpr int64_t BRG_DW_OC = 8;
 static constexpr int32_t BRG_DW_X_STAGE_MAX = 8;
+static constexpr int64_t BRG_K_MAX = DX_BLOCKED_K_MAX;
 
 struct BrgDwXStage {
     const float* src = nullptr;
@@ -6126,7 +6215,10 @@ static float* brg_dw_stage_alloc(BrgDwXStage& slot, size_t need) {
 static bool brg_dw_x_geom_ok(
     int64_t C_in, int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride
 ) {
-    return stride == 1 && k_h == 7 && k_w == 7
+    // Square K only: dX Wt transpose is K×K. Pack/dW loops are already generic.
+    return stride == 1
+        && k_h == k_w
+        && k_h >= 1 && k_h <= BRG_K_MAX
         && (C_in % BRG_DW_IC) == 0 && (C_out % BRG_DW_OC) == 0;
 }
 
@@ -6538,7 +6630,6 @@ static bool try_brgemm_style_dx(
 ) {
     if (!brg_dw_x_geom_ok(C_in, C_out, k_h, k_w, stride)) return false;
     if (!dx || !W || !d_conv_buf || N <= 0) return false;
-    if (k_h != 7 || k_w != 7) return false;
 
     const int64_t OH = conv_out_h;
     const int64_t OW = conv_out_w;
