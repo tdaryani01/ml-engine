@@ -381,3 +381,4 @@ All Phase E planning questions resolved. See decisions log.
 | 2026-09-02 | Q5: `batch_id` UUID per fetch; epoch/batch_idx hints only |
 | 2026-09-02 | Q6: `TrainingEngine` + tests first; no `ModelController` wire until E gates pass |
 | 2026-09-02 | This phase: early stopping = manager; defer auto-fork / E6 policy layer |
+| 2026-09-07 | `store_backend`: default `file_streaming`; `noop` for tests; `cache`/`queue`/`redis` reserved |

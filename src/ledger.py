@@ -105,7 +105,7 @@ class LedgerConfig:
     keep_last_k_checkpoints: int = 20
     contract_list_enabled: bool = False  # Phase F: off until grad/benchmark parity
     native_async_submit: bool = False  # Independent of ledger I/O; see config.yaml ledger
-    store_backend: str = "file_streaming"
+    store_backend: str = "file_streaming"  # file_streaming | file_sync | noop | cache | queue | redis
     flush_stall_threshold: int = 64
 
 
@@ -522,6 +522,7 @@ class TrainingLedger:
 from src.ledger_store import (  # noqa: E402
     FileLedgerStore,
     LedgerStore as LedgerStoreBackend,
+    NoopLedgerStore,
     StreamingFileLedgerStore,
     SyncFileLedgerStore,
     create_ledger_store,

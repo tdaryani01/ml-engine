@@ -6,7 +6,7 @@ planning decisions. Details in [ledger-design.md](./ledger-design.md) and
 
 **Status:** E1–E5 implemented · **Wired to fit()** · Phase F design: [contract-list-architecture.md](./contract-list-architecture.md)
 
-**Last updated:** 2026-09-02
+**Last updated:** 2026-09-07
 
 ---
 
@@ -263,3 +263,5 @@ Scratch buffers, activations, dataset blobs, DLL handles, global backend singlet
 | 2026-09-02 | Q5: batch_id UUID; epoch/batch_idx hints |
 | 2026-09-02 | Q6: TrainingEngine + tests before ModelController |
 | 2026-09-02 | **This phase:** early stopping = manager (stop + rollback to best); defer E6 auto-fork |
+| 2026-09-07 | `store_backend` is pluggable: default `file_streaming` (stream writer); `noop` for tests (no journal I/O); `cache` / `queue` / `redis` reserved |
+| 2026-09-07 | CNN bench `fit` must pass `ledger_settings` from config (same path as `run_pipeline`) |

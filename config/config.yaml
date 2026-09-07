@@ -106,7 +106,9 @@ ledger:
   # on the caller thread (strict OMP team). true = persistent native worker.
   # With async, OMP_NUM_THREADS defaults to auto (num_threads-1) unless runtime
   # yaml sets a normal int. OMP_THREAD_LIMIT stays at the full budget.
-  native_async_submit: true
+  native_async_submit: false
+  # Pluggable ledger store. Default file_streaming = current stream writer.
+  # noop = tests (no disk). Future: cache | queue | redis.
   store_backend: file_streaming
 
 # =====================================================================

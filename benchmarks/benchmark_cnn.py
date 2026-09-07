@@ -35,9 +35,10 @@ from src.data.base_loader import BaseDataLoader
 from src.data.in_memory_provider import InMemoryDataProvider
 from utils.engine_ops import create_engine_context
 from config.schema import (
-    PipelineConfig, MetaConfig, IngestionConfig, ArchitectureConfig, 
+    PipelineConfig, MetaConfig, IngestionConfig, ArchitectureConfig,
     OptimizationConfig, RegularizationConfig, TransformationsConfig,
-    FourierConfig, PersistenceConfig, DiagnosticsConfig, SplitConfig
+    FourierConfig, PersistenceConfig, DiagnosticsConfig, SplitConfig,
+    LedgerSettings,
 )
 
 
@@ -382,7 +383,8 @@ def load_benchmark_data(config_path: str = None):
             figure_height=4,
             plot_style="default",
             output_format="png"
-        )
+        ),
+        ledger=LedgerSettings(**(cfg_dict.get("ledger") or {})),
     )
 
     loader = BaseDataLoader.create_loader(typed_cfg)
@@ -595,6 +597,8 @@ def run_custom_engine_benchmark(
     backend: EngineBackend = EngineBackend.NATIVE,
     num_threads: int = 4,
     config_path: str | None = None,
+    ledger_settings: LedgerSettings | None = None,
+    output_dir: str = "diagnostics_output",
 ) -> dict:
     engine_ctx = create_engine_context(backend)
 
@@ -677,7 +681,9 @@ def run_custom_engine_benchmark(
             model_type=task_type,
             early_stopping_enabled=early_stopping_enabled,
             patience=patience,
-            min_delta=min_delta
+            min_delta=min_delta,
+            ledger_settings=ledger_settings,
+            output_dir=output_dir,
         )
         custom_train_time = time.perf_counter() - t0_train
 
@@ -930,6 +936,10 @@ def _benchmark_common_from_config(config_path: str = None):
     patience = int(cfg_dict["optimization"].get("patience", 10))
     min_delta = float(cfg_dict["optimization"].get("min_delta", 1e-4))
     lr_scheduler_type = cfg_dict["optimization"].get("lr_scheduler", "none")
+    ledger_settings = LedgerSettings(**(cfg_dict.get("ledger") or {}))
+    output_dir = str(
+        (cfg_dict.get("meta") or {}).get("output_dir", "diagnostics_output")
+    )
 
     specs = extract_layer_specs(cnn_dict)
     if cnn_dict:
@@ -963,6 +973,8 @@ def _benchmark_common_from_config(config_path: str = None):
         "patience": patience,
         "min_delta": min_delta,
         "lr_scheduler_type": lr_scheduler_type,
+        "ledger_settings": ledger_settings,
+        "output_dir": output_dir,
         "specs": specs,
         "X_train": X_train,
         "y_train": y_train,
@@ -1022,6 +1034,8 @@ def custom_benchmark_child(config_path, result_queue) -> None:
             backend=c["backend"],
             num_threads=c["num_threads"],
             config_path=config_path,
+            ledger_settings=c["ledger_settings"],
+            output_dir=c["output_dir"],
         )
         result_queue.put(("ok", c_res))
     except Exception as exc:

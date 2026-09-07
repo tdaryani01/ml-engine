@@ -568,6 +568,45 @@ def test_engine_flush_tick_in_run_step():
     print("[PASSED] engine: flush tick at step start, begin_flush at step end")
 
 
+def test_noop_store_discards_without_disk_or_encode():
+    """store_backend=noop: flush advances head, no journal files, encode never runs."""
+    from pathlib import Path
+
+    from src.ledger_async_writer import NoopJournalWriter
+    from src.ledger_store import NoopLedgerStore, create_ledger_store
+
+    doc = LedgerDocument(
+        doc_type=STEP_COMMAND,
+        branch_id="main",
+        model_instance_id="cnn-0",
+        architecture_id="cnn_v1",
+        body={
+            "step_id": 1,
+            "base_version": 0,
+            "batch_ref": BatchRef.new().to_dict(),
+            "lr": 0.01,
+            "m_samples": 4,
+            "scheduler_epoch": 0,
+        },
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        store = create_ledger_store("noop", tmp)
+        assert isinstance(store, NoopLedgerStore)
+        assert isinstance(store._writer, NoopJournalWriter)
+        try:
+            with mock.patch("src.ledger_store.document_to_bytes", wraps=document_to_bytes) as encode:
+                assert store.push(doc) == 1
+                assert store.begin_flush() is True
+                assert store.try_reap_flush() is True
+                assert store.head_lsn() == 1
+                encode.assert_not_called()
+            assert list(store.scan()) == []
+            assert not (Path(tmp) / "journal.bin").exists()
+        finally:
+            store.close()
+    print("[PASSED] noop store: no disk journal, no encode")
+
+
 PHASE_E_TESTS = [
     test_e1_batch_ref_uuid_unique,
     test_e1_document_round_trip,
@@ -582,6 +621,7 @@ PHASE_E_TESTS = [
     test_e6_prime_fit_with_ledger_and_early_stop_rollback,
     test_streaming_store_push_defers_encode_until_flush,
     test_engine_flush_tick_in_run_step,
+    test_noop_store_discards_without_disk_or_encode,
 ]
 
 

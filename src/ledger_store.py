@@ -322,12 +322,132 @@ class StreamingFileLedgerStore:
         return document_from_bytes(records[0])
 
 
+class NoopLedgerStore:
+    """
+    Ledger store with NoopJournalWriter: same flush/reap API as streaming, no disk.
+
+    push() queues; begin_flush() advances head without encoding. Checkpoints stay
+    in memory only (last-wins per branch/version) so ES restore can still work.
+    """
+
+    def __init__(self, root: str | Path | None = None):
+        from src.ledger_async_writer import NoopJournalWriter
+
+        self.root = Path(root) if root is not None else Path(".")
+        self._meta = _HeadMeta()
+        self._queue: deque[tuple[int, _QueueItem]] = deque()
+        self._writer = NoopJournalWriter(None)
+        self._checkpoints: dict[tuple[str, int], LedgerDocument] = {}
+        self._closed = False
+
+    def push(self, doc: LedgerDocument) -> int:
+        if self._closed:
+            raise RuntimeError("ledger store is closed")
+        lsn = self._meta.next_lsn
+        self._meta.next_lsn += 1
+        doc.lsn = lsn
+        self._queue.append((lsn, doc))
+        return lsn
+
+    def begin_flush(self) -> bool:
+        if self._closed or self._writer.has_pending() or not self._queue:
+            return False
+        lsn, item = self._queue.popleft()
+
+        def _encode() -> bytes:
+            return b""
+
+        if self._writer.submit_work(_encode, lsn):
+            return True
+        self._queue.appendleft((lsn, item))
+        return False
+
+    def try_reap_flush(self) -> bool:
+        completed, lsn = self._writer.try_reap()
+        if completed and lsn is not None:
+            self._meta.head_lsn = lsn
+            return True
+        return False
+
+    def has_flush_pending(self) -> bool:
+        return self._writer.has_pending()
+
+    def queue_pending(self) -> bool:
+        return bool(self._queue)
+
+    def poll(self, limit: int = 8) -> int:
+        n = 0
+        if self.try_reap_flush():
+            n += 1
+        if n < limit and self.begin_flush():
+            n += 1
+        return n
+
+    def flush(self) -> None:
+        while self._queue or self._writer.has_pending():
+            if self._writer.has_pending():
+                lsn = self._writer.wait_pending()
+                if lsn is not None:
+                    self._meta.head_lsn = lsn
+            elif self._queue:
+                self.begin_flush()
+        self._writer.flush_os()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self.flush()
+        finally:
+            self._writer.close()
+            self._closed = True
+
+    def get(self, lsn: int) -> LedgerDocument:
+        raise KeyError(f"LSN {lsn} not found (noop store retains no journal)")
+
+    def scan(self, from_lsn: int = 1, to_lsn: int | None = None) -> Iterator[LedgerDocument]:
+        return iter(())
+
+    def head_lsn(self) -> int:
+        return self._meta.head_lsn
+
+    def put_checkpoint(self, doc: LedgerDocument) -> None:
+        if doc.doc_type != CHECKPOINT:
+            raise ValueError("put_checkpoint expects doc_type=checkpoint")
+        version = int(doc.body["version"])
+        self._checkpoints[(doc.branch_id, version)] = doc
+
+    def get_checkpoint(self, branch_id: str, version: int) -> LedgerDocument | None:
+        return self._checkpoints.get((branch_id, version))
+
+
 class RedisLedgerStore:
     """Placeholder for distributed ledger backend (Redis Streams, etc.)."""
 
     def __init__(self, *args, **kwargs):
         raise NotImplementedError(
-            "Redis ledger backend is not implemented. Use store_backend=file_streaming or file_sync."
+            "Redis ledger backend is not implemented. "
+            "Use store_backend=file_streaming, file_sync, or noop."
+        )
+
+
+class CacheLedgerStore:
+    """Placeholder: in-process / shared-memory cache backend (future)."""
+
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Cache ledger backend is not implemented yet. "
+            "Use store_backend=file_streaming or noop."
+        )
+
+
+class QueueLedgerStore:
+    """Placeholder: durable queue / stream backend (future)."""
+
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(
+            "Queue ledger backend is not implemented yet. "
+            "Use store_backend=file_streaming or noop."
         )
 
 
@@ -357,11 +477,25 @@ FileLedgerStore = StreamingFileLedgerStore
 
 
 def create_ledger_store(backend: str, root: str | Path) -> LedgerStore:
+    """Factory for ledger persistence backends.
+
+    Known keys:
+      file_streaming | streaming | async  — SyncJournalWriter / overlapped (default)
+      file_sync | sync | file             — fsync every push (tests)
+      noop | null | none | discard        — NoopJournalWriter, no disk (tests/bench)
+      cache | queue | redis               — reserved; NotImplementedError for now
+    """
     key = backend.strip().lower()
     if key in ("file_sync", "sync", "file"):
         return SyncFileLedgerStore(root)
     if key in ("file_streaming", "streaming", "async"):
         return StreamingFileLedgerStore(root)
+    if key in ("noop", "null", "none", "discard"):
+        return NoopLedgerStore(root)
+    if key in ("cache",):
+        return CacheLedgerStore(root)
+    if key in ("queue",):
+        return QueueLedgerStore(root)
     if key in ("redis",):
         return RedisLedgerStore(root)
     raise ValueError(f"Unknown ledger store backend: {backend!r}")
