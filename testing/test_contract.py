@@ -190,7 +190,11 @@ def test_contract_async_submit_reaps():
 
 
 def test_contract_async_forward_matches_direct_predict():
-    """Async-enabled predict executes the forward contract with matching output."""
+    """Async-enabled predict executes the forward contract with matching output.
+
+    Note: currently heap-aborts on some builds (see docs/phase-e-reference.md
+    Known open bugs). This test must remain in the default suite — do not skip.
+    """
     rng = np.random.default_rng(29)
     X = rng.standard_normal((8, 1, 28, 32), dtype=np.float32)
     model = _make_model(seed=37)

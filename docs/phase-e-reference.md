@@ -250,6 +250,21 @@ Scratch buffers, activations, dataset blobs, DLL handles, global backend singlet
 
 ---
 
+## Known open bugs
+
+### Async contract forward crash (`test_contract_async_forward_matches_direct_predict`)
+
+| | |
+|--|--|
+| **Symptom** | Hard abort when `native_async_submit=true` and `predict()` routes through `ContractRuntime.run_async_forward` (forward-only submit to the native async worker). Observed: glibc `corrupted size vs. prev_size` → process abort (exit 134 / signal -6). |
+| **Repro** | Full suite (`run_tests.py`) or `testing/test_contract.py` alone. Isolates to this test after prior contract tests pass. |
+| **Observed** | 2026-09-07 full suite: 18/19 modules pass; Contract fails only on this case. Still fails after forcing main-thread pack path serial — **not** explained by the sync OMP prep-pack change. |
+| **Not broken** | Async *training* submit/reap (`test_contract_async_submit_reaps`, busy pushback, engine finalize) passes. Sync contract path (`native_async_submit=false`, current default in `config.yaml`) is unaffected. |
+| **Root cause** | Unknown. Not diagnosed. |
+| **Policy** | Keep the test in the default suite — no skip/bypass. Formal runs must surface this. Default/bench configs stay on sync submit until closed. |
+
+---
+
 ## Decisions log (canonical)
 
 | Date | Decision |
@@ -268,3 +283,4 @@ Scratch buffers, activations, dataset blobs, DLL handles, global backend singlet
 | 2026-09-07 | Sync contract: no wait/poll loops when `native_async_submit=false`; prep packs use OMP |
 | 2026-09-07 | Predict densifies logical W once (e.g. 32→28) so fwd skips per-conv strided copies |
 | 2026-09-07 | BRGEMM dX planar scatter uses pointer-bump (same math; avoids `c*spatial` imul) |
+| 2026-09-07 | **Open bug:** async predict/`run_async_forward` heap-aborts (`corrupted size vs. prev_size`); tracked in [Known open bugs](#known-open-bugs); suite must not skip it |
