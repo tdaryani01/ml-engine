@@ -48,7 +48,7 @@ architecture:
         out_channels: 8
         kernel_size: 7
         stride: 1
-        pad: 1
+        pad: 2
       - type: "relu"
       - type: "pool"
         pool_size: 2
@@ -58,7 +58,7 @@ architecture:
         out_channels: 16
         kernel_size: 7
         stride: 1
-        pad: 1
+        pad: 2
       - type: "relu"
       - type: "pool"
         pool_size: 2

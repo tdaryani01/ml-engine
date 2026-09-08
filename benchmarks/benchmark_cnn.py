@@ -101,7 +101,8 @@ def extract_layer_specs(cnn_config: dict) -> list:
                 "out_channels": out_c,
                 "kernel_size": int(item.get("kernel_size", 3)),
                 "stride": int(item.get("stride", 1)),
-                "padding": int(item.get("pad", item.get("padding", 0))),
+                "padding": int(item.get("pad") if item.get("pad") is not None
+                               else (item.get("padding") if item.get("padding") is not None else 0)),
                 "pool_size": 0,
                 "pool_stride": 0
             })
