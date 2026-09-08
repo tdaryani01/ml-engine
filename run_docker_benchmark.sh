@@ -40,6 +40,7 @@ fi
 
 PYTORCH_IMG="ml-engine-pytorch-bench:latest"
 CUSTOM_IMG="ml-engine-custom-bench:latest"
+MATRIX_IMG="ml-engine-matrix-bench:latest"
 RUNTIME_SCRIPT="$ROOT/utils/runtime.py"
 CONFIG_PATH="$ROOT/config/config.yaml"
 
@@ -263,6 +264,22 @@ stop_existing_benchmark_containers() {
     >/dev/null 2>&1 || true
 }
 
+build_matrix_container() {
+  echo
+  echo "[+] Verifying Docker context and endpoint connectivity..."
+  test_docker_endpoint
+  if ! docker image inspect "$CUSTOM_IMG" >/dev/null 2>&1; then
+    echo "[!] $CUSTOM_IMG missing; building custom image first..."
+    build_custom_container
+  fi
+  echo
+  echo "[+] Building Matrix Sweep Image (scripts/Dockerfile.matrix)..."
+  docker build "${build_flags[@]+"${build_flags[@]}"}" \
+    -f scripts/Dockerfile.matrix -t "$MATRIX_IMG" .
+  echo
+  echo "[OK] Matrix benchmark container image successfully built."
+}
+
 write_runtime_env_file() {
   local env_file="$DIAG_DIR/.runtime.env"
   local -a override_args=()
@@ -413,8 +430,8 @@ run_kernel_sweep() {
     "Log file             : $DIAG_DIR/$log_name"
 
   echo
-  echo "[+] Executing kernel sweep in Custom Engine container..."
-  invoke_docker_run ml-engine-bench-sweep "$CUSTOM_IMG" "$env_file" \
+  echo "[+] Executing kernel sweep in Matrix container (native + Torch)..."
+  invoke_docker_run ml-engine-bench-sweep "$MATRIX_IMG" "$env_file" \
     --entrypoint python -- \
     -u benchmarks/sweep_kernel_pad.py \
     --k-min "$K_MIN" --k-max "$K_MAX" --pad "$PAD" \
@@ -436,8 +453,8 @@ run_matrix_sweep() {
     "Log file             : $DIAG_DIR/$log_name"
 
   echo
-  echo "[+] Executing full conv matrix in Custom Engine container..."
-  invoke_docker_run ml-engine-bench-matrix "$CUSTOM_IMG" "$env_file" \
+  echo "[+] Executing full conv matrix in Matrix container (native + Torch)..."
+  invoke_docker_run ml-engine-bench-matrix "$MATRIX_IMG" "$env_file" \
     --entrypoint python -- \
     -u benchmarks/sweep_kernel_pad.py \
     --full-matrix \
@@ -463,8 +480,8 @@ run_sample_sweep() {
   local -a kernel_args=($SAMPLE_KERNELS)
 
   echo
-  echo "[+] Executing sample conv sweep in Custom Engine container..."
-  invoke_docker_run ml-engine-bench-sample "$CUSTOM_IMG" "$env_file" \
+  echo "[+] Executing sample conv sweep in Matrix container (native + Torch)..."
+  invoke_docker_run ml-engine-bench-sample "$MATRIX_IMG" "$env_file" \
     --entrypoint python -- \
     -u benchmarks/sweep_kernel_pad.py \
     --kernels "${kernel_args[@]}" \
@@ -479,18 +496,18 @@ run_sample_sweep() {
 clean_containers() {
   echo
   echo "[+] Pruning benchmark containers and dangling build stages..."
-  docker image rm -f "$PYTORCH_IMG" "$CUSTOM_IMG" >/dev/null 2>&1 || true
+  docker image rm -f "$PYTORCH_IMG" "$CUSTOM_IMG" "$MATRIX_IMG" >/dev/null 2>&1 || true
   docker builder prune -f
   echo "[OK] Benchmark artifacts cleaned."
 }
 
 case "$ACTION" in
-  build)         build_containers ;;
+  build)         build_containers; build_matrix_container ;;
   build-custom)  build_custom_container ;;
   run)           run_benchmarks ;;
   clean)         clean_containers ;;
-  sweep)         build_custom_container; run_kernel_sweep ;;
-  matrix)        build_custom_container; run_matrix_sweep ;;
-  sample)        build_custom_container; run_sample_sweep ;;
-  all)           build_containers; run_benchmarks ;;
+  sweep)         build_custom_container; build_matrix_container; run_kernel_sweep ;;
+  matrix)        build_custom_container; build_matrix_container; run_matrix_sweep ;;
+  sample)        build_custom_container; build_matrix_container; run_sample_sweep ;;
+  all)           build_containers; build_matrix_container; run_benchmarks ;;
 esac
