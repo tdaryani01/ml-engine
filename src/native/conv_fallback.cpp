@@ -601,6 +601,29 @@ static inline void bwd_dx_store_tile(
     }
 }
 
+// Sliding kw windows from two AVX loads + alignr (identical math to
+// loadu(row+base+kw) for kw=0..6). Used by Stride1Specialist fwd/dw for K=2..7
+// so every K shares the same crawl; K=1 stays a single load.
+static __forceinline void stride1_kw_windows_alignr(
+    const float* __restrict row, int64_t base,
+    __m256& vx0, __m256& vx1, __m256& vx2, __m256& vx3,
+    __m256& vx4, __m256& vx5, __m256& vx6
+) {
+    const __m256 xa   = _mm256_loadu_ps(row + base);
+    const __m256 xb   = _mm256_loadu_ps(row + base + FWD_TILE_OW);
+    const __m256 xmid = _mm256_permute2f128_ps(xa, xb, 0x21);
+    const __m256i ia   = _mm256_castps_si256(xa);
+    const __m256i ib   = _mm256_castps_si256(xb);
+    const __m256i imid = _mm256_castps_si256(xmid);
+    vx0 = xa;
+    vx1 = _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 4));
+    vx2 = _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 8));
+    vx3 = _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 12));
+    vx4 = xmid;
+    vx5 = _mm256_castsi256_ps(_mm256_alignr_epi8(ib, imid, 4));
+    vx6 = _mm256_castsi256_ps(_mm256_alignr_epi8(ib, imid, 8));
+}
+
 template<>
 struct Stride1Specialist<1> {
     static constexpr int K = 1;
@@ -752,8 +775,13 @@ struct Stride1Specialist<2> {
                 }
 
                 const float* __restrict in_row = xp + ih * x_row_stride;
-                const __m256 vx0 = _mm256_loadu_ps(in_row + iw0 + 0);
-                const __m256 vx1 = _mm256_loadu_ps(in_row + iw0 + 1);
+                __m256 vx0, vx1, vx2_u, vx3_u, vx4_u, vx5_u, vx6_u;
+                stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2_u, vx3_u, vx4_u, vx5_u, vx6_u);
+                (void)vx2_u;
+                (void)vx3_u;
+                (void)vx4_u;
+                (void)vx5_u;
+                (void)vx6_u;
 
                 const float* __restrict w0 = wp0 + kh * K;
                 vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
@@ -861,9 +889,12 @@ struct Stride1Specialist<3> {
                 }
 
                 const float* __restrict in_row = xp + ih * x_row_stride;
-                const __m256 vx0 = _mm256_loadu_ps(in_row + iw0 + 0);
-                const __m256 vx1 = _mm256_loadu_ps(in_row + iw0 + 1);
-                const __m256 vx2 = _mm256_loadu_ps(in_row + iw0 + 2);
+                __m256 vx0, vx1, vx2, vx3_u, vx4_u, vx5_u, vx6_u;
+                stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2, vx3_u, vx4_u, vx5_u, vx6_u);
+                (void)vx3_u;
+                (void)vx4_u;
+                (void)vx5_u;
+                (void)vx6_u;
 
                 const float* __restrict w0 = wp0 + kh * K;
                 vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
@@ -975,10 +1006,11 @@ struct Stride1Specialist<4> {
                 }
 
                 const float* __restrict in_row = xp + ih * x_row_stride;
-                const __m256 vx0 = _mm256_loadu_ps(in_row + iw0 + 0);
-                const __m256 vx1 = _mm256_loadu_ps(in_row + iw0 + 1);
-                const __m256 vx2 = _mm256_loadu_ps(in_row + iw0 + 2);
-                const __m256 vx3 = _mm256_loadu_ps(in_row + iw0 + 3);
+                __m256 vx0, vx1, vx2, vx3, vx4_u, vx5_u, vx6_u;
+                stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2, vx3, vx4_u, vx5_u, vx6_u);
+                (void)vx4_u;
+                (void)vx5_u;
+                (void)vx6_u;
 
                 const float* __restrict w0 = wp0 + kh * K;
                 vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
@@ -1051,7 +1083,7 @@ template<>
 struct Stride1Specialist<6> {
     static constexpr int K = 6;
 
-    // Forward: x_pad => loadu every kw; fully unrolled kh×kw.
+    // Forward: x_pad => two-load + alignr kw windows (same as K=7).
     static void fwd_tile(
     const ConvFwdTileDoc& doc,
     const float* __restrict x_pad_buf,
@@ -1095,12 +1127,9 @@ struct Stride1Specialist<6> {
             }
 
             const float* __restrict in_row = xp + ih * x_row_stride;
-            const __m256 vx0 = _mm256_loadu_ps(in_row + iw0 + 0);
-            const __m256 vx1 = _mm256_loadu_ps(in_row + iw0 + 1);
-            const __m256 vx2 = _mm256_loadu_ps(in_row + iw0 + 2);
-            const __m256 vx3 = _mm256_loadu_ps(in_row + iw0 + 3);
-            const __m256 vx4 = _mm256_loadu_ps(in_row + iw0 + 4);
-            const __m256 vx5 = _mm256_loadu_ps(in_row + iw0 + 5);
+            __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6_unused;
+            stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6_unused);
+            (void)vx6_unused;
 
             const float* __restrict w0 = wp0 + kh * K;
             vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
@@ -1224,11 +1253,10 @@ struct Stride1Specialist<5> {
                 }
 
                 const float* __restrict in_row = xp + ih * x_row_stride;
-                const __m256 vx0 = _mm256_loadu_ps(in_row + iw0 + 0);
-                const __m256 vx1 = _mm256_loadu_ps(in_row + iw0 + 1);
-                const __m256 vx2 = _mm256_loadu_ps(in_row + iw0 + 2);
-                const __m256 vx3 = _mm256_loadu_ps(in_row + iw0 + 3);
-                const __m256 vx4 = _mm256_loadu_ps(in_row + iw0 + 4);
+                __m256 vx0, vx1, vx2, vx3, vx4, vx5_u, vx6_u;
+                stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5_u, vx6_u);
+                (void)vx5_u;
+                (void)vx6_u;
 
                 const float* __restrict w0 = wp0 + kh * K;
                 vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
@@ -1349,25 +1377,8 @@ struct Stride1Specialist<7> {
 
                 const float* __restrict in_row = xp + ih * x_row_stride;
 
-                // The seven kw taps are sub-spans of in_row[iw0 .. iw0+13], so
-                // two aligned vector loads cover all of them and the shifted
-                // views come from register shuffles; the old seven
-                // consecutive-offset loads could never be more than one-in-seven
-                // aligned.
-                const __m256 xa   = _mm256_loadu_ps(in_row + iw0);
-                const __m256 xb   = _mm256_loadu_ps(in_row + iw0 + FWD_TILE_OW);
-                const __m256 xmid = _mm256_permute2f128_ps(xa, xb, 0x21);
-                const __m256i ia   = _mm256_castps_si256(xa);
-                const __m256i ib   = _mm256_castps_si256(xb);
-                const __m256i imid = _mm256_castps_si256(xmid);
-
-                const __m256 vx0 = xa;
-                const __m256 vx1 = _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 4));
-                const __m256 vx2 = _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 8));
-                const __m256 vx3 = _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 12));
-                const __m256 vx4 = xmid;
-                const __m256 vx5 = _mm256_castsi256_ps(_mm256_alignr_epi8(ib, imid, 4));
-                const __m256 vx6 = _mm256_castsi256_ps(_mm256_alignr_epi8(ib, imid, 8));
+                __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6;
+                stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6);
 
                 const float* __restrict w0 = wp0 + kh * K;
                 vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
@@ -2919,8 +2930,15 @@ void Stride1Specialist<2>::dw_nci(
                 const int64_t ow = t * FWD_TILE_OW;
                 const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
                 const int64_t iw0 = x_pad_l + ow - pad;
-                v_acc0 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 0), v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 1), v_acc1);
+                __m256 vx0, vx1, vx2_u, vx3_u, vx4_u, vx5_u, vx6_u;
+                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2_u, vx3_u, vx4_u, vx5_u, vx6_u);
+                (void)vx2_u;
+                (void)vx3_u;
+                (void)vx4_u;
+                (void)vx5_u;
+                (void)vx6_u;
+                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
+                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
             }
         }
         const int64_t base = kh * K;
@@ -3184,9 +3202,15 @@ void Stride1Specialist<3>::dw_nci(
                 const int64_t ow = t * FWD_TILE_OW;
                 const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
                 const int64_t iw0 = x_pad_l + ow - pad;
-                v_acc0 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 0), v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 1), v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 2), v_acc2);
+                __m256 vx0, vx1, vx2, vx3_u, vx4_u, vx5_u, vx6_u;
+                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2, vx3_u, vx4_u, vx5_u, vx6_u);
+                (void)vx3_u;
+                (void)vx4_u;
+                (void)vx5_u;
+                (void)vx6_u;
+                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
+                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
+                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
             }
         }
         const int64_t base = kh * K;
@@ -3401,10 +3425,15 @@ void Stride1Specialist<4>::dw_nci(
                 const int64_t ow = t * FWD_TILE_OW;
                 const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
                 const int64_t iw0 = x_pad_l + ow - pad;
-                v_acc0 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 0), v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 1), v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 2), v_acc2);
-                v_acc3 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 3), v_acc3);
+                __m256 vx0, vx1, vx2, vx3, vx4_u, vx5_u, vx6_u;
+                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2, vx3, vx4_u, vx5_u, vx6_u);
+                (void)vx4_u;
+                (void)vx5_u;
+                (void)vx6_u;
+                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
+                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
+                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
+                v_acc3 = _mm256_fmadd_ps(dy8, vx3, v_acc3);
             }
         }
         const int64_t base = kh * K;
@@ -3872,12 +3901,16 @@ void Stride1Specialist<6>::dw_nci(
                 const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
                 const int64_t iw0 = x_pad_l + ow - pad;
 
-                v_acc0 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 0), v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 1), v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 2), v_acc2);
-                v_acc3 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 3), v_acc3);
-                v_acc4 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 4), v_acc4);
-                v_acc5 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 5), v_acc5);
+                __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6_u;
+                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6_u);
+                (void)vx6_u;
+
+                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
+                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
+                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
+                v_acc3 = _mm256_fmadd_ps(dy8, vx3, v_acc3);
+                v_acc4 = _mm256_fmadd_ps(dy8, vx4, v_acc4);
+                v_acc5 = _mm256_fmadd_ps(dy8, vx5, v_acc5);
             }
         }
 
@@ -3935,11 +3968,16 @@ void Stride1Specialist<5>::dw_nci(
                 const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
                 const int64_t iw0 = x_pad_l + ow - pad;
 
-                v_acc0 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 0), v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 1), v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 2), v_acc2);
-                v_acc3 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 3), v_acc3);
-                v_acc4 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 4), v_acc4);
+                __m256 vx0, vx1, vx2, vx3, vx4, vx5_u, vx6_u;
+                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5_u, vx6_u);
+                (void)vx5_u;
+                (void)vx6_u;
+
+                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
+                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
+                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
+                v_acc3 = _mm256_fmadd_ps(dy8, vx3, v_acc3);
+                v_acc4 = _mm256_fmadd_ps(dy8, vx4, v_acc4);
             }
         }
 
@@ -4222,29 +4260,16 @@ void Stride1Specialist<7>::dw_nci(
                 const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
                 const int64_t iw0 = x_pad_l + ow - pad;
 
-                // The seven kw windows are sub-spans of x_row[iw0 .. iw0+13],
-                // so two vector loads cover all of them; the shifted views come
-                // from register shuffles instead of seven consecutive-offset
-                // loads, six of which can never be 32B-aligned.
-                const __m256 xa = _mm256_loadu_ps(x_row + iw0);
-                const __m256 xb = _mm256_loadu_ps(x_row + iw0 + FWD_TILE_OW);
-                const __m256 xmid = _mm256_permute2f128_ps(xa, xb, 0x21);
-                const __m256i ia = _mm256_castps_si256(xa);
-                const __m256i ib = _mm256_castps_si256(xb);
-                const __m256i imid = _mm256_castps_si256(xmid);
+                __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6;
+                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6);
 
-                v_acc0 = _mm256_fmadd_ps(dy8, xa, v_acc0);
-                v_acc1 = _mm256_fmadd_ps(
-                    dy8, _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 4)), v_acc1);
-                v_acc2 = _mm256_fmadd_ps(
-                    dy8, _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 8)), v_acc2);
-                v_acc3 = _mm256_fmadd_ps(
-                    dy8, _mm256_castsi256_ps(_mm256_alignr_epi8(imid, ia, 12)), v_acc3);
-                v_acc4 = _mm256_fmadd_ps(dy8, xmid, v_acc4);
-                v_acc5 = _mm256_fmadd_ps(
-                    dy8, _mm256_castsi256_ps(_mm256_alignr_epi8(ib, imid, 4)), v_acc5);
-                v_acc6 = _mm256_fmadd_ps(
-                    dy8, _mm256_castsi256_ps(_mm256_alignr_epi8(ib, imid, 8)), v_acc6);
+                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
+                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
+                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
+                v_acc3 = _mm256_fmadd_ps(dy8, vx3, v_acc3);
+                v_acc4 = _mm256_fmadd_ps(dy8, vx4, v_acc4);
+                v_acc5 = _mm256_fmadd_ps(dy8, vx5, v_acc5);
+                v_acc6 = _mm256_fmadd_ps(dy8, vx6, v_acc6);
             }
         }
         const int64_t base = kh * K;
