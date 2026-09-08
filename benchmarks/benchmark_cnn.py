@@ -578,6 +578,19 @@ def reset_benchmark_data_provider(data_provider) -> None:
     data_provider.reset_epoch()
 
 
+def _ledger_setup_from_config(config_path: str | None = None) -> tuple[LedgerSettings, str]:
+    """Hydrate ledger + output_dir from config.yaml (noop store, contract flags, etc.)."""
+    if config_path is None:
+        config_path = os.path.join(project_root, "config", "config.yaml")
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg_dict = yaml.safe_load(f) or {}
+    ledger_settings = LedgerSettings(**(cfg_dict.get("ledger") or {}))
+    output_dir = str(
+        (cfg_dict.get("meta") or {}).get("output_dir", "diagnostics_output")
+    )
+    return ledger_settings, output_dir
+
+
 def run_custom_engine_benchmark(
     data_provider: InMemoryDataProvider,
     X_train: np.ndarray,
@@ -599,8 +612,16 @@ def run_custom_engine_benchmark(
     num_threads: int = 4,
     config_path: str | None = None,
     ledger_settings: LedgerSettings | None = None,
-    output_dir: str = "diagnostics_output",
+    output_dir: str | None = None,
 ) -> dict:
+    # Always honor config.yaml ledger (enabled + noop + contract) unless caller overrides.
+    if ledger_settings is None or output_dir is None:
+        cfg_ledger, cfg_output_dir = _ledger_setup_from_config(config_path)
+        if ledger_settings is None:
+            ledger_settings = cfg_ledger
+        if output_dir is None:
+            output_dir = cfg_output_dir
+
     engine_ctx = create_engine_context(backend)
 
     native_lib = engine_ctx.native_lib or (

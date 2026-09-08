@@ -279,7 +279,7 @@ Scratch buffers, activations, dataset blobs, DLL handles, global backend singlet
 | 2026-09-02 | Q6: TrainingEngine + tests before ModelController |
 | 2026-09-02 | **This phase:** early stopping = manager (stop + rollback to best); defer E6 auto-fork |
 | 2026-09-07 | `store_backend` is pluggable: default `file_streaming` (stream writer); `noop` for tests (no journal I/O); `cache` / `queue` / `redis` reserved |
-| 2026-09-07 | CNN bench `fit` must pass `ledger_settings` from config (same path as `run_pipeline`) |
+| 2026-09-07 | CNN benches must hydrate `ledger_settings` from config (`run_custom_engine_benchmark`, docker `--target=custom`, matrix/sweep). Omitting it skips TrainingEngine → **no contract path**; train wall jumps (~3.6k Python forwards vs ~400). `noop` is fine — the hit is missing contract, not journal I/O. Docker `run` isolates engines with single-target containers, so this bite is easy to miss vs bare-metal `benchmark_cnn.py`. |
 | 2026-09-07 | Sync contract: no wait/poll loops when `native_async_submit=false`; prep packs use OMP |
 | 2026-09-07 | Predict densifies logical W once (e.g. 32→28) so fwd skips per-conv strided copies |
 | 2026-09-07 | BRGEMM dX planar scatter uses pointer-bump (same math; avoids `c*spatial` imul) |

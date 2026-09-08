@@ -10,6 +10,7 @@ from utils.runtime import get_docker_section
 
 import numpy as np
 from config.constants import DataKeys
+from config.schema import LedgerSettings
 from benchmarks.benchmark_cnn import (
     load_benchmark_data,
     run_pytorch_benchmark,
@@ -169,6 +170,11 @@ def main():
     early_stopping_enabled = bool(cfg_dict["optimization"].get("early_stopping_enabled", False))
     patience = int(cfg_dict["optimization"].get("patience", 10))
     min_delta = float(cfg_dict["optimization"].get("min_delta", 1e-4))
+    # Same ledger/engine setup as bare-metal benchmark_cnn (config.yaml → noop + contract).
+    ledger_settings = LedgerSettings(**(cfg_dict.get("ledger") or {}))
+    output_dir = str(
+        (cfg_dict.get("meta") or {}).get("output_dir", "diagnostics_output")
+    )
 
     X_train = data_provider.splits[DataKeys.X_TRAIN]
     y_train = data_provider.splits[DataKeys.Y_TRAIN]
@@ -233,6 +239,9 @@ def main():
                 min_delta=min_delta,
                 backend=backend,
                 num_threads=num_threads,
+                config_path=config_path,
+                ledger_settings=ledger_settings,
+                output_dir=output_dir,
             )
 
     save_results(args.output, results)
