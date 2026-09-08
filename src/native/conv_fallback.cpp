@@ -549,7 +549,7 @@ static inline int64_t fwd_compute_ow(int64_t out_w, int64_t out_w_stride) {
 }
 
 // --- Stride-1 padded-buffer kernel specialists (template<int K>) ---
-// Only explicit specializations are implemented. Runtime dispatch via
+// Primary template defined after alignr helpers. Runtime dispatch via
 // stride1_specialist_k() / stride1_try_*_specialist().
 
 struct ConvBwdDxTileDoc;
@@ -561,18 +561,11 @@ static inline int64_t stride1_specialist_k(int64_t k_h, int64_t k_w) {
     if (k_h != k_w) {
         return 0;
     }
-    switch (k_h) {
-        case 1: return 1;
-        case 2: return 2;
-        case 3: return 3;
-        case 4: return 4;
-        case 5: return 5;
-        case 6: return 6;
-        case 7: return 7;
-        case 9: return 9;
-        case 11: return 11;
-        default: return 0;
+    // Primary Stride1Specialist<K> covers every square K in this range.
+    if (k_h >= 1 && k_h <= 11) {
+        return k_h;
     }
+    return 0;
 }
 
 static inline bool stride1_fwd_builds_x_pad(int64_t k_h, int64_t k_w) {
@@ -678,591 +671,38 @@ static __forceinline void stride1_kw_windows_alignr11(
     vx10 = _mm256_castsi256_ps(_mm256_alignr_epi8(imid_bc, ib, 8));
 }
 
-template<>
-struct Stride1Specialist<1> {
-    static constexpr int K = 1;
+// Max square K handled by the primary Stride1Specialist template.
+static constexpr int STRIDE1_SPECIALIST_K_MAX = 11;
 
-    static void fwd_tile(
-        const ConvFwdTileDoc& doc,
-        const float* __restrict x_pad_buf,
-        int64_t x_pad_l, int64_t x_row_stride,
-        const float* __restrict W,
-        float* __restrict out,
-        int64_t C_in, int64_t C_out, int64_t H,
-        int64_t pad, int64_t k_spatial, int64_t spatial_out, int64_t out_w_stride
-    ) {
-        const int64_t ih_base = doc.oh - pad;
-        const int64_t c_rem   = doc.cout_count;
-        const int64_t x_plane = H * x_row_stride;
-
-        float* __restrict out_r0 = &out[(doc.n * C_out + doc.cout0 + 0) * spatial_out + doc.oh * out_w_stride + doc.ow];
-        float* __restrict out_r1 = (c_rem > 1) ? &out[(doc.n * C_out + doc.cout0 + 1) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r2 = (c_rem > 2) ? &out[(doc.n * C_out + doc.cout0 + 2) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r3 = (c_rem > 3) ? &out[(doc.n * C_out + doc.cout0 + 3) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-
-        __m256 vo0 = _mm256_loadu_ps(out_r0);
-        __m256 vo1 = (c_rem > 1) ? _mm256_loadu_ps(out_r1) : _mm256_setzero_ps();
-        __m256 vo2 = (c_rem > 2) ? _mm256_loadu_ps(out_r2) : _mm256_setzero_ps();
-        __m256 vo3 = (c_rem > 3) ? _mm256_loadu_ps(out_r3) : _mm256_setzero_ps();
-
-        const bool full_ow = (doc.ow_count == FWD_TILE_OW);
-        const __m256i out_mask = bwd_dw_lane_mask(doc.ow_count);
-
-        const float* __restrict xp_base = &x_pad_buf[doc.n * C_in * x_plane];
-        const int64_t iw0 = x_pad_l + doc.ow - pad;
-
-        for (int64_t cin = 0; cin < C_in; ++cin) {
-            const float* __restrict xp  = xp_base + cin * x_plane;
-            const float* __restrict wp0 = &W[((doc.cout0 + 0) * C_in + cin) * k_spatial];
-            const float* __restrict wp1 = (c_rem > 1) ? &W[((doc.cout0 + 1) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp2 = (c_rem > 2) ? &W[((doc.cout0 + 2) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp3 = (c_rem > 3) ? &W[((doc.cout0 + 3) * C_in + cin) * k_spatial] : nullptr;
-
-            for (int64_t kh = 0; kh < K; ++kh) {
-                const int64_t ih = ih_base + kh;
-                if (ih < 0 || ih >= H) {
-                    continue;
-                }
-
-                const float* __restrict in_row = xp + ih * x_row_stride;
-                const __m256 vx0 = _mm256_loadu_ps(in_row + iw0 + 0);
-
-                const float* __restrict w0 = wp0 + kh * K;
-                vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
-
-                if (c_rem > 1) {
-                    const float* __restrict w1 = wp1 + kh * K;
-                    vo1 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w1[0]), vo1);
-                }
-                if (c_rem > 2) {
-                    const float* __restrict w2 = wp2 + kh * K;
-                    vo2 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w2[0]), vo2);
-                }
-                if (c_rem > 3) {
-                    const float* __restrict w3 = wp3 + kh * K;
-                    vo3 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w3[0]), vo3);
-                }
-            }
-        }
-
-        if (full_ow) {
-            _mm256_storeu_ps(out_r0, vo0);
-            if (c_rem > 1) _mm256_storeu_ps(out_r1, vo1);
-            if (c_rem > 2) _mm256_storeu_ps(out_r2, vo2);
-            if (c_rem > 3) _mm256_storeu_ps(out_r3, vo3);
-        } else {
-            _mm256_maskstore_ps(out_r0, out_mask, vo0);
-            if (c_rem > 1) _mm256_maskstore_ps(out_r1, out_mask, vo1);
-            if (c_rem > 2) _mm256_maskstore_ps(out_r2, out_mask, vo2);
-            if (c_rem > 3) _mm256_maskstore_ps(out_r3, out_mask, vo3);
-        }
-    }
-
-    static void bwd_dx_tile(
-        const ConvBwdDxTileDoc& doc,
-        const float* __restrict dy_pad_buf,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        const float* __restrict W,
-        float* __restrict dx,
-        int64_t C_in, int64_t C_out, int64_t W_in_stride,
-        int64_t pad, int64_t spatial_in, int64_t k_spatial,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-
-    static void dw_nci(
-        int64_t n, int64_t cout, int64_t cin,
-        float* __restrict dw_slice,
-        const float* __restrict dy_pad_buf,
-        const float* __restrict x_pad_buf,
-        int64_t C_in, int64_t C_out,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        int64_t x_pad_l, int64_t x_row_stride,
-        int64_t H, int64_t pad,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-};
-
-template<>
-struct Stride1Specialist<2> {
-    static constexpr int K = 2;
-
-    static void fwd_tile(
-        const ConvFwdTileDoc& doc,
-        const float* __restrict x_pad_buf,
-        int64_t x_pad_l, int64_t x_row_stride,
-        const float* __restrict W,
-        float* __restrict out,
-        int64_t C_in, int64_t C_out, int64_t H,
-        int64_t pad, int64_t k_spatial, int64_t spatial_out, int64_t out_w_stride
-    ) {
-        const int64_t ih_base = doc.oh - pad;
-        const int64_t c_rem   = doc.cout_count;
-        const int64_t x_plane = H * x_row_stride;
-
-        float* __restrict out_r0 = &out[(doc.n * C_out + doc.cout0 + 0) * spatial_out + doc.oh * out_w_stride + doc.ow];
-        float* __restrict out_r1 = (c_rem > 1) ? &out[(doc.n * C_out + doc.cout0 + 1) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r2 = (c_rem > 2) ? &out[(doc.n * C_out + doc.cout0 + 2) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r3 = (c_rem > 3) ? &out[(doc.n * C_out + doc.cout0 + 3) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-
-        __m256 vo0 = _mm256_loadu_ps(out_r0);
-        __m256 vo1 = (c_rem > 1) ? _mm256_loadu_ps(out_r1) : _mm256_setzero_ps();
-        __m256 vo2 = (c_rem > 2) ? _mm256_loadu_ps(out_r2) : _mm256_setzero_ps();
-        __m256 vo3 = (c_rem > 3) ? _mm256_loadu_ps(out_r3) : _mm256_setzero_ps();
-
-        const bool full_ow = (doc.ow_count == FWD_TILE_OW);
-        const __m256i out_mask = bwd_dw_lane_mask(doc.ow_count);
-
-        const float* __restrict xp_base = &x_pad_buf[doc.n * C_in * x_plane];
-        const int64_t iw0 = x_pad_l + doc.ow - pad;
-
-        for (int64_t cin = 0; cin < C_in; ++cin) {
-            const float* __restrict xp  = xp_base + cin * x_plane;
-            const float* __restrict wp0 = &W[((doc.cout0 + 0) * C_in + cin) * k_spatial];
-            const float* __restrict wp1 = (c_rem > 1) ? &W[((doc.cout0 + 1) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp2 = (c_rem > 2) ? &W[((doc.cout0 + 2) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp3 = (c_rem > 3) ? &W[((doc.cout0 + 3) * C_in + cin) * k_spatial] : nullptr;
-
-            for (int64_t kh = 0; kh < K; ++kh) {
-                const int64_t ih = ih_base + kh;
-                if (ih < 0 || ih >= H) {
-                    continue;
-                }
-
-                const float* __restrict in_row = xp + ih * x_row_stride;
-                __m256 vx0, vx1, vx2_u, vx3_u, vx4_u, vx5_u, vx6_u;
-                stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2_u, vx3_u, vx4_u, vx5_u, vx6_u);
-                (void)vx2_u;
-                (void)vx3_u;
-                (void)vx4_u;
-                (void)vx5_u;
-                (void)vx6_u;
-
-                const float* __restrict w0 = wp0 + kh * K;
-                vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
-                vo0 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w0[1]), vo0);
-
-                if (c_rem > 1) {
-                    const float* __restrict w1 = wp1 + kh * K;
-                    vo1 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w1[0]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w1[1]), vo1);
-                }
-                if (c_rem > 2) {
-                    const float* __restrict w2 = wp2 + kh * K;
-                    vo2 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w2[0]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w2[1]), vo2);
-                }
-                if (c_rem > 3) {
-                    const float* __restrict w3 = wp3 + kh * K;
-                    vo3 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w3[0]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w3[1]), vo3);
-                }
-            }
-        }
-
-        if (full_ow) {
-            _mm256_storeu_ps(out_r0, vo0);
-            if (c_rem > 1) _mm256_storeu_ps(out_r1, vo1);
-            if (c_rem > 2) _mm256_storeu_ps(out_r2, vo2);
-            if (c_rem > 3) _mm256_storeu_ps(out_r3, vo3);
-        } else {
-            _mm256_maskstore_ps(out_r0, out_mask, vo0);
-            if (c_rem > 1) _mm256_maskstore_ps(out_r1, out_mask, vo1);
-            if (c_rem > 2) _mm256_maskstore_ps(out_r2, out_mask, vo2);
-            if (c_rem > 3) _mm256_maskstore_ps(out_r3, out_mask, vo3);
-        }
-    }
-
-    static void bwd_dx_tile(
-        const ConvBwdDxTileDoc& doc,
-        const float* __restrict dy_pad_buf,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        const float* __restrict W,
-        float* __restrict dx,
-        int64_t C_in, int64_t C_out, int64_t W_in_stride,
-        int64_t pad, int64_t spatial_in, int64_t k_spatial,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-
-    static void dw_nci(
-        int64_t n, int64_t cout, int64_t cin,
-        float* __restrict dw_slice,
-        const float* __restrict dy_pad_buf,
-        const float* __restrict x_pad_buf,
-        int64_t C_in, int64_t C_out,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        int64_t x_pad_l, int64_t x_row_stride,
-        int64_t H, int64_t pad,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-};
-
-template<>
-struct Stride1Specialist<3> {
-    static constexpr int K = 3;
-
-    static void fwd_tile(
-        const ConvFwdTileDoc& doc,
-        const float* __restrict x_pad_buf,
-        int64_t x_pad_l, int64_t x_row_stride,
-        const float* __restrict W,
-        float* __restrict out,
-        int64_t C_in, int64_t C_out, int64_t H,
-        int64_t pad, int64_t k_spatial, int64_t spatial_out, int64_t out_w_stride
-    ) {
-        const int64_t ih_base = doc.oh - pad;
-        const int64_t c_rem   = doc.cout_count;
-        const int64_t x_plane = H * x_row_stride;
-
-        float* __restrict out_r0 = &out[(doc.n * C_out + doc.cout0 + 0) * spatial_out + doc.oh * out_w_stride + doc.ow];
-        float* __restrict out_r1 = (c_rem > 1) ? &out[(doc.n * C_out + doc.cout0 + 1) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r2 = (c_rem > 2) ? &out[(doc.n * C_out + doc.cout0 + 2) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r3 = (c_rem > 3) ? &out[(doc.n * C_out + doc.cout0 + 3) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-
-        __m256 vo0 = _mm256_loadu_ps(out_r0);
-        __m256 vo1 = (c_rem > 1) ? _mm256_loadu_ps(out_r1) : _mm256_setzero_ps();
-        __m256 vo2 = (c_rem > 2) ? _mm256_loadu_ps(out_r2) : _mm256_setzero_ps();
-        __m256 vo3 = (c_rem > 3) ? _mm256_loadu_ps(out_r3) : _mm256_setzero_ps();
-
-        const bool full_ow = (doc.ow_count == FWD_TILE_OW);
-        const __m256i out_mask = bwd_dw_lane_mask(doc.ow_count);
-
-        const float* __restrict xp_base = &x_pad_buf[doc.n * C_in * x_plane];
-        const int64_t iw0 = x_pad_l + doc.ow - pad;
-
-        for (int64_t cin = 0; cin < C_in; ++cin) {
-            const float* __restrict xp  = xp_base + cin * x_plane;
-            const float* __restrict wp0 = &W[((doc.cout0 + 0) * C_in + cin) * k_spatial];
-            const float* __restrict wp1 = (c_rem > 1) ? &W[((doc.cout0 + 1) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp2 = (c_rem > 2) ? &W[((doc.cout0 + 2) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp3 = (c_rem > 3) ? &W[((doc.cout0 + 3) * C_in + cin) * k_spatial] : nullptr;
-
-            for (int64_t kh = 0; kh < K; ++kh) {
-                const int64_t ih = ih_base + kh;
-                if (ih < 0 || ih >= H) {
-                    continue;
-                }
-
-                const float* __restrict in_row = xp + ih * x_row_stride;
-                __m256 vx0, vx1, vx2, vx3_u, vx4_u, vx5_u, vx6_u;
-                stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2, vx3_u, vx4_u, vx5_u, vx6_u);
-                (void)vx3_u;
-                (void)vx4_u;
-                (void)vx5_u;
-                (void)vx6_u;
-
-                const float* __restrict w0 = wp0 + kh * K;
-                vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
-                vo0 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w0[1]), vo0);
-                vo0 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w0[2]), vo0);
-
-                if (c_rem > 1) {
-                    const float* __restrict w1 = wp1 + kh * K;
-                    vo1 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w1[0]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w1[1]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w1[2]), vo1);
-                }
-                if (c_rem > 2) {
-                    const float* __restrict w2 = wp2 + kh * K;
-                    vo2 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w2[0]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w2[1]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w2[2]), vo2);
-                }
-                if (c_rem > 3) {
-                    const float* __restrict w3 = wp3 + kh * K;
-                    vo3 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w3[0]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w3[1]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w3[2]), vo3);
-                }
-            }
-        }
-
-        if (full_ow) {
-            _mm256_storeu_ps(out_r0, vo0);
-            if (c_rem > 1) _mm256_storeu_ps(out_r1, vo1);
-            if (c_rem > 2) _mm256_storeu_ps(out_r2, vo2);
-            if (c_rem > 3) _mm256_storeu_ps(out_r3, vo3);
-        } else {
-            _mm256_maskstore_ps(out_r0, out_mask, vo0);
-            if (c_rem > 1) _mm256_maskstore_ps(out_r1, out_mask, vo1);
-            if (c_rem > 2) _mm256_maskstore_ps(out_r2, out_mask, vo2);
-            if (c_rem > 3) _mm256_maskstore_ps(out_r3, out_mask, vo3);
-        }
-    }
-
-    static void bwd_dx_tile(
-        const ConvBwdDxTileDoc& doc,
-        const float* __restrict dy_pad_buf,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        const float* __restrict W,
-        float* __restrict dx,
-        int64_t C_in, int64_t C_out, int64_t W_in_stride,
-        int64_t pad, int64_t spatial_in, int64_t k_spatial,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-
-    static void dw_nci(
-        int64_t n, int64_t cout, int64_t cin,
-        float* __restrict dw_slice,
-        const float* __restrict dy_pad_buf,
-        const float* __restrict x_pad_buf,
-        int64_t C_in, int64_t C_out,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        int64_t x_pad_l, int64_t x_row_stride,
-        int64_t H, int64_t pad,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-};
-
-template<>
-struct Stride1Specialist<4> {
-    static constexpr int K = 4;
-
-    static void fwd_tile(
-        const ConvFwdTileDoc& doc,
-        const float* __restrict x_pad_buf,
-        int64_t x_pad_l, int64_t x_row_stride,
-        const float* __restrict W,
-        float* __restrict out,
-        int64_t C_in, int64_t C_out, int64_t H,
-        int64_t pad, int64_t k_spatial, int64_t spatial_out, int64_t out_w_stride
-    ) {
-        const int64_t ih_base = doc.oh - pad;
-        const int64_t c_rem   = doc.cout_count;
-        const int64_t x_plane = H * x_row_stride;
-
-        float* __restrict out_r0 = &out[(doc.n * C_out + doc.cout0 + 0) * spatial_out + doc.oh * out_w_stride + doc.ow];
-        float* __restrict out_r1 = (c_rem > 1) ? &out[(doc.n * C_out + doc.cout0 + 1) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r2 = (c_rem > 2) ? &out[(doc.n * C_out + doc.cout0 + 2) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r3 = (c_rem > 3) ? &out[(doc.n * C_out + doc.cout0 + 3) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-
-        __m256 vo0 = _mm256_loadu_ps(out_r0);
-        __m256 vo1 = (c_rem > 1) ? _mm256_loadu_ps(out_r1) : _mm256_setzero_ps();
-        __m256 vo2 = (c_rem > 2) ? _mm256_loadu_ps(out_r2) : _mm256_setzero_ps();
-        __m256 vo3 = (c_rem > 3) ? _mm256_loadu_ps(out_r3) : _mm256_setzero_ps();
-
-        const bool full_ow = (doc.ow_count == FWD_TILE_OW);
-        const __m256i out_mask = bwd_dw_lane_mask(doc.ow_count);
-
-        const float* __restrict xp_base = &x_pad_buf[doc.n * C_in * x_plane];
-        const int64_t iw0 = x_pad_l + doc.ow - pad;
-
-        for (int64_t cin = 0; cin < C_in; ++cin) {
-            const float* __restrict xp  = xp_base + cin * x_plane;
-            const float* __restrict wp0 = &W[((doc.cout0 + 0) * C_in + cin) * k_spatial];
-            const float* __restrict wp1 = (c_rem > 1) ? &W[((doc.cout0 + 1) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp2 = (c_rem > 2) ? &W[((doc.cout0 + 2) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp3 = (c_rem > 3) ? &W[((doc.cout0 + 3) * C_in + cin) * k_spatial] : nullptr;
-
-            for (int64_t kh = 0; kh < K; ++kh) {
-                const int64_t ih = ih_base + kh;
-                if (ih < 0 || ih >= H) {
-                    continue;
-                }
-
-                const float* __restrict in_row = xp + ih * x_row_stride;
-                __m256 vx0, vx1, vx2, vx3, vx4_u, vx5_u, vx6_u;
-                stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2, vx3, vx4_u, vx5_u, vx6_u);
-                (void)vx4_u;
-                (void)vx5_u;
-                (void)vx6_u;
-
-                const float* __restrict w0 = wp0 + kh * K;
-                vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
-                vo0 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w0[1]), vo0);
-                vo0 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w0[2]), vo0);
-                vo0 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w0[3]), vo0);
-
-                if (c_rem > 1) {
-                    const float* __restrict w1 = wp1 + kh * K;
-                    vo1 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w1[0]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w1[1]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w1[2]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w1[3]), vo1);
-                }
-                if (c_rem > 2) {
-                    const float* __restrict w2 = wp2 + kh * K;
-                    vo2 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w2[0]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w2[1]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w2[2]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w2[3]), vo2);
-                }
-                if (c_rem > 3) {
-                    const float* __restrict w3 = wp3 + kh * K;
-                    vo3 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w3[0]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w3[1]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w3[2]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w3[3]), vo3);
-                }
-            }
-        }
-
-        if (full_ow) {
-            _mm256_storeu_ps(out_r0, vo0);
-            if (c_rem > 1) _mm256_storeu_ps(out_r1, vo1);
-            if (c_rem > 2) _mm256_storeu_ps(out_r2, vo2);
-            if (c_rem > 3) _mm256_storeu_ps(out_r3, vo3);
-        } else {
-            _mm256_maskstore_ps(out_r0, out_mask, vo0);
-            if (c_rem > 1) _mm256_maskstore_ps(out_r1, out_mask, vo1);
-            if (c_rem > 2) _mm256_maskstore_ps(out_r2, out_mask, vo2);
-            if (c_rem > 3) _mm256_maskstore_ps(out_r3, out_mask, vo3);
-        }
-    }
-
-    static void bwd_dx_tile(
-        const ConvBwdDxTileDoc& doc,
-        const float* __restrict dy_pad_buf,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        const float* __restrict W,
-        float* __restrict dx,
-        int64_t C_in, int64_t C_out, int64_t W_in_stride,
-        int64_t pad, int64_t spatial_in, int64_t k_spatial,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-
-    static void dw_nci(
-        int64_t n, int64_t cout, int64_t cin,
-        float* __restrict dw_slice,
-        const float* __restrict dy_pad_buf,
-        const float* __restrict x_pad_buf,
-        int64_t C_in, int64_t C_out,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        int64_t x_pad_l, int64_t x_row_stride,
-        int64_t H, int64_t pad,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-};
-
-template<>
-struct Stride1Specialist<6> {
-    static constexpr int K = 6;
-
-    // Forward: x_pad => two-load + alignr kw windows (same as K=7).
-    static void fwd_tile(
-    const ConvFwdTileDoc& doc,
-    const float* __restrict x_pad_buf,
-    int64_t x_pad_l, int64_t x_row_stride,
-    const float* __restrict W,
-    float* __restrict out,
-    int64_t C_in, int64_t C_out, int64_t H,
-    int64_t pad, int64_t k_spatial, int64_t spatial_out, int64_t out_w_stride
+// Fill vx[0..K) from the matching alignr helper (K=1: single loadu).
+template<int K>
+static __forceinline void stride1_load_kw_windows(
+    const float* __restrict row, int64_t base, __m256 vx[STRIDE1_SPECIALIST_K_MAX]
 ) {
-    const int64_t ih_base = doc.oh - pad;
-    const int64_t c_rem   = doc.cout_count;
-    const int64_t x_plane = H * x_row_stride;
-
-    float* __restrict out_r0 = &out[(doc.n * C_out + doc.cout0 + 0) * spatial_out + doc.oh * out_w_stride + doc.ow];
-    float* __restrict out_r1 = (c_rem > 1) ? &out[(doc.n * C_out + doc.cout0 + 1) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-    float* __restrict out_r2 = (c_rem > 2) ? &out[(doc.n * C_out + doc.cout0 + 2) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-    float* __restrict out_r3 = (c_rem > 3) ? &out[(doc.n * C_out + doc.cout0 + 3) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-
-    __m256 vo0 = _mm256_loadu_ps(out_r0);
-    __m256 vo1 = (c_rem > 1) ? _mm256_loadu_ps(out_r1) : _mm256_setzero_ps();
-    __m256 vo2 = (c_rem > 2) ? _mm256_loadu_ps(out_r2) : _mm256_setzero_ps();
-    __m256 vo3 = (c_rem > 3) ? _mm256_loadu_ps(out_r3) : _mm256_setzero_ps();
-
-    const bool full_ow = (doc.ow_count == FWD_TILE_OW);
-    const __m256i out_mask = bwd_dw_lane_mask(doc.ow_count);
-
-    const float* __restrict xp_base = &x_pad_buf[doc.n * C_in * x_plane];
-    const int64_t iw0 = x_pad_l + doc.ow - pad;
-
-    for (int64_t cin = 0; cin < C_in; ++cin) {
-        const float* __restrict xp  = xp_base + cin * x_plane;
-        const float* __restrict wp0 = &W[((doc.cout0 + 0) * C_in + cin) * k_spatial];
-        const float* __restrict wp1 = (c_rem > 1) ? &W[((doc.cout0 + 1) * C_in + cin) * k_spatial] : nullptr;
-        const float* __restrict wp2 = (c_rem > 2) ? &W[((doc.cout0 + 2) * C_in + cin) * k_spatial] : nullptr;
-        const float* __restrict wp3 = (c_rem > 3) ? &W[((doc.cout0 + 3) * C_in + cin) * k_spatial] : nullptr;
-
-        for (int64_t kh = 0; kh < K; ++kh) {
-            const int64_t ih = ih_base + kh;
-            if (ih < 0 || ih >= H) {
-                continue;
-            }
-
-            const float* __restrict in_row = xp + ih * x_row_stride;
-            __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6_unused;
-            stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6_unused);
-            (void)vx6_unused;
-
-            const float* __restrict w0 = wp0 + kh * K;
-            vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
-            vo0 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w0[1]), vo0);
-            vo0 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w0[2]), vo0);
-            vo0 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w0[3]), vo0);
-            vo0 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w0[4]), vo0);
-            vo0 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w0[5]), vo0);
-
-            if (c_rem > 1) {
-                const float* __restrict w1 = wp1 + kh * K;
-                vo1 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w1[0]), vo1);
-                vo1 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w1[1]), vo1);
-                vo1 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w1[2]), vo1);
-                vo1 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w1[3]), vo1);
-                vo1 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w1[4]), vo1);
-                vo1 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w1[5]), vo1);
-            }
-            if (c_rem > 2) {
-                const float* __restrict w2 = wp2 + kh * K;
-                vo2 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w2[0]), vo2);
-                vo2 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w2[1]), vo2);
-                vo2 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w2[2]), vo2);
-                vo2 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w2[3]), vo2);
-                vo2 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w2[4]), vo2);
-                vo2 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w2[5]), vo2);
-            }
-            if (c_rem > 3) {
-                const float* __restrict w3 = wp3 + kh * K;
-                vo3 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w3[0]), vo3);
-                vo3 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w3[1]), vo3);
-                vo3 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w3[2]), vo3);
-                vo3 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w3[3]), vo3);
-                vo3 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w3[4]), vo3);
-                vo3 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w3[5]), vo3);
-            }
-        }
-    }
-
-    if (full_ow) {
-        _mm256_storeu_ps(out_r0, vo0);
-        if (c_rem > 1) _mm256_storeu_ps(out_r1, vo1);
-        if (c_rem > 2) _mm256_storeu_ps(out_r2, vo2);
-        if (c_rem > 3) _mm256_storeu_ps(out_r3, vo3);
+    static_assert(K >= 1 && K <= STRIDE1_SPECIALIST_K_MAX, "Stride1 K out of range");
+    if constexpr (K == 1) {
+        vx[0] = _mm256_loadu_ps(row + base);
+    } else if constexpr (K <= 7) {
+        stride1_kw_windows_alignr(
+            row, base, vx[0], vx[1], vx[2], vx[3], vx[4], vx[5], vx[6]
+        );
+    } else if constexpr (K <= 9) {
+        stride1_kw_windows_alignr9(
+            row, base, vx[0], vx[1], vx[2], vx[3], vx[4], vx[5], vx[6], vx[7], vx[8]
+        );
     } else {
-        _mm256_maskstore_ps(out_r0, out_mask, vo0);
-        if (c_rem > 1) _mm256_maskstore_ps(out_r1, out_mask, vo1);
-        if (c_rem > 2) _mm256_maskstore_ps(out_r2, out_mask, vo2);
-        if (c_rem > 3) _mm256_maskstore_ps(out_r3, out_mask, vo3);
+        stride1_kw_windows_alignr11(
+            row, base,
+            vx[0], vx[1], vx[2], vx[3], vx[4], vx[5], vx[6], vx[7], vx[8], vx[9], vx[10]
+        );
     }
-    }
+}
 
-    static void bwd_dx_tile(
-        const ConvBwdDxTileDoc& doc,
-        const float* __restrict dy_pad_buf,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        const float* __restrict W,
-        float* __restrict dx,
-        int64_t C_in, int64_t C_out, int64_t W_in_stride,
-        int64_t pad, int64_t spatial_in, int64_t k_spatial,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-
-    static void dw_nci(
-        int64_t n, int64_t cout, int64_t cin,
-        float* __restrict dw_slice,
-        const float* __restrict dy_pad_buf,
-        const float* __restrict x_pad_buf,
-        int64_t C_in, int64_t C_out,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        int64_t x_pad_l, int64_t x_row_stride,
-        int64_t H, int64_t pad,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-};
-
-template<>
-struct Stride1Specialist<5> {
-    static constexpr int K = 5;
+// Primary Stride1 specialist (same idea as Stride2Specialist<KernelK>): one body,
+// K chosen at compile time. Explicit per-K clones removed to cut blast radius.
+template<int K>
+struct Stride1Specialist {
+    static_assert(K >= 1 && K <= STRIDE1_SPECIALIST_K_MAX, "Stride1 K out of range");
 
     static void fwd_tile(
         const ConvFwdTileDoc& doc,
@@ -1307,41 +747,34 @@ struct Stride1Specialist<5> {
                 }
 
                 const float* __restrict in_row = xp + ih * x_row_stride;
-                __m256 vx0, vx1, vx2, vx3, vx4, vx5_u, vx6_u;
-                stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5_u, vx6_u);
-                (void)vx5_u;
-                (void)vx6_u;
+                __m256 vx[STRIDE1_SPECIALIST_K_MAX];
+                stride1_load_kw_windows<K>(in_row, iw0, vx);
 
                 const float* __restrict w0 = wp0 + kh * K;
-                vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
-                vo0 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w0[1]), vo0);
-                vo0 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w0[2]), vo0);
-                vo0 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w0[3]), vo0);
-                vo0 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w0[4]), vo0);
-
+#pragma GCC unroll 16
+                for (int kw = 0; kw < K; ++kw) {
+                    vo0 = _mm256_fmadd_ps(vx[kw], _mm256_set1_ps(w0[kw]), vo0);
+                }
                 if (c_rem > 1) {
                     const float* __restrict w1 = wp1 + kh * K;
-                    vo1 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w1[0]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w1[1]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w1[2]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w1[3]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w1[4]), vo1);
+#pragma GCC unroll 16
+                    for (int kw = 0; kw < K; ++kw) {
+                        vo1 = _mm256_fmadd_ps(vx[kw], _mm256_set1_ps(w1[kw]), vo1);
+                    }
                 }
                 if (c_rem > 2) {
                     const float* __restrict w2 = wp2 + kh * K;
-                    vo2 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w2[0]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w2[1]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w2[2]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w2[3]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w2[4]), vo2);
+#pragma GCC unroll 16
+                    for (int kw = 0; kw < K; ++kw) {
+                        vo2 = _mm256_fmadd_ps(vx[kw], _mm256_set1_ps(w2[kw]), vo2);
+                    }
                 }
                 if (c_rem > 3) {
                     const float* __restrict w3 = wp3 + kh * K;
-                    vo3 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w3[0]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w3[1]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w3[2]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w3[3]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w3[4]), vo3);
+#pragma GCC unroll 16
+                    for (int kw = 0; kw < K; ++kw) {
+                        vo3 = _mm256_fmadd_ps(vx[kw], _mm256_set1_ps(w3[kw]), vo3);
+                    }
                 }
             }
         }
@@ -1383,421 +816,7 @@ struct Stride1Specialist<5> {
     );
 };
 
-template<>
-struct Stride1Specialist<7> {
-    static constexpr int K = 7;
-
-    static void fwd_tile(
-        const ConvFwdTileDoc& doc,
-        const float* __restrict x_pad_buf,
-        int64_t x_pad_l, int64_t x_row_stride,
-        const float* __restrict W,
-        float* __restrict out,
-        int64_t C_in, int64_t C_out, int64_t H,
-        int64_t pad, int64_t k_spatial, int64_t spatial_out, int64_t out_w_stride
-    ) {
-        const int64_t ih_base = doc.oh - pad;
-        const int64_t c_rem   = doc.cout_count;
-        const int64_t x_plane = H * x_row_stride;
-
-        float* __restrict out_r0 = &out[(doc.n * C_out + doc.cout0 + 0) * spatial_out + doc.oh * out_w_stride + doc.ow];
-        float* __restrict out_r1 = (c_rem > 1) ? &out[(doc.n * C_out + doc.cout0 + 1) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r2 = (c_rem > 2) ? &out[(doc.n * C_out + doc.cout0 + 2) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r3 = (c_rem > 3) ? &out[(doc.n * C_out + doc.cout0 + 3) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-
-        __m256 vo0 = _mm256_loadu_ps(out_r0);
-        __m256 vo1 = (c_rem > 1) ? _mm256_loadu_ps(out_r1) : _mm256_setzero_ps();
-        __m256 vo2 = (c_rem > 2) ? _mm256_loadu_ps(out_r2) : _mm256_setzero_ps();
-        __m256 vo3 = (c_rem > 3) ? _mm256_loadu_ps(out_r3) : _mm256_setzero_ps();
-
-        const bool full_ow = (doc.ow_count == FWD_TILE_OW);
-        const __m256i out_mask = bwd_dw_lane_mask(doc.ow_count);
-
-        const float* __restrict xp_base = &x_pad_buf[doc.n * C_in * x_plane];
-        const int64_t iw0 = x_pad_l + doc.ow - pad;
-
-        for (int64_t cin = 0; cin < C_in; ++cin) {
-            const float* __restrict xp  = xp_base + cin * x_plane;
-            const float* __restrict wp0 = &W[((doc.cout0 + 0) * C_in + cin) * k_spatial];
-            const float* __restrict wp1 = (c_rem > 1) ? &W[((doc.cout0 + 1) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp2 = (c_rem > 2) ? &W[((doc.cout0 + 2) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp3 = (c_rem > 3) ? &W[((doc.cout0 + 3) * C_in + cin) * k_spatial] : nullptr;
-
-            for (int64_t kh = 0; kh < K; ++kh) {
-                const int64_t ih = ih_base + kh;
-                if (ih < 0 || ih >= H) {
-                    continue;
-                }
-
-                const float* __restrict in_row = xp + ih * x_row_stride;
-
-                __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6;
-                stride1_kw_windows_alignr(in_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6);
-
-                const float* __restrict w0 = wp0 + kh * K;
-                vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
-                vo0 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w0[1]), vo0);
-                vo0 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w0[2]), vo0);
-                vo0 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w0[3]), vo0);
-                vo0 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w0[4]), vo0);
-                vo0 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w0[5]), vo0);
-                vo0 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w0[6]), vo0);
-
-                if (c_rem > 1) {
-                    const float* __restrict w1 = wp1 + kh * K;
-                    vo1 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w1[0]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w1[1]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w1[2]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w1[3]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w1[4]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w1[5]), vo1);
-                    vo1 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w1[6]), vo1);
-                }
-                if (c_rem > 2) {
-                    const float* __restrict w2 = wp2 + kh * K;
-                    vo2 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w2[0]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w2[1]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w2[2]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w2[3]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w2[4]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w2[5]), vo2);
-                    vo2 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w2[6]), vo2);
-                }
-                if (c_rem > 3) {
-                    const float* __restrict w3 = wp3 + kh * K;
-                    vo3 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w3[0]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w3[1]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w3[2]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w3[3]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w3[4]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w3[5]), vo3);
-                    vo3 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w3[6]), vo3);
-                }
-            }
-        }
-
-        if (full_ow) {
-            _mm256_storeu_ps(out_r0, vo0);
-            if (c_rem > 1) _mm256_storeu_ps(out_r1, vo1);
-            if (c_rem > 2) _mm256_storeu_ps(out_r2, vo2);
-            if (c_rem > 3) _mm256_storeu_ps(out_r3, vo3);
-        } else {
-            _mm256_maskstore_ps(out_r0, out_mask, vo0);
-            if (c_rem > 1) _mm256_maskstore_ps(out_r1, out_mask, vo1);
-            if (c_rem > 2) _mm256_maskstore_ps(out_r2, out_mask, vo2);
-            if (c_rem > 3) _mm256_maskstore_ps(out_r3, out_mask, vo3);
-        }
-    }
-
-    static void bwd_dx_tile(
-        const ConvBwdDxTileDoc& doc,
-        const float* __restrict dy_pad_buf,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        const float* __restrict W,
-        float* __restrict dx,
-        int64_t C_in, int64_t C_out, int64_t W_in_stride,
-        int64_t pad, int64_t spatial_in, int64_t k_spatial,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-
-    static void dw_nci(
-        int64_t n, int64_t cout, int64_t cin,
-        float* __restrict dw_slice,
-        const float* __restrict dy_pad_buf,
-        const float* __restrict x_pad_buf,
-        int64_t C_in, int64_t C_out,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        int64_t x_pad_l, int64_t x_row_stride,
-        int64_t H, int64_t pad,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-};
-
-template<>
-struct Stride1Specialist<9> {
-    static constexpr int K = 9;
-
-    static void fwd_tile(
-        const ConvFwdTileDoc& doc,
-        const float* __restrict x_pad_buf,
-        int64_t x_pad_l, int64_t x_row_stride,
-        const float* __restrict W,
-        float* __restrict out,
-        int64_t C_in, int64_t C_out, int64_t H,
-        int64_t pad, int64_t k_spatial, int64_t spatial_out, int64_t out_w_stride
-    ) {
-        const int64_t ih_base = doc.oh - pad;
-        const int64_t c_rem   = doc.cout_count;
-        const int64_t x_plane = H * x_row_stride;
-
-        float* __restrict out_r0 = &out[(doc.n * C_out + doc.cout0 + 0) * spatial_out + doc.oh * out_w_stride + doc.ow];
-        float* __restrict out_r1 = (c_rem > 1) ? &out[(doc.n * C_out + doc.cout0 + 1) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r2 = (c_rem > 2) ? &out[(doc.n * C_out + doc.cout0 + 2) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r3 = (c_rem > 3) ? &out[(doc.n * C_out + doc.cout0 + 3) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-
-        __m256 vo0 = _mm256_loadu_ps(out_r0);
-        __m256 vo1 = (c_rem > 1) ? _mm256_loadu_ps(out_r1) : _mm256_setzero_ps();
-        __m256 vo2 = (c_rem > 2) ? _mm256_loadu_ps(out_r2) : _mm256_setzero_ps();
-        __m256 vo3 = (c_rem > 3) ? _mm256_loadu_ps(out_r3) : _mm256_setzero_ps();
-
-        const bool full_ow = (doc.ow_count == FWD_TILE_OW);
-        const __m256i out_mask = bwd_dw_lane_mask(doc.ow_count);
-
-        const float* __restrict xp_base = &x_pad_buf[doc.n * C_in * x_plane];
-        const int64_t iw0 = x_pad_l + doc.ow - pad;
-
-        for (int64_t cin = 0; cin < C_in; ++cin) {
-            const float* __restrict xp  = xp_base + cin * x_plane;
-            const float* __restrict wp0 = &W[((doc.cout0 + 0) * C_in + cin) * k_spatial];
-            const float* __restrict wp1 = (c_rem > 1) ? &W[((doc.cout0 + 1) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp2 = (c_rem > 2) ? &W[((doc.cout0 + 2) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp3 = (c_rem > 3) ? &W[((doc.cout0 + 3) * C_in + cin) * k_spatial] : nullptr;
-
-            for (int64_t kh = 0; kh < K; ++kh) {
-                const int64_t ih = ih_base + kh;
-                if (ih < 0 || ih >= H) {
-                    continue;
-                }
-
-                const float* __restrict in_row = xp + ih * x_row_stride;
-
-                __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vx8;
-                stride1_kw_windows_alignr9(in_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vx8);
-
-                const float* __restrict w0 = wp0 + kh * K;
-                vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
-                vo0 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w0[1]), vo0);
-                vo0 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w0[2]), vo0);
-                vo0 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w0[3]), vo0);
-                vo0 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w0[4]), vo0);
-                vo0 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w0[5]), vo0);
-                vo0 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w0[6]), vo0);
-                vo0 = _mm256_fmadd_ps(vx7, _mm256_set1_ps(w0[7]), vo0);
-                vo0 = _mm256_fmadd_ps(vx8, _mm256_set1_ps(w0[8]), vo0);
-
-                if (c_rem > 1) {
-                    const float* __restrict w1 = wp1 + kh * K;
-                vo1 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w1[0]), vo1);
-                vo1 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w1[1]), vo1);
-                vo1 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w1[2]), vo1);
-                vo1 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w1[3]), vo1);
-                vo1 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w1[4]), vo1);
-                vo1 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w1[5]), vo1);
-                vo1 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w1[6]), vo1);
-                vo1 = _mm256_fmadd_ps(vx7, _mm256_set1_ps(w1[7]), vo1);
-                vo1 = _mm256_fmadd_ps(vx8, _mm256_set1_ps(w1[8]), vo1);
-                }
-                if (c_rem > 2) {
-                    const float* __restrict w2 = wp2 + kh * K;
-                vo2 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w2[0]), vo2);
-                vo2 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w2[1]), vo2);
-                vo2 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w2[2]), vo2);
-                vo2 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w2[3]), vo2);
-                vo2 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w2[4]), vo2);
-                vo2 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w2[5]), vo2);
-                vo2 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w2[6]), vo2);
-                vo2 = _mm256_fmadd_ps(vx7, _mm256_set1_ps(w2[7]), vo2);
-                vo2 = _mm256_fmadd_ps(vx8, _mm256_set1_ps(w2[8]), vo2);
-                }
-                if (c_rem > 3) {
-                    const float* __restrict w3 = wp3 + kh * K;
-                vo3 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w3[0]), vo3);
-                vo3 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w3[1]), vo3);
-                vo3 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w3[2]), vo3);
-                vo3 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w3[3]), vo3);
-                vo3 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w3[4]), vo3);
-                vo3 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w3[5]), vo3);
-                vo3 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w3[6]), vo3);
-                vo3 = _mm256_fmadd_ps(vx7, _mm256_set1_ps(w3[7]), vo3);
-                vo3 = _mm256_fmadd_ps(vx8, _mm256_set1_ps(w3[8]), vo3);
-                }
-            }
-        }
-
-        if (full_ow) {
-            _mm256_storeu_ps(out_r0, vo0);
-            if (c_rem > 1) _mm256_storeu_ps(out_r1, vo1);
-            if (c_rem > 2) _mm256_storeu_ps(out_r2, vo2);
-            if (c_rem > 3) _mm256_storeu_ps(out_r3, vo3);
-        } else {
-            _mm256_maskstore_ps(out_r0, out_mask, vo0);
-            if (c_rem > 1) _mm256_maskstore_ps(out_r1, out_mask, vo1);
-            if (c_rem > 2) _mm256_maskstore_ps(out_r2, out_mask, vo2);
-            if (c_rem > 3) _mm256_maskstore_ps(out_r3, out_mask, vo3);
-        }
-    }
-
-    static void bwd_dx_tile(
-        const ConvBwdDxTileDoc& doc,
-        const float* __restrict dy_pad_buf,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        const float* __restrict W,
-        float* __restrict dx,
-        int64_t C_in, int64_t C_out, int64_t W_in_stride,
-        int64_t pad, int64_t spatial_in, int64_t k_spatial,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-
-    static void dw_nci(
-        int64_t n, int64_t cout, int64_t cin,
-        float* __restrict dw_slice,
-        const float* __restrict dy_pad_buf,
-        const float* __restrict x_pad_buf,
-        int64_t C_in, int64_t C_out,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        int64_t x_pad_l, int64_t x_row_stride,
-        int64_t H, int64_t pad,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-};
-
-template<>
-struct Stride1Specialist<11> {
-    static constexpr int K = 11;
-
-    static void fwd_tile(
-        const ConvFwdTileDoc& doc,
-        const float* __restrict x_pad_buf,
-        int64_t x_pad_l, int64_t x_row_stride,
-        const float* __restrict W,
-        float* __restrict out,
-        int64_t C_in, int64_t C_out, int64_t H,
-        int64_t pad, int64_t k_spatial, int64_t spatial_out, int64_t out_w_stride
-    ) {
-        const int64_t ih_base = doc.oh - pad;
-        const int64_t c_rem   = doc.cout_count;
-        const int64_t x_plane = H * x_row_stride;
-
-        float* __restrict out_r0 = &out[(doc.n * C_out + doc.cout0 + 0) * spatial_out + doc.oh * out_w_stride + doc.ow];
-        float* __restrict out_r1 = (c_rem > 1) ? &out[(doc.n * C_out + doc.cout0 + 1) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r2 = (c_rem > 2) ? &out[(doc.n * C_out + doc.cout0 + 2) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-        float* __restrict out_r3 = (c_rem > 3) ? &out[(doc.n * C_out + doc.cout0 + 3) * spatial_out + doc.oh * out_w_stride + doc.ow] : nullptr;
-
-        __m256 vo0 = _mm256_loadu_ps(out_r0);
-        __m256 vo1 = (c_rem > 1) ? _mm256_loadu_ps(out_r1) : _mm256_setzero_ps();
-        __m256 vo2 = (c_rem > 2) ? _mm256_loadu_ps(out_r2) : _mm256_setzero_ps();
-        __m256 vo3 = (c_rem > 3) ? _mm256_loadu_ps(out_r3) : _mm256_setzero_ps();
-
-        const bool full_ow = (doc.ow_count == FWD_TILE_OW);
-        const __m256i out_mask = bwd_dw_lane_mask(doc.ow_count);
-
-        const float* __restrict xp_base = &x_pad_buf[doc.n * C_in * x_plane];
-        const int64_t iw0 = x_pad_l + doc.ow - pad;
-
-        for (int64_t cin = 0; cin < C_in; ++cin) {
-            const float* __restrict xp  = xp_base + cin * x_plane;
-            const float* __restrict wp0 = &W[((doc.cout0 + 0) * C_in + cin) * k_spatial];
-            const float* __restrict wp1 = (c_rem > 1) ? &W[((doc.cout0 + 1) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp2 = (c_rem > 2) ? &W[((doc.cout0 + 2) * C_in + cin) * k_spatial] : nullptr;
-            const float* __restrict wp3 = (c_rem > 3) ? &W[((doc.cout0 + 3) * C_in + cin) * k_spatial] : nullptr;
-
-            for (int64_t kh = 0; kh < K; ++kh) {
-                const int64_t ih = ih_base + kh;
-                if (ih < 0 || ih >= H) {
-                    continue;
-                }
-
-                const float* __restrict in_row = xp + ih * x_row_stride;
-
-                __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vx8, vx9, vx10;
-                stride1_kw_windows_alignr11(
-                    in_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vx8, vx9, vx10
-                );
-
-                const float* __restrict w0 = wp0 + kh * K;
-                vo0 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w0[0]), vo0);
-                vo0 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w0[1]), vo0);
-                vo0 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w0[2]), vo0);
-                vo0 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w0[3]), vo0);
-                vo0 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w0[4]), vo0);
-                vo0 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w0[5]), vo0);
-                vo0 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w0[6]), vo0);
-                vo0 = _mm256_fmadd_ps(vx7, _mm256_set1_ps(w0[7]), vo0);
-                vo0 = _mm256_fmadd_ps(vx8, _mm256_set1_ps(w0[8]), vo0);
-                vo0 = _mm256_fmadd_ps(vx9, _mm256_set1_ps(w0[9]), vo0);
-                vo0 = _mm256_fmadd_ps(vx10, _mm256_set1_ps(w0[10]), vo0);
-
-                if (c_rem > 1) {
-                    const float* __restrict w1 = wp1 + kh * K;
-                vo1 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w1[0]), vo1);
-                vo1 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w1[1]), vo1);
-                vo1 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w1[2]), vo1);
-                vo1 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w1[3]), vo1);
-                vo1 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w1[4]), vo1);
-                vo1 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w1[5]), vo1);
-                vo1 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w1[6]), vo1);
-                vo1 = _mm256_fmadd_ps(vx7, _mm256_set1_ps(w1[7]), vo1);
-                vo1 = _mm256_fmadd_ps(vx8, _mm256_set1_ps(w1[8]), vo1);
-                vo1 = _mm256_fmadd_ps(vx9, _mm256_set1_ps(w1[9]), vo1);
-                vo1 = _mm256_fmadd_ps(vx10, _mm256_set1_ps(w1[10]), vo1);
-                }
-                if (c_rem > 2) {
-                    const float* __restrict w2 = wp2 + kh * K;
-                vo2 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w2[0]), vo2);
-                vo2 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w2[1]), vo2);
-                vo2 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w2[2]), vo2);
-                vo2 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w2[3]), vo2);
-                vo2 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w2[4]), vo2);
-                vo2 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w2[5]), vo2);
-                vo2 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w2[6]), vo2);
-                vo2 = _mm256_fmadd_ps(vx7, _mm256_set1_ps(w2[7]), vo2);
-                vo2 = _mm256_fmadd_ps(vx8, _mm256_set1_ps(w2[8]), vo2);
-                vo2 = _mm256_fmadd_ps(vx9, _mm256_set1_ps(w2[9]), vo2);
-                vo2 = _mm256_fmadd_ps(vx10, _mm256_set1_ps(w2[10]), vo2);
-                }
-                if (c_rem > 3) {
-                    const float* __restrict w3 = wp3 + kh * K;
-                vo3 = _mm256_fmadd_ps(vx0, _mm256_set1_ps(w3[0]), vo3);
-                vo3 = _mm256_fmadd_ps(vx1, _mm256_set1_ps(w3[1]), vo3);
-                vo3 = _mm256_fmadd_ps(vx2, _mm256_set1_ps(w3[2]), vo3);
-                vo3 = _mm256_fmadd_ps(vx3, _mm256_set1_ps(w3[3]), vo3);
-                vo3 = _mm256_fmadd_ps(vx4, _mm256_set1_ps(w3[4]), vo3);
-                vo3 = _mm256_fmadd_ps(vx5, _mm256_set1_ps(w3[5]), vo3);
-                vo3 = _mm256_fmadd_ps(vx6, _mm256_set1_ps(w3[6]), vo3);
-                vo3 = _mm256_fmadd_ps(vx7, _mm256_set1_ps(w3[7]), vo3);
-                vo3 = _mm256_fmadd_ps(vx8, _mm256_set1_ps(w3[8]), vo3);
-                vo3 = _mm256_fmadd_ps(vx9, _mm256_set1_ps(w3[9]), vo3);
-                vo3 = _mm256_fmadd_ps(vx10, _mm256_set1_ps(w3[10]), vo3);
-                }
-            }
-        }
-
-        if (full_ow) {
-            _mm256_storeu_ps(out_r0, vo0);
-            if (c_rem > 1) _mm256_storeu_ps(out_r1, vo1);
-            if (c_rem > 2) _mm256_storeu_ps(out_r2, vo2);
-            if (c_rem > 3) _mm256_storeu_ps(out_r3, vo3);
-        } else {
-            _mm256_maskstore_ps(out_r0, out_mask, vo0);
-            if (c_rem > 1) _mm256_maskstore_ps(out_r1, out_mask, vo1);
-            if (c_rem > 2) _mm256_maskstore_ps(out_r2, out_mask, vo2);
-            if (c_rem > 3) _mm256_maskstore_ps(out_r3, out_mask, vo3);
-        }
-    }
-
-    static void bwd_dx_tile(
-        const ConvBwdDxTileDoc& doc,
-        const float* __restrict dy_pad_buf,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        const float* __restrict W,
-        float* __restrict dx,
-        int64_t C_in, int64_t C_out, int64_t W_in_stride,
-        int64_t pad, int64_t spatial_in, int64_t k_spatial,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-
-    static void dw_nci(
-        int64_t n, int64_t cout, int64_t cin,
-        float* __restrict dw_slice,
-        const float* __restrict dy_pad_buf,
-        const float* __restrict x_pad_buf,
-        int64_t C_in, int64_t C_out,
-        int64_t dy_pad_l, int64_t dy_row_stride,
-        int64_t x_pad_l, int64_t x_row_stride,
-        int64_t H, int64_t pad,
-        int64_t conv_out_h, int64_t conv_out_w
-    );
-};
+// Sentinel removed: explicit Stride1Specialist clones deleted below.
 
 static inline bool stride1_try_fwd_specialist(
     int64_t k_h, int64_t k_w,
@@ -1859,8 +878,20 @@ static inline bool stride1_try_fwd_specialist(
                 W, out, C_in, C_out, H, pad, k_spatial, spatial_out, out_w_stride
             );
             return true;
+        case 8:
+            Stride1Specialist<8>::fwd_tile(
+                doc, x_pad_buf, x_pad_l, x_row_stride,
+                W, out, C_in, C_out, H, pad, k_spatial, spatial_out, out_w_stride
+            );
+            return true;
         case 9:
             Stride1Specialist<9>::fwd_tile(
+                doc, x_pad_buf, x_pad_l, x_row_stride,
+                W, out, C_in, C_out, H, pad, k_spatial, spatial_out, out_w_stride
+            );
+            return true;
+        case 10:
+            Stride1Specialist<10>::fwd_tile(
                 doc, x_pad_buf, x_pad_l, x_row_stride,
                 W, out, C_in, C_out, H, pad, k_spatial, spatial_out, out_w_stride
             );
@@ -1940,8 +971,22 @@ static inline bool stride1_try_bwd_dx_specialist(
                 conv_out_h, conv_out_w
             );
             return true;
+        case 8:
+            Stride1Specialist<8>::bwd_dx_tile(
+                doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
+                C_in, C_out, W_in_stride, pad, spatial_in, k_spatial,
+                conv_out_h, conv_out_w
+            );
+            return true;
         case 9:
             Stride1Specialist<9>::bwd_dx_tile(
+                doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
+                C_in, C_out, W_in_stride, pad, spatial_in, k_spatial,
+                conv_out_h, conv_out_w
+            );
+            return true;
+        case 10:
+            Stride1Specialist<10>::bwd_dx_tile(
                 doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
                 C_in, C_out, W_in_stride, pad, spatial_in, k_spatial,
                 conv_out_h, conv_out_w
@@ -2051,8 +1096,30 @@ static inline bool stride1_try_dw_specialist(
                 conv_out_h, conv_out_w
             );
             return true;
+        case 8:
+            Stride1Specialist<8>::dw_nci(
+                n, cout, cin, dw_slice,
+                dy_pad_buf, x_pad_buf,
+                C_in, C_out,
+                dy_pad_l, dy_row_stride,
+                x_pad_l, x_row_stride,
+                H, pad,
+                conv_out_h, conv_out_w
+            );
+            return true;
         case 9:
             Stride1Specialist<9>::dw_nci(
+                n, cout, cin, dw_slice,
+                dy_pad_buf, x_pad_buf,
+                C_in, C_out,
+                dy_pad_l, dy_row_stride,
+                x_pad_l, x_row_stride,
+                H, pad,
+                conv_out_h, conv_out_w
+            );
+            return true;
+        case 10:
+            Stride1Specialist<10>::dw_nci(
                 n, cout, cin, dw_slice,
                 dy_pad_buf, x_pad_buf,
                 C_in, C_out,
@@ -2602,8 +1669,10 @@ static __forceinline __m256 fmadd_dx_cout1(__m256 v_dx, __m256 r0, float w0) {
     return _mm256_fmadd_ps(r0, _mm256_set1_ps(w0), v_dx);
 }
 
-// One cout×4 group: fully unrolled kw against padded dY row offsets (K=6).
-static __forceinline void stride1_bwd_dx_accum_cout4_k6(
+// --- Primary Stride1Specialist<K> backward (one body for K=1..11) ---
+
+template<int K>
+static __forceinline void stride1_bwd_dx_accum_cout4(
     __m256& v_dx,
     int64_t ow0,
     const float* __restrict dy0,
@@ -2615,46 +1684,19 @@ static __forceinline void stride1_bwd_dx_accum_cout4_k6(
     const float* __restrict wp2,
     const float* __restrict wp3
 ) {
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 0), _mm256_loadu_ps(dy1 + ow0 - 0),
-        _mm256_loadu_ps(dy2 + ow0 - 0), _mm256_loadu_ps(dy3 + ow0 - 0),
-        wp0[0], wp1[0], wp2[0], wp3[0]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 1), _mm256_loadu_ps(dy1 + ow0 - 1),
-        _mm256_loadu_ps(dy2 + ow0 - 1), _mm256_loadu_ps(dy3 + ow0 - 1),
-        wp0[1], wp1[1], wp2[1], wp3[1]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 2), _mm256_loadu_ps(dy1 + ow0 - 2),
-        _mm256_loadu_ps(dy2 + ow0 - 2), _mm256_loadu_ps(dy3 + ow0 - 2),
-        wp0[2], wp1[2], wp2[2], wp3[2]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 3), _mm256_loadu_ps(dy1 + ow0 - 3),
-        _mm256_loadu_ps(dy2 + ow0 - 3), _mm256_loadu_ps(dy3 + ow0 - 3),
-        wp0[3], wp1[3], wp2[3], wp3[3]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 4), _mm256_loadu_ps(dy1 + ow0 - 4),
-        _mm256_loadu_ps(dy2 + ow0 - 4), _mm256_loadu_ps(dy3 + ow0 - 4),
-        wp0[4], wp1[4], wp2[4], wp3[4]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 5), _mm256_loadu_ps(dy1 + ow0 - 5),
-        _mm256_loadu_ps(dy2 + ow0 - 5), _mm256_loadu_ps(dy3 + ow0 - 5),
-        wp0[5], wp1[5], wp2[5], wp3[5]
-    );
+#pragma GCC unroll 16
+    for (int kw = 0; kw < K; ++kw) {
+        v_dx = fmadd_dx_cout4(
+            v_dx,
+            _mm256_loadu_ps(dy0 + ow0 - kw), _mm256_loadu_ps(dy1 + ow0 - kw),
+            _mm256_loadu_ps(dy2 + ow0 - kw), _mm256_loadu_ps(dy3 + ow0 - kw),
+            wp0[kw], wp1[kw], wp2[kw], wp3[kw]
+        );
+    }
 }
 
-// C_out=8: two fixed cout×4 groups, no cout loop.
-static void stride1_bwd_dx_tile_c8_k6(
+template<int K>
+static void stride1_bwd_dx_tile_c8(
     const ConvBwdDxTileDoc& doc,
     const float* __restrict dy_pad_buf,
     int64_t dy_pad_l, int64_t dy_row_stride,
@@ -2664,244 +1706,6 @@ static void stride1_bwd_dx_tile_c8_k6(
     int64_t pad, int64_t spatial_in, int64_t k_spatial,
     int64_t conv_out_h, int64_t conv_out_w
 ) {
-    static constexpr int K = Stride1Specialist<6>::K;
-    (void)C_in;
-
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 8 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-
-    int64_t kh_lo = 0;
-    int64_t kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-
-        stride1_bwd_dx_accum_cout4_k6(
-            v_dx, ow0,
-            dy_oh + 0 * dy_plane, dy_oh + 1 * dy_plane,
-            dy_oh + 2 * dy_plane, dy_oh + 3 * dy_plane,
-            w_kh + 0 * w_cout_stride, w_kh + 1 * w_cout_stride,
-            w_kh + 2 * w_cout_stride, w_kh + 3 * w_cout_stride
-        );
-        stride1_bwd_dx_accum_cout4_k6(
-            v_dx, ow0,
-            dy_oh + 4 * dy_plane, dy_oh + 5 * dy_plane,
-            dy_oh + 6 * dy_plane, dy_oh + 7 * dy_plane,
-            w_kh + 4 * w_cout_stride, w_kh + 5 * w_cout_stride,
-            w_kh + 6 * w_cout_stride, w_kh + 7 * w_cout_stride
-        );
-    }
-
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-// C_out=16: four fixed cout×4 groups, no cout loop.
-static void stride1_bwd_dx_tile_c16_k6(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<6>::K;
-    (void)C_in;
-
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 16 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-
-    int64_t kh_lo = 0;
-    int64_t kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-
-        stride1_bwd_dx_accum_cout4_k6(
-            v_dx, ow0,
-            dy_oh + 0 * dy_plane, dy_oh + 1 * dy_plane,
-            dy_oh + 2 * dy_plane, dy_oh + 3 * dy_plane,
-            w_kh + 0 * w_cout_stride, w_kh + 1 * w_cout_stride,
-            w_kh + 2 * w_cout_stride, w_kh + 3 * w_cout_stride
-        );
-        stride1_bwd_dx_accum_cout4_k6(
-            v_dx, ow0,
-            dy_oh + 4 * dy_plane, dy_oh + 5 * dy_plane,
-            dy_oh + 6 * dy_plane, dy_oh + 7 * dy_plane,
-            w_kh + 4 * w_cout_stride, w_kh + 5 * w_cout_stride,
-            w_kh + 6 * w_cout_stride, w_kh + 7 * w_cout_stride
-        );
-        stride1_bwd_dx_accum_cout4_k6(
-            v_dx, ow0,
-            dy_oh + 8 * dy_plane, dy_oh + 9 * dy_plane,
-            dy_oh + 10 * dy_plane, dy_oh + 11 * dy_plane,
-            w_kh + 8 * w_cout_stride, w_kh + 9 * w_cout_stride,
-            w_kh + 10 * w_cout_stride, w_kh + 11 * w_cout_stride
-        );
-        stride1_bwd_dx_accum_cout4_k6(
-            v_dx, ow0,
-            dy_oh + 12 * dy_plane, dy_oh + 13 * dy_plane,
-            dy_oh + 14 * dy_plane, dy_oh + 15 * dy_plane,
-            w_kh + 12 * w_cout_stride, w_kh + 13 * w_cout_stride,
-            w_kh + 14 * w_cout_stride, w_kh + 15 * w_cout_stride
-        );
-    }
-
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<6>::bwd_dx_tile(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t C_out, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    if (C_out == 8) {
-        stride1_bwd_dx_tile_c8_k6(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    if (C_out == 16) {
-        stride1_bwd_dx_tile_c16_k6(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-
-    (void)C_in;
-
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * C_out * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-
-    int64_t kh_lo = 0;
-    int64_t kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-
-        int64_t cout = 0;
-        for (; cout + 3 < C_out; cout += 4) {
-            stride1_bwd_dx_accum_cout4_k6(
-                v_dx, ow0,
-                dy_oh + (cout + 0) * dy_plane,
-                dy_oh + (cout + 1) * dy_plane,
-                dy_oh + (cout + 2) * dy_plane,
-                dy_oh + (cout + 3) * dy_plane,
-                w_kh + (cout + 0) * w_cout_stride,
-                w_kh + (cout + 1) * w_cout_stride,
-                w_kh + (cout + 2) * w_cout_stride,
-                w_kh + (cout + 3) * w_cout_stride
-            );
-        }
-        for (; cout < C_out; ++cout) {
-            const float* __restrict dy_row = dy_oh + cout * dy_plane;
-            const float* __restrict wp = w_kh + cout * w_cout_stride;
-
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 0), wp[0]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 1), wp[1]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 2), wp[2]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 3), wp[3]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 4), wp[4]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 5), wp[5]);
-        }
-    }
-
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-// --- Stride1Specialist<1> backward implementations ---
-
-#define STRIDE1_BWD_DX_ACCUM_K1(v_dx, ow0, dy0, dy1, dy2, dy3, wp0, wp1, wp2, wp3) \
-    do { \
-        (v_dx) = fmadd_dx_cout4( \
-            (v_dx), \
-            _mm256_loadu_ps((dy0) + (ow0) - 0), _mm256_loadu_ps((dy1) + (ow0) - 0), \
-            _mm256_loadu_ps((dy2) + (ow0) - 0), _mm256_loadu_ps((dy3) + (ow0) - 0), \
-            (wp0)[0], (wp1)[0], (wp2)[0], (wp3)[0] \
-        ); \
-    } while (0)
-
-static void stride1_bwd_dx_tile_c8_k1(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<1>::K;
     (void)C_in;
     if (bwd_dx_mock_edges_enabled() &&
         !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
@@ -2924,14 +1728,14 @@ static void stride1_bwd_dx_tile_c8_k1(
         const int64_t oh = doc.oh + pad - kh;
         const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
         const float* __restrict w_kh = w_cin + kh * K;
-        STRIDE1_BWD_DX_ACCUM_K1(
+        stride1_bwd_dx_accum_cout4<K>(
             v_dx, ow0,
             dy_oh + 0 * dy_plane, dy_oh + 1 * dy_plane,
             dy_oh + 2 * dy_plane, dy_oh + 3 * dy_plane,
             w_kh + 0 * w_cout_stride, w_kh + 1 * w_cout_stride,
             w_kh + 2 * w_cout_stride, w_kh + 3 * w_cout_stride
         );
-        STRIDE1_BWD_DX_ACCUM_K1(
+        stride1_bwd_dx_accum_cout4<K>(
             v_dx, ow0,
             dy_oh + 4 * dy_plane, dy_oh + 5 * dy_plane,
             dy_oh + 6 * dy_plane, dy_oh + 7 * dy_plane,
@@ -2942,7 +1746,8 @@ static void stride1_bwd_dx_tile_c8_k1(
     bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
 }
 
-static void stride1_bwd_dx_tile_c16_k1(
+template<int K>
+static void stride1_bwd_dx_tile_c16(
     const ConvBwdDxTileDoc& doc,
     const float* __restrict dy_pad_buf,
     int64_t dy_pad_l, int64_t dy_row_stride,
@@ -2952,7 +1757,6 @@ static void stride1_bwd_dx_tile_c16_k1(
     int64_t pad, int64_t spatial_in, int64_t k_spatial,
     int64_t conv_out_h, int64_t conv_out_w
 ) {
-    static constexpr int K = Stride1Specialist<1>::K;
     (void)C_in;
     if (bwd_dx_mock_edges_enabled() &&
         !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
@@ -2976,7 +1780,7 @@ static void stride1_bwd_dx_tile_c16_k1(
         const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
         const float* __restrict w_kh = w_cin + kh * K;
         for (int64_t g = 0; g < 16; g += 4) {
-            STRIDE1_BWD_DX_ACCUM_K1(
+            stride1_bwd_dx_accum_cout4<K>(
                 v_dx, ow0,
                 dy_oh + (g + 0) * dy_plane, dy_oh + (g + 1) * dy_plane,
                 dy_oh + (g + 2) * dy_plane, dy_oh + (g + 3) * dy_plane,
@@ -2988,7 +1792,8 @@ static void stride1_bwd_dx_tile_c16_k1(
     bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
 }
 
-void Stride1Specialist<1>::bwd_dx_tile(
+template<int K>
+void Stride1Specialist<K>::bwd_dx_tile(
     const ConvBwdDxTileDoc& doc,
     const float* __restrict dy_pad_buf,
     int64_t dy_pad_l, int64_t dy_row_stride,
@@ -2999,7 +1804,7 @@ void Stride1Specialist<1>::bwd_dx_tile(
     int64_t conv_out_h, int64_t conv_out_w
 ) {
     if (C_out == 8) {
-        stride1_bwd_dx_tile_c8_k1(
+        stride1_bwd_dx_tile_c8<K>(
             doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
             C_in, W_in_stride, pad, spatial_in, k_spatial,
             conv_out_h, conv_out_w
@@ -3007,7 +1812,7 @@ void Stride1Specialist<1>::bwd_dx_tile(
         return;
     }
     if (C_out == 16) {
-        stride1_bwd_dx_tile_c16_k1(
+        stride1_bwd_dx_tile_c16<K>(
             doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
             C_in, W_in_stride, pad, spatial_in, k_spatial,
             conv_out_h, conv_out_w
@@ -3038,7 +1843,7 @@ void Stride1Specialist<1>::bwd_dx_tile(
         const float* __restrict w_kh = w_cin + kh * K;
         int64_t cout = 0;
         for (; cout + 3 < C_out; cout += 4) {
-            STRIDE1_BWD_DX_ACCUM_K1(
+            stride1_bwd_dx_accum_cout4<K>(
                 v_dx, ow0,
                 dy_oh + (cout + 0) * dy_plane,
                 dy_oh + (cout + 1) * dy_plane,
@@ -3053,240 +1858,17 @@ void Stride1Specialist<1>::bwd_dx_tile(
         for (; cout < C_out; ++cout) {
             const float* __restrict dy_row = dy_oh + cout * dy_plane;
             const float* __restrict wp = w_kh + cout * w_cout_stride;
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 0), wp[0]);
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<1>::dw_nci(
-    int64_t n, int64_t cout, int64_t cin,
-    float* __restrict dw_slice,
-    const float* __restrict dy_pad_buf,
-    const float* __restrict x_pad_buf,
-    int64_t C_in, int64_t C_out,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    int64_t x_pad_l, int64_t x_row_stride,
-    int64_t H, int64_t pad,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    (void)C_in;
-    (void)C_out;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const int64_t x_plane  = H * x_row_stride;
-    const float* __restrict dy_nc =
-        &dy_pad_buf[(n * C_out + cout) * dy_plane];
-    const float* __restrict x_nc =
-        &x_pad_buf[(n * C_in + cin) * x_plane];
-    const int64_t ow_tiles = (conv_out_w + FWD_TILE_OW - 1) / FWD_TILE_OW;
-    for (int64_t kh = 0; kh < K; ++kh) {
-        __m256 v_acc0 = _mm256_setzero_ps();
-        for (int64_t oh = 0; oh < conv_out_h; ++oh) {
-            const int64_t ih = oh - pad + kh;
-            if (ih < 0 || ih >= H) continue;
-            const float* __restrict dy_row = &dy_nc[oh * dy_row_stride];
-            const float* __restrict x_row  = &x_nc[ih * x_row_stride];
-            for (int64_t t = 0; t < ow_tiles; ++t) {
-                const int64_t ow = t * FWD_TILE_OW;
-                const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
-                const int64_t iw0 = x_pad_l + ow - pad;
-                v_acc0 = _mm256_fmadd_ps(dy8, _mm256_loadu_ps(x_row + iw0 + 0), v_acc0);
+#pragma GCC unroll 16
+            for (int kw = 0; kw < K; ++kw) {
+                v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - kw), wp[kw]);
             }
         }
-        dw_slice[kh * K + 0] += _mm256_reduce_add_ps(v_acc0);
-    }
-}
-
-#undef STRIDE1_BWD_DX_ACCUM_K1
-
-// --- Stride1Specialist<2> backward implementations ---
-
-#define STRIDE1_BWD_DX_ACCUM_K2(v_dx, ow0, dy0, dy1, dy2, dy3, wp0, wp1, wp2, wp3) \
-    do { \
-        (v_dx) = fmadd_dx_cout4( \
-            (v_dx), \
-            _mm256_loadu_ps((dy0) + (ow0) - 0), _mm256_loadu_ps((dy1) + (ow0) - 0), \
-            _mm256_loadu_ps((dy2) + (ow0) - 0), _mm256_loadu_ps((dy3) + (ow0) - 0), \
-            (wp0)[0], (wp1)[0], (wp2)[0], (wp3)[0] \
-        ); \
-        (v_dx) = fmadd_dx_cout4( \
-            (v_dx), \
-            _mm256_loadu_ps((dy0) + (ow0) - 1), _mm256_loadu_ps((dy1) + (ow0) - 1), \
-            _mm256_loadu_ps((dy2) + (ow0) - 1), _mm256_loadu_ps((dy3) + (ow0) - 1), \
-            (wp0)[1], (wp1)[1], (wp2)[1], (wp3)[1] \
-        ); \
-    } while (0)
-
-static void stride1_bwd_dx_tile_c8_k2(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<2>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 8 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        STRIDE1_BWD_DX_ACCUM_K2(
-            v_dx, ow0,
-            dy_oh + 0 * dy_plane, dy_oh + 1 * dy_plane,
-            dy_oh + 2 * dy_plane, dy_oh + 3 * dy_plane,
-            w_kh + 0 * w_cout_stride, w_kh + 1 * w_cout_stride,
-            w_kh + 2 * w_cout_stride, w_kh + 3 * w_cout_stride
-        );
-        STRIDE1_BWD_DX_ACCUM_K2(
-            v_dx, ow0,
-            dy_oh + 4 * dy_plane, dy_oh + 5 * dy_plane,
-            dy_oh + 6 * dy_plane, dy_oh + 7 * dy_plane,
-            w_kh + 4 * w_cout_stride, w_kh + 5 * w_cout_stride,
-            w_kh + 6 * w_cout_stride, w_kh + 7 * w_cout_stride
-        );
     }
     bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
 }
 
-static void stride1_bwd_dx_tile_c16_k2(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<2>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 16 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        for (int64_t g = 0; g < 16; g += 4) {
-            STRIDE1_BWD_DX_ACCUM_K2(
-                v_dx, ow0,
-                dy_oh + (g + 0) * dy_plane, dy_oh + (g + 1) * dy_plane,
-                dy_oh + (g + 2) * dy_plane, dy_oh + (g + 3) * dy_plane,
-                w_kh + (g + 0) * w_cout_stride, w_kh + (g + 1) * w_cout_stride,
-                w_kh + (g + 2) * w_cout_stride, w_kh + (g + 3) * w_cout_stride
-            );
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<2>::bwd_dx_tile(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t C_out, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    if (C_out == 8) {
-        stride1_bwd_dx_tile_c8_k2(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    if (C_out == 16) {
-        stride1_bwd_dx_tile_c16_k2(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * C_out * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        int64_t cout = 0;
-        for (; cout + 3 < C_out; cout += 4) {
-            STRIDE1_BWD_DX_ACCUM_K2(
-                v_dx, ow0,
-                dy_oh + (cout + 0) * dy_plane,
-                dy_oh + (cout + 1) * dy_plane,
-                dy_oh + (cout + 2) * dy_plane,
-                dy_oh + (cout + 3) * dy_plane,
-                w_kh + (cout + 0) * w_cout_stride,
-                w_kh + (cout + 1) * w_cout_stride,
-                w_kh + (cout + 2) * w_cout_stride,
-                w_kh + (cout + 3) * w_cout_stride
-            );
-        }
-        for (; cout < C_out; ++cout) {
-            const float* __restrict dy_row = dy_oh + cout * dy_plane;
-            const float* __restrict wp = w_kh + cout * w_cout_stride;
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 0), wp[0]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 1), wp[1]);
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<2>::dw_nci(
+template<int K>
+void Stride1Specialist<K>::dw_nci(
     int64_t n, int64_t cout, int64_t cin,
     float* __restrict dw_slice,
     const float* __restrict dy_pad_buf,
@@ -3307,8 +1889,11 @@ void Stride1Specialist<2>::dw_nci(
         &x_pad_buf[(n * C_in + cin) * x_plane];
     const int64_t ow_tiles = (conv_out_w + FWD_TILE_OW - 1) / FWD_TILE_OW;
     for (int64_t kh = 0; kh < K; ++kh) {
-        __m256 v_acc0 = _mm256_setzero_ps();
-        __m256 v_acc1 = _mm256_setzero_ps();
+        __m256 v_acc[STRIDE1_SPECIALIST_K_MAX];
+#pragma GCC unroll 16
+        for (int kw = 0; kw < K; ++kw) {
+            v_acc[kw] = _mm256_setzero_ps();
+        }
         for (int64_t oh = 0; oh < conv_out_h; ++oh) {
             const int64_t ih = oh - pad + kh;
             if (ih < 0 || ih >= H) continue;
@@ -3318,790 +1903,20 @@ void Stride1Specialist<2>::dw_nci(
                 const int64_t ow = t * FWD_TILE_OW;
                 const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
                 const int64_t iw0 = x_pad_l + ow - pad;
-                __m256 vx0, vx1, vx2_u, vx3_u, vx4_u, vx5_u, vx6_u;
-                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2_u, vx3_u, vx4_u, vx5_u, vx6_u);
-                (void)vx2_u;
-                (void)vx3_u;
-                (void)vx4_u;
-                (void)vx5_u;
-                (void)vx6_u;
-                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
+                __m256 vx[STRIDE1_SPECIALIST_K_MAX];
+                stride1_load_kw_windows<K>(x_row, iw0, vx);
+#pragma GCC unroll 16
+                for (int kw = 0; kw < K; ++kw) {
+                    v_acc[kw] = _mm256_fmadd_ps(dy8, vx[kw], v_acc[kw]);
+                }
             }
         }
         const int64_t base = kh * K;
-        dw_slice[base + 0] += _mm256_reduce_add_ps(v_acc0);
-        dw_slice[base + 1] += _mm256_reduce_add_ps(v_acc1);
-    }
-}
-
-#undef STRIDE1_BWD_DX_ACCUM_K2
-
-#define STRIDE1_BWD_DX_ACCUM_K3(v_dx, ow0, dy0, dy1, dy2, dy3, wp0, wp1, wp2, wp3) \
-    do { \
-        (v_dx) = fmadd_dx_cout4( \
-            (v_dx), \
-            _mm256_loadu_ps((dy0) + (ow0) - 0), _mm256_loadu_ps((dy1) + (ow0) - 0), \
-            _mm256_loadu_ps((dy2) + (ow0) - 0), _mm256_loadu_ps((dy3) + (ow0) - 0), \
-            (wp0)[0], (wp1)[0], (wp2)[0], (wp3)[0] \
-        ); \
-        (v_dx) = fmadd_dx_cout4( \
-            (v_dx), \
-            _mm256_loadu_ps((dy0) + (ow0) - 1), _mm256_loadu_ps((dy1) + (ow0) - 1), \
-            _mm256_loadu_ps((dy2) + (ow0) - 1), _mm256_loadu_ps((dy3) + (ow0) - 1), \
-            (wp0)[1], (wp1)[1], (wp2)[1], (wp3)[1] \
-        ); \
-        (v_dx) = fmadd_dx_cout4( \
-            (v_dx), \
-            _mm256_loadu_ps((dy0) + (ow0) - 2), _mm256_loadu_ps((dy1) + (ow0) - 2), \
-            _mm256_loadu_ps((dy2) + (ow0) - 2), _mm256_loadu_ps((dy3) + (ow0) - 2), \
-            (wp0)[2], (wp1)[2], (wp2)[2], (wp3)[2] \
-        ); \
-    } while (0)
-
-#define STRIDE1_BWD_DX_ACCUM_K4(v_dx, ow0, dy0, dy1, dy2, dy3, wp0, wp1, wp2, wp3) \
-    do { \
-        (v_dx) = fmadd_dx_cout4( \
-            (v_dx), \
-            _mm256_loadu_ps((dy0) + (ow0) - 0), _mm256_loadu_ps((dy1) + (ow0) - 0), \
-            _mm256_loadu_ps((dy2) + (ow0) - 0), _mm256_loadu_ps((dy3) + (ow0) - 0), \
-            (wp0)[0], (wp1)[0], (wp2)[0], (wp3)[0] \
-        ); \
-        (v_dx) = fmadd_dx_cout4( \
-            (v_dx), \
-            _mm256_loadu_ps((dy0) + (ow0) - 1), _mm256_loadu_ps((dy1) + (ow0) - 1), \
-            _mm256_loadu_ps((dy2) + (ow0) - 1), _mm256_loadu_ps((dy3) + (ow0) - 1), \
-            (wp0)[1], (wp1)[1], (wp2)[1], (wp3)[1] \
-        ); \
-        (v_dx) = fmadd_dx_cout4( \
-            (v_dx), \
-            _mm256_loadu_ps((dy0) + (ow0) - 2), _mm256_loadu_ps((dy1) + (ow0) - 2), \
-            _mm256_loadu_ps((dy2) + (ow0) - 2), _mm256_loadu_ps((dy3) + (ow0) - 2), \
-            (wp0)[2], (wp1)[2], (wp2)[2], (wp3)[2] \
-        ); \
-        (v_dx) = fmadd_dx_cout4( \
-            (v_dx), \
-            _mm256_loadu_ps((dy0) + (ow0) - 3), _mm256_loadu_ps((dy1) + (ow0) - 3), \
-            _mm256_loadu_ps((dy2) + (ow0) - 3), _mm256_loadu_ps((dy3) + (ow0) - 3), \
-            (wp0)[3], (wp1)[3], (wp2)[3], (wp3)[3] \
-        ); \
-    } while (0)
-
-static void stride1_bwd_dx_tile_c8_k3(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<3>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 8 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        STRIDE1_BWD_DX_ACCUM_K3(
-            v_dx, ow0,
-            dy_oh + 0 * dy_plane, dy_oh + 1 * dy_plane,
-            dy_oh + 2 * dy_plane, dy_oh + 3 * dy_plane,
-            w_kh + 0 * w_cout_stride, w_kh + 1 * w_cout_stride,
-            w_kh + 2 * w_cout_stride, w_kh + 3 * w_cout_stride
-        );
-        STRIDE1_BWD_DX_ACCUM_K3(
-            v_dx, ow0,
-            dy_oh + 4 * dy_plane, dy_oh + 5 * dy_plane,
-            dy_oh + 6 * dy_plane, dy_oh + 7 * dy_plane,
-            w_kh + 4 * w_cout_stride, w_kh + 5 * w_cout_stride,
-            w_kh + 6 * w_cout_stride, w_kh + 7 * w_cout_stride
-        );
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-static void stride1_bwd_dx_tile_c16_k3(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<3>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 16 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        for (int64_t g = 0; g < 16; g += 4) {
-            STRIDE1_BWD_DX_ACCUM_K3(
-                v_dx, ow0,
-                dy_oh + (g + 0) * dy_plane, dy_oh + (g + 1) * dy_plane,
-                dy_oh + (g + 2) * dy_plane, dy_oh + (g + 3) * dy_plane,
-                w_kh + (g + 0) * w_cout_stride, w_kh + (g + 1) * w_cout_stride,
-                w_kh + (g + 2) * w_cout_stride, w_kh + (g + 3) * w_cout_stride
-            );
+#pragma GCC unroll 16
+        for (int kw = 0; kw < K; ++kw) {
+            dw_slice[base + kw] += _mm256_reduce_add_ps(v_acc[kw]);
         }
     }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<3>::bwd_dx_tile(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t C_out, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    if (C_out == 8) {
-        stride1_bwd_dx_tile_c8_k3(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    if (C_out == 16) {
-        stride1_bwd_dx_tile_c16_k3(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * C_out * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        int64_t cout = 0;
-        for (; cout + 3 < C_out; cout += 4) {
-            STRIDE1_BWD_DX_ACCUM_K3(
-                v_dx, ow0,
-                dy_oh + (cout + 0) * dy_plane,
-                dy_oh + (cout + 1) * dy_plane,
-                dy_oh + (cout + 2) * dy_plane,
-                dy_oh + (cout + 3) * dy_plane,
-                w_kh + (cout + 0) * w_cout_stride,
-                w_kh + (cout + 1) * w_cout_stride,
-                w_kh + (cout + 2) * w_cout_stride,
-                w_kh + (cout + 3) * w_cout_stride
-            );
-        }
-        for (; cout < C_out; ++cout) {
-            const float* __restrict dy_row = dy_oh + cout * dy_plane;
-            const float* __restrict wp = w_kh + cout * w_cout_stride;
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 0), wp[0]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 1), wp[1]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 2), wp[2]);
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<3>::dw_nci(
-    int64_t n, int64_t cout, int64_t cin,
-    float* __restrict dw_slice,
-    const float* __restrict dy_pad_buf,
-    const float* __restrict x_pad_buf,
-    int64_t C_in, int64_t C_out,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    int64_t x_pad_l, int64_t x_row_stride,
-    int64_t H, int64_t pad,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    (void)C_in;
-    (void)C_out;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const int64_t x_plane  = H * x_row_stride;
-    const float* __restrict dy_nc =
-        &dy_pad_buf[(n * C_out + cout) * dy_plane];
-    const float* __restrict x_nc =
-        &x_pad_buf[(n * C_in + cin) * x_plane];
-    const int64_t ow_tiles = (conv_out_w + FWD_TILE_OW - 1) / FWD_TILE_OW;
-    for (int64_t kh = 0; kh < K; ++kh) {
-        __m256 v_acc0 = _mm256_setzero_ps();
-        __m256 v_acc1 = _mm256_setzero_ps();
-        __m256 v_acc2 = _mm256_setzero_ps();
-        for (int64_t oh = 0; oh < conv_out_h; ++oh) {
-            const int64_t ih = oh - pad + kh;
-            if (ih < 0 || ih >= H) continue;
-            const float* __restrict dy_row = &dy_nc[oh * dy_row_stride];
-            const float* __restrict x_row  = &x_nc[ih * x_row_stride];
-            for (int64_t t = 0; t < ow_tiles; ++t) {
-                const int64_t ow = t * FWD_TILE_OW;
-                const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
-                const int64_t iw0 = x_pad_l + ow - pad;
-                __m256 vx0, vx1, vx2, vx3_u, vx4_u, vx5_u, vx6_u;
-                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2, vx3_u, vx4_u, vx5_u, vx6_u);
-                (void)vx3_u;
-                (void)vx4_u;
-                (void)vx5_u;
-                (void)vx6_u;
-                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
-            }
-        }
-        const int64_t base = kh * K;
-        dw_slice[base + 0] += _mm256_reduce_add_ps(v_acc0);
-        dw_slice[base + 1] += _mm256_reduce_add_ps(v_acc1);
-        dw_slice[base + 2] += _mm256_reduce_add_ps(v_acc2);
-    }
-}
-
-static void stride1_bwd_dx_tile_c8_k4(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<4>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 8 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        STRIDE1_BWD_DX_ACCUM_K4(
-            v_dx, ow0,
-            dy_oh + 0 * dy_plane, dy_oh + 1 * dy_plane,
-            dy_oh + 2 * dy_plane, dy_oh + 3 * dy_plane,
-            w_kh + 0 * w_cout_stride, w_kh + 1 * w_cout_stride,
-            w_kh + 2 * w_cout_stride, w_kh + 3 * w_cout_stride
-        );
-        STRIDE1_BWD_DX_ACCUM_K4(
-            v_dx, ow0,
-            dy_oh + 4 * dy_plane, dy_oh + 5 * dy_plane,
-            dy_oh + 6 * dy_plane, dy_oh + 7 * dy_plane,
-            w_kh + 4 * w_cout_stride, w_kh + 5 * w_cout_stride,
-            w_kh + 6 * w_cout_stride, w_kh + 7 * w_cout_stride
-        );
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-static void stride1_bwd_dx_tile_c16_k4(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<4>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 16 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        for (int64_t g = 0; g < 16; g += 4) {
-            STRIDE1_BWD_DX_ACCUM_K4(
-                v_dx, ow0,
-                dy_oh + (g + 0) * dy_plane, dy_oh + (g + 1) * dy_plane,
-                dy_oh + (g + 2) * dy_plane, dy_oh + (g + 3) * dy_plane,
-                w_kh + (g + 0) * w_cout_stride, w_kh + (g + 1) * w_cout_stride,
-                w_kh + (g + 2) * w_cout_stride, w_kh + (g + 3) * w_cout_stride
-            );
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<4>::bwd_dx_tile(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t C_out, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    if (C_out == 8) {
-        stride1_bwd_dx_tile_c8_k4(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    if (C_out == 16) {
-        stride1_bwd_dx_tile_c16_k4(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * C_out * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        int64_t cout = 0;
-        for (; cout + 3 < C_out; cout += 4) {
-            STRIDE1_BWD_DX_ACCUM_K4(
-                v_dx, ow0,
-                dy_oh + (cout + 0) * dy_plane,
-                dy_oh + (cout + 1) * dy_plane,
-                dy_oh + (cout + 2) * dy_plane,
-                dy_oh + (cout + 3) * dy_plane,
-                w_kh + (cout + 0) * w_cout_stride,
-                w_kh + (cout + 1) * w_cout_stride,
-                w_kh + (cout + 2) * w_cout_stride,
-                w_kh + (cout + 3) * w_cout_stride
-            );
-        }
-        for (; cout < C_out; ++cout) {
-            const float* __restrict dy_row = dy_oh + cout * dy_plane;
-            const float* __restrict wp = w_kh + cout * w_cout_stride;
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 0), wp[0]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 1), wp[1]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 2), wp[2]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 3), wp[3]);
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<4>::dw_nci(
-    int64_t n, int64_t cout, int64_t cin,
-    float* __restrict dw_slice,
-    const float* __restrict dy_pad_buf,
-    const float* __restrict x_pad_buf,
-    int64_t C_in, int64_t C_out,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    int64_t x_pad_l, int64_t x_row_stride,
-    int64_t H, int64_t pad,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    (void)C_in;
-    (void)C_out;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const int64_t x_plane  = H * x_row_stride;
-    const float* __restrict dy_nc =
-        &dy_pad_buf[(n * C_out + cout) * dy_plane];
-    const float* __restrict x_nc =
-        &x_pad_buf[(n * C_in + cin) * x_plane];
-    const int64_t ow_tiles = (conv_out_w + FWD_TILE_OW - 1) / FWD_TILE_OW;
-    for (int64_t kh = 0; kh < K; ++kh) {
-        __m256 v_acc0 = _mm256_setzero_ps();
-        __m256 v_acc1 = _mm256_setzero_ps();
-        __m256 v_acc2 = _mm256_setzero_ps();
-        __m256 v_acc3 = _mm256_setzero_ps();
-        for (int64_t oh = 0; oh < conv_out_h; ++oh) {
-            const int64_t ih = oh - pad + kh;
-            if (ih < 0 || ih >= H) continue;
-            const float* __restrict dy_row = &dy_nc[oh * dy_row_stride];
-            const float* __restrict x_row  = &x_nc[ih * x_row_stride];
-            for (int64_t t = 0; t < ow_tiles; ++t) {
-                const int64_t ow = t * FWD_TILE_OW;
-                const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
-                const int64_t iw0 = x_pad_l + ow - pad;
-                __m256 vx0, vx1, vx2, vx3, vx4_u, vx5_u, vx6_u;
-                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2, vx3, vx4_u, vx5_u, vx6_u);
-                (void)vx4_u;
-                (void)vx5_u;
-                (void)vx6_u;
-                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
-                v_acc3 = _mm256_fmadd_ps(dy8, vx3, v_acc3);
-            }
-        }
-        const int64_t base = kh * K;
-        dw_slice[base + 0] += _mm256_reduce_add_ps(v_acc0);
-        dw_slice[base + 1] += _mm256_reduce_add_ps(v_acc1);
-        dw_slice[base + 2] += _mm256_reduce_add_ps(v_acc2);
-        dw_slice[base + 3] += _mm256_reduce_add_ps(v_acc3);
-    }
-}
-
-#undef STRIDE1_BWD_DX_ACCUM_K3
-#undef STRIDE1_BWD_DX_ACCUM_K4
-
-// --- Stride1Specialist<5> backward implementations (mirror k6, K=5 taps) ---
-
-static __forceinline void stride1_bwd_dx_accum_cout4_k5(
-    __m256& v_dx,
-    int64_t ow0,
-    const float* __restrict dy0,
-    const float* __restrict dy1,
-    const float* __restrict dy2,
-    const float* __restrict dy3,
-    const float* __restrict wp0,
-    const float* __restrict wp1,
-    const float* __restrict wp2,
-    const float* __restrict wp3
-) {
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 0), _mm256_loadu_ps(dy1 + ow0 - 0),
-        _mm256_loadu_ps(dy2 + ow0 - 0), _mm256_loadu_ps(dy3 + ow0 - 0),
-        wp0[0], wp1[0], wp2[0], wp3[0]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 1), _mm256_loadu_ps(dy1 + ow0 - 1),
-        _mm256_loadu_ps(dy2 + ow0 - 1), _mm256_loadu_ps(dy3 + ow0 - 1),
-        wp0[1], wp1[1], wp2[1], wp3[1]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 2), _mm256_loadu_ps(dy1 + ow0 - 2),
-        _mm256_loadu_ps(dy2 + ow0 - 2), _mm256_loadu_ps(dy3 + ow0 - 2),
-        wp0[2], wp1[2], wp2[2], wp3[2]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 3), _mm256_loadu_ps(dy1 + ow0 - 3),
-        _mm256_loadu_ps(dy2 + ow0 - 3), _mm256_loadu_ps(dy3 + ow0 - 3),
-        wp0[3], wp1[3], wp2[3], wp3[3]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 4), _mm256_loadu_ps(dy1 + ow0 - 4),
-        _mm256_loadu_ps(dy2 + ow0 - 4), _mm256_loadu_ps(dy3 + ow0 - 4),
-        wp0[4], wp1[4], wp2[4], wp3[4]
-    );
-}
-
-static void stride1_bwd_dx_tile_c8_k5(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<5>::K;
-    (void)C_in;
-
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 8 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-
-    int64_t kh_lo = 0;
-    int64_t kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-
-        stride1_bwd_dx_accum_cout4_k5(
-            v_dx, ow0,
-            dy_oh + 0 * dy_plane, dy_oh + 1 * dy_plane,
-            dy_oh + 2 * dy_plane, dy_oh + 3 * dy_plane,
-            w_kh + 0 * w_cout_stride, w_kh + 1 * w_cout_stride,
-            w_kh + 2 * w_cout_stride, w_kh + 3 * w_cout_stride
-        );
-        stride1_bwd_dx_accum_cout4_k5(
-            v_dx, ow0,
-            dy_oh + 4 * dy_plane, dy_oh + 5 * dy_plane,
-            dy_oh + 6 * dy_plane, dy_oh + 7 * dy_plane,
-            w_kh + 4 * w_cout_stride, w_kh + 5 * w_cout_stride,
-            w_kh + 6 * w_cout_stride, w_kh + 7 * w_cout_stride
-        );
-    }
-
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-static void stride1_bwd_dx_tile_c16_k5(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<5>::K;
-    (void)C_in;
-
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 16 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-
-    int64_t kh_lo = 0;
-    int64_t kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-
-        stride1_bwd_dx_accum_cout4_k5(
-            v_dx, ow0,
-            dy_oh + 0 * dy_plane, dy_oh + 1 * dy_plane,
-            dy_oh + 2 * dy_plane, dy_oh + 3 * dy_plane,
-            w_kh + 0 * w_cout_stride, w_kh + 1 * w_cout_stride,
-            w_kh + 2 * w_cout_stride, w_kh + 3 * w_cout_stride
-        );
-        stride1_bwd_dx_accum_cout4_k5(
-            v_dx, ow0,
-            dy_oh + 4 * dy_plane, dy_oh + 5 * dy_plane,
-            dy_oh + 6 * dy_plane, dy_oh + 7 * dy_plane,
-            w_kh + 4 * w_cout_stride, w_kh + 5 * w_cout_stride,
-            w_kh + 6 * w_cout_stride, w_kh + 7 * w_cout_stride
-        );
-        stride1_bwd_dx_accum_cout4_k5(
-            v_dx, ow0,
-            dy_oh + 8 * dy_plane, dy_oh + 9 * dy_plane,
-            dy_oh + 10 * dy_plane, dy_oh + 11 * dy_plane,
-            w_kh + 8 * w_cout_stride, w_kh + 9 * w_cout_stride,
-            w_kh + 10 * w_cout_stride, w_kh + 11 * w_cout_stride
-        );
-        stride1_bwd_dx_accum_cout4_k5(
-            v_dx, ow0,
-            dy_oh + 12 * dy_plane, dy_oh + 13 * dy_plane,
-            dy_oh + 14 * dy_plane, dy_oh + 15 * dy_plane,
-            w_kh + 12 * w_cout_stride, w_kh + 13 * w_cout_stride,
-            w_kh + 14 * w_cout_stride, w_kh + 15 * w_cout_stride
-        );
-    }
-
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<5>::bwd_dx_tile(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t C_out, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    if (C_out == 8) {
-        stride1_bwd_dx_tile_c8_k5(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    if (C_out == 16) {
-        stride1_bwd_dx_tile_c16_k5(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-
-    (void)C_in;
-
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * C_out * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-
-    int64_t kh_lo = 0;
-    int64_t kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-
-        int64_t cout = 0;
-        for (; cout + 3 < C_out; cout += 4) {
-            stride1_bwd_dx_accum_cout4_k5(
-                v_dx, ow0,
-                dy_oh + (cout + 0) * dy_plane,
-                dy_oh + (cout + 1) * dy_plane,
-                dy_oh + (cout + 2) * dy_plane,
-                dy_oh + (cout + 3) * dy_plane,
-                w_kh + (cout + 0) * w_cout_stride,
-                w_kh + (cout + 1) * w_cout_stride,
-                w_kh + (cout + 2) * w_cout_stride,
-                w_kh + (cout + 3) * w_cout_stride
-            );
-        }
-        for (; cout < C_out; ++cout) {
-            const float* __restrict dy_row = dy_oh + cout * dy_plane;
-            const float* __restrict wp = w_kh + cout * w_cout_stride;
-
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 0), wp[0]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 1), wp[1]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 2), wp[2]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 3), wp[3]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 4), wp[4]);
-        }
-    }
-
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
 }
 
 // Accumulate dX for one input tile: dx += sum_cout sum_kh,kw dY[cout,oh,ow] * W[cout,cin,tap]
@@ -4244,1079 +2059,6 @@ static inline void decode_dw_nci_task(
     cin  = t % C_in;  t /= C_in;
     cout = t % C_out; t /= C_out;
     n    = t;
-}
-
-// Stride-1 dW specialist: x_pad + dy_pad => all strips interior; K tap accs per kh.
-void Stride1Specialist<6>::dw_nci(
-    int64_t n, int64_t cout, int64_t cin,
-    float* __restrict dw_slice,
-    const float* __restrict dy_pad_buf,
-    const float* __restrict x_pad_buf,
-    int64_t C_in, int64_t C_out,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    int64_t x_pad_l, int64_t x_row_stride,
-    int64_t H, int64_t pad,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const int64_t x_plane  = H * x_row_stride;
-    const float* __restrict dy_nc =
-        &dy_pad_buf[(n * C_out + cout) * dy_plane];
-    const float* __restrict x_nc =
-        &x_pad_buf[(n * C_in + cin) * x_plane];
-
-    const int64_t ow_tiles = (conv_out_w + FWD_TILE_OW - 1) / FWD_TILE_OW;
-
-    for (int64_t kh = 0; kh < K; ++kh) {
-        __m256 v_acc0 = _mm256_setzero_ps();
-        __m256 v_acc1 = _mm256_setzero_ps();
-        __m256 v_acc2 = _mm256_setzero_ps();
-        __m256 v_acc3 = _mm256_setzero_ps();
-        __m256 v_acc4 = _mm256_setzero_ps();
-        __m256 v_acc5 = _mm256_setzero_ps();
-
-        for (int64_t oh = 0; oh < conv_out_h; ++oh) {
-            const int64_t ih = oh - pad + kh;
-            if (ih < 0 || ih >= H) {
-                continue;
-            }
-
-            const float* __restrict dy_row = &dy_nc[oh * dy_row_stride];
-            const float* __restrict x_row  = &x_nc[ih * x_row_stride];
-
-            for (int64_t t = 0; t < ow_tiles; ++t) {
-                const int64_t ow = t * FWD_TILE_OW;
-                const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
-                const int64_t iw0 = x_pad_l + ow - pad;
-
-                __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6_u;
-                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6_u);
-                (void)vx6_u;
-
-                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
-                v_acc3 = _mm256_fmadd_ps(dy8, vx3, v_acc3);
-                v_acc4 = _mm256_fmadd_ps(dy8, vx4, v_acc4);
-                v_acc5 = _mm256_fmadd_ps(dy8, vx5, v_acc5);
-            }
-        }
-
-        const int64_t base = kh * K;
-        dw_slice[base + 0] += _mm256_reduce_add_ps(v_acc0);
-        dw_slice[base + 1] += _mm256_reduce_add_ps(v_acc1);
-        dw_slice[base + 2] += _mm256_reduce_add_ps(v_acc2);
-        dw_slice[base + 3] += _mm256_reduce_add_ps(v_acc3);
-        dw_slice[base + 4] += _mm256_reduce_add_ps(v_acc4);
-        dw_slice[base + 5] += _mm256_reduce_add_ps(v_acc5);
-    }
-}
-
-void Stride1Specialist<5>::dw_nci(
-    int64_t n, int64_t cout, int64_t cin,
-    float* __restrict dw_slice,
-    const float* __restrict dy_pad_buf,
-    const float* __restrict x_pad_buf,
-    int64_t C_in, int64_t C_out,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    int64_t x_pad_l, int64_t x_row_stride,
-    int64_t H, int64_t pad,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    (void)C_in;
-    (void)C_out;
-
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const int64_t x_plane  = H * x_row_stride;
-    const float* __restrict dy_nc =
-        &dy_pad_buf[(n * C_out + cout) * dy_plane];
-    const float* __restrict x_nc =
-        &x_pad_buf[(n * C_in + cin) * x_plane];
-
-    const int64_t ow_tiles = (conv_out_w + FWD_TILE_OW - 1) / FWD_TILE_OW;
-
-    for (int64_t kh = 0; kh < K; ++kh) {
-        __m256 v_acc0 = _mm256_setzero_ps();
-        __m256 v_acc1 = _mm256_setzero_ps();
-        __m256 v_acc2 = _mm256_setzero_ps();
-        __m256 v_acc3 = _mm256_setzero_ps();
-        __m256 v_acc4 = _mm256_setzero_ps();
-
-        for (int64_t oh = 0; oh < conv_out_h; ++oh) {
-            const int64_t ih = oh - pad + kh;
-            if (ih < 0 || ih >= H) {
-                continue;
-            }
-
-            const float* __restrict dy_row = &dy_nc[oh * dy_row_stride];
-            const float* __restrict x_row  = &x_nc[ih * x_row_stride];
-
-            for (int64_t t = 0; t < ow_tiles; ++t) {
-                const int64_t ow = t * FWD_TILE_OW;
-                const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
-                const int64_t iw0 = x_pad_l + ow - pad;
-
-                __m256 vx0, vx1, vx2, vx3, vx4, vx5_u, vx6_u;
-                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5_u, vx6_u);
-                (void)vx5_u;
-                (void)vx6_u;
-
-                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
-                v_acc3 = _mm256_fmadd_ps(dy8, vx3, v_acc3);
-                v_acc4 = _mm256_fmadd_ps(dy8, vx4, v_acc4);
-            }
-        }
-
-        const int64_t base = kh * K;
-        dw_slice[base + 0] += _mm256_reduce_add_ps(v_acc0);
-        dw_slice[base + 1] += _mm256_reduce_add_ps(v_acc1);
-        dw_slice[base + 2] += _mm256_reduce_add_ps(v_acc2);
-        dw_slice[base + 3] += _mm256_reduce_add_ps(v_acc3);
-        dw_slice[base + 4] += _mm256_reduce_add_ps(v_acc4);
-    }
-}
-
-// --- Stride1Specialist<7> backward implementations ---
-
-static __forceinline void stride1_bwd_dx_accum_cout4_k7(
-    __m256& v_dx,
-    int64_t ow0,
-    const float* __restrict dy0,
-    const float* __restrict dy1,
-    const float* __restrict dy2,
-    const float* __restrict dy3,
-    const float* __restrict wp0,
-    const float* __restrict wp1,
-    const float* __restrict wp2,
-    const float* __restrict wp3
-) {
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 0), _mm256_loadu_ps(dy1 + ow0 - 0),
-        _mm256_loadu_ps(dy2 + ow0 - 0), _mm256_loadu_ps(dy3 + ow0 - 0),
-        wp0[0], wp1[0], wp2[0], wp3[0]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 1), _mm256_loadu_ps(dy1 + ow0 - 1),
-        _mm256_loadu_ps(dy2 + ow0 - 1), _mm256_loadu_ps(dy3 + ow0 - 1),
-        wp0[1], wp1[1], wp2[1], wp3[1]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 2), _mm256_loadu_ps(dy1 + ow0 - 2),
-        _mm256_loadu_ps(dy2 + ow0 - 2), _mm256_loadu_ps(dy3 + ow0 - 2),
-        wp0[2], wp1[2], wp2[2], wp3[2]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 3), _mm256_loadu_ps(dy1 + ow0 - 3),
-        _mm256_loadu_ps(dy2 + ow0 - 3), _mm256_loadu_ps(dy3 + ow0 - 3),
-        wp0[3], wp1[3], wp2[3], wp3[3]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 4), _mm256_loadu_ps(dy1 + ow0 - 4),
-        _mm256_loadu_ps(dy2 + ow0 - 4), _mm256_loadu_ps(dy3 + ow0 - 4),
-        wp0[4], wp1[4], wp2[4], wp3[4]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 5), _mm256_loadu_ps(dy1 + ow0 - 5),
-        _mm256_loadu_ps(dy2 + ow0 - 5), _mm256_loadu_ps(dy3 + ow0 - 5),
-        wp0[5], wp1[5], wp2[5], wp3[5]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 6), _mm256_loadu_ps(dy1 + ow0 - 6),
-        _mm256_loadu_ps(dy2 + ow0 - 6), _mm256_loadu_ps(dy3 + ow0 - 6),
-        wp0[6], wp1[6], wp2[6], wp3[6]
-    );
-}
-
-static void stride1_bwd_dx_tile_c8_k7(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<7>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 8 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        stride1_bwd_dx_accum_cout4_k7(
-            v_dx, ow0,
-            dy_oh + 0 * dy_plane, dy_oh + 1 * dy_plane,
-            dy_oh + 2 * dy_plane, dy_oh + 3 * dy_plane,
-            w_kh + 0 * w_cout_stride, w_kh + 1 * w_cout_stride,
-            w_kh + 2 * w_cout_stride, w_kh + 3 * w_cout_stride
-        );
-        stride1_bwd_dx_accum_cout4_k7(
-            v_dx, ow0,
-            dy_oh + 4 * dy_plane, dy_oh + 5 * dy_plane,
-            dy_oh + 6 * dy_plane, dy_oh + 7 * dy_plane,
-            w_kh + 4 * w_cout_stride, w_kh + 5 * w_cout_stride,
-            w_kh + 6 * w_cout_stride, w_kh + 7 * w_cout_stride
-        );
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-static void stride1_bwd_dx_tile_c16_k7(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<7>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 16 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        for (int64_t g = 0; g < 16; g += 4) {
-            stride1_bwd_dx_accum_cout4_k7(
-                v_dx, ow0,
-                dy_oh + (g + 0) * dy_plane, dy_oh + (g + 1) * dy_plane,
-                dy_oh + (g + 2) * dy_plane, dy_oh + (g + 3) * dy_plane,
-                w_kh + (g + 0) * w_cout_stride, w_kh + (g + 1) * w_cout_stride,
-                w_kh + (g + 2) * w_cout_stride, w_kh + (g + 3) * w_cout_stride
-            );
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<7>::bwd_dx_tile(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t C_out, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    if (C_out == 8) {
-        stride1_bwd_dx_tile_c8_k7(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    if (C_out == 16) {
-        stride1_bwd_dx_tile_c16_k7(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * C_out * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        int64_t cout = 0;
-        for (; cout + 3 < C_out; cout += 4) {
-            stride1_bwd_dx_accum_cout4_k7(
-                v_dx, ow0,
-                dy_oh + (cout + 0) * dy_plane,
-                dy_oh + (cout + 1) * dy_plane,
-                dy_oh + (cout + 2) * dy_plane,
-                dy_oh + (cout + 3) * dy_plane,
-                w_kh + (cout + 0) * w_cout_stride,
-                w_kh + (cout + 1) * w_cout_stride,
-                w_kh + (cout + 2) * w_cout_stride,
-                w_kh + (cout + 3) * w_cout_stride
-            );
-        }
-        for (; cout < C_out; ++cout) {
-            const float* __restrict dy_row = dy_oh + cout * dy_plane;
-            const float* __restrict wp = w_kh + cout * w_cout_stride;
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 0), wp[0]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 1), wp[1]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 2), wp[2]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 3), wp[3]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 4), wp[4]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 5), wp[5]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 6), wp[6]);
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<7>::dw_nci(
-    int64_t n, int64_t cout, int64_t cin,
-    float* __restrict dw_slice,
-    const float* __restrict dy_pad_buf,
-    const float* __restrict x_pad_buf,
-    int64_t C_in, int64_t C_out,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    int64_t x_pad_l, int64_t x_row_stride,
-    int64_t H, int64_t pad,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    (void)C_in;
-    (void)C_out;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const int64_t x_plane  = H * x_row_stride;
-    const float* __restrict dy_nc =
-        &dy_pad_buf[(n * C_out + cout) * dy_plane];
-    const float* __restrict x_nc =
-        &x_pad_buf[(n * C_in + cin) * x_plane];
-    const int64_t ow_tiles = (conv_out_w + FWD_TILE_OW - 1) / FWD_TILE_OW;
-    for (int64_t kh = 0; kh < K; ++kh) {
-        __m256 v_acc0 = _mm256_setzero_ps();
-        __m256 v_acc1 = _mm256_setzero_ps();
-        __m256 v_acc2 = _mm256_setzero_ps();
-        __m256 v_acc3 = _mm256_setzero_ps();
-        __m256 v_acc4 = _mm256_setzero_ps();
-        __m256 v_acc5 = _mm256_setzero_ps();
-        __m256 v_acc6 = _mm256_setzero_ps();
-        for (int64_t oh = 0; oh < conv_out_h; ++oh) {
-            const int64_t ih = oh - pad + kh;
-            if (ih < 0 || ih >= H) continue;
-            const float* __restrict dy_row = &dy_nc[oh * dy_row_stride];
-            const float* __restrict x_row  = &x_nc[ih * x_row_stride];
-            for (int64_t t = 0; t < ow_tiles; ++t) {
-                const int64_t ow = t * FWD_TILE_OW;
-                const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
-                const int64_t iw0 = x_pad_l + ow - pad;
-
-                __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6;
-                stride1_kw_windows_alignr(x_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6);
-
-                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
-                v_acc3 = _mm256_fmadd_ps(dy8, vx3, v_acc3);
-                v_acc4 = _mm256_fmadd_ps(dy8, vx4, v_acc4);
-                v_acc5 = _mm256_fmadd_ps(dy8, vx5, v_acc5);
-                v_acc6 = _mm256_fmadd_ps(dy8, vx6, v_acc6);
-            }
-        }
-        const int64_t base = kh * K;
-        dw_slice[base + 0] += _mm256_reduce_add_ps(v_acc0);
-        dw_slice[base + 1] += _mm256_reduce_add_ps(v_acc1);
-        dw_slice[base + 2] += _mm256_reduce_add_ps(v_acc2);
-        dw_slice[base + 3] += _mm256_reduce_add_ps(v_acc3);
-        dw_slice[base + 4] += _mm256_reduce_add_ps(v_acc4);
-        dw_slice[base + 5] += _mm256_reduce_add_ps(v_acc5);
-        dw_slice[base + 6] += _mm256_reduce_add_ps(v_acc6);
-    }
-}
-
-// --- Stride1Specialist<9> backward implementations ---
-
-static __forceinline void stride1_bwd_dx_accum_cout4_k9(
-    __m256& v_dx,
-    int64_t ow0,
-    const float* __restrict dy0,
-    const float* __restrict dy1,
-    const float* __restrict dy2,
-    const float* __restrict dy3,
-    const float* __restrict wp0,
-    const float* __restrict wp1,
-    const float* __restrict wp2,
-    const float* __restrict wp3
-) {
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 0), _mm256_loadu_ps(dy1 + ow0 - 0),
-        _mm256_loadu_ps(dy2 + ow0 - 0), _mm256_loadu_ps(dy3 + ow0 - 0),
-        wp0[0], wp1[0], wp2[0], wp3[0]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 1), _mm256_loadu_ps(dy1 + ow0 - 1),
-        _mm256_loadu_ps(dy2 + ow0 - 1), _mm256_loadu_ps(dy3 + ow0 - 1),
-        wp0[1], wp1[1], wp2[1], wp3[1]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 2), _mm256_loadu_ps(dy1 + ow0 - 2),
-        _mm256_loadu_ps(dy2 + ow0 - 2), _mm256_loadu_ps(dy3 + ow0 - 2),
-        wp0[2], wp1[2], wp2[2], wp3[2]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 3), _mm256_loadu_ps(dy1 + ow0 - 3),
-        _mm256_loadu_ps(dy2 + ow0 - 3), _mm256_loadu_ps(dy3 + ow0 - 3),
-        wp0[3], wp1[3], wp2[3], wp3[3]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 4), _mm256_loadu_ps(dy1 + ow0 - 4),
-        _mm256_loadu_ps(dy2 + ow0 - 4), _mm256_loadu_ps(dy3 + ow0 - 4),
-        wp0[4], wp1[4], wp2[4], wp3[4]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 5), _mm256_loadu_ps(dy1 + ow0 - 5),
-        _mm256_loadu_ps(dy2 + ow0 - 5), _mm256_loadu_ps(dy3 + ow0 - 5),
-        wp0[5], wp1[5], wp2[5], wp3[5]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 6), _mm256_loadu_ps(dy1 + ow0 - 6),
-        _mm256_loadu_ps(dy2 + ow0 - 6), _mm256_loadu_ps(dy3 + ow0 - 6),
-        wp0[6], wp1[6], wp2[6], wp3[6]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 7), _mm256_loadu_ps(dy1 + ow0 - 7),
-        _mm256_loadu_ps(dy2 + ow0 - 7), _mm256_loadu_ps(dy3 + ow0 - 7),
-        wp0[7], wp1[7], wp2[7], wp3[7]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 8), _mm256_loadu_ps(dy1 + ow0 - 8),
-        _mm256_loadu_ps(dy2 + ow0 - 8), _mm256_loadu_ps(dy3 + ow0 - 8),
-        wp0[8], wp1[8], wp2[8], wp3[8]
-    );
-}
-
-static void stride1_bwd_dx_tile_c8_k9(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<9>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 8 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        stride1_bwd_dx_accum_cout4_k9(
-            v_dx, ow0,
-            dy_oh + 0 * dy_plane, dy_oh + 1 * dy_plane,
-            dy_oh + 2 * dy_plane, dy_oh + 3 * dy_plane,
-            w_kh + 0 * w_cout_stride, w_kh + 1 * w_cout_stride,
-            w_kh + 2 * w_cout_stride, w_kh + 3 * w_cout_stride
-        );
-        stride1_bwd_dx_accum_cout4_k9(
-            v_dx, ow0,
-            dy_oh + 4 * dy_plane, dy_oh + 5 * dy_plane,
-            dy_oh + 6 * dy_plane, dy_oh + 7 * dy_plane,
-            w_kh + 4 * w_cout_stride, w_kh + 5 * w_cout_stride,
-            w_kh + 6 * w_cout_stride, w_kh + 7 * w_cout_stride
-        );
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-static void stride1_bwd_dx_tile_c16_k9(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<9>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 16 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        for (int64_t g = 0; g < 16; g += 4) {
-            stride1_bwd_dx_accum_cout4_k9(
-                v_dx, ow0,
-                dy_oh + (g + 0) * dy_plane, dy_oh + (g + 1) * dy_plane,
-                dy_oh + (g + 2) * dy_plane, dy_oh + (g + 3) * dy_plane,
-                w_kh + (g + 0) * w_cout_stride, w_kh + (g + 1) * w_cout_stride,
-                w_kh + (g + 2) * w_cout_stride, w_kh + (g + 3) * w_cout_stride
-            );
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<9>::bwd_dx_tile(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t C_out, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    if (C_out == 8) {
-        stride1_bwd_dx_tile_c8_k9(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    if (C_out == 16) {
-        stride1_bwd_dx_tile_c16_k9(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * C_out * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        int64_t cout = 0;
-        for (; cout + 3 < C_out; cout += 4) {
-            stride1_bwd_dx_accum_cout4_k9(
-                v_dx, ow0,
-                dy_oh + (cout + 0) * dy_plane,
-                dy_oh + (cout + 1) * dy_plane,
-                dy_oh + (cout + 2) * dy_plane,
-                dy_oh + (cout + 3) * dy_plane,
-                w_kh + (cout + 0) * w_cout_stride,
-                w_kh + (cout + 1) * w_cout_stride,
-                w_kh + (cout + 2) * w_cout_stride,
-                w_kh + (cout + 3) * w_cout_stride
-            );
-        }
-        for (; cout < C_out; ++cout) {
-            const float* __restrict dy_row = dy_oh + cout * dy_plane;
-            const float* __restrict wp = w_kh + cout * w_cout_stride;
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 0), wp[0]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 1), wp[1]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 2), wp[2]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 3), wp[3]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 4), wp[4]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 5), wp[5]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 6), wp[6]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 7), wp[7]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 8), wp[8]);
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<9>::dw_nci(
-    int64_t n, int64_t cout, int64_t cin,
-    float* __restrict dw_slice,
-    const float* __restrict dy_pad_buf,
-    const float* __restrict x_pad_buf,
-    int64_t C_in, int64_t C_out,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    int64_t x_pad_l, int64_t x_row_stride,
-    int64_t H, int64_t pad,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    (void)C_in;
-    (void)C_out;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const int64_t x_plane  = H * x_row_stride;
-    const float* __restrict dy_nc =
-        &dy_pad_buf[(n * C_out + cout) * dy_plane];
-    const float* __restrict x_nc =
-        &x_pad_buf[(n * C_in + cin) * x_plane];
-    const int64_t ow_tiles = (conv_out_w + FWD_TILE_OW - 1) / FWD_TILE_OW;
-    for (int64_t kh = 0; kh < K; ++kh) {
-        __m256 v_acc0 = _mm256_setzero_ps();
-        __m256 v_acc1 = _mm256_setzero_ps();
-        __m256 v_acc2 = _mm256_setzero_ps();
-        __m256 v_acc3 = _mm256_setzero_ps();
-        __m256 v_acc4 = _mm256_setzero_ps();
-        __m256 v_acc5 = _mm256_setzero_ps();
-        __m256 v_acc6 = _mm256_setzero_ps();
-        __m256 v_acc7 = _mm256_setzero_ps();
-        __m256 v_acc8 = _mm256_setzero_ps();
-        for (int64_t oh = 0; oh < conv_out_h; ++oh) {
-            const int64_t ih = oh - pad + kh;
-            if (ih < 0 || ih >= H) continue;
-            const float* __restrict dy_row = &dy_nc[oh * dy_row_stride];
-            const float* __restrict x_row  = &x_nc[ih * x_row_stride];
-            for (int64_t t = 0; t < ow_tiles; ++t) {
-                const int64_t ow = t * FWD_TILE_OW;
-                const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
-                const int64_t iw0 = x_pad_l + ow - pad;
-
-                __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vx8;
-                stride1_kw_windows_alignr9(x_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vx8);
-
-                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
-                v_acc3 = _mm256_fmadd_ps(dy8, vx3, v_acc3);
-                v_acc4 = _mm256_fmadd_ps(dy8, vx4, v_acc4);
-                v_acc5 = _mm256_fmadd_ps(dy8, vx5, v_acc5);
-                v_acc6 = _mm256_fmadd_ps(dy8, vx6, v_acc6);
-                v_acc7 = _mm256_fmadd_ps(dy8, vx7, v_acc7);
-                v_acc8 = _mm256_fmadd_ps(dy8, vx8, v_acc8);
-            }
-        }
-        const int64_t base = kh * K;
-        dw_slice[base + 0] += _mm256_reduce_add_ps(v_acc0);
-        dw_slice[base + 1] += _mm256_reduce_add_ps(v_acc1);
-        dw_slice[base + 2] += _mm256_reduce_add_ps(v_acc2);
-        dw_slice[base + 3] += _mm256_reduce_add_ps(v_acc3);
-        dw_slice[base + 4] += _mm256_reduce_add_ps(v_acc4);
-        dw_slice[base + 5] += _mm256_reduce_add_ps(v_acc5);
-        dw_slice[base + 6] += _mm256_reduce_add_ps(v_acc6);
-        dw_slice[base + 7] += _mm256_reduce_add_ps(v_acc7);
-        dw_slice[base + 8] += _mm256_reduce_add_ps(v_acc8);
-    }
-}
-
-// --- Stride1Specialist<11> backward implementations ---
-
-static __forceinline void stride1_bwd_dx_accum_cout4_k11(
-    __m256& v_dx,
-    int64_t ow0,
-    const float* __restrict dy0,
-    const float* __restrict dy1,
-    const float* __restrict dy2,
-    const float* __restrict dy3,
-    const float* __restrict wp0,
-    const float* __restrict wp1,
-    const float* __restrict wp2,
-    const float* __restrict wp3
-) {
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 0), _mm256_loadu_ps(dy1 + ow0 - 0),
-        _mm256_loadu_ps(dy2 + ow0 - 0), _mm256_loadu_ps(dy3 + ow0 - 0),
-        wp0[0], wp1[0], wp2[0], wp3[0]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 1), _mm256_loadu_ps(dy1 + ow0 - 1),
-        _mm256_loadu_ps(dy2 + ow0 - 1), _mm256_loadu_ps(dy3 + ow0 - 1),
-        wp0[1], wp1[1], wp2[1], wp3[1]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 2), _mm256_loadu_ps(dy1 + ow0 - 2),
-        _mm256_loadu_ps(dy2 + ow0 - 2), _mm256_loadu_ps(dy3 + ow0 - 2),
-        wp0[2], wp1[2], wp2[2], wp3[2]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 3), _mm256_loadu_ps(dy1 + ow0 - 3),
-        _mm256_loadu_ps(dy2 + ow0 - 3), _mm256_loadu_ps(dy3 + ow0 - 3),
-        wp0[3], wp1[3], wp2[3], wp3[3]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 4), _mm256_loadu_ps(dy1 + ow0 - 4),
-        _mm256_loadu_ps(dy2 + ow0 - 4), _mm256_loadu_ps(dy3 + ow0 - 4),
-        wp0[4], wp1[4], wp2[4], wp3[4]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 5), _mm256_loadu_ps(dy1 + ow0 - 5),
-        _mm256_loadu_ps(dy2 + ow0 - 5), _mm256_loadu_ps(dy3 + ow0 - 5),
-        wp0[5], wp1[5], wp2[5], wp3[5]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 6), _mm256_loadu_ps(dy1 + ow0 - 6),
-        _mm256_loadu_ps(dy2 + ow0 - 6), _mm256_loadu_ps(dy3 + ow0 - 6),
-        wp0[6], wp1[6], wp2[6], wp3[6]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 7), _mm256_loadu_ps(dy1 + ow0 - 7),
-        _mm256_loadu_ps(dy2 + ow0 - 7), _mm256_loadu_ps(dy3 + ow0 - 7),
-        wp0[7], wp1[7], wp2[7], wp3[7]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 8), _mm256_loadu_ps(dy1 + ow0 - 8),
-        _mm256_loadu_ps(dy2 + ow0 - 8), _mm256_loadu_ps(dy3 + ow0 - 8),
-        wp0[8], wp1[8], wp2[8], wp3[8]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 9), _mm256_loadu_ps(dy1 + ow0 - 9),
-        _mm256_loadu_ps(dy2 + ow0 - 9), _mm256_loadu_ps(dy3 + ow0 - 9),
-        wp0[9], wp1[9], wp2[9], wp3[9]
-    );
-    v_dx = fmadd_dx_cout4(
-        v_dx,
-        _mm256_loadu_ps(dy0 + ow0 - 10), _mm256_loadu_ps(dy1 + ow0 - 10),
-        _mm256_loadu_ps(dy2 + ow0 - 10), _mm256_loadu_ps(dy3 + ow0 - 10),
-        wp0[10], wp1[10], wp2[10], wp3[10]
-    );
-}
-
-static void stride1_bwd_dx_tile_c8_k11(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<11>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 8 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        stride1_bwd_dx_accum_cout4_k11(
-            v_dx, ow0,
-            dy_oh + 0 * dy_plane, dy_oh + 1 * dy_plane,
-            dy_oh + 2 * dy_plane, dy_oh + 3 * dy_plane,
-            w_kh + 0 * w_cout_stride, w_kh + 1 * w_cout_stride,
-            w_kh + 2 * w_cout_stride, w_kh + 3 * w_cout_stride
-        );
-        stride1_bwd_dx_accum_cout4_k11(
-            v_dx, ow0,
-            dy_oh + 4 * dy_plane, dy_oh + 5 * dy_plane,
-            dy_oh + 6 * dy_plane, dy_oh + 7 * dy_plane,
-            w_kh + 4 * w_cout_stride, w_kh + 5 * w_cout_stride,
-            w_kh + 6 * w_cout_stride, w_kh + 7 * w_cout_stride
-        );
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-static void stride1_bwd_dx_tile_c16_k11(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    static constexpr int K = Stride1Specialist<11>::K;
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * 16 * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        for (int64_t g = 0; g < 16; g += 4) {
-            stride1_bwd_dx_accum_cout4_k11(
-                v_dx, ow0,
-                dy_oh + (g + 0) * dy_plane, dy_oh + (g + 1) * dy_plane,
-                dy_oh + (g + 2) * dy_plane, dy_oh + (g + 3) * dy_plane,
-                w_kh + (g + 0) * w_cout_stride, w_kh + (g + 1) * w_cout_stride,
-                w_kh + (g + 2) * w_cout_stride, w_kh + (g + 3) * w_cout_stride
-            );
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<11>::bwd_dx_tile(
-    const ConvBwdDxTileDoc& doc,
-    const float* __restrict dy_pad_buf,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    const float* __restrict W,
-    float* __restrict dx,
-    int64_t C_in, int64_t C_out, int64_t W_in_stride,
-    int64_t pad, int64_t spatial_in, int64_t k_spatial,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    if (C_out == 8) {
-        stride1_bwd_dx_tile_c8_k11(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    if (C_out == 16) {
-        stride1_bwd_dx_tile_c16_k11(
-            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
-            C_in, W_in_stride, pad, spatial_in, k_spatial,
-            conv_out_h, conv_out_w
-        );
-        return;
-    }
-    (void)C_in;
-    if (bwd_dx_mock_edges_enabled() &&
-        !bwd_dx_tile_is_interior(doc, K, pad, conv_out_w)) {
-        return;
-    }
-    float* __restrict dx_row =
-        &dx[(doc.n * C_in + doc.cin) * spatial_in + doc.oh * W_in_stride + doc.ow];
-    const __m256i v_idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
-    const __m256i dx_mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(doc.ow_count), v_idx);
-    const bool full_dx = (doc.ow_count == FWD_TILE_OW);
-    __m256 v_dx = full_dx ? _mm256_loadu_ps(dx_row) : _mm256_maskload_ps(dx_row, dx_mask);
-    const float* __restrict w_cin = &W[doc.cin * k_spatial];
-    const int64_t w_cout_stride = C_in * k_spatial;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const float* __restrict dy_n = &dy_pad_buf[doc.n * C_out * dy_plane];
-    const int64_t ow0 = doc.ow + pad + dy_pad_l;
-    int64_t kh_lo = 0, kh_hi = K;
-    bwd_dx_k_kh_bounds<K>(doc.oh, pad, conv_out_h, kh_lo, kh_hi);
-    for (int64_t kh = kh_lo; kh < kh_hi; ++kh) {
-        const int64_t oh = doc.oh + pad - kh;
-        const float* __restrict dy_oh = dy_n + oh * dy_row_stride;
-        const float* __restrict w_kh = w_cin + kh * K;
-        int64_t cout = 0;
-        for (; cout + 3 < C_out; cout += 4) {
-            stride1_bwd_dx_accum_cout4_k11(
-                v_dx, ow0,
-                dy_oh + (cout + 0) * dy_plane,
-                dy_oh + (cout + 1) * dy_plane,
-                dy_oh + (cout + 2) * dy_plane,
-                dy_oh + (cout + 3) * dy_plane,
-                w_kh + (cout + 0) * w_cout_stride,
-                w_kh + (cout + 1) * w_cout_stride,
-                w_kh + (cout + 2) * w_cout_stride,
-                w_kh + (cout + 3) * w_cout_stride
-            );
-        }
-        for (; cout < C_out; ++cout) {
-            const float* __restrict dy_row = dy_oh + cout * dy_plane;
-            const float* __restrict wp = w_kh + cout * w_cout_stride;
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 0), wp[0]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 1), wp[1]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 2), wp[2]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 3), wp[3]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 4), wp[4]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 5), wp[5]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 6), wp[6]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 7), wp[7]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 8), wp[8]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 9), wp[9]);
-            v_dx = fmadd_dx_cout1(v_dx, _mm256_loadu_ps(dy_row + ow0 - 10), wp[10]);
-        }
-    }
-    bwd_dx_store_tile(dx_row, v_dx, full_dx, dx_mask);
-}
-
-void Stride1Specialist<11>::dw_nci(
-    int64_t n, int64_t cout, int64_t cin,
-    float* __restrict dw_slice,
-    const float* __restrict dy_pad_buf,
-    const float* __restrict x_pad_buf,
-    int64_t C_in, int64_t C_out,
-    int64_t dy_pad_l, int64_t dy_row_stride,
-    int64_t x_pad_l, int64_t x_row_stride,
-    int64_t H, int64_t pad,
-    int64_t conv_out_h, int64_t conv_out_w
-) {
-    (void)C_in;
-    (void)C_out;
-    const int64_t dy_plane = conv_out_h * dy_row_stride;
-    const int64_t x_plane  = H * x_row_stride;
-    const float* __restrict dy_nc =
-        &dy_pad_buf[(n * C_out + cout) * dy_plane];
-    const float* __restrict x_nc =
-        &x_pad_buf[(n * C_in + cin) * x_plane];
-    const int64_t ow_tiles = (conv_out_w + FWD_TILE_OW - 1) / FWD_TILE_OW;
-    for (int64_t kh = 0; kh < K; ++kh) {
-        __m256 v_acc0 = _mm256_setzero_ps();
-        __m256 v_acc1 = _mm256_setzero_ps();
-        __m256 v_acc2 = _mm256_setzero_ps();
-        __m256 v_acc3 = _mm256_setzero_ps();
-        __m256 v_acc4 = _mm256_setzero_ps();
-        __m256 v_acc5 = _mm256_setzero_ps();
-        __m256 v_acc6 = _mm256_setzero_ps();
-        __m256 v_acc7 = _mm256_setzero_ps();
-        __m256 v_acc8 = _mm256_setzero_ps();
-        __m256 v_acc9 = _mm256_setzero_ps();
-        __m256 v_acc10 = _mm256_setzero_ps();
-        for (int64_t oh = 0; oh < conv_out_h; ++oh) {
-            const int64_t ih = oh - pad + kh;
-            if (ih < 0 || ih >= H) continue;
-            const float* __restrict dy_row = &dy_nc[oh * dy_row_stride];
-            const float* __restrict x_row  = &x_nc[ih * x_row_stride];
-            for (int64_t t = 0; t < ow_tiles; ++t) {
-                const int64_t ow = t * FWD_TILE_OW;
-                const __m256 dy8 = _mm256_loadu_ps(dy_row + dy_pad_l + ow);
-                const int64_t iw0 = x_pad_l + ow - pad;
-
-                __m256 vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vx8, vx9, vx10;
-                stride1_kw_windows_alignr11(
-                    x_row, iw0, vx0, vx1, vx2, vx3, vx4, vx5, vx6, vx7, vx8, vx9, vx10
-                );
-
-                v_acc0 = _mm256_fmadd_ps(dy8, vx0, v_acc0);
-                v_acc1 = _mm256_fmadd_ps(dy8, vx1, v_acc1);
-                v_acc2 = _mm256_fmadd_ps(dy8, vx2, v_acc2);
-                v_acc3 = _mm256_fmadd_ps(dy8, vx3, v_acc3);
-                v_acc4 = _mm256_fmadd_ps(dy8, vx4, v_acc4);
-                v_acc5 = _mm256_fmadd_ps(dy8, vx5, v_acc5);
-                v_acc6 = _mm256_fmadd_ps(dy8, vx6, v_acc6);
-                v_acc7 = _mm256_fmadd_ps(dy8, vx7, v_acc7);
-                v_acc8 = _mm256_fmadd_ps(dy8, vx8, v_acc8);
-                v_acc9 = _mm256_fmadd_ps(dy8, vx9, v_acc9);
-                v_acc10 = _mm256_fmadd_ps(dy8, vx10, v_acc10);
-            }
-        }
-        const int64_t base = kh * K;
-        dw_slice[base + 0] += _mm256_reduce_add_ps(v_acc0);
-        dw_slice[base + 1] += _mm256_reduce_add_ps(v_acc1);
-        dw_slice[base + 2] += _mm256_reduce_add_ps(v_acc2);
-        dw_slice[base + 3] += _mm256_reduce_add_ps(v_acc3);
-        dw_slice[base + 4] += _mm256_reduce_add_ps(v_acc4);
-        dw_slice[base + 5] += _mm256_reduce_add_ps(v_acc5);
-        dw_slice[base + 6] += _mm256_reduce_add_ps(v_acc6);
-        dw_slice[base + 7] += _mm256_reduce_add_ps(v_acc7);
-        dw_slice[base + 8] += _mm256_reduce_add_ps(v_acc8);
-        dw_slice[base + 9] += _mm256_reduce_add_ps(v_acc9);
-        dw_slice[base + 10] += _mm256_reduce_add_ps(v_acc10);
-    }
 }
 
 // Spatial-first dW for one (n, cout, cin): accumulate over all oh x ow strips, then reduce.
@@ -5586,18 +2328,10 @@ static inline int64_t stride2_specialist_k(int64_t k_h, int64_t k_w) {
     if (k_h != k_w) {
         return 0;
     }
-    switch (k_h) {
-        case 1: return 1;
-        case 2: return 2;
-        case 3: return 3;
-        case 4: return 4;
-        case 5: return 5;
-        case 6: return 6;
-        case 7: return 7;
-        case 9: return 9;
-        case 11: return 11;
-        default: return 0;
+    if (k_h >= 1 && k_h <= 11) {
+        return k_h;
     }
+    return 0;
 }
 
 static inline int64_t stride2_x_row_stride(
@@ -6420,8 +3154,20 @@ static void process_bwd_dx_tile_stride2_dispatch(
             C_in, C_out, W_in_stride, pad, spatial_in, k_spatial,
             conv_out_h, conv_out_w
         );
+    } else if (specialist_k == 8) {
+        process_bwd_dx_tile_stride2<8>(
+            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
+            C_in, C_out, W_in_stride, pad, spatial_in, k_spatial,
+            conv_out_h, conv_out_w
+        );
     } else if (specialist_k == 9) {
         process_bwd_dx_tile_stride2<9>(
+            doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
+            C_in, C_out, W_in_stride, pad, spatial_in, k_spatial,
+            conv_out_h, conv_out_w
+        );
+    } else if (specialist_k == 10) {
+        process_bwd_dx_tile_stride2<10>(
             doc, dy_pad_buf, dy_pad_l, dy_row_stride, W, dx,
             C_in, C_out, W_in_stride, pad, spatial_in, k_spatial,
             conv_out_h, conv_out_w
@@ -6539,8 +3285,20 @@ static void conv2d_forward_stride2_dispatch(
             N, C_in, H, W_in, W_in_stride, C_out, pad, out_h, out_w,
             spatial_in, spatial_out, k_spatial, out_w_stride, fwd_stats
         );
+    } else if (specialist_k == 8) {
+        conv2d_forward_stride2_phase2<8>(
+            x, W, out,
+            N, C_in, H, W_in, W_in_stride, C_out, pad, out_h, out_w,
+            spatial_in, spatial_out, k_spatial, out_w_stride, fwd_stats
+        );
     } else if (specialist_k == 9) {
         conv2d_forward_stride2_phase2<9>(
+            x, W, out,
+            N, C_in, H, W_in, W_in_stride, C_out, pad, out_h, out_w,
+            spatial_in, spatial_out, k_spatial, out_w_stride, fwd_stats
+        );
+    } else if (specialist_k == 10) {
+        conv2d_forward_stride2_phase2<10>(
             x, W, out,
             N, C_in, H, W_in, W_in_stride, C_out, pad, out_h, out_w,
             spatial_in, spatial_out, k_spatial, out_w_stride, fwd_stats
@@ -6636,8 +3394,28 @@ static void stride2_dw_nci_dispatch(
             H, pad,
             conv_out_h, conv_out_w
         );
+    } else if (specialist_k == 8) {
+        Stride2Specialist<8>::dw_nci(
+            n, cout, cin, dw_slice,
+            dy_pad_buf, x_pad_buf,
+            C_in, C_out,
+            dy_pad_l, dy_row_stride,
+            x_pad_l, x_row_stride,
+            H, pad,
+            conv_out_h, conv_out_w
+        );
     } else if (specialist_k == 9) {
         Stride2Specialist<9>::dw_nci(
+            n, cout, cin, dw_slice,
+            dy_pad_buf, x_pad_buf,
+            C_in, C_out,
+            dy_pad_l, dy_row_stride,
+            x_pad_l, x_row_stride,
+            H, pad,
+            conv_out_h, conv_out_w
+        );
+    } else if (specialist_k == 10) {
+        Stride2Specialist<10>::dw_nci(
             n, cout, cin, dw_slice,
             dy_pad_buf, x_pad_buf,
             C_in, C_out,
@@ -7135,7 +3913,13 @@ static bool try_fwd_oc_simd(
         case 7: return conv2d_forward_oc_mimo_avx2<7>(
             x, W, bias, out, N, C_in, H, W_in, W_in_stride, C_out, pad,
             out_w_stride, fuse_relu);
+        case 8: return conv2d_forward_oc_mimo_avx2<8>(
+            x, W, bias, out, N, C_in, H, W_in, W_in_stride, C_out, pad,
+            out_w_stride, fuse_relu);
         case 9: return conv2d_forward_oc_mimo_avx2<9>(
+            x, W, bias, out, N, C_in, H, W_in, W_in_stride, C_out, pad,
+            out_w_stride, fuse_relu);
+        case 10: return conv2d_forward_oc_mimo_avx2<10>(
             x, W, bias, out, N, C_in, H, W_in, W_in_stride, C_out, pad,
             out_w_stride, fuse_relu);
         case 11: return conv2d_forward_oc_mimo_avx2<11>(
@@ -7488,7 +4272,9 @@ static bool try_fwd_to_nChw8c(
         case 5: return conv2d_forward_to_nChw8c_avx2<5>(x,W,bias,out_blocked,N,C_in,H,W_in,W_in_stride,C_out,pad,src_nChw8c);
         case 6: return conv2d_forward_to_nChw8c_avx2<6>(x,W,bias,out_blocked,N,C_in,H,W_in,W_in_stride,C_out,pad,src_nChw8c);
         case 7: return conv2d_forward_to_nChw8c_avx2<7>(x,W,bias,out_blocked,N,C_in,H,W_in,W_in_stride,C_out,pad,src_nChw8c);
+        case 8: return conv2d_forward_to_nChw8c_avx2<8>(x,W,bias,out_blocked,N,C_in,H,W_in,W_in_stride,C_out,pad,src_nChw8c);
         case 9: return conv2d_forward_to_nChw8c_avx2<9>(x,W,bias,out_blocked,N,C_in,H,W_in,W_in_stride,C_out,pad,src_nChw8c);
+        case 10: return conv2d_forward_to_nChw8c_avx2<10>(x,W,bias,out_blocked,N,C_in,H,W_in,W_in_stride,C_out,pad,src_nChw8c);
         case 11: return conv2d_forward_to_nChw8c_avx2<11>(x,W,bias,out_blocked,N,C_in,H,W_in,W_in_stride,C_out,pad,src_nChw8c);
         default: return false;
     }
