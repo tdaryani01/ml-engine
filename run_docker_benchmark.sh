@@ -53,6 +53,10 @@ K_MAX=7
 PAD=1
 SAMPLE_KERNELS="1 3 4 7"
 
+# Preserve argv before option parsing shifts it away — needed for the sg docker
+# re-exec below (otherwise "run" becomes the default action "all" and rebuilds).
+_ORIG_ARGS=("$@")
+
 if [[ -x "$ROOT/.venv/bin/python" ]]; then
   PYTHON="$ROOT/.venv/bin/python"
 elif command -v python3 >/dev/null 2>&1; then
@@ -116,7 +120,7 @@ if [[ -z "${ML_ENGINE_DOCKER_SG:-}" ]] && ! docker info >/dev/null 2>&1; then
       echo "[!] docker group is configured but inactive in this shell; re-running under sg docker" >&2
       export ML_ENGINE_DOCKER_SG=1
       _quoted=()
-      for _a in "$@"; do
+      for _a in "${_ORIG_ARGS[@]}"; do
         _quoted+=("$(printf %q "$_a")")
       done
       exec sg docker -c "cd $(printf %q "$ROOT") && exec $(printf %q "$0") ${_quoted[*]}"

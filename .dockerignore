@@ -23,7 +23,7 @@ uprof_reports_*
 uprof_sessions
 uprof_configs
 
-# Host native build trees (image rebuilds its own .so)
+# Host native build trees (image rebuilds its own .so / oneDNN)
 build
 third_party
 bin/*.so

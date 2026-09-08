@@ -2,15 +2,34 @@ FROM python:3.13-slim
 
 WORKDIR /workspace
 
-# Native build toolchain & OpenMP runtime (same family as host build_native.sh)
+# Native build toolchain & OpenMP runtime (same family as host build_native.sh).
+# cmake/ninja/git: build oneDNN *inside* the image so libdnnl matches container glibc
+# (host third_party/onednn_install is GLIBC_2.43; python:3.13-slim is older).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    ca-certificates \
+    cmake \
+    git \
     libgomp1 \
+    ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
 # Slim deps for native-backend benchmark (no numba/scipy/torch — torch lives in the pytorch image)
 COPY requirements-docker-custom.txt .
 RUN pip install --no-cache-dir -r requirements-docker-custom.txt
+
+# --- oneDNN (container glibc) ---
+# Clone main (host install is also from main; GitHub has no v3.14 tag yet).
+RUN git clone --depth 1 --branch main \
+      https://github.com/uxlfoundation/oneDNN.git /tmp/oneDNN \
+    && cmake -G Ninja -S /tmp/oneDNN -B /tmp/oneDNN/build \
+         -DCMAKE_BUILD_TYPE=Release \
+         -DDNNL_BUILD_TESTS=OFF \
+         -DDNNL_BUILD_EXAMPLES=OFF \
+         -DCMAKE_INSTALL_PREFIX=/workspace/third_party/onednn_install \
+    && cmake --build /tmp/oneDNN/build -j"$(nproc)" \
+    && cmake --install /tmp/oneDNN/build \
+    && rm -rf /tmp/oneDNN
 
 # --- Native layer (invalidates only when C++/build script/OpenBLAS change) ---
 COPY build_native.sh .
