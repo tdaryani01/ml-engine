@@ -367,6 +367,8 @@ class TrainingEngine:
 
     def _wait_native_done(self) -> None:
         """Only wait point: native completion (after all useful work is done)."""
+        if not self._async_contract:
+            return
         if self._flag_step_done or self._native_ready():
             return
         rt = self._contract_runtime()
@@ -468,6 +470,8 @@ class TrainingEngine:
 
     def drain_pending(self) -> list[float]:
         """Drain one externally submitted async step."""
+        if not self._async_contract:
+            return list(self._epoch_losses)
         while self._inflight is not None:
             self._do_useful_work()
             self._wait_native_done()

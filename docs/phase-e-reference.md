@@ -265,3 +265,6 @@ Scratch buffers, activations, dataset blobs, DLL handles, global backend singlet
 | 2026-09-02 | **This phase:** early stopping = manager (stop + rollback to best); defer E6 auto-fork |
 | 2026-09-07 | `store_backend` is pluggable: default `file_streaming` (stream writer); `noop` for tests (no journal I/O); `cache` / `queue` / `redis` reserved |
 | 2026-09-07 | CNN bench `fit` must pass `ledger_settings` from config (same path as `run_pipeline`) |
+| 2026-09-07 | Sync contract: no wait/poll loops when `native_async_submit=false`; prep packs use OMP |
+| 2026-09-07 | Predict densifies logical W once (e.g. 32→28) so fwd skips per-conv strided copies |
+| 2026-09-07 | BRGEMM dX planar scatter uses pointer-bump (same math; avoids `c*spatial` imul) |

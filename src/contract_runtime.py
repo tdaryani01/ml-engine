@@ -246,6 +246,9 @@ def _bind_runner(lib) -> None:
     if hasattr(lib, "service_brgemm_dw_x_pack_requests"):
         lib.service_brgemm_dw_x_pack_requests.restype = ctypes.c_int32
         lib.service_brgemm_dw_x_pack_requests.argtypes = []
+    if hasattr(lib, "set_contract_async_overlap"):
+        lib.set_contract_async_overlap.restype = None
+        lib.set_contract_async_overlap.argtypes = [ctypes.c_int32]
 
 
 @dataclass
@@ -357,6 +360,10 @@ class ContractRuntime:
             and hasattr(self._lib, "submit_contract_training_step")
             and hasattr(self._lib, "wait_contract_completion")
         )
+        set_overlap = getattr(self._lib, "set_contract_async_overlap", None)
+        if set_overlap is not None:
+            # async on → serial main packs (OMP busy); async off → OMP packs
+            set_overlap(ctypes.c_int32(1 if self._async_enabled else 0))
         self._pending_token: int | None = None
         self._engine_driven = False
         self._submitted: _SubmittedStep | None = None
@@ -1109,8 +1116,10 @@ class ContractRuntime:
         """Non-blocking: reap ASYNC_READY on this thread, finish grads, publish.
 
         Must run on the Python trainer thread (holds/reacquires GIL around numpy).
-        Native worker never calls into Python.
+        Native worker never calls into Python. No-op when async is off.
         """
+        if not self._async_enabled:
+            return False
         if self._completed is not None:
             return True
         if self._submitted is None:
@@ -1133,9 +1142,12 @@ class ContractRuntime:
     def wait_for_completion(self, timeout: float | None = None) -> bool:
         """Block until native READY is reaped and finished on this thread.
 
-        Polls with a short wait so this thread can drain mid-step BRGEMM x-pack
-        requests while the OMP team runs L1/dense (the reserved main core).
+        Async only: polls with a short wait so this thread can drain mid-step
+        BRGEMM x-pack requests while the OMP team runs L1/dense.
+        Sync path has no worker — returns immediately.
         """
+        if not self._async_enabled:
+            return True
         if self._poll_complete_on_main():
             return True
         if timeout is not None and timeout <= 0:
@@ -1186,6 +1198,8 @@ class ContractRuntime:
 
     def completion_signaled(self) -> bool:
         """True when this thread has finished a native step into `_completed`."""
+        if not self._async_enabled:
+            return False
         self._poll_complete_on_main()
         return self._completed is not None
 
@@ -1323,17 +1337,16 @@ class ContractRuntime:
     def _stage_input_pad(
         self, slot_idx: int, slot: "_ExecutionSlot", X: np.ndarray
     ) -> None:
-        """Build conv layer 0's padded input on the main thread.
+        """Build conv layer 0's padded input (OMP when async off)."""
+        self._stage_input_pad_ctx(slot_idx, slot.ctx, X)
 
-        Layer 0's input is the batch itself, so its padded copy is known before
-        the step runs. Native otherwise rebuilds it twice per step (stride-1
-        forward and backward dW) on the OMP team. Staging is best-effort: on any
-        miss the native side rebuilds exactly as before.
-        """
+    def _stage_input_pad_ctx(
+        self, slot_idx: int, ctx: ContractExecCtx, X: np.ndarray
+    ) -> None:
         stage = getattr(self._lib, "stage_conv_x_pad", None)
-        if stage is None or slot.ctx.num_layers <= 0:
+        if stage is None or ctx.num_layers <= 0:
             return
-        lb = slot.ctx.layers[0]
+        lb = ctx.layers[0]
         if lb.conv_stride != 1:
             return
         conv_out_w = (
@@ -1342,7 +1355,7 @@ class ContractRuntime:
         stage(
             ctypes.c_int32(slot_idx),
             ctypes.c_void_p(_ptr(X)),
-            ctypes.c_int64(int(slot.ctx.N)),
+            ctypes.c_int64(int(ctx.N)),
             ctypes.c_int64(int(lb.C_in)),
             ctypes.c_int64(int(lb.H)),
             ctypes.c_int64(int(lb.W_in)),
@@ -1363,19 +1376,21 @@ class ContractRuntime:
     def _stage_brgemm_dw_x(
         self, slot_idx: int, slot: "_ExecutionSlot", X: np.ndarray
     ) -> None:
-        """Pack layer-0 BRGEMM dW x panels on the main thread when eligible.
+        """Pack layer-0 BRGEMM dW x panels when eligible (OMP when async off)."""
+        self._stage_brgemm_dw_x_ctx(slot_idx, slot.ctx, X)
 
-        Same overlap window as stage_conv_x_pad. Only fires when Cin/Cout are
-        multiples of 8 (current CNN L0 Cin=3 skips; L1 is published after fwd).
-        """
+    def _stage_brgemm_dw_x_ctx(
+        self, slot_idx: int, ctx: ContractExecCtx, X: np.ndarray
+    ) -> None:
         stage = getattr(self._lib, "stage_brgemm_dw_x_pack", None)
-        if stage is None or slot.ctx.num_layers <= 0:
+        if stage is None or ctx.num_layers <= 0:
             return
-        lb = slot.ctx.layers[0]
+        lb = ctx.layers[0]
         if (
             lb.conv_stride != 1
-            or lb.k_h != 7
-            or lb.k_w != 7
+            or lb.k_h != lb.k_w
+            or lb.k_h < 1
+            or lb.k_h > 7
             or (lb.C_in % 8) != 0
             or (lb.C_out % 8) != 0
         ):
@@ -1383,7 +1398,7 @@ class ContractRuntime:
         stage(
             ctypes.c_int32(slot_idx),
             ctypes.c_void_p(_ptr(X)),
-            ctypes.c_int64(int(slot.ctx.N)),
+            ctypes.c_int64(int(ctx.N)),
             ctypes.c_int64(int(lb.C_in)),
             ctypes.c_int64(int(lb.H)),
             ctypes.c_int64(int(lb.W_in)),
@@ -1391,6 +1406,13 @@ class ContractRuntime:
             ctypes.c_int64(int(lb.k_w)),
             ctypes.c_int64(int(lb.conv_pad)),
         )
+
+    def _stage_sync_useful_work(self, ctx: ContractExecCtx, X: np.ndarray) -> None:
+        """When async is off: OMP-parallelize prep packs before the sync step."""
+        if self._async_enabled:
+            return
+        self._stage_input_pad_ctx(0, ctx, X)
+        self._stage_brgemm_dw_x_ctx(0, ctx, X)
 
     def _stage_dx_wt(self, slot_idx: int, slot: "_ExecutionSlot") -> None:
         """Rebuild the cin-blocked backward-dX transposed-W buffer on main.
@@ -1437,6 +1459,8 @@ class ContractRuntime:
         self,
     ) -> tuple[float, list[np.ndarray], list[np.ndarray], int] | None:
         """Non-blocking: return post-contract result if native READY was reaped."""
+        if not self._async_enabled:
+            return None
         self._poll_complete_on_main()
         if self._completed is None:
             return None
@@ -1491,6 +1515,7 @@ class ContractRuntime:
         self._bind_dense(ctx, m, X.dtype)
         self._refresh_step_bindings(X, y, m, lr, apply_adam=apply_adam)
 
+        self._stage_sync_useful_work(ctx, X)
         self._invoke_native_sync(ctx)
 
         loss, grad_weights, grad_biases = self._collect_grads(

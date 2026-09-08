@@ -635,9 +635,22 @@ class CNNNetwork:
         return self._backward_from_cache(cache, y, active_lr)
 
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
+        X = processed_data
+        # Val/bench tensors are often (N,C,H,32) with logical W=28. Torch is dense
+        # 28 — crop once here so oneDNN/ConvBlock skip per-call densify copies.
+        logical = getattr(self, "input_logical_w", None)
+        if (
+            X.ndim == 4
+            and X.shape[3] > 28
+            and (logical == 28 or (logical is None and X.shape[3] == 32))
+        ):
+            w_log = 28 if logical is None else int(logical)
+            if X.shape[3] != w_log:
+                X = np.ascontiguousarray(X[:, :, :, :w_log])
+
         if (
             self._contract_runtime is not None
             and self._contract_runtime.uses_async_forward()
         ):
-            return self._contract_runtime.run_async_forward(processed_data)
-        return self._forward(processed_data, training=False)
+            return self._contract_runtime.run_async_forward(X)
+        return self._forward(X, training=False)

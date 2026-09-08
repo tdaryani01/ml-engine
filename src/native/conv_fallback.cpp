@@ -13,6 +13,7 @@
 #endif
 #include "export.h"
 #include "conv_onednn_fwd.h"
+#include "omp_config.h"
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
@@ -1861,9 +1862,8 @@ static inline int64_t bwd_x_row_stride(
     return (stride + FWD_TILE_OW - 1) & ~(FWD_TILE_OW - 1);
 }
 
-// Zero-padded rows: logical index i -> padded[i + pad_l].
-// parallel=false is used when the Python main thread stages this ahead of the
-// step that consumes it; the OMP team is busy with the previous step then.
+// parallel=false when the Python main thread stages ahead of a busy OMP team
+// (async overlap). parallel=true when async is off (main_stage_use_omp).
 static void build_bwd_row_pad_buf(
     const float* __restrict src, float* __restrict dst,
     int64_t nplanes, int64_t nrows, int64_t row_w,
@@ -1930,17 +1930,23 @@ static inline void build_x_pad_buf(
 }
 
 // ---------------------------------------------------------------------------
-// Main-thread staged x_pad
+// Contract async-overlap flag + main-thread staged x_pad
 //
-// A conv layer's padded input depends only on that layer's input tensor, so it
-// can be built before the step that consumes it. The OMP team currently builds
-// it twice per step (stride-1 forward, then backward dW) while the Python main
-// thread sits blocked waiting on the native worker. Staging moves that copy to
-// the main thread.
-//
-// One entry per pipeline slot: the main thread writes the slot it is filling
-// while the worker reads the slot that is in flight, so entries never alias.
+// async on  → pack serially on main (OMP team busy on the in-flight step)
+// async off → pack with OMP (team free); sync path stages before native invoke
 // ---------------------------------------------------------------------------
+static std::atomic<int> g_contract_async_overlap{0};
+
+extern "C" ML_ENGINE_EXPORT void set_contract_async_overlap(int32_t enabled) {
+    g_contract_async_overlap.store(enabled ? 1 : 0, std::memory_order_release);
+}
+
+static inline bool main_stage_use_omp() {
+    return g_contract_async_overlap.load(std::memory_order_acquire) == 0;
+}
+
+// Layer-0 padded input depends only on the batch tensor — stage before the
+// step that consumes it. One entry per pipeline slot (no alias with in-flight).
 constexpr int32_t STAGED_X_PAD_MAX_SLOTS = 4;
 
 struct StagedXPad {
@@ -2007,9 +2013,12 @@ extern "C" ML_ENGINE_EXPORT int32_t stage_conv_x_pad(
     float* buf = staged_x_pad_alloc(slot, need);
     if (!buf) return -3;
 
+    if (main_stage_use_omp()) {
+        ml_omp_before_parallel();
+    }
     build_bwd_row_pad_buf(
         x, buf, N * C_in, H, W_in, W_in_stride, pad_l, row_stride,
-        /*parallel=*/false
+        /*parallel=*/main_stage_use_omp()
     );
 
     slot.src = x;
@@ -7393,7 +7402,8 @@ static float* brg_dw_x_stage_lookup(
     return nullptr;
 }
 
-// Fill a durable slot (main-thread prepare, or publish after fwd). Serial pack.
+// Fill a durable slot (main-thread prepare, or publish after fwd).
+// parallel follows async overlap: OMP when sync, serial when overlapping.
 static int32_t brg_dw_x_stage_store(
     int32_t slot_idx, const float* x,
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
@@ -7410,9 +7420,12 @@ static int32_t brg_dw_x_stage_store(
         * (size_t)W_ext * (size_t)BRG_DW_IC;
     float* buf = brg_dw_stage_alloc(slot, need);
     if (!buf) return -3;
+    if (main_stage_use_omp()) {
+        ml_omp_before_parallel();
+    }
     brg_pack_x_blocked(
         x, buf, N, C_in, H, W_in, W_in_stride, x_pad_l, W_ext,
-        /*parallel=*/false
+        /*parallel=*/main_stage_use_omp()
     );
     slot.src = x;
     slot.N = N;
@@ -7793,12 +7806,20 @@ static bool try_brgemm_style_dx(
                                         _mm256_set1_ps(dy[o]), w_oc[o], acc);
                                 }
                                 float* __restrict dst = dx_row + iw;
-                                // Planar cin: lane c at dst[c * spatial_in]
+                                // Planar cin: lane c at dst[c * spatial_in].
+                                // Pointer bump (not c*spatial_in) — profile showed
+                                // imul-heavy address math on the scalar scatter.
                                 alignas(32) float lanes[8];
                                 _mm256_store_ps(lanes, acc);
-                                for (int64_t c = 0; c < BRG_DW_IC; ++c) {
-                                    dst[c * spatial_in] += lanes[c];
-                                }
+                                float* __restrict p = dst;
+                                p[0] += lanes[0]; p += spatial_in;
+                                p[0] += lanes[1]; p += spatial_in;
+                                p[0] += lanes[2]; p += spatial_in;
+                                p[0] += lanes[3]; p += spatial_in;
+                                p[0] += lanes[4]; p += spatial_in;
+                                p[0] += lanes[5]; p += spatial_in;
+                                p[0] += lanes[6]; p += spatial_in;
+                                p[0] += lanes[7];
                             }
                         }
                     }

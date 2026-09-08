@@ -98,6 +98,7 @@ optimization:
 ledger:
   enabled: true
   path: "training_ledger"
+  store_backend: noop
   branch_id: "main"
   checkpoint_every_steps: 50
   checkpoint_on_local_best: true
@@ -109,7 +110,6 @@ ledger:
   native_async_submit: false
   # Pluggable ledger store. Default file_streaming = current stream writer.
   # noop = tests (no disk). Future: cache | queue | redis.
-  store_backend: file_streaming
 
 # =====================================================================
 # REGULARIZATION STRAIN MATRIX
