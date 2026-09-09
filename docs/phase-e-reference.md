@@ -285,3 +285,6 @@ Scratch buffers, activations, dataset blobs, DLL handles, global backend singlet
 | 2026-09-07 | BRGEMM dX planar scatter uses pointer-bump (same math; avoids `c*spatial` imul) |
 | 2026-09-07 | **Open bug:** async predict/`run_async_forward` heap-aborts (`corrupted size vs. prev_size`); suite must not skip it |
 | 2026-09-09 | **Closed:** async predict abort — trust bound `conv_out_w_stride`, set stride in sync bind, invalidate staged x_pad after step (see Known open bugs) |
+| 2026-09-09 | **Multi-tenant native:** stages + async mailboxes keyed by per-`ContractRuntime` tenant id; one `TrainingSession` per model instance (parallel different models OK) |
+| 2026-09-09 | **Multi-session engine:** `TrainingEngine.sessions` list; `start_session` registers (PENDING/ACTIVE); `run()` round-robins epochs; shared ledger tags docs with `session_id` via `model_instance_id`; MLP+CNN share `TrainableModel` + pluggable `contract_factory` |
+| 2026-09-09 | **Session lifecycle:** `end_session` / `finish_session` drain+drop; `resume_session` restores session-tagged checkpoint (shared ledger head unchanged); concurrent sync `run_step` allocates ledger version under lock |

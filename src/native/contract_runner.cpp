@@ -1,5 +1,6 @@
 // contract_runner.cpp — Phase F: execute compiled contract list in one native call.
 #include "export.h"
+#include "native_tenant.h"
 #include "omp_config.h"
 #include <immintrin.h>
 #include <cstdint>
@@ -793,7 +794,7 @@ static int32_t run_contract_training_step_impl(
 }
 
 // ---------------------------------------------------------------------------
-// F2.3 / F4: non-blocking submit + completion ring (one native worker thread)
+// F2.3 / F4: per-tenant async mailbox (one worker thread per native tenant)
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -803,83 +804,109 @@ enum AsyncState : int32_t {
     ASYNC_READY = 2,
 };
 
-std::mutex g_async_mtx;
-std::condition_variable g_async_job_cv;
-std::condition_variable g_async_completion_cv;
-std::thread g_async_worker;
-bool g_async_worker_started = false;
-bool g_async_shutdown = false;
-bool g_async_has_job = false;
+struct AsyncMailbox {
+    std::mutex mtx;
+    std::condition_variable job_cv;
+    std::condition_variable completion_cv;
+    std::thread worker;
+    bool worker_started = false;
+    bool shutdown = false;
+    bool has_job = false;
+    const ContractOpRow* ops = nullptr;
+    int32_t op_count = 0;
+    ContractExecCtx* ctx = nullptr;
+    int64_t submit_token = 0;
+    std::atomic<int32_t> state{ASYNC_IDLE};
+    int64_t ready_token = 0;
+    int32_t ready_status = 0;
+    int32_t tenant_id = 0;
+};
 
-const ContractOpRow* g_async_ops = nullptr;
-int32_t g_async_op_count = 0;
-ContractExecCtx* g_async_ctx = nullptr;
-int64_t g_async_submit_token = 0;
+AsyncMailbox g_async_mailboxes[NATIVE_MAX_TENANTS];
 
-std::atomic<int32_t> g_async_state{ASYNC_IDLE};
-int64_t g_async_ready_token = 0;
-int32_t g_async_ready_status = 0;
-
-void trace_mailbox_invariant_locked(const char* where) {
-    const int32_t state = g_async_state.load(std::memory_order_relaxed);
-    const bool bad_job_state = g_async_has_job && state != ASYNC_RUNNING;
-    const bool bad_idle_job = state == ASYNC_IDLE && g_async_has_job;
-    const bool bad_ready_job = state == ASYNC_READY && g_async_has_job;
-    const bool bad_running_worker = state == ASYNC_RUNNING && !g_async_worker_started;
+void trace_mailbox_invariant_locked(AsyncMailbox& mb, const char* where) {
+    const int32_t state = mb.state.load(std::memory_order_relaxed);
+    const bool bad_job_state = mb.has_job && state != ASYNC_RUNNING;
+    const bool bad_idle_job = state == ASYNC_IDLE && mb.has_job;
+    const bool bad_ready_job = state == ASYNC_READY && mb.has_job;
+    const bool bad_running_worker = state == ASYNC_RUNNING && !mb.worker_started;
     if (bad_job_state || bad_idle_job || bad_ready_job || bad_running_worker) {
         std::fprintf(
             stderr,
-            "[MAILBOX_DESYNC][native] where=%s state=%d has_job=%d "
+            "[MAILBOX_DESYNC][native] tenant=%d where=%s state=%d has_job=%d "
             "worker_started=%d shutdown=%d submit_token=%lld ready_token=%lld\n",
+            mb.tenant_id,
             where,
             state,
-            g_async_has_job ? 1 : 0,
-            g_async_worker_started ? 1 : 0,
-            g_async_shutdown ? 1 : 0,
-            static_cast<long long>(g_async_submit_token),
-            static_cast<long long>(g_async_ready_token)
+            mb.has_job ? 1 : 0,
+            mb.worker_started ? 1 : 0,
+            mb.shutdown ? 1 : 0,
+            static_cast<long long>(mb.submit_token),
+            static_cast<long long>(mb.ready_token)
         );
         std::fflush(stderr);
     }
 }
 
-void contract_async_worker_loop() {
+void contract_async_worker_loop(int32_t tenant_id) {
+    AsyncMailbox& mb = g_async_mailboxes[tenant_id];
+    native_tenant_put(tenant_id);
     for (;;) {
-        std::unique_lock<std::mutex> lock(g_async_mtx);
-        g_async_job_cv.wait(lock, [] {
-            return g_async_shutdown || g_async_has_job;
+        std::unique_lock<std::mutex> lock(mb.mtx);
+        mb.job_cv.wait(lock, [&mb] {
+            return mb.shutdown || mb.has_job;
         });
-        if (g_async_shutdown) {
+        if (mb.shutdown) {
             break;
         }
 
-        const ContractOpRow* ops = g_async_ops;
-        const int32_t op_count = g_async_op_count;
-        ContractExecCtx* ctx = g_async_ctx;
-        const int64_t token = g_async_submit_token;
-        g_async_has_job = false;
-        trace_mailbox_invariant_locked("worker_take");
+        const ContractOpRow* ops = mb.ops;
+        const int32_t op_count = mb.op_count;
+        ContractExecCtx* ctx = mb.ctx;
+        const int64_t token = mb.submit_token;
+        mb.has_job = false;
+        trace_mailbox_invariant_locked(mb, "worker_take");
         lock.unlock();
 
+        native_tenant_put(tenant_id);
         const int32_t status = run_contract_training_step_impl(ops, op_count, ctx);
 
         {
-            std::lock_guard<std::mutex> ready_lock(g_async_mtx);
-            g_async_ready_token = token;
-            g_async_ready_status = status;
-            g_async_state.store(ASYNC_READY, std::memory_order_release);
-            trace_mailbox_invariant_locked("worker_ready");
+            std::lock_guard<std::mutex> ready_lock(mb.mtx);
+            mb.ready_token = token;
+            mb.ready_status = status;
+            mb.state.store(ASYNC_READY, std::memory_order_release);
+            trace_mailbox_invariant_locked(mb, "worker_ready");
         }
-        g_async_completion_cv.notify_one();
+        mb.completion_cv.notify_one();
     }
 }
 
-void ensure_async_worker_started() {
-    if (g_async_worker_started) {
+void ensure_async_worker_started(AsyncMailbox& mb) {
+    if (mb.worker_started) {
         return;
     }
-    g_async_worker_started = true;
-    g_async_worker = std::thread(contract_async_worker_loop);
+    mb.worker_started = true;
+    mb.tenant_id = native_tenant_get();
+    const int32_t tid = mb.tenant_id;
+    mb.worker = std::thread(contract_async_worker_loop, tid);
+}
+
+void shutdown_async_mailbox(AsyncMailbox& mb) {
+    {
+        std::lock_guard<std::mutex> lock(mb.mtx);
+        mb.shutdown = true;
+        trace_mailbox_invariant_locked(mb, "shutdown");
+    }
+    mb.job_cv.notify_all();
+    mb.completion_cv.notify_all();
+    if (mb.worker.joinable()) {
+        mb.worker.join();
+    }
+    mb.worker_started = false;
+    mb.shutdown = false;
+    mb.has_job = false;
+    mb.state.store(ASYNC_IDLE, std::memory_order_release);
 }
 
 }  // namespace
@@ -913,7 +940,8 @@ ML_ENGINE_EXPORT int32_t submit_contract_training_step(
         return -1;
     }
 
-    const int32_t state = g_async_state.load(std::memory_order_acquire);
+    AsyncMailbox& mb = g_async_mailboxes[native_tenant_get()];
+    const int32_t state = mb.state.load(std::memory_order_acquire);
     if (state == ASYNC_READY) {
         return -3;
     }
@@ -921,22 +949,22 @@ ML_ENGINE_EXPORT int32_t submit_contract_training_step(
         return -2;
     }
 
-    ensure_async_worker_started();
+    ensure_async_worker_started(mb);
 
     {
-        std::lock_guard<std::mutex> lock(g_async_mtx);
-        if (g_async_has_job || g_async_state.load(std::memory_order_relaxed) != ASYNC_IDLE) {
+        std::lock_guard<std::mutex> lock(mb.mtx);
+        if (mb.has_job || mb.state.load(std::memory_order_relaxed) != ASYNC_IDLE) {
             return -2;
         }
-        g_async_ops = ops;
-        g_async_op_count = op_count;
-        g_async_ctx = ctx;
-        g_async_submit_token = step_token;
-        g_async_has_job = true;
-        g_async_state.store(ASYNC_RUNNING, std::memory_order_release);
-        trace_mailbox_invariant_locked("submit");
+        mb.ops = ops;
+        mb.op_count = op_count;
+        mb.ctx = ctx;
+        mb.submit_token = step_token;
+        mb.has_job = true;
+        mb.state.store(ASYNC_RUNNING, std::memory_order_release);
+        trace_mailbox_invariant_locked(mb, "submit");
     }
-    g_async_job_cv.notify_one();
+    mb.job_cv.notify_one();
     return 0;
 }
 
@@ -948,14 +976,15 @@ ML_ENGINE_EXPORT int32_t try_reap_contract_completion(
     if (!out_step_token || !out_status) {
         return -1;
     }
-    std::lock_guard<std::mutex> lock(g_async_mtx);
-    if (g_async_state.load(std::memory_order_acquire) != ASYNC_READY) {
+    AsyncMailbox& mb = g_async_mailboxes[native_tenant_get()];
+    std::lock_guard<std::mutex> lock(mb.mtx);
+    if (mb.state.load(std::memory_order_acquire) != ASYNC_READY) {
         return 0;
     }
-    *out_step_token = g_async_ready_token;
-    *out_status = g_async_ready_status;
-    g_async_state.store(ASYNC_IDLE, std::memory_order_release);
-    trace_mailbox_invariant_locked("try_reap");
+    *out_step_token = mb.ready_token;
+    *out_status = mb.ready_status;
+    mb.state.store(ASYNC_IDLE, std::memory_order_release);
+    trace_mailbox_invariant_locked(mb, "try_reap");
     return 1;
 }
 
@@ -970,27 +999,28 @@ ML_ENGINE_EXPORT int32_t wait_contract_completion(
         return -1;
     }
 
-    std::unique_lock<std::mutex> lock(g_async_mtx);
-    const auto ready_or_shutdown = [] {
-        return g_async_shutdown ||
-            g_async_state.load(std::memory_order_acquire) == ASYNC_READY;
+    AsyncMailbox& mb = g_async_mailboxes[native_tenant_get()];
+    std::unique_lock<std::mutex> lock(mb.mtx);
+    const auto ready_or_shutdown = [&mb] {
+        return mb.shutdown ||
+            mb.state.load(std::memory_order_acquire) == ASYNC_READY;
     };
     bool signaled = true;
     if (timeout_ms < 0) {
-        g_async_completion_cv.wait(lock, ready_or_shutdown);
+        mb.completion_cv.wait(lock, ready_or_shutdown);
     } else {
-        signaled = g_async_completion_cv.wait_for(
+        signaled = mb.completion_cv.wait_for(
             lock, std::chrono::milliseconds(timeout_ms), ready_or_shutdown);
     }
     if (!signaled ||
-        g_async_state.load(std::memory_order_acquire) != ASYNC_READY) {
+        mb.state.load(std::memory_order_acquire) != ASYNC_READY) {
         return 0;
     }
 
-    *out_step_token = g_async_ready_token;
-    *out_status = g_async_ready_status;
-    g_async_state.store(ASYNC_IDLE, std::memory_order_release);
-    trace_mailbox_invariant_locked("wait_reap");
+    *out_step_token = mb.ready_token;
+    *out_status = mb.ready_status;
+    mb.state.store(ASYNC_IDLE, std::memory_order_release);
+    trace_mailbox_invariant_locked(mb, "wait_reap");
     return 1;
 }
 
@@ -1008,32 +1038,34 @@ ML_ENGINE_EXPORT int32_t contract_async_debug_snapshot(
         !out_submit_token || !out_ready_token) {
         return -1;
     }
-    std::lock_guard<std::mutex> lock(g_async_mtx);
-    *out_state = g_async_state.load(std::memory_order_relaxed);
-    *out_has_job = g_async_has_job ? 1 : 0;
-    *out_worker_started = g_async_worker_started ? 1 : 0;
-    *out_shutdown = g_async_shutdown ? 1 : 0;
-    *out_submit_token = g_async_submit_token;
-    *out_ready_token = g_async_ready_token;
-    trace_mailbox_invariant_locked("python_snapshot");
+    AsyncMailbox& mb = g_async_mailboxes[native_tenant_get()];
+    std::lock_guard<std::mutex> lock(mb.mtx);
+    *out_state = mb.state.load(std::memory_order_relaxed);
+    *out_has_job = mb.has_job ? 1 : 0;
+    *out_worker_started = mb.worker_started ? 1 : 0;
+    *out_shutdown = mb.shutdown ? 1 : 0;
+    *out_submit_token = mb.submit_token;
+    *out_ready_token = mb.ready_token;
+    trace_mailbox_invariant_locked(mb, "python_snapshot");
     return 0;
 }
 
 ML_ENGINE_EXPORT int32_t contract_async_in_flight() {
-    const int32_t state = g_async_state.load(std::memory_order_acquire);
+    AsyncMailbox& mb = g_async_mailboxes[native_tenant_get()];
+    const int32_t state = mb.state.load(std::memory_order_acquire);
     return (state == ASYNC_RUNNING) ? 1 : 0;
 }
 
-ML_ENGINE_EXPORT void contract_async_shutdown() {
-    {
-        std::lock_guard<std::mutex> lock(g_async_mtx);
-        g_async_shutdown = true;
-        trace_mailbox_invariant_locked("shutdown");
+ML_ENGINE_EXPORT void contract_async_shutdown_tenant(int32_t tenant_id) {
+    if (tenant_id < 0 || tenant_id >= NATIVE_MAX_TENANTS) {
+        return;
     }
-    g_async_job_cv.notify_all();
-    g_async_completion_cv.notify_all();
-    if (g_async_worker.joinable()) {
-        g_async_worker.join();
+    shutdown_async_mailbox(g_async_mailboxes[tenant_id]);
+}
+
+ML_ENGINE_EXPORT void contract_async_shutdown() {
+    for (int32_t t = 0; t < NATIVE_MAX_TENANTS; ++t) {
+        shutdown_async_mailbox(g_async_mailboxes[t]);
     }
 #if defined(ML_ENGINE_PROFILE_CONTRACT_THREADS) && defined(__linux__) && defined(_OPENMP)
     contract_profile_report();

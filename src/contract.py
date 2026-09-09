@@ -167,3 +167,26 @@ def compile_cnn_training_step(
     contract.ops.append(ContractOpDesc(opcode=ContractOp.ADAM_APPLY, layer_idx=-1))
 
     return contract
+
+
+def cnn_contract_factory(model: Any) -> ContractList:
+    """Default ContractFactory for CNNNetwork — validates stack then compiles."""
+    from config.constants import EngineBackend
+    from src.spatial_layers import Conv2D, ConvBlock, Flatten, MaxPool2D
+
+    if getattr(model, "backend", None) != EngineBackend.NATIVE:
+        raise ValueError("Contract list requires NATIVE backend")
+    dense_w_indices = getattr(model, "_dense_w_indices", None)
+    if dense_w_indices is None or len(dense_w_indices) < 1:
+        raise ValueError("Contract path requires at least one dense head layer")
+    if len(dense_w_indices) > 8:
+        raise ValueError("Contract path supports at most 8 dense layers")
+    for layer in model.layers:
+        if not isinstance(layer, (ConvBlock, Flatten)) and layer != "relu":
+            if isinstance(layer, (Conv2D, MaxPool2D)):
+                raise ValueError("Contract path requires fused ConvBlock spatial stack")
+    return compile_cnn_training_step(
+        model.layers,
+        layer_param_idx=model._layer_param_idx,
+        dense_w_indices=dense_w_indices,
+    )

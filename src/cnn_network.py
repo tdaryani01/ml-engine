@@ -1,16 +1,17 @@
 # src/cnn_network.py
 import logging
-from typing import Callable
 
 import numpy as np
 from config.constants import EngineBackend
+from src.contract import cnn_contract_factory
 from src.scratch_arena import ScratchArena
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten, ConvBlock
+from src.trainable_model import TrainableModel
 from src.training_cache import ForwardCache, new_forward_cache
 from utils.engine_ops import create_engine_context
 
 
-class CNNNetwork:
+class CNNNetwork(TrainableModel):
     """
     Modular Convolutional Neural Network engine.
     Automatically identifies and constructs fused ConvBlocks (Conv2D -> ReLU -> MaxPool2D)
@@ -22,18 +23,26 @@ class CNNNetwork:
                  lam_l1: float = 0.01, lam_l2: float = 0.01, p_dropout: float = 0.0,
                  max_norm: float = 5.0, task_type: str = "multiclass",
                  input_logical_w: int | None = None, **kwargs):
+        contract_list_enabled = bool(kwargs.pop("contract_list_enabled", False))
+        native_async_submit = bool(kwargs.pop("native_async_submit", False))
+        contract_factory = kwargs.pop("contract_factory", None) or cnn_contract_factory
+        super().__init__(
+            optimizer_instance,
+            lam_l1=lam_l1,
+            lam_l2=lam_l2,
+            p_dropout=p_dropout,
+            max_norm=max_norm,
+            contract_list_enabled=False,
+            native_async_submit=native_async_submit,
+            contract_factory=contract_factory,
+            **kwargs,
+        )
         self.engine_ctx = engine_ctx or create_engine_context(backend)
         self.backend = self.engine_ctx.backend
         self.scratch_arena = ScratchArena(self.backend)
-        self.optimizer = optimizer_instance
-        self.lam_l1 = lam_l1
-        self.lam_l2 = lam_l2
-        self.p_dropout = p_dropout
-        self.max_norm = max_norm
         self.task_type = task_type
         # Logical W before SIMD row pad (e.g. 28 in stride-32, 124 in stride-128).
         self.input_logical_w = input_logical_w
-        self.diagnostic_counter = 0
 
         self.layers = []
         self.weights = []
@@ -70,126 +79,9 @@ class CNNNetwork:
             if isinstance(layer, (ConvBlock, Conv2D)):
                 self._layer_param_idx[li] = self.param_layers.index(layer)
         self._train_cache: ForwardCache | None = None
-        self.contract_list_enabled = bool(kwargs.pop("contract_list_enabled", False))
-        self._contract_runtime = None
-        native_async_submit = bool(kwargs.pop("native_async_submit", False))
-        if self.contract_list_enabled:
-            self._init_contract_path(native_async_submit=native_async_submit)
-
-    def enable_contract_list(self, *, native_async_submit: bool = False) -> None:
-        """Opt-in contract path after construction (e.g. from training engine at fit time)."""
-        if self._contract_runtime is not None:
-            return
-        self.contract_list_enabled = True
-        self._init_contract_path(native_async_submit=native_async_submit)
-
-    def _init_contract_path(self, *, native_async_submit: bool = False) -> None:
-        from src.contract import compile_cnn_training_step
-        from src.contract_runtime import ContractRuntime
-        from src.spatial_layers import ConvBlock
-
-        if self.backend != EngineBackend.NATIVE:
-            raise ValueError("Contract list requires NATIVE backend")
-        if len(self._dense_w_indices) < 1:
-            raise ValueError("Contract path requires at least one dense head layer")
-        if len(self._dense_w_indices) > 8:
-            raise ValueError("Contract path supports at most 8 dense layers")
-        for layer in self.layers:
-            if not isinstance(layer, (ConvBlock, Flatten)) and layer != "relu":
-                from src.spatial_layers import Conv2D, MaxPool2D
-                if isinstance(layer, (Conv2D, MaxPool2D)):
-                    raise ValueError("Contract path requires fused ConvBlock spatial stack")
-
-        contract = compile_cnn_training_step(
-            self.layers,
-            layer_param_idx=self._layer_param_idx,
-            dense_w_indices=self._dense_w_indices,
-        )
-        self._contract = contract
-        self._contract_runtime = ContractRuntime(
-            self, contract, native_async_submit=native_async_submit
-        )
-        logging.info(
-            "[CNN] Contract list enabled: %d ops (native_async_submit=%s)",
-            contract.op_count,
-            native_async_submit,
-        )
-
-    
-    def add_training_step(
-        self,
-        X: np.ndarray,
-        y: np.ndarray,
-        lr: float,
-        *,
-        apply_adam: bool = False,
-        step_token: int | None = None,
-    ) -> str:
-        """Manager handshake: OK if accepted, BUSY if single native slot occupied."""
-        if self._contract_runtime is None:
-            raise RuntimeError("Contract path not initialized")
-        if self._contract_runtime.try_submit_step(
-            X, y, lr, apply_adam=apply_adam, step_token=step_token
-        ):
-            return "OK"
-        return "BUSY"
-
-    def prepare_training_step(
-        self,
-        X: np.ndarray,
-        y: np.ndarray,
-        lr: float,
-        *,
-        apply_adam: bool = False,
-        step_token: int | None = None,
-    ) -> bool:
-        """Prepare the inactive async slot without submitting it."""
-        if self._contract_runtime is None:
-            raise RuntimeError("Contract path not initialized")
-        return self._contract_runtime.prepare_step(
-            X, y, lr, apply_adam=apply_adam, step_token=step_token
-        )
-
-    def contract_busy(self) -> bool:
-        if self._contract_runtime is None:
-            return False
-        return self._contract_runtime.is_busy()
-
-    def submit_contract_train_step(
-        self,
-        X: np.ndarray,
-        y: np.ndarray,
-        lr: float,
-        *,
-        apply_adam: bool = False,
-        step_token: int | None = None,
-    ) -> str:
-        return self.add_training_step(
-            X, y, lr, apply_adam=apply_adam, step_token=step_token
-        )
-
-    def try_reap_contract_train_step(
-        self,
-    ) -> tuple[float, list, list, int] | None:
-        if self._contract_runtime is None:
-            return None
-        return self._contract_runtime.try_reap_step()
-
-    def run_contract_train_step(
-        self,
-        X: np.ndarray,
-        y: np.ndarray,
-        lr: float,
-        *,
-        apply_adam: bool = False,
-        step_token: int | None = None,
-        tick_fn: Callable[[], None] | None = None,
-    ) -> tuple[float, list, list, int]:
-        if self._contract_runtime is None:
-            raise RuntimeError("Contract path not initialized")
-        return self._contract_runtime.run_step(
-            X, y, lr, apply_adam=apply_adam, step_token=step_token, tick_fn=tick_fn
-        )
+        # Contract needs layer indices — enable after spatial/dense build.
+        if contract_list_enabled:
+            self.enable_contract_list(native_async_submit=native_async_submit)
 
     @property
     def layer_sizes(self) -> list:

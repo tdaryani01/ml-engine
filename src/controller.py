@@ -179,7 +179,7 @@ class ModelController:
             )
             logging.info("[Model Controller] Training ledger enabled: %s", ledger_dir)
             try:
-                self.train_history, self.val_history = engine.start_session(
+                session = engine.start_session(
                     model=self.model,
                     data_provider=self.data_provider,
                     initial_lr=self.initial_lr,
@@ -195,7 +195,12 @@ class ModelController:
                     compute_r2_score=self.compute_r2_score,
                     max_epochs=max_epochs,
                 )
-                self.steps_completed = engine.session.steps_completed if engine.session else self.steps_completed
+                results = engine.run()
+                hist = results.get(session.session_id)
+                if hist is None:
+                    hist = (list(session.train_history), list(session.val_history))
+                self.train_history, self.val_history = hist
+                self.steps_completed = session.steps_completed
             finally:
                 engine.close()
             return self.train_history, self.val_history

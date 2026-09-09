@@ -293,11 +293,18 @@ class TrainingLedger:
     frozen: bool = False
     _best_val_loss: float = field(default=float("inf"), repr=False)
 
-    def _envelope(self, doc_type: str, body: dict[str, Any], version: int | None = None, step_id: int | None = None) -> LedgerDocument:
+    def _envelope(
+        self,
+        doc_type: str,
+        body: dict[str, Any],
+        version: int | None = None,
+        step_id: int | None = None,
+        model_instance_id: str | None = None,
+    ) -> LedgerDocument:
         return LedgerDocument(
             doc_type=doc_type,
             branch_id=self.branch_id,
-            model_instance_id=self.model_instance_id,
+            model_instance_id=model_instance_id or self.model_instance_id,
             architecture_id=self.architecture_id,
             body=body,
             version=version,
@@ -406,6 +413,7 @@ class TrainingLedger:
         val_loss: float | None = None,
         verdict: str = VERDICT_HEALTHY,
         scheduler_epoch: int = 0,
+        model_instance_id: str | None = None,
     ) -> int:
         """One journal record per batch (command + result + consolidated + metrics)."""
         command = {
@@ -425,17 +433,123 @@ class TrainingLedger:
             "metrics": metrics,
         }
         return self.push(
-            self._envelope(STEP_COMPLETE, body, version=version, step_id=step_id)
+            self._envelope(
+                STEP_COMPLETE,
+                body,
+                version=version,
+                step_id=step_id,
+                model_instance_id=model_instance_id,
+            )
         )
 
     
-    def push_checkpoint(self, model: Any, version: int, val_loss: float | None = None, is_local_best: bool = False) -> int:
+    def push_checkpoint(
+        self,
+        model: Any,
+        version: int,
+        val_loss: float | None = None,
+        is_local_best: bool = False,
+        model_instance_id: str | None = None,
+    ) -> int:
         body = capture_model_checkpoint(model, version, val_loss=val_loss)
         body["is_local_best"] = is_local_best
-        doc = self._envelope(CHECKPOINT, body, version=version, step_id=version)
+        doc = self._envelope(
+            CHECKPOINT,
+            body,
+            version=version,
+            step_id=version,
+            model_instance_id=model_instance_id,
+        )
         lsn = self.push(doc)
         self.store.put_checkpoint(doc)
         return lsn
+
+    def scan_session(
+        self, session_id: str, doc_type: str | None = None
+    ) -> Iterator[LedgerDocument]:
+        """Yield documents tagged with this session (model_instance_id)."""
+        for doc in self.store.scan():
+            if doc.model_instance_id != session_id:
+                continue
+            if doc_type is not None and doc.doc_type != doc_type:
+                continue
+            yield doc
+
+    def session_head_version(self, session_id: str) -> int:
+        """Highest ledger version seen on docs for this session_id."""
+        head = 0
+        for doc in self.scan_session(session_id):
+            if doc.version is not None:
+                head = max(head, int(doc.version))
+            body_v = doc.body.get("version") if isinstance(doc.body, dict) else None
+            if body_v is not None:
+                head = max(head, int(body_v))
+        return head
+
+    def latest_checkpoint_for_session(self, session_id: str) -> LedgerDocument | None:
+        """Most recent checkpoint document tagged with session_id."""
+        best: LedgerDocument | None = None
+        best_v = -1
+        for doc in self.scan_session(session_id, CHECKPOINT):
+            v = int(
+                doc.version
+                if doc.version is not None
+                else doc.body.get("version", -1)
+            )
+            if v > best_v:
+                best_v = v
+                best = doc
+        return best
+
+    def restore_session_checkpoint(
+        self,
+        model: Any,
+        session_id: str,
+        version: int | None = None,
+    ) -> LedgerDocument:
+        """
+        Restore model weights from a session-tagged checkpoint.
+
+        Does not rewind the shared ledger.version (other sessions may be ahead).
+        """
+        if version is None:
+            doc = self.latest_checkpoint_for_session(session_id)
+            if doc is None:
+                raise KeyError(f"No checkpoint for session={session_id!r}")
+        else:
+            doc = None
+            for candidate in self.scan_session(session_id, CHECKPOINT):
+                v = int(
+                    candidate.version
+                    if candidate.version is not None
+                    else candidate.body.get("version", -1)
+                )
+                if v == int(version):
+                    doc = candidate
+                    break
+            if doc is None:
+                raise KeyError(
+                    f"No checkpoint for session={session_id!r} version={version}"
+                )
+        restore_model_checkpoint(model, doc.body)
+        return doc
+
+    def replay_session_apply_from_version(
+        self,
+        session: Any,
+        session_id: str,
+        from_version: int,
+        to_version: int,
+        default_lr: float,
+    ) -> None:
+        """Apply stored step.complete records for one session in (from_version, to_version]."""
+        for doc in self.scan_session(session_id, STEP_COMPLETE):
+            result = train_step_result_from_body(doc.body)
+            ver = int(doc.version if doc.version is not None else result.step_id)
+            if ver <= from_version or ver > to_version:
+                continue
+            lr = float(doc.body.get("command", {}).get("lr", default_lr))
+            session.apply_step(result, lr)
 
     def fork_branch(self, new_branch_id: str, parent_version: int, reason: str, settings_delta: dict[str, Any] | None = None) -> TrainingLedger:
         parent_lsn = self.store.head_lsn()

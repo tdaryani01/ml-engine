@@ -249,6 +249,20 @@ def _bind_runner(lib) -> None:
     if hasattr(lib, "set_contract_async_overlap"):
         lib.set_contract_async_overlap.restype = None
         lib.set_contract_async_overlap.argtypes = [ctypes.c_int32]
+    if hasattr(lib, "native_tenant_create"):
+        lib.native_tenant_create.restype = ctypes.c_int32
+        lib.native_tenant_create.argtypes = []
+        lib.native_tenant_set_current.restype = None
+        lib.native_tenant_set_current.argtypes = [ctypes.c_int32]
+        lib.native_tenant_current.restype = ctypes.c_int32
+        lib.native_tenant_current.argtypes = []
+        lib.native_tenant_invalidate_all.restype = None
+        lib.native_tenant_invalidate_all.argtypes = [ctypes.c_int32]
+        lib.native_tenant_release.restype = None
+        lib.native_tenant_release.argtypes = [ctypes.c_int32]
+    if hasattr(lib, "contract_async_shutdown_tenant"):
+        lib.contract_async_shutdown_tenant.restype = None
+        lib.contract_async_shutdown_tenant.argtypes = [ctypes.c_int32]
 
 
 @dataclass
@@ -324,10 +338,20 @@ class _SubmittedStep:
 
 
 def shutdown_contract_async() -> None:
-    """Stop native contract worker thread (call at end of fit / tests)."""
+    """Stop all native contract workers and wipe every tenant's stage tables."""
     lib = _load_conv_dll()
-    if lib is not None and hasattr(lib, "contract_async_shutdown"):
+    if lib is None:
+        return
+    if hasattr(lib, "contract_async_shutdown"):
         lib.contract_async_shutdown()
+    # Wipe stages for every tenant id (0..7) so process teardown leaves no ABA.
+    inv = getattr(lib, "native_tenant_invalidate_all", None)
+    set_t = getattr(lib, "native_tenant_set_current", None)
+    if inv is not None and set_t is not None:
+        for tid in range(8):
+            set_t(ctypes.c_int32(tid))
+            inv(ctypes.c_int32(tid))
+        set_t(ctypes.c_int32(0))
 
 
 class ContractRuntime:
@@ -355,6 +379,14 @@ class ContractRuntime:
         self._conv_bindings_ready = False
         self._dense_bindings_ready = False
         self._input_logical_w: int | None = getattr(model, "input_logical_w", None)
+        self._tenant_id = 0
+        create_tenant = getattr(self._lib, "native_tenant_create", None)
+        if create_tenant is not None:
+            tid = int(create_tenant())
+            if tid < 0:
+                raise RuntimeError("native_tenant_create: no free tenant slots")
+            self._tenant_id = tid
+        self._activate_tenant()
         self._async_enabled = (
             bool(native_async_submit)
             and hasattr(self._lib, "submit_contract_training_step")
@@ -396,6 +428,31 @@ class ContractRuntime:
         if self._async_enabled and hasattr(self._lib, "contract_register_completion_callback"):
             self._lib.contract_register_completion_callback(None)
         self._trace_mailbox("init")
+
+    def _activate_tenant(self) -> None:
+        """Bind this runtime's native tenant on the calling thread."""
+        set_t = getattr(self._lib, "native_tenant_set_current", None)
+        if set_t is not None:
+            set_t(ctypes.c_int32(int(self._tenant_id)))
+
+    def close(self) -> None:
+        """Release native tenant stages + async worker for this runtime only."""
+        self._activate_tenant()
+        self._invalidate_input_pad_stage()
+        shut = getattr(self._lib, "contract_async_shutdown_tenant", None)
+        if shut is not None and self._tenant_id > 0:
+            shut(ctypes.c_int32(int(self._tenant_id)))
+        release = getattr(self._lib, "native_tenant_release", None)
+        if release is not None and self._tenant_id > 0:
+            release(ctypes.c_int32(int(self._tenant_id)))
+            self._tenant_id = 0
+
+    def __del__(self) -> None:
+        try:
+            if getattr(self, "_tenant_id", 0) > 0:
+                self.close()
+        except Exception:
+            pass
 
     def _bindings_still_valid(self, m: int) -> bool:
         if not self._bindings_ready:
@@ -820,12 +877,6 @@ class ContractRuntime:
         # Slot buffers are about to be replaced; drop staged pads keyed on the
         # old input pointers so a recycled address cannot produce a false hit.
         self._invalidate_input_pad_stage()
-        drop_wt = getattr(self._lib, "invalidate_dx_cin_blocked_wt_stage", None)
-        if drop_wt is not None:
-            drop_wt(ctypes.c_int32(-1))
-        drop_brg = getattr(self._lib, "invalidate_brgemm_dw_x_pack", None)
-        if drop_brg is not None:
-            drop_brg(ctypes.c_int32(-1))
         self._slots = [self._make_async_slot(X, cap), self._make_async_slot(X, cap)]
 
     def _bind_slot_parameter_banks(
@@ -1017,6 +1068,7 @@ class ContractRuntime:
         slot.ctx.act = None
 
         token = -(int(self.model.optimizer.t) + 1)
+        self._activate_tenant()
         status = self._lib.submit_contract_training_step(
             ctypes.cast(self._ops, ctypes.POINTER(ContractOpRow)),
             ctypes.c_int32(self._forward_op_count),
@@ -1174,6 +1226,7 @@ class ContractRuntime:
         def _drain_pack() -> None:
             if service is None:
                 return
+            self._activate_tenant()
             for _ in range(8):
                 if int(service()) <= 0:
                     break
@@ -1357,6 +1410,7 @@ class ContractRuntime:
     def _stage_input_pad_ctx(
         self, slot_idx: int, ctx: ContractExecCtx, X: np.ndarray
     ) -> None:
+        self._activate_tenant()
         stage = getattr(self._lib, "stage_conv_x_pad", None)
         if stage is None or ctx.num_layers <= 0:
             return
@@ -1380,9 +1434,13 @@ class ContractRuntime:
         )
 
     def _invalidate_input_pad_stage(self, slot_idx: int = -1) -> None:
+        self._activate_tenant()
         drop = getattr(self._lib, "invalidate_conv_x_pad_stage", None)
         if drop is not None:
             drop(ctypes.c_int32(slot_idx))
+        drop_wt = getattr(self._lib, "invalidate_dx_cin_blocked_wt_stage", None)
+        if drop_wt is not None:
+            drop_wt(ctypes.c_int32(slot_idx))
         drop_brg = getattr(self._lib, "invalidate_brgemm_dw_x_pack", None)
         if drop_brg is not None:
             drop_brg(ctypes.c_int32(slot_idx))
@@ -1396,6 +1454,7 @@ class ContractRuntime:
     def _stage_brgemm_dw_x_ctx(
         self, slot_idx: int, ctx: ContractExecCtx, X: np.ndarray
     ) -> None:
+        self._activate_tenant()
         stage = getattr(self._lib, "stage_brgemm_dw_x_pack", None)
         if stage is None or ctx.num_layers <= 0:
             return
@@ -1437,6 +1496,7 @@ class ContractRuntime:
         Mirrors native's try_cin_blocked_dx gate exactly; on any mismatch
         native falls back to rebuilding it itself.
         """
+        self._activate_tenant()
         stage = getattr(self._lib, "stage_dx_cin_blocked_wt", None)
         if stage is None:
             return
@@ -1540,6 +1600,7 @@ class ContractRuntime:
         return loss, grad_weights, grad_biases, m
 
     def _invoke_native_sync(self, ctx: ContractExecCtx) -> None:
+        self._activate_tenant()
         status = self._lib.run_contract_training_step(
             ctypes.cast(self._ops, ctypes.POINTER(ContractOpRow)),
             ctypes.c_int32(self.contract.op_count),
@@ -1553,6 +1614,7 @@ class ContractRuntime:
             raise RuntimeError(f"run_contract_training_step failed with status {status}")
 
     def _submit_native(self, ctx: ContractExecCtx, step_token: int) -> None:
+        self._activate_tenant()
         status = self._lib.submit_contract_training_step(
             ctypes.cast(self._ops, ctypes.POINTER(ContractOpRow)),
             ctypes.c_int32(self.contract.op_count),
@@ -1570,6 +1632,7 @@ class ContractRuntime:
     def _try_reap_native(self) -> bool:
         if not self._async_enabled:
             return True
+        self._activate_tenant()
         out_token = ctypes.c_int64()
         out_status = ctypes.c_int32()
         rc = self._lib.try_reap_contract_completion(
@@ -1588,6 +1651,7 @@ class ContractRuntime:
         return True
 
     def _wait_reap_native(self, timeout_ms: int) -> bool:
+        self._activate_tenant()
         out_token = ctypes.c_int64()
         out_status = ctypes.c_int32()
         rc = self._lib.wait_contract_completion(

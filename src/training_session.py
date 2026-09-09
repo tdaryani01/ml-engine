@@ -1,21 +1,38 @@
 # src/training_session.py
 """Training session boundary: step results, grad compute vs optimizer apply, fit loop.
 
-Worker policy (Phase E): one model + ScratchArena per worker; never share a
-TrainingSession or call train_step on the same model instance concurrently.
-Workers run sequentially or in separate processes; a single consolidator applies
-TrainStepResult batches.
+Isolation policy:
+- One TrainingSession owns exactly one model instance (weights, arena, optimizer).
+- Many sessions may run in one process, each with its own model instance
+  (same architecture/config is fine; sharing one model object is not).
+- Native stage caches / async mailboxes are per-model tenant — concurrent
+  different models are supported once each has its own ContractRuntime tenant.
 """
 from __future__ import annotations
 
 import copy
 import logging
+import uuid
+import weakref
+from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from config.constants import DataKeys, ModelType
+
+# model id(model) -> weakref to the live TrainingSession that owns it
+_model_session_owners: dict[int, weakref.ReferenceType] = {}
+
+
+class SessionStatus(str, Enum):
+    """Engine scheduling state. Finished sessions are dropped from the engine list."""
+
+    PENDING = "pending"  # registered; not advanced by run() until activated
+    ACTIVE = "active"  # run() advances this session
+    FINISHED = "finished"  # ended; normally dropped from engine.sessions
 
 
 @dataclass
@@ -60,6 +77,9 @@ class TrainStepResult:
 class TrainingSession:
     """
     Owns one model's training loop. Computes grads in train_step; applies via apply_step.
+
+    Pipeline hot state (inflight/prefetch/async flags) lives on the session so one
+    engine can keep many sessions alive and round-robin them.
     """
 
     def __init__(
@@ -69,8 +89,22 @@ class TrainingSession:
         initial_lr: float = 0.01,
         scheduler: Any = None,
         predict_fn: Callable[[np.ndarray], np.ndarray] | None = None,
+        *,
+        session_id: str | None = None,
+        status: SessionStatus = SessionStatus.PENDING,
     ):
+        mid = id(model)
+        existing = _model_session_owners.get(mid)
+        if existing is not None and existing() is not None:
+            raise RuntimeError(
+                "TrainingSession: model instance is already owned by another session. "
+                "Create a separate model instance per session (shared architecture OK)."
+            )
         self.model = model
+        self._model_id = mid
+        _model_session_owners[mid] = weakref.ref(
+            self, lambda _r, _mid=mid: _model_session_owners.pop(_mid, None)
+        )
         self.data_provider = data_provider
         self.initial_lr = initial_lr
         self.scheduler = scheduler
@@ -80,8 +114,43 @@ class TrainingSession:
         self.train_history: List[float] = []
         self.val_history: List[float] = []
         self.engine: Any = None  # TrainingEngine when ledger enabled
+        self.session_id = session_id or str(uuid.uuid4())
+        self.status = status
+        self._fit_kwargs: Dict[str, Any] = {}
+        self._fit_ready = False
+        self._fit_done = False
+        self._fit_epoch = 0
+        self._fit_es_state: Dict[str, Any] | None = None
+        self._fit_is_classification = False
+        self._fit_X_val = None
+        self._fit_y_val = None
+        # Per-session async / pipeline state (was on TrainingEngine)
+        self._inflight: Any = None
+        self._prepared: Any = None
+        self._prefetch: deque = deque()
+        self._async_contract = False
+        self._epoch_losses: List[float] = []
+        self._epoch_steps_done = 0
+        self._flag_step_done = False
+        self._flag_capacity = True
+        self._steps_since_checkpoint = 0
+        self._last_healthy_version = 0
 
-    
+    def detach_model_ownership(self) -> None:
+        """Release the one-session-per-model registry entry (used by end_session)."""
+        mid = getattr(self, "_model_id", None)
+        if mid is None:
+            return
+        existing = _model_session_owners.get(mid)
+        if existing is not None and existing() is self:
+            _model_session_owners.pop(mid, None)
+
+    def on_contract_step_done(self) -> None:
+        self._flag_step_done = True
+
+    def on_capacity(self) -> None:
+        self._flag_capacity = True
+
     def reserve_step_id(self) -> int:
         """Allocate the next step_id on the main thread (strict FIFO submit order)."""
         self.step_id += 1
@@ -264,6 +333,160 @@ class TrainingSession:
         self.model.set_train_batch_cap(cap)
         logging.debug(f"[TrainingSession] Train buffer cap set to N={cap}.")
 
+    def begin_fit(
+        self,
+        steps: int,
+        source_mode: Any,
+        model_type: ModelType,
+        early_stopping_enabled: bool = True,
+        patience: int = 15,
+        min_delta: float = 1e-5,
+        compute_r2_score: Callable[[np.ndarray, np.ndarray], float] | None = None,
+        engine: Any = None,
+        max_epochs: int | None = None,
+    ) -> None:
+        """Prepare epoch state for engine.run() round-robin (does not train yet)."""
+        self.engine = engine
+        self._fit_kwargs = {
+            "steps": steps,
+            "source_mode": source_mode,
+            "model_type": model_type,
+            "early_stopping_enabled": early_stopping_enabled,
+            "patience": patience,
+            "min_delta": min_delta,
+            "compute_r2_score": compute_r2_score,
+            "max_epochs": max_epochs,
+        }
+        self._fit_done = False
+        self._fit_epoch = 0
+        self._fit_is_classification = model_type in (
+            ModelType.BINARY_CLASSIFICATION,
+            ModelType.MULTI_CLASS,
+            ModelType.CNN,
+        )
+        self._fit_X_val, self._fit_y_val = self.data_provider.get_validation_set()
+        if self._fit_is_classification:
+            y_val_target = self._fit_y_val
+            val_class_dist = (
+                np.sum(y_val_target, axis=0).tolist()
+                if hasattr(y_val_target, "ndim") and y_val_target.ndim > 1
+                else np.unique(y_val_target, return_counts=True)[1].tolist()
+            )
+            logging.info(
+                f"[Forensic Trace] Static Validation Set Class Distribution: {val_class_dist}"
+            )
+        if steps <= 0:
+            logging.info(
+                "[TrainingSession] Steps count set to 0. Skipping training execution loops."
+            )
+            self._fit_done = True
+            self._fit_ready = True
+            return
+        self._set_train_batch_caps(model_type)
+        if hasattr(self.model.optimizer, "_setup_done"):
+            self.model.optimizer._setup_done = False
+            self.model.optimizer.t = 0
+            logging.info(
+                "[TrainingSession] Patched Adam state: Tracking vectors cleared for new execution pass."
+            )
+        self._fit_es_state = {
+            "best_val_loss": float("inf"),
+            "best_epoch": 0,
+            "patience_counter": 0,
+            "weights": None,
+            "biases": None,
+            "best_version": None,
+        }
+        if self.engine is not None:
+            self.engine.on_fit_start(self)
+        self._fit_ready = True
+
+    def advance_fit_epoch(self) -> bool:
+        """
+        Run one training epoch for this session.
+        Returns True if more epochs remain; False when fit is complete.
+        """
+        if self._fit_done:
+            return False
+        if not self._fit_ready:
+            raise RuntimeError("advance_fit_epoch requires begin_fit first")
+        kw = self._fit_kwargs
+        steps = int(kw["steps"])
+        if steps <= 0:
+            self._fit_done = True
+            return False
+
+        epoch = self._fit_epoch
+        active_lr = self.scheduler.step(epoch) if self.scheduler else self.initial_lr
+        epoch_train_loss, _ = self._run_epoch_training_pass(
+            active_lr, steps, epoch, self._fit_is_classification
+        )
+        if epoch_train_loss == 0.0:
+            self.finish_fit()
+            return False
+        self.train_history.append(epoch_train_loss)
+
+        X_val, y_val_target = self._fit_X_val, self._fit_y_val
+        val_preds = self._predict_with_thread_policy(X_val)
+        current_val_loss = self.model.compute_total_loss(val_preds, y_val_target)
+        current_val_raw_cost = self.model.calculate_raw_cost(val_preds, y_val_target)
+        self.val_history.append(current_val_loss)
+
+        self._evaluate_epoch_performance(
+            epoch,
+            epoch_train_loss,
+            val_preds,
+            y_val_target,
+            current_val_loss,
+            active_lr,
+            self._fit_is_classification,
+            kw.get("compute_r2_score"),
+        )
+
+        es_state = self._fit_es_state or {}
+        if kw.get("early_stopping_enabled", True):
+            if self._handle_early_stopping(
+                epoch,
+                current_val_raw_cost,
+                float(kw.get("min_delta", 1e-5)),
+                int(kw.get("patience", 15)),
+                es_state,
+                current_val_loss=current_val_loss,
+            ):
+                self.finish_fit()
+                return False
+        max_epochs = kw.get("max_epochs")
+        if max_epochs is not None and epoch + 1 >= max_epochs:
+            self.finish_fit()
+            return False
+        self._fit_epoch = epoch + 1
+        return True
+
+    def finish_fit(self) -> Tuple[List[float], List[float]]:
+        """Finalize reports and engine on_fit_end; marks session fit done."""
+        if self._fit_done and not self._fit_ready:
+            return self.train_history, self.val_history
+        kw = self._fit_kwargs
+        if self._fit_X_val is not None and kw:
+            self._generate_final_summary_report(
+                self._fit_X_val,
+                self._fit_y_val,
+                kw.get("source_mode"),
+                self._fit_is_classification,
+                kw.get("model_type"),
+                self._fit_es_state or {
+                    "best_val_loss": float("inf"),
+                    "best_epoch": 0,
+                },
+                bool(kw.get("early_stopping_enabled", True)),
+                kw.get("compute_r2_score"),
+            )
+        if self.engine is not None:
+            self.engine.on_fit_end(self)
+        self._fit_done = True
+        self._fit_ready = False
+        return self.train_history, self.val_history
+
     def fit(
         self,
         steps: int,
@@ -276,85 +499,24 @@ class TrainingSession:
         engine: Any = None,
         max_epochs: int | None = None,
     ) -> Tuple[List[float], List[float]]:
-        """Epoch training loop (extracted from ModelController)."""
-        self.engine = engine
-        if self.engine is not None:
-            self.engine.on_fit_start()
-        epoch = 0
-        is_classification = model_type in (
-            ModelType.BINARY_CLASSIFICATION,
-            ModelType.MULTI_CLASS,
-            ModelType.CNN,
+        """Blocking epoch loop (single session). Prefer engine.start_session + run()."""
+        self.begin_fit(
+            steps=steps,
+            source_mode=source_mode,
+            model_type=model_type,
+            early_stopping_enabled=early_stopping_enabled,
+            patience=patience,
+            min_delta=min_delta,
+            compute_r2_score=compute_r2_score,
+            engine=engine,
+            max_epochs=max_epochs,
         )
-
-        X_val, y_val_target = self.data_provider.get_validation_set()
-
-        if is_classification:
-            val_class_dist = (
-                np.sum(y_val_target, axis=0).tolist()
-                if hasattr(y_val_target, "ndim") and y_val_target.ndim > 1
-                else np.unique(y_val_target, return_counts=True)[1].tolist()
-            )
-            logging.info(f"[Forensic Trace] Static Validation Set Class Distribution: {val_class_dist}")
-
-        if steps <= 0:
-            logging.info("[TrainingSession] Steps count set to 0. Skipping training execution loops.")
-            return self.train_history, self.val_history
-
-        self._set_train_batch_caps(model_type)
-
-        if hasattr(self.model.optimizer, "_setup_done"):
-            self.model.optimizer._setup_done = False
-            self.model.optimizer.t = 0
-            logging.info("[TrainingSession] Patched Adam state: Tracking vectors cleared for new execution pass.")
-
-        es_state: Dict[str, Any] = {
-            "best_val_loss": float("inf"),
-            "best_epoch": 0,
-            "patience_counter": 0,
-            "weights": None,
-            "biases": None,
-            "best_version": None,
-        }
-
-        while True:
-            active_lr = self.scheduler.step(epoch) if self.scheduler else self.initial_lr
-
-            epoch_train_loss, _ = self._run_epoch_training_pass(active_lr, steps, epoch, is_classification)
-            if epoch_train_loss == 0.0:
-                break
-            self.train_history.append(epoch_train_loss)
-
-            val_preds = self._predict_with_thread_policy(X_val)
-            current_val_loss = self.model.compute_total_loss(val_preds, y_val_target)
-            current_val_raw_cost = self.model.calculate_raw_cost(val_preds, y_val_target)
-
-            self.val_history.append(current_val_loss)
-
-            self._evaluate_epoch_performance(
-                epoch, epoch_train_loss, val_preds, y_val_target,
-                current_val_loss, active_lr, is_classification, compute_r2_score,
-            )
-
-            if early_stopping_enabled:
-                if self._handle_early_stopping(
-                    epoch, current_val_raw_cost, min_delta, patience, es_state,
-                    current_val_loss=current_val_loss,
-                ):
-                    break
-            if max_epochs is not None and epoch + 1 >= max_epochs:
-                break
-            epoch += 1
-
-        self._generate_final_summary_report(
-            X_val, y_val_target, source_mode, is_classification, model_type,
-            es_state, early_stopping_enabled, compute_r2_score,
-        )
-        if self.engine is not None:
-            self.engine.on_fit_end()
+        while self.advance_fit_epoch():
+            pass
+        if not self._fit_done:
+            self.finish_fit()
         return self.train_history, self.val_history
 
-    
     def _run_epoch_training_pass(
         self,
         active_lr: float,
@@ -371,7 +533,7 @@ class TrainingSession:
         from src.training_engine import StepInput
 
         async_contract = (
-            self.engine is not None and self.engine.uses_async_contract()
+            self.engine is not None and self.engine.uses_async_contract(self)
         )
 
         if async_contract:
@@ -397,6 +559,7 @@ class TrainingSession:
                 self.steps_completed += 1
 
             batch_losses = self.engine.run_training_loop(
+                session=self,
                 steps_budget=steps,
                 next_step=_next_step,
                 on_submitted=_on_submitted,
@@ -417,7 +580,7 @@ class TrainingSession:
             step = StepInput(X=X_b_norm, y=y_b, batch_ref=batch_ref, lr=active_lr)
 
             if self.engine is not None:
-                batch_losses.append(self.engine.run_step(step))
+                batch_losses.append(self.engine.run_step(step, session=self))
             else:
                 batch_losses.append(self.train_and_apply(X_b_norm, y_b, active_lr))
 

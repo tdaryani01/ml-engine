@@ -12,6 +12,7 @@
 #endif
 #endif
 #include "export.h"
+#include "native_tenant.h"
 #include "omp_config.h"
 #include <cstdint>
 #include <cstring>
@@ -1395,23 +1396,68 @@ static inline void build_x_pad_buf(
 }
 
 // ---------------------------------------------------------------------------
-// Contract async-overlap flag + main-thread staged x_pad
+// Contract async-overlap flag + main-thread staged x_pad (per native tenant)
 //
 // async on  → pack serially on main (OMP team busy on the in-flight step)
 // async off → pack with OMP (team free); sync path stages before native invoke
 // ---------------------------------------------------------------------------
-static std::atomic<int> g_contract_async_overlap{0};
+static std::atomic<int32_t> g_tenant_async_overlap[NATIVE_MAX_TENANTS] = {};
 
 extern "C" ML_ENGINE_EXPORT void set_contract_async_overlap(int32_t enabled) {
-    g_contract_async_overlap.store(enabled ? 1 : 0, std::memory_order_release);
+    const int32_t t = native_tenant_get();
+    g_tenant_async_overlap[t].store(enabled ? 1 : 0, std::memory_order_release);
 }
 
 static inline bool main_stage_use_omp() {
-    return g_contract_async_overlap.load(std::memory_order_acquire) == 0;
+    const int32_t t = native_tenant_get();
+    return g_tenant_async_overlap[t].load(std::memory_order_acquire) == 0;
+}
+
+extern "C" ML_ENGINE_EXPORT int32_t native_tenant_create(void) {
+    auto& mask = native_tenant_alloc_mask();
+    for (int32_t id = 1; id < NATIVE_MAX_TENANTS; ++id) {
+        const uint32_t bit = 1u << static_cast<uint32_t>(id);
+        uint32_t prev = mask.load(std::memory_order_relaxed);
+        while ((prev & bit) == 0) {
+            if (mask.compare_exchange_weak(
+                    prev, prev | bit, std::memory_order_acq_rel)) {
+                g_tenant_async_overlap[id].store(0, std::memory_order_release);
+                return id;
+            }
+        }
+    }
+    return -1;
+}
+
+extern "C" ML_ENGINE_EXPORT void native_tenant_set_current(int32_t tenant_id) {
+    native_tenant_put(tenant_id);
+}
+
+extern "C" ML_ENGINE_EXPORT int32_t native_tenant_current(void) {
+    return native_tenant_get();
+}
+
+// Forward decls — defined after all stage tables.
+static void tenant_invalidate_stages(int32_t tenant_id);
+
+extern "C" ML_ENGINE_EXPORT void native_tenant_invalidate_all(int32_t tenant_id) {
+    tenant_invalidate_stages(tenant_id);
+}
+
+extern "C" ML_ENGINE_EXPORT void native_tenant_release(int32_t tenant_id) {
+    if (tenant_id <= 0 || tenant_id >= NATIVE_MAX_TENANTS) {
+        return;
+    }
+    tenant_invalidate_stages(tenant_id);
+    auto& mask = native_tenant_alloc_mask();
+    mask.fetch_and(~(1u << static_cast<uint32_t>(tenant_id)), std::memory_order_acq_rel);
+    if (native_tenant_get() == tenant_id) {
+        native_tenant_put(0);
+    }
 }
 
 // Layer-0 padded input depends only on the batch tensor — stage before the
-// step that consumes it. One entry per pipeline slot (no alias with in-flight).
+// step that consumes it. One entry per pipeline slot per tenant.
 constexpr int32_t STAGED_X_PAD_MAX_SLOTS = 4;
 
 struct StagedXPad {
@@ -1428,7 +1474,7 @@ struct StagedXPad {
     bool valid = false;
 };
 
-static StagedXPad g_staged_x_pad[STAGED_X_PAD_MAX_SLOTS];
+static StagedXPad g_staged_x_pad[NATIVE_MAX_TENANTS][STAGED_X_PAD_MAX_SLOTS];
 
 static float* staged_x_pad_alloc(StagedXPad& slot, size_t need_floats) {
     if (slot.buf && need_floats <= slot.cap_floats) {
@@ -1442,13 +1488,15 @@ static float* staged_x_pad_alloc(StagedXPad& slot, size_t need_floats) {
     return slot.buf;
 }
 
-// Returns a staged buffer only on an exact match of source pointer + geometry.
+// Returns a staged buffer only on an exact match of source pointer + geometry
+// for the current native tenant.
 static float* staged_x_pad_lookup(
     const float* src, int64_t N, int64_t C_in, int64_t H, int64_t W_in,
     int64_t src_row_stride, int64_t pad_l, int64_t row_stride
 ) {
+    const int32_t t = native_tenant_get();
     for (int32_t i = 0; i < STAGED_X_PAD_MAX_SLOTS; ++i) {
-        const StagedXPad& s = g_staged_x_pad[i];
+        const StagedXPad& s = g_staged_x_pad[t][i];
         if (!s.valid || !s.buf || s.src != src) continue;
         if (s.N != N || s.C_in != C_in || s.H != H || s.W_in != W_in) continue;
         if (s.src_row_stride != src_row_stride || s.pad_l != pad_l ||
@@ -1465,7 +1513,8 @@ extern "C" ML_ENGINE_EXPORT int32_t stage_conv_x_pad(
     int64_t k_w, int64_t pad, int64_t conv_out_w
 ) {
     if (slot_idx < 0 || slot_idx >= STAGED_X_PAD_MAX_SLOTS) return -1;
-    StagedXPad& slot = g_staged_x_pad[slot_idx];
+    const int32_t t = native_tenant_get();
+    StagedXPad& slot = g_staged_x_pad[t][slot_idx];
     slot.valid = false;
     if (!x || N <= 0 || C_in <= 0 || H <= 0 || W_in <= 0) return -2;
 
@@ -1499,12 +1548,13 @@ extern "C" ML_ENGINE_EXPORT int32_t stage_conv_x_pad(
 }
 
 extern "C" ML_ENGINE_EXPORT void invalidate_conv_x_pad_stage(int32_t slot_idx) {
+    const int32_t t = native_tenant_get();
     if (slot_idx < 0) {
         for (int32_t i = 0; i < STAGED_X_PAD_MAX_SLOTS; ++i) {
-            g_staged_x_pad[i].valid = false;
+            g_staged_x_pad[t][i].valid = false;
         }
     } else if (slot_idx < STAGED_X_PAD_MAX_SLOTS) {
-        g_staged_x_pad[slot_idx].valid = false;
+        g_staged_x_pad[t][slot_idx].valid = false;
     }
 }
 
@@ -3779,7 +3829,7 @@ struct StagedDxWt {
     bool valid = false;
 };
 
-static StagedDxWt g_staged_dx_wt[STAGED_DX_WT_MAX_SLOTS];
+static StagedDxWt g_staged_dx_wt[NATIVE_MAX_TENANTS][STAGED_DX_WT_MAX_SLOTS];
 
 static float* staged_dx_wt_alloc(StagedDxWt& slot, size_t need_floats) {
     if (slot.buf && need_floats <= slot.cap_floats) {
@@ -3795,8 +3845,9 @@ static float* staged_dx_wt_alloc(StagedDxWt& slot, size_t need_floats) {
 static float* staged_dx_wt_lookup(
     const float* w_src, int64_t C_out, int64_t C_in, int64_t K
 ) {
+    const int32_t t = native_tenant_get();
     for (int32_t i = 0; i < STAGED_DX_WT_MAX_SLOTS; ++i) {
-        const StagedDxWt& s = g_staged_dx_wt[i];
+        const StagedDxWt& s = g_staged_dx_wt[t][i];
         if (!s.valid || !s.buf || s.w_src != w_src) continue;
         if (s.C_out != C_out || s.C_in != C_in || s.K != K) continue;
         return s.buf;
@@ -3811,7 +3862,8 @@ extern "C" ML_ENGINE_EXPORT int32_t stage_dx_cin_blocked_wt(
     int32_t slot_idx, const float* W, int64_t C_out, int64_t C_in, int64_t K
 ) {
     if (slot_idx < 0 || slot_idx >= STAGED_DX_WT_MAX_SLOTS) return -1;
-    StagedDxWt& slot = g_staged_dx_wt[slot_idx];
+    const int32_t t = native_tenant_get();
+    StagedDxWt& slot = g_staged_dx_wt[t][slot_idx];
     slot.valid = false;
     if (!W || C_out <= 0 || C_in <= 0 || K <= 0) return -2;
 
@@ -3830,12 +3882,13 @@ extern "C" ML_ENGINE_EXPORT int32_t stage_dx_cin_blocked_wt(
 }
 
 extern "C" ML_ENGINE_EXPORT void invalidate_dx_cin_blocked_wt_stage(int32_t slot_idx) {
+    const int32_t t = native_tenant_get();
     if (slot_idx < 0) {
         for (int32_t i = 0; i < STAGED_DX_WT_MAX_SLOTS; ++i) {
-            g_staged_dx_wt[i].valid = false;
+            g_staged_dx_wt[t][i].valid = false;
         }
     } else if (slot_idx < STAGED_DX_WT_MAX_SLOTS) {
-        g_staged_dx_wt[slot_idx].valid = false;
+        g_staged_dx_wt[t][slot_idx].valid = false;
     }
 }
 
@@ -4262,7 +4315,7 @@ struct BrgDwXStage {
     bool valid = false;
 };
 
-static BrgDwXStage g_brg_dw_x_stage[BRG_DW_X_STAGE_MAX];
+static BrgDwXStage g_brg_dw_x_stage[NATIVE_MAX_TENANTS][BRG_DW_X_STAGE_MAX];
 
 static thread_local float* tls_brg_dy_pack = nullptr;
 static thread_local size_t tls_brg_dy_cap = 0;
@@ -4431,8 +4484,9 @@ static float* brg_dw_x_stage_lookup(
     const float* src, int64_t N, int64_t C_in, int64_t H, int64_t W_in,
     int64_t src_row_stride, int64_t x_pad_l, int64_t W_ext
 ) {
+    const int32_t t = native_tenant_get();
     for (int32_t i = 0; i < BRG_DW_X_STAGE_MAX; ++i) {
-        const BrgDwXStage& s = g_brg_dw_x_stage[i];
+        const BrgDwXStage& s = g_brg_dw_x_stage[t][i];
         if (!s.valid || !s.buf || s.src != src) continue;
         if (s.N != N || s.C_in != C_in || s.H != H || s.W_in != W_in) continue;
         if (s.src_row_stride != src_row_stride || s.x_pad_l != x_pad_l
@@ -4453,7 +4507,8 @@ static int32_t brg_dw_x_stage_store(
 ) {
     if (slot_idx < 0 || slot_idx >= BRG_DW_X_STAGE_MAX) return -1;
     if (!x || N <= 0 || (C_in % BRG_DW_IC) != 0) return -2;
-    BrgDwXStage& slot = g_brg_dw_x_stage[slot_idx];
+    const int32_t t = native_tenant_get();
+    BrgDwXStage& slot = g_brg_dw_x_stage[t][slot_idx];
     slot.valid = false;
     const int64_t x_pad_l = pad;
     const int64_t W_ext = x_pad_l + W_in + (k_w - 1);
@@ -4499,15 +4554,16 @@ extern "C" ML_ENGINE_EXPORT int32_t publish_brgemm_dw_x_pack(
     int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride, int64_t pad
 ) {
     if (!brg_dw_x_geom_ok(C_in, C_out, k_h, k_w, stride)) return 1; // skip
+    const int32_t t = native_tenant_get();
     // Prefer an existing entry for this src, else first free, else slot 0.
     int32_t slot_i = -1;
     int32_t free_i = -1;
     for (int32_t i = 0; i < BRG_DW_X_STAGE_MAX; ++i) {
-        if (g_brg_dw_x_stage[i].src == x) {
+        if (g_brg_dw_x_stage[t][i].src == x) {
             slot_i = i;
             break;
         }
-        if (free_i < 0 && !g_brg_dw_x_stage[i].valid) free_i = i;
+        if (free_i < 0 && !g_brg_dw_x_stage[t][i].valid) free_i = i;
     }
     if (slot_i < 0) slot_i = (free_i >= 0) ? free_i : 0;
     return brg_dw_x_stage_store(
@@ -4516,12 +4572,13 @@ extern "C" ML_ENGINE_EXPORT int32_t publish_brgemm_dw_x_pack(
 }
 
 extern "C" ML_ENGINE_EXPORT void invalidate_brgemm_dw_x_pack(int32_t slot_idx) {
+    const int32_t t = native_tenant_get();
     if (slot_idx < 0) {
         for (int32_t i = 0; i < BRG_DW_X_STAGE_MAX; ++i) {
-            g_brg_dw_x_stage[i].valid = false;
+            g_brg_dw_x_stage[t][i].valid = false;
         }
     } else if (slot_idx < BRG_DW_X_STAGE_MAX) {
-        g_brg_dw_x_stage[slot_idx].valid = false;
+        g_brg_dw_x_stage[t][slot_idx].valid = false;
     }
 }
 
@@ -4546,8 +4603,8 @@ struct BrgPackRequest {
     int64_t pad = 0;
 };
 
-static BrgPackRequest g_brg_pack_req;
-static std::mutex g_brg_pack_mtx;
+static BrgPackRequest g_brg_pack_req[NATIVE_MAX_TENANTS];
+static std::mutex g_brg_pack_mtx[NATIVE_MAX_TENANTS];
 
 // Worker: ask main to pack this x for upcoming BRGEMM dW. Non-blocking.
 // Returns 0 if queued/already staged, 1 if geometry skips, <0 on error.
@@ -4566,63 +4623,88 @@ extern "C" ML_ENGINE_EXPORT int32_t request_brgemm_dw_x_pack(
         )) {
         return 0;
     }
-    std::lock_guard<std::mutex> lock(g_brg_pack_mtx);
-    if (g_brg_pack_req.state == BRG_PACK_PENDING) {
-        if (g_brg_pack_req.x == x) return 0;
+    const int32_t t = native_tenant_get();
+    std::lock_guard<std::mutex> lock(g_brg_pack_mtx[t]);
+    BrgPackRequest& req = g_brg_pack_req[t];
+    if (req.state == BRG_PACK_PENDING) {
+        if (req.x == x) return 0;
         return -2; // prior request still waiting on main
     }
-    g_brg_pack_req.x = x;
-    g_brg_pack_req.N = N;
-    g_brg_pack_req.C_in = C_in;
-    g_brg_pack_req.H = H;
-    g_brg_pack_req.W_in = W_in;
-    g_brg_pack_req.W_in_stride = W_in_stride;
-    g_brg_pack_req.C_out = C_out;
-    g_brg_pack_req.k_h = k_h;
-    g_brg_pack_req.k_w = k_w;
-    g_brg_pack_req.stride = stride;
-    g_brg_pack_req.pad = pad;
-    g_brg_pack_req.state = BRG_PACK_PENDING;
+    req.x = x;
+    req.N = N;
+    req.C_in = C_in;
+    req.H = H;
+    req.W_in = W_in;
+    req.W_in_stride = W_in_stride;
+    req.C_out = C_out;
+    req.k_h = k_h;
+    req.k_w = k_w;
+    req.stride = stride;
+    req.pad = pad;
+    req.state = BRG_PACK_PENDING;
     return 0;
 }
 
 // Main/Python: drain one pending pack request (serial pack into durable stage).
 // Returns 1 if packed, 0 if nothing pending, <0 on failure.
 extern "C" ML_ENGINE_EXPORT int32_t service_brgemm_dw_x_pack_requests(void) {
+    const int32_t t = native_tenant_get();
     const float* x = nullptr;
     int64_t N = 0, C_in = 0, H = 0, W_in = 0, W_in_stride = 0;
     int64_t C_out = 0, k_h = 0, k_w = 0, stride = 0, pad = 0;
     {
-        std::lock_guard<std::mutex> lock(g_brg_pack_mtx);
-        if (g_brg_pack_req.state != BRG_PACK_PENDING) return 0;
-        x = g_brg_pack_req.x;
-        N = g_brg_pack_req.N;
-        C_in = g_brg_pack_req.C_in;
-        H = g_brg_pack_req.H;
-        W_in = g_brg_pack_req.W_in;
-        W_in_stride = g_brg_pack_req.W_in_stride;
-        C_out = g_brg_pack_req.C_out;
-        k_h = g_brg_pack_req.k_h;
-        k_w = g_brg_pack_req.k_w;
-        stride = g_brg_pack_req.stride;
-        pad = g_brg_pack_req.pad;
+        std::lock_guard<std::mutex> lock(g_brg_pack_mtx[t]);
+        BrgPackRequest& req = g_brg_pack_req[t];
+        if (req.state != BRG_PACK_PENDING) return 0;
+        x = req.x;
+        N = req.N;
+        C_in = req.C_in;
+        H = req.H;
+        W_in = req.W_in;
+        W_in_stride = req.W_in_stride;
+        C_out = req.C_out;
+        k_h = req.k_h;
+        k_w = req.k_w;
+        stride = req.stride;
+        pad = req.pad;
     }
     const int32_t rc = publish_brgemm_dw_x_pack(
         x, N, C_in, H, W_in, W_in_stride, C_out, k_h, k_w, stride, pad
     );
     {
-        std::lock_guard<std::mutex> lock(g_brg_pack_mtx);
+        std::lock_guard<std::mutex> lock(g_brg_pack_mtx[t]);
+        BrgPackRequest& req = g_brg_pack_req[t];
         // Only clear if this is still the same pending request.
-        if (g_brg_pack_req.state == BRG_PACK_PENDING && g_brg_pack_req.x == x) {
-            g_brg_pack_req.state = BRG_PACK_IDLE;
+        if (req.state == BRG_PACK_PENDING && req.x == x) {
+            req.state = BRG_PACK_IDLE;
         }
     }
     return (rc < 0) ? rc : 1;
 }
 
 extern "C" ML_ENGINE_EXPORT void reset_brgemm_dw_x_pack_request(void) {
-    std::lock_guard<std::mutex> lock(g_brg_pack_mtx);
-    g_brg_pack_req.state = BRG_PACK_IDLE;
+    const int32_t t = native_tenant_get();
+    std::lock_guard<std::mutex> lock(g_brg_pack_mtx[t]);
+    g_brg_pack_req[t].state = BRG_PACK_IDLE;
+}
+
+static void tenant_invalidate_stages(int32_t tenant_id) {
+    if (tenant_id < 0 || tenant_id >= NATIVE_MAX_TENANTS) {
+        return;
+    }
+    for (int32_t i = 0; i < STAGED_X_PAD_MAX_SLOTS; ++i) {
+        g_staged_x_pad[tenant_id][i].valid = false;
+    }
+    for (int32_t i = 0; i < STAGED_DX_WT_MAX_SLOTS; ++i) {
+        g_staged_dx_wt[tenant_id][i].valid = false;
+    }
+    for (int32_t i = 0; i < BRG_DW_X_STAGE_MAX; ++i) {
+        g_brg_dw_x_stage[tenant_id][i].valid = false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_brg_pack_mtx[tenant_id]);
+        g_brg_pack_req[tenant_id].state = BRG_PACK_IDLE;
+    }
 }
 
 // dy: NCHW planar cout -> [N][OH][nb_oc][OW][8]  (ow-major, then oc in block)
