@@ -15,7 +15,7 @@ meta:
 # =====================================================================
 ingestion:
   source_mode: "csv"                 # IngestionMode: "csv" or "stream"
-  data_file_path: "data/samples/csv/synthetic_shapes.npz"
+  data_file_path: "data/samples/csv/synthetic_shapes_128.npz"
   feature_names: "auto"              # Ingest all pixel feature columns (px_0 to px_2351)
   splits:
     train: 0.70

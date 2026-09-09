@@ -132,6 +132,7 @@ class ModelFactory:
                 dense_sizes=resolved_dense_sizes,
                 backend=backend_val,
                 engine_ctx=engine_ctx,
+                input_logical_w=int(input_shape[2]),
                 **factory_kwargs
             )
 

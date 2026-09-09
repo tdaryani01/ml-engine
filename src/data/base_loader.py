@@ -41,7 +41,8 @@ class BaseDataLoader(ABC):
                 csv_path=cfg.ingestion.data_file_path,
                 input_shape=input_shape,
                 num_classes=cfg.architecture.num_classes,
-                val_split=cfg.ingestion.splits.val
+                val_split=cfg.ingestion.splits.val,
+                train_split=cfg.ingestion.splits.train,
             )
 
         source_mode = getattr(cfg.ingestion, "source_mode", None)

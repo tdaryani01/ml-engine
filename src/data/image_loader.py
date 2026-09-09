@@ -45,12 +45,16 @@ class ImageCSVLoader(BaseDataLoader):
         input_shape: List[int],
         num_classes: int,
         val_split: float = 0.15,
+        train_split: Optional[float] = None,
         random_state: int = 42
     ):
         self.csv_path = csv_path
         self.input_shape = input_shape
         self.num_classes = num_classes
         self.val_split = val_split
+        # If train_split is set, use train+val counts; leftover (e.g. test) is dropped.
+        # If None, all non-val samples go to train (legacy behavior).
+        self.train_split = train_split
         self.random_state = random_state
 
     def _load_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -129,7 +133,12 @@ class ImageCSVLoader(BaseDataLoader):
         rng.shuffle(indices)
 
         val_count = int(n_samples * self.val_split)
-        val_idx, train_idx = indices[:val_count], indices[val_count:]
+        if self.train_split is not None:
+            train_count = int(n_samples * self.train_split)
+            train_idx = indices[:train_count]
+            val_idx = indices[train_count : train_count + val_count]
+        else:
+            val_idx, train_idx = indices[:val_count], indices[val_count:]
 
         X_train, y_train = X[train_idx], y[train_idx]
         X_val, y_val = X[val_idx], y[val_idx]

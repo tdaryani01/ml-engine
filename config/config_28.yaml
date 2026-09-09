@@ -15,7 +15,7 @@ meta:
 # =====================================================================
 ingestion:
   source_mode: "csv"                 # IngestionMode: "csv" or "stream"
-  data_file_path: "data/samples/csv/synthetic_shapes_128.npz"
+  data_file_path: "data/samples/csv/synthetic_shapes_28.npz"
   feature_names: "auto"              # Unused for CNN NPZ path; tabular CSV still uses column names
   splits:
     train: 0.70
@@ -41,7 +41,7 @@ architecture:
   # CNN SPECIFIC PIPELINE CONFIGURATION (Active when model_type: "cnn")
   # -------------------------------------------------------------------
   cnn:
-    input_shape: [3, 128, 128]       # [Channels, Height, Width] — procedural shapes @ 128²
+    input_shape: [3, 28, 28]       # [Channels, Height, Width] — procedural shapes @ 28²
     spatial_pipeline:
       - type: "conv"
         in_channels: 3

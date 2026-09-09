@@ -669,28 +669,46 @@ def run_custom_engine_benchmark(
     )
 
     model = controller.model
-    orig_forward = model._forward
-    orig_backward = model.backward
-    orig_predict = model.predict
-
     forward_counter = [0]
     backward_counter = [0]
 
-    def counted_forward(X, training=True, **kwargs):
+    # Contract fit uses run_contract_train_step (fused fwd+bwd), not _forward/backward.
+    if hasattr(model, "run_contract_train_step"):
+        _orig_contract_step = model.run_contract_train_step
+
+        def _counted_contract_step(*args, **kwargs):
+            forward_counter[0] += 1
+            backward_counter[0] += 1
+            return _orig_contract_step(*args, **kwargs)
+
+        model.run_contract_train_step = _counted_contract_step
+
+    # Non-contract train_step: forward_train then _compute_grads_from_cache.
+    if hasattr(model, "forward_train"):
+        _orig_forward_train = model.forward_train
+
+        def _counted_forward_train(*args, **kwargs):
+            forward_counter[0] += 1
+            return _orig_forward_train(*args, **kwargs)
+
+        model.forward_train = _counted_forward_train
+
+    if hasattr(model, "_compute_grads_from_cache"):
+        _orig_grads = model._compute_grads_from_cache
+
+        def _counted_grads(*args, **kwargs):
+            backward_counter[0] += 1
+            return _orig_grads(*args, **kwargs)
+
+        model._compute_grads_from_cache = _counted_grads
+
+    _orig_predict = model.predict
+
+    def _counted_predict(processed_data, *args, **kwargs):
         forward_counter[0] += 1
-        return orig_forward(X, training=training, **kwargs)
+        return _orig_predict(processed_data, *args, **kwargs)
 
-    def counted_backward(*args, **kwargs):
-        backward_counter[0] += 1
-        return orig_backward(*args, **kwargs)
-
-    def counted_predict(processed_data, *args, **kwargs):
-        forward_counter[0] += 1
-        return orig_predict(processed_data, *args, **kwargs)
-
-    model._forward = counted_forward
-    model.backward = counted_backward
-    model.predict = counted_predict
+    model.predict = _counted_predict
 
     custom_total_params = extract_custom_engine_param_count(controller)
 
@@ -708,6 +726,9 @@ def run_custom_engine_benchmark(
             output_dir=output_dir,
         )
         custom_train_time = time.perf_counter() - t0_train
+        # Snapshot before post-fit predict/inf so counts match Torch (train+val only).
+        custom_forward_counts = forward_counter[0]
+        custom_backward_counts = backward_counter[0]
 
         t0_inf = time.perf_counter()
         for _ in range(100):
@@ -745,8 +766,8 @@ def run_custom_engine_benchmark(
         "epochs_completed": custom_epochs_completed,
         "best_epoch": custom_best_epoch,
         "early_stopped": custom_early_stopped,
-        "forward_counts": forward_counter[0],
-        "backward_counts": backward_counter[0],
+        "forward_counts": custom_forward_counts,
+        "backward_counts": custom_backward_counts,
         "train_loss": float(final_custom_train_loss),
         "val_loss": float(final_custom_val_loss),
         "val_acc": float(final_custom_val_acc),

@@ -2,9 +2,9 @@
 """
 Procedural RGB shape images for the CNN path.
 
-Kept intentionally synthetic (no external downloads), but closer to real photos
-than the old 28x28 binary silhouettes: soft edges, color, lighting, clutter,
-and mild geometric jitter at a usable spatial size (default 128x128).
+NPZ output (X NCHW float32, y int labels). Shapes are high-contrast silhouettes
+on a dark background — easy enough for the tiny bench CNN to learn in a few
+epochs at 128², while keeping the NPZ ingest path used by the pipeline.
 """
 from __future__ import annotations
 
@@ -20,85 +20,35 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 CLASS_NAMES = ("circle", "square", "cross", "diamond")
 
 
-def _rot_grid(h: int, w: int, c_y: float, c_x: float, angle_rad: float):
-    """Pixel coordinate grids in a frame rotated about (c_y, c_x)."""
+def draw_circle(grid: np.ndarray, c_y: int, c_x: int, radius: int) -> None:
+    h, w = grid.shape[1], grid.shape[2]
     y, x = np.ogrid[:h, :w]
-    ys = y.astype(np.float32) - c_y
-    xs = x.astype(np.float32) - c_x
-    ca, sa = float(np.cos(angle_rad)), float(np.sin(angle_rad))
-    yr = ca * ys - sa * xs
-    xr = sa * ys + ca * xs
-    return yr, xr
+    mask = (x - c_x) ** 2 + (y - c_y) ** 2 <= radius ** 2
+    grid[:, mask] = 1.0
 
 
-def _soft_mask(signed_dist: np.ndarray, edge: float) -> np.ndarray:
-    """Smoothstep from solid (dist<=0) to transparent over `edge` pixels."""
-    edge = max(float(edge), 1e-3)
-    t = np.clip(0.5 - signed_dist / (2.0 * edge), 0.0, 1.0).astype(np.float32)
-    return t * t * (3.0 - 2.0 * t)
+def draw_square(grid: np.ndarray, c_y: int, c_x: int, half_size: int) -> None:
+    h, w = grid.shape[1], grid.shape[2]
+    y_min, y_max = max(0, c_y - half_size), min(h, c_y + half_size + 1)
+    x_min, x_max = max(0, c_x - half_size), min(w, c_x + half_size + 1)
+    grid[:, y_min:y_max, x_min:x_max] = 1.0
 
 
-def _lowfreq_field(h: int, w: int, rng: np.random.Generator, amplitude: float = 1.0) -> np.ndarray:
-    """Cheap multi-sine field used for background texture / lighting."""
-    yy = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None]
-    xx = np.linspace(0.0, 1.0, w, dtype=np.float32)[None, :]
-    field = np.zeros((h, w), dtype=np.float32)
-    for _ in range(4):
-        fy = rng.uniform(1.0, 5.0)
-        fx = rng.uniform(1.0, 5.0)
-        phase = rng.uniform(0.0, 2.0 * np.pi)
-        amp = rng.uniform(0.35, 1.0)
-        field += amp * np.sin(2.0 * np.pi * (fy * yy + fx * xx) + phase)
-    field -= field.min()
-    denom = field.max() - field.min() + 1e-6
-    field = field / denom
-    return (field * amplitude).astype(np.float32)
+def draw_cross(grid: np.ndarray, c_y: int, c_x: int, arm_len: int, thickness: int) -> None:
+    h, w = grid.shape[1], grid.shape[2]
+    x_min, x_max = max(0, c_x - arm_len), min(w, c_x + arm_len + 1)
+    y_min, y_max = max(0, c_y - thickness), min(h, c_y + thickness + 1)
+    grid[:, y_min:y_max, x_min:x_max] = 1.0
+    x_min, x_max = max(0, c_x - thickness), min(w, c_x + thickness + 1)
+    y_min, y_max = max(0, c_y - arm_len), min(h, c_y + arm_len + 1)
+    grid[:, y_min:y_max, x_min:x_max] = 1.0
 
 
-def _background(h: int, w: int, channels: int, rng: np.random.Generator) -> np.ndarray:
-    base = rng.uniform(0.12, 0.55, size=(channels, 1, 1)).astype(np.float32)
-    img = np.broadcast_to(base, (channels, h, w)).copy()
-    for c in range(channels):
-        tex = _lowfreq_field(h, w, rng, amplitude=rng.uniform(0.08, 0.22))
-        img[c] += tex * rng.choice([-1.0, 1.0])
-    # Soft vignette / lighting
-    yy = (np.linspace(-1.0, 1.0, h, dtype=np.float32)[:, None]) ** 2
-    xx = (np.linspace(-1.0, 1.0, w, dtype=np.float32)[None, :]) ** 2
-    vignette = 1.0 - 0.35 * (yy + xx)
-    img *= vignette
-    return np.clip(img, 0.0, 1.0).astype(np.float32)
-
-
-def _paint(img: np.ndarray, alpha: np.ndarray, color: np.ndarray) -> None:
-    a = alpha[None, :, :]
-    img *= (1.0 - a)
-    img += a * color[:, None, None]
-
-
-def _shape_alpha(
-    class_idx: int,
-    h: int,
-    w: int,
-    c_y: float,
-    c_x: float,
-    scale: float,
-    angle: float,
-    edge: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    yr, xr = _rot_grid(h, w, c_y, c_x, angle)
-    if class_idx == 0:  # circle
-        dist = np.sqrt(xr * xr + yr * yr) - scale
-    elif class_idx == 1:  # square (L-inf ball)
-        dist = np.maximum(np.abs(xr), np.abs(yr)) - scale
-    elif class_idx == 2:  # cross / plus
-        thick = max(scale * rng.uniform(0.18, 0.32), 1.5)
-        d_h = np.maximum(np.abs(yr) - thick, np.abs(xr) - scale)
-        d_v = np.maximum(np.abs(xr) - thick, np.abs(yr) - scale)
-        dist = np.minimum(d_h, d_v)
-    else:  # diamond (L1 ball)
-        dist = (np.abs(xr) + np.abs(yr)) - scale
-    return _soft_mask(dist, edge)
+def draw_diamond(grid: np.ndarray, c_y: int, c_x: int, radius: int) -> None:
+    h, w = grid.shape[1], grid.shape[2]
+    y, x = np.ogrid[:h, :w]
+    mask = np.abs(x - c_x) + np.abs(y - c_y) <= radius
+    grid[:, mask] = 1.0
 
 
 def generate_one(
@@ -109,46 +59,26 @@ def generate_one(
     rng: np.random.Generator,
     noise_level: float,
 ) -> np.ndarray:
-    img = _background(height, width, channels, rng)
+    img = np.zeros((channels, height, width), dtype=np.float32)
 
-    margin = max(height, width) // 8
-    c_y = float(rng.integers(margin, height - margin))
-    c_x = float(rng.integers(margin, width - margin))
-    scale = float(rng.uniform(0.18, 0.38) * min(height, width))
-    angle = float(rng.uniform(-0.55, 0.55))  # ~±31°
-    edge = float(rng.uniform(1.2, 3.5) * (min(height, width) / 128.0))
+    margin = max(height, width) // 4
+    c_y = int(rng.integers(margin, height - margin))
+    c_x = int(rng.integers(margin, width - margin))
+    scale = int(rng.integers(max(4, min(height, width) // 8), max(5, min(height, width) // 3)))
+    thickness = max(1, scale // 5)
 
-    alpha = _shape_alpha(class_idx, height, width, c_y, c_x, scale, angle, edge, rng)
+    if class_idx == 0:
+        draw_circle(img, c_y, c_x, radius=scale)
+    elif class_idx == 1:
+        draw_square(img, c_y, c_x, half_size=scale)
+    elif class_idx == 2:
+        draw_cross(img, c_y, c_x, arm_len=scale, thickness=thickness)
+    else:
+        draw_diamond(img, c_y, c_x, radius=scale)
 
-    # Occasional hollow / ring style for circles & diamonds
-    if class_idx in (0, 3) and rng.random() < 0.35:
-        inner = scale * rng.uniform(0.35, 0.65)
-        yr, xr = _rot_grid(height, width, c_y, c_x, angle)
-        if class_idx == 0:
-            inner_dist = inner - np.sqrt(xr * xr + yr * yr)
-        else:
-            inner_dist = inner - (np.abs(xr) + np.abs(yr))
-        hole = _soft_mask(inner_dist, edge)
-        alpha = np.clip(alpha - hole, 0.0, 1.0)
-
-    color = rng.uniform(0.35, 1.0, size=(channels,)).astype(np.float32)
-    # Mild per-channel tint imbalance so shapes are not pure gray
-    color *= rng.uniform(0.75, 1.25, size=(channels,)).astype(np.float32)
-    color = np.clip(color, 0.0, 1.0)
-
-    _paint(img, alpha, color)
-
-    # Speckle clutter (small distractors)
-    n_clutter = int(rng.integers(0, 6))
-    for _ in range(n_clutter):
-        cy = float(rng.integers(0, height))
-        cx = float(rng.integers(0, width))
-        rad = float(rng.uniform(1.0, max(2.0, min(height, width) * 0.04)))
-        yy = np.arange(height, dtype=np.float32)[:, None] - cy
-        xx = np.arange(width, dtype=np.float32)[None, :] - cx
-        blob = _soft_mask(np.sqrt(xx * xx + yy * yy) - rad, 1.25)
-        blob_color = rng.uniform(0.0, 1.0, size=(channels,)).astype(np.float32)
-        _paint(img, blob * rng.uniform(0.15, 0.45), blob_color)
+    # Mild per-channel tint so RGB is not pure gray (still high contrast).
+    tint = rng.uniform(0.75, 1.0, size=(channels, 1, 1)).astype(np.float32)
+    img *= tint
 
     if noise_level > 0:
         img = img + rng.normal(0.0, noise_level, size=img.shape).astype(np.float32)
@@ -162,7 +92,7 @@ def generate_shapes_dataset(
     channels: int = 3,
     height: int = 128,
     width: int = 128,
-    noise_level: float = 0.04,
+    noise_level: float = 0.05,
     seed: int = 42,
     also_csv: bool = False,
 ) -> None:
@@ -172,7 +102,7 @@ def generate_shapes_dataset(
     Class 2: Cross
     Class 3: Diamond
 
-    Default artifact is a float32 NPZ (`X` NCHW + `y` labels). Optional CSV is
+    Default artifact is float32 NPZ (`X` NCHW + `y` labels). Optional CSV is
     available for debugging but is huge at 128² — prefer NPZ for training.
     """
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -225,28 +155,53 @@ def generate_shapes_dataset(
         logging.info("[Shape Generator] Wrote CSV %s", csv_path)
 
 
+def _default_output(height: int, width: int) -> str:
+    """Size-tagged path so 28² and 128² can coexist without clobbering."""
+    return os.path.join("data", "samples", "csv", f"synthetic_shapes_{height}.npz")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate procedural RGB shape images for CNN training.")
     parser.add_argument(
         "--output",
-        default=os.path.join("data", "samples", "csv", "synthetic_shapes.npz"),
-        help="Output path (.npz preferred; .csv forces text export)",
+        default=None,
+        help="Output path (.npz preferred). Default: synthetic_shapes_{H}.npz",
     )
     parser.add_argument("--per-class", type=int, default=400)
     parser.add_argument("--channels", type=int, default=3)
     parser.add_argument("--height", type=int, default=128)
     parser.add_argument("--width", type=int, default=128)
-    parser.add_argument("--noise", type=float, default=0.04)
+    parser.add_argument("--noise", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--also-csv",
         action="store_true",
         help="Also write a flattened CSV (very large at 128²; not recommended)",
     )
+    parser.add_argument(
+        "--both",
+        action="store_true",
+        help="Write both 28² and 128² size-tagged NPZs (ignores --height/--width/--output)",
+    )
     args = parser.parse_args()
 
+    if args.both:
+        for h, w in ((28, 28), (128, 128)):
+            generate_shapes_dataset(
+                _default_output(h, w),
+                num_samples_per_class=args.per_class,
+                channels=args.channels,
+                height=h,
+                width=w,
+                noise_level=args.noise,
+                seed=args.seed,
+                also_csv=args.also_csv,
+            )
+        return
+
+    out = args.output if args.output is not None else _default_output(args.height, args.width)
     generate_shapes_dataset(
-        args.output,
+        out,
         num_samples_per_class=args.per_class,
         channels=args.channels,
         height=args.height,

@@ -20,7 +20,8 @@ class CNNNetwork:
                  backend: EngineBackend = EngineBackend.NATIVE,
                  engine_ctx=None,
                  lam_l1: float = 0.01, lam_l2: float = 0.01, p_dropout: float = 0.0,
-                 max_norm: float = 5.0, task_type: str = "multiclass", **kwargs):
+                 max_norm: float = 5.0, task_type: str = "multiclass",
+                 input_logical_w: int | None = None, **kwargs):
         self.engine_ctx = engine_ctx or create_engine_context(backend)
         self.backend = self.engine_ctx.backend
         self.scratch_arena = ScratchArena(self.backend)
@@ -30,6 +31,8 @@ class CNNNetwork:
         self.p_dropout = p_dropout
         self.max_norm = max_norm
         self.task_type = task_type
+        # Logical W before SIMD row pad (e.g. 28 in stride-32, 124 in stride-128).
+        self.input_logical_w = input_logical_w
         self.diagnostic_counter = 0
 
         self.layers = []
@@ -636,17 +639,12 @@ class CNNNetwork:
 
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
         X = processed_data
-        # Val/bench tensors are often (N,C,H,32) with logical W=28. Torch is dense
-        # 28 — crop once here so ConvBlock can skip per-call densify copies.
+        # Crop SIMD W-halo for Torch densify / paths that want logical width only.
         logical = getattr(self, "input_logical_w", None)
-        if (
-            X.ndim == 4
-            and X.shape[3] > 28
-            and (logical == 28 or (logical is None and X.shape[3] == 32))
-        ):
-            w_log = 28 if logical is None else int(logical)
-            if X.shape[3] != w_log:
-                X = np.ascontiguousarray(X[:, :, :, :w_log])
+        if logical is None and X.ndim == 4 and X.shape[3] == 32:
+            logical = 28
+        if X.ndim == 4 and logical is not None and X.shape[3] > int(logical):
+            X = np.ascontiguousarray(X[:, :, :, : int(logical)])
 
         if (
             self._contract_runtime is not None

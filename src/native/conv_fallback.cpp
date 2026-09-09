@@ -4268,6 +4268,10 @@ static thread_local float* tls_brg_dy_pack = nullptr;
 static thread_local size_t tls_brg_dy_cap = 0;
 static thread_local float* tls_brg_x_pack = nullptr;
 static thread_local size_t tls_brg_x_cap = 0;
+// Per-thread nChw8c slab for brgemm dX: [H][W_in][8]. Avoids planar
+// scatter RMW inside (kh,kw,oc,ow); unpack to NCHW once per (n,ic_b).
+static thread_local float* tls_brg_dx_blocked = nullptr;
+static thread_local size_t tls_brg_dx_blocked_cap = 0;
 
 static float* brg_dw_alloc(float*& slot, size_t& cap, size_t need) {
     if (need <= cap && slot) return slot;
@@ -4295,6 +4299,78 @@ static bool brg_dw_x_geom_ok(
         && k_h == k_w
         && k_h >= 1 && k_h <= BRG_K_MAX
         && (C_in % BRG_DW_IC) == 0 && (C_out % BRG_DW_OC) == 0;
+}
+
+// Diagnostic-only: ML_ENGINE_BWD_PACK_TIMING=1 accumulates wall ns for brgemm
+// bwd pack vs compute. Zero cost when unset. Dump via dump_bwd_pack_timing().
+static bool bwd_pack_timing_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* env = std::getenv("ML_ENGINE_BWD_PACK_TIMING");
+        cached = (env && env[0] == '1' && env[1] == '\0') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static std::atomic<uint64_t> g_bwd_pack_calls{0};
+static std::atomic<uint64_t> g_bwd_ns_dy_pack{0};
+static std::atomic<uint64_t> g_bwd_ns_x_pack{0};
+static std::atomic<uint64_t> g_bwd_ns_dw_compute{0};
+static std::atomic<uint64_t> g_bwd_ns_dx_wt{0};
+static std::atomic<uint64_t> g_bwd_ns_dx_compute{0};
+static std::atomic<uint64_t> g_bwd_ns_fused_total{0};
+static std::atomic<uint64_t> g_bwd_x_pack_hits{0};
+static std::atomic<uint64_t> g_bwd_x_pack_misses{0};
+static std::atomic<uint64_t> g_bwd_dy_pack_shared{0};
+static std::atomic<uint64_t> g_bwd_dy_pack_local{0};
+
+static inline uint64_t bwd_pack_now_ns() {
+    using clock = std::chrono::steady_clock;
+    return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        clock::now().time_since_epoch()).count();
+}
+
+extern "C" ML_ENGINE_EXPORT void dump_bwd_pack_timing(void) {
+    const uint64_t calls = g_bwd_pack_calls.load(std::memory_order_relaxed);
+    if (calls == 0) {
+        std::fprintf(stderr, "[BWD_PACK_TIMING] no samples\n");
+        std::fflush(stderr);
+        return;
+    }
+    const double inv = 1e-6 / (double)calls; // ns → ms per call
+    std::fprintf(
+        stderr,
+        "[BWD_PACK_TIMING] calls=%llu  dy_pack=%.3fms  x_pack=%.3fms "
+        "(hit=%llu miss=%llu)  dw_compute=%.3fms  dx_wt=%.3fms  "
+        "dx_compute=%.3fms  fused_total=%.3fms  "
+        "dy_shared=%llu dy_local=%llu\n",
+        (unsigned long long)calls,
+        g_bwd_ns_dy_pack.load() * inv,
+        g_bwd_ns_x_pack.load() * inv,
+        (unsigned long long)g_bwd_x_pack_hits.load(),
+        (unsigned long long)g_bwd_x_pack_misses.load(),
+        g_bwd_ns_dw_compute.load() * inv,
+        g_bwd_ns_dx_wt.load() * inv,
+        g_bwd_ns_dx_compute.load() * inv,
+        g_bwd_ns_fused_total.load() * inv,
+        (unsigned long long)g_bwd_dy_pack_shared.load(),
+        (unsigned long long)g_bwd_dy_pack_local.load()
+    );
+    std::fflush(stderr);
+}
+
+extern "C" ML_ENGINE_EXPORT void reset_bwd_pack_timing(void) {
+    g_bwd_pack_calls.store(0);
+    g_bwd_ns_dy_pack.store(0);
+    g_bwd_ns_x_pack.store(0);
+    g_bwd_ns_dw_compute.store(0);
+    g_bwd_ns_dx_wt.store(0);
+    g_bwd_ns_dx_compute.store(0);
+    g_bwd_ns_fused_total.store(0);
+    g_bwd_x_pack_hits.store(0);
+    g_bwd_x_pack_misses.store(0);
+    g_bwd_dy_pack_shared.store(0);
+    g_bwd_dy_pack_local.store(0);
 }
 
 // x: NCHW -> [N][nb_ic][H][W_ext][8]. parallel=true uses OMP team; false = main/serial.
@@ -4619,9 +4695,14 @@ static bool try_brgemm_style_dw(
             * (size_t)OW * (size_t)BRG_DW_OC;
         dy_pack = brg_dw_alloc(tls_brg_dy_pack, tls_brg_dy_cap, dy_need);
         if (!dy_pack) return false;
+        const uint64_t t0 = bwd_pack_timing_enabled() ? bwd_pack_now_ns() : 0;
         brg_pack_dy_blocked(
             d_conv_buf, dy_pack, N, C_out, OH, OW, conv_out_w_stride,
             conv_spatial);
+        if (bwd_pack_timing_enabled()) {
+            g_bwd_ns_dy_pack.fetch_add(bwd_pack_now_ns() - t0, std::memory_order_relaxed);
+            g_bwd_dy_pack_local.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     // Prefer prepare/fwd-published pack (main-thread or post-fwd overlap).
@@ -4633,20 +4714,103 @@ static bool try_brgemm_style_dw(
             * (size_t)W_ext * (size_t)BRG_DW_IC;
         x_pack = brg_dw_alloc(tls_brg_x_pack, tls_brg_x_cap, x_need);
         if (!x_pack) return false;
+        const uint64_t t0 = bwd_pack_timing_enabled() ? bwd_pack_now_ns() : 0;
         brg_pack_x_blocked(
             x, x_pack, N, C_in, H, W_in, W_in_stride, x_pad_l, W_ext,
             /*parallel=*/true
         );
+        if (bwd_pack_timing_enabled()) {
+            g_bwd_ns_x_pack.fetch_add(bwd_pack_now_ns() - t0, std::memory_order_relaxed);
+            g_bwd_x_pack_misses.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (bwd_pack_timing_enabled()) {
+        g_bwd_x_pack_hits.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (!dw_prezeroed) {
         std::memset(dW, 0, (size_t)(C_out * C_in * k_spatial) * sizeof(float));
     }
 
-    // Parallel over channel tiles; each (ic_b,oc_b) owns a disjoint dW slice.
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int64_t ic_b = 0; ic_b < nb_ic; ++ic_b) {
-        for (int64_t oc_b = 0; oc_b < nb_oc; ++oc_b) {
+    // Dual-OC: one x broadcast FMAs into two OC8 tiles (nb_oc_blocking=2).
+    // Parallel over (ic, oc_pair, kh) so L1 (nb_ic=1, nb_oc=2) keeps OMP work.
+    const int64_t nb_oc_pairs = nb_oc / 2;
+    const uint64_t t_comp0 = bwd_pack_timing_enabled() ? bwd_pack_now_ns() : 0;
+    if (nb_oc_pairs > 0) {
+        #pragma omp parallel for collapse(3) schedule(static)
+        for (int64_t ic_b = 0; ic_b < nb_ic; ++ic_b) {
+            for (int64_t oc_p = 0; oc_p < nb_oc_pairs; ++oc_p) {
+                for (int64_t kh = 0; kh < k_h; ++kh) {
+                    const int64_t oc0 = oc_p * 2;
+                    const int64_t oc1 = oc0 + 1;
+                    for (int64_t kw = 0; kw < k_w; ++kw) {
+                        __m256 Crow0[BRG_DW_IC];
+                        __m256 Crow1[BRG_DW_IC];
+                        for (int64_t ci = 0; ci < BRG_DW_IC; ++ci) {
+                            Crow0[ci] = _mm256_setzero_ps();
+                            Crow1[ci] = _mm256_setzero_ps();
+                        }
+
+                        for (int64_t n = 0; n < N; ++n) {
+                            for (int64_t oh = 0; oh < OH; ++oh) {
+                                const int64_t ih = oh - pad + kh;
+                                if (ih < 0 || ih >= H) continue;
+
+                                const float* __restrict x_base =
+                                    &x_pack[((n * nb_ic + ic_b) * H + ih) * W_ext
+                                            * BRG_DW_IC];
+                                const float* __restrict B0 =
+                                    &dy_pack[(((n * OH + oh) * nb_oc + oc0) * OW)
+                                             * BRG_DW_OC];
+                                const float* __restrict B1 =
+                                    &dy_pack[(((n * OH + oh) * nb_oc + oc1) * OW)
+                                             * BRG_DW_OC];
+                                for (int64_t ow = 0; ow < OW; ++ow) {
+                                    const __m256 bv0 =
+                                        _mm256_loadu_ps(B0 + ow * BRG_DW_OC);
+                                    const __m256 bv1 =
+                                        _mm256_loadu_ps(B1 + ow * BRG_DW_OC);
+                                    const float* __restrict xp =
+                                        &x_base[(ow + kw) * BRG_DW_IC];
+                                    for (int64_t ci = 0; ci < BRG_DW_IC; ++ci) {
+                                        const __m256 av =
+                                            _mm256_set1_ps(xp[ci]);
+                                        Crow0[ci] = _mm256_fmadd_ps(
+                                            av, bv0, Crow0[ci]);
+                                        Crow1[ci] = _mm256_fmadd_ps(
+                                            av, bv1, Crow1[ci]);
+                                    }
+                                }
+                            }
+                        }
+
+                        alignas(32) float Cstore0[BRG_DW_IC][BRG_DW_OC];
+                        alignas(32) float Cstore1[BRG_DW_IC][BRG_DW_OC];
+                        for (int64_t ci = 0; ci < BRG_DW_IC; ++ci) {
+                            _mm256_store_ps(Cstore0[ci], Crow0[ci]);
+                            _mm256_store_ps(Cstore1[ci], Crow1[ci]);
+                        }
+                        for (int64_t co = 0; co < BRG_DW_OC; ++co) {
+                            for (int64_t ci = 0; ci < BRG_DW_IC; ++ci) {
+                                const int64_t cin = ic_b * BRG_DW_IC + ci;
+                                const int64_t cout0 = oc0 * BRG_DW_OC + co;
+                                const int64_t cout1 = oc1 * BRG_DW_OC + co;
+                                dW[((cout0 * C_in + cin) * k_spatial) + kh * k_w + kw]
+                                    += Cstore0[ci][co] * inv_m;
+                                dW[((cout1 * C_in + cin) * k_spatial) + kh * k_w + kw]
+                                    += Cstore1[ci][co] * inv_m;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Odd OC tile rem (nb_oc == 1 on L0-like geoms).
+    if ((nb_oc & 1) != 0) {
+        const int64_t oc_b = nb_oc - 1;
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int64_t ic_b = 0; ic_b < nb_ic; ++ic_b) {
             for (int64_t kh = 0; kh < k_h; ++kh) {
                 for (int64_t kw = 0; kw < k_w; ++kw) {
                     __m256 Crow[BRG_DW_IC];
@@ -4665,7 +4829,6 @@ static bool try_brgemm_style_dw(
                             const float* __restrict B =
                                 &dy_pack[(((n * OH + oh) * nb_oc + oc_b) * OW)
                                          * BRG_DW_OC];
-                            // Direct outer-product over OW — no A_row gather.
                             for (int64_t ow = 0; ow < OW; ++ow) {
                                 const __m256 bv =
                                     _mm256_loadu_ps(B + ow * BRG_DW_OC);
@@ -4694,6 +4857,9 @@ static bool try_brgemm_style_dw(
                 }
             }
         }
+    }
+    if (bwd_pack_timing_enabled()) {
+        g_bwd_ns_dw_compute.fetch_add(bwd_pack_now_ns() - t_comp0, std::memory_order_relaxed);
     }
     return true;
 }
@@ -4725,24 +4891,42 @@ static bool try_brgemm_style_dx(
             * (size_t)OW * (size_t)BRG_DW_OC;
         dy_pack = brg_dw_alloc(tls_brg_dy_pack, tls_brg_dy_cap, dy_need);
         if (!dy_pack) return false;
+        const uint64_t t0 = bwd_pack_timing_enabled() ? bwd_pack_now_ns() : 0;
         brg_pack_dy_blocked(
             d_conv_buf, dy_pack, N, C_out, OH, OW, conv_out_w_stride,
             conv_spatial);
+        if (bwd_pack_timing_enabled()) {
+            g_bwd_ns_dy_pack.fetch_add(bwd_pack_now_ns() - t0, std::memory_order_relaxed);
+            g_bwd_dy_pack_local.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     float* Wt = staged_dx_wt_lookup(W, C_out, C_in, k_h);
     if (!Wt) {
         Wt = acquire_dx_cin_blocked_wt_buf((size_t)(C_out * k_h * k_w * C_in));
         if (!Wt) return false;
+        const uint64_t t0 = bwd_pack_timing_enabled() ? bwd_pack_now_ns() : 0;
         transpose_dx_cin_blocked_wt(W, Wt, C_out, C_in, k_h);
+        if (bwd_pack_timing_enabled()) {
+            g_bwd_ns_dx_wt.fetch_add(bwd_pack_now_ns() - t0, std::memory_order_relaxed);
+        }
     }
 
+    const uint64_t t_comp0 = bwd_pack_timing_enabled() ? bwd_pack_now_ns() : 0;
+    // Hyp: planar += scatter (spatial_in stride) was the uProf hotspot.
+    // Accumulate in blocked [H][W_in][8], unpack once to NCHW.
     #pragma omp parallel for collapse(2) schedule(static)
     for (int64_t n = 0; n < N; ++n) {
         for (int64_t ic_b = 0; ic_b < nb_ic; ++ic_b) {
-            // Own this (n, ic_b) dx slab: accumulate over all (oh,ow,kh,kw,oc).
-            float* __restrict dx_slab =
-                &dx[(n * C_in + ic_b * BRG_DW_IC) * spatial_in];
+            const size_t blocked_need = (size_t)H * (size_t)W_in * (size_t)BRG_DW_IC;
+            float* blocked = brg_dw_alloc(
+                tls_brg_dx_blocked, tls_brg_dx_blocked_cap, blocked_need);
+            if (!blocked) {
+                // Fall through impossible inside parallel — zero slab and skip.
+                continue;
+            }
+            std::memset(blocked, 0, blocked_need * sizeof(float));
+
             for (int64_t kh = 0; kh < k_h; ++kh) {
                 for (int64_t kw = 0; kw < k_w; ++kw) {
                     for (int64_t oc_b = 0; oc_b < nb_oc; ++oc_b) {
@@ -4759,8 +4943,8 @@ static bool try_brgemm_style_dx(
                             const float* __restrict dy_row =
                                 &dy_pack[(((n * OH + oh) * nb_oc + oc_b) * OW)
                                          * BRG_DW_OC];
-                            float* __restrict dx_row =
-                                &dx_slab[ih * W_in_stride];
+                            float* __restrict blk_row =
+                                &blocked[(size_t)ih * (size_t)W_in * (size_t)BRG_DW_IC];
                             for (int64_t ow = 0; ow < OW; ++ow) {
                                 const int64_t iw = ow - pad + kw;
                                 if (iw < 0 || iw >= W_in) continue;
@@ -4771,27 +4955,40 @@ static bool try_brgemm_style_dx(
                                     acc = _mm256_fmadd_ps(
                                         _mm256_set1_ps(dy[o]), w_oc[o], acc);
                                 }
-                                float* __restrict dst = dx_row + iw;
-                                // Planar cin: lane c at dst[c * spatial_in].
-                                // Pointer bump (not c*spatial_in) — profile showed
-                                // imul-heavy address math on the scalar scatter.
-                                alignas(32) float lanes[8];
-                                _mm256_store_ps(lanes, acc);
-                                float* __restrict p = dst;
-                                p[0] += lanes[0]; p += spatial_in;
-                                p[0] += lanes[1]; p += spatial_in;
-                                p[0] += lanes[2]; p += spatial_in;
-                                p[0] += lanes[3]; p += spatial_in;
-                                p[0] += lanes[4]; p += spatial_in;
-                                p[0] += lanes[5]; p += spatial_in;
-                                p[0] += lanes[6]; p += spatial_in;
-                                p[0] += lanes[7];
+                                float* __restrict dst =
+                                    blk_row + (size_t)iw * (size_t)BRG_DW_IC;
+                                const __m256 prev = _mm256_load_ps(dst);
+                                _mm256_store_ps(dst, _mm256_add_ps(prev, acc));
                             }
                         }
                     }
                 }
             }
+
+            // Unpack blocked → planar NCHW for this (n, ic_b) slab.
+            float* __restrict dx_slab =
+                &dx[(n * C_in + ic_b * BRG_DW_IC) * spatial_in];
+            for (int64_t ih = 0; ih < H; ++ih) {
+                const float* __restrict blk_row =
+                    &blocked[(size_t)ih * (size_t)W_in * (size_t)BRG_DW_IC];
+                for (int64_t iw = 0; iw < W_in; ++iw) {
+                    alignas(32) float lanes[8];
+                    _mm256_store_ps(lanes, _mm256_load_ps(blk_row + (size_t)iw * 8));
+                    float* __restrict p = &dx_slab[ih * W_in_stride + iw];
+                    p[0] = lanes[0]; p += spatial_in;
+                    p[0] = lanes[1]; p += spatial_in;
+                    p[0] = lanes[2]; p += spatial_in;
+                    p[0] = lanes[3]; p += spatial_in;
+                    p[0] = lanes[4]; p += spatial_in;
+                    p[0] = lanes[5]; p += spatial_in;
+                    p[0] = lanes[6]; p += spatial_in;
+                    p[0] = lanes[7];
+                }
+            }
         }
+    }
+    if (bwd_pack_timing_enabled()) {
+        g_bwd_ns_dx_compute.fetch_add(bwd_pack_now_ns() - t_comp0, std::memory_order_relaxed);
     }
     return true;
 }
@@ -4826,6 +5023,7 @@ void conv2d_backward_fallback_avx2(
     }
 
     // Prefer BRGEMM-style dW/dX when geometry matches (before pad/nci spray).
+    const uint64_t t_fused0 = bwd_pack_timing_enabled() ? bwd_pack_now_ns() : 0;
     float* shared_dy_pack = nullptr;
     if ((do_dw || do_dx) &&
         brg_dw_x_geom_ok(C_in, C_out, k_h, k_w, stride)) {
@@ -4838,9 +5036,15 @@ void conv2d_backward_fallback_avx2(
             shared_dy_pack =
                 brg_dw_alloc(tls_brg_dy_pack, tls_brg_dy_cap, dy_need);
             if (shared_dy_pack) {
+                const uint64_t t0 = bwd_pack_timing_enabled() ? bwd_pack_now_ns() : 0;
                 brg_pack_dy_blocked(
                     d_conv_buf, shared_dy_pack, N, C_out, OH, OW,
                     conv_out_w_stride, conv_spatial);
+                if (bwd_pack_timing_enabled()) {
+                    g_bwd_ns_dy_pack.fetch_add(
+                        bwd_pack_now_ns() - t0, std::memory_order_relaxed);
+                    g_bwd_dy_pack_shared.fetch_add(1, std::memory_order_relaxed);
+                }
             }
         }
     }
@@ -5193,5 +5397,10 @@ void conv2d_backward_fallback_avx2(
         for (int64_t i = 0; i < dw_count; ++i) {
             dW[i] *= inv_m;
         }
+    }
+    if (bwd_pack_timing_enabled()) {
+        g_bwd_ns_fused_total.fetch_add(
+            bwd_pack_now_ns() - t_fused0, std::memory_order_relaxed);
+        g_bwd_pack_calls.fetch_add(1, std::memory_order_relaxed);
     }
 }
