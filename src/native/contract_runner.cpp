@@ -36,22 +36,6 @@ int32_t direct_conv_block_forward_avx2(
     int64_t conv_stride, int64_t conv_pad, int64_t conv_out_w_stride,
     int64_t pool_size, int64_t pool_stride);
 
-int32_t direct_conv_block_forward_avx2_ex(
-    const float* x, const float* W, const float* bias,
-    float* out_conv, float* out_pool, uint8_t* argmax_buf,
-    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
-    int64_t C_out, int64_t k_h, int64_t k_w,
-    int64_t conv_stride, int64_t conv_pad, int64_t conv_out_w_stride,
-    int64_t pool_size, int64_t pool_stride,
-    int32_t src_nChw8c, int32_t keep_pool_nChw8c,
-    int32_t* out_conv_is_nChw8c, int32_t* out_pool_is_nChw8c);
-
-void ensure_nchw_from_nChw8c(
-    float* buf, int64_t N, int64_t C, int64_t H, int64_t W, int64_t W_stride,
-    int32_t* is_nChw8c_flag);
-
-void invalidate_fwd_oc_wei_pack(void);
-
 int32_t direct_conv_block_backward_avx2(
     const float* dout_pool, const uint8_t* argmax_buf,
     const float* x, const float* W, const float* conv_act,
@@ -148,10 +132,6 @@ struct LayerBinding {
     // memset is pure duplicate work.
     int64_t dw_prezeroed;
 };
-
-// Per-contract-step: which layer buffers are still nChw8c (fwd kept blocked).
-static int32_t g_out_conv_nChw8c[8] = {};
-static int32_t g_out_pool_nChw8c[8] = {};
 
 struct DenseBinding {
     float* W;
@@ -475,8 +455,6 @@ static void adam_apply_all(ContractExecCtx* ctx) {
             d->b_next, d->ms_b_next, d->vs_b_next,
             d->fan_out, a, ctx->lr, 0.0f);
     }
-    // W contents changed — drop durable Ohwi/OIhw packs for next fwd.
-    invalidate_fwd_oc_wei_pack();
 }
 
 #if defined(ML_ENGINE_PROFILE_CONTRACT_THREADS) && defined(__linux__) && defined(_OPENMP)
@@ -707,10 +685,6 @@ static int32_t run_contract_training_step_impl(
 
     const float inv_m = 1.0f / (float)ctx->N;
     ctx->act = const_cast<float*>(ctx->X);
-    for (int i = 0; i < 8; ++i) {
-        g_out_conv_nChw8c[i] = 0;
-        g_out_pool_nChw8c[i] = 0;
-    }
 
     for (int32_t i = 0; i < op_count; ++i) {
         const ContractOpRow* op = &ops[i];
@@ -732,27 +706,16 @@ static int32_t run_contract_training_step_impl(
                 const int64_t conv_out_h = (L->H + 2 * L->conv_pad - L->k_h) / L->conv_stride + 1;
                 L->pool_out_h = (conv_out_h - L->pool_size) / L->pool_stride + 1;
                 L->pool_out_w = (conv_out_w - L->pool_size) / L->pool_stride + 1;
-                const int32_t src_blocked =
-                    (op->layer_idx > 0 && g_out_pool_nChw8c[op->layer_idx - 1]) ? 1 : 0;
-                // Keep pool blocked for the next conv; last conv converts for dense.
-                const int32_t keep_pool =
-                    (op->layer_idx + 1 < ctx->num_layers) ? 1 : 0;
-                int32_t st = direct_conv_block_forward_avx2_ex(
+                int32_t st = direct_conv_block_forward_avx2(
                     x_in, L->W, L->b, L->out_conv, L->out_pool, L->argmax,
                     ctx->N, L->C_in, L->H, L->W_in, L->W_stride, L->C_out,
                     L->k_h, L->k_w, L->conv_stride, L->conv_pad, L->conv_out_w_stride,
-                    L->pool_size, L->pool_stride,
-                    src_blocked, keep_pool,
-                    &g_out_conv_nChw8c[op->layer_idx],
-                    &g_out_pool_nChw8c[op->layer_idx]);
+                    L->pool_size, L->pool_stride);
                 if (st != 0) return st;
                 L->conv_act_cache = L->out_conv;
                 ctx->act = L->out_pool;
                 ctx->flat_dim = L->C_out * L->pool_out_h * L->pool_out_w;
-                // BRGEMM dW x-pack expects NCHW. Skip while pool stays nChw8c
-                // (bwd ensure_* converts before dW; pack on demand / prepare).
-                if (op->layer_idx + 1 < ctx->num_layers
-                    && !g_out_pool_nChw8c[op->layer_idx]) {
+                if (op->layer_idx + 1 < ctx->num_layers) {
                     LayerBinding* Nxt = &ctx->layers[op->layer_idx + 1];
                     (void)request_brgemm_dw_x_pack(
                         ctx->act, ctx->N, Nxt->C_in, Nxt->H, Nxt->W_in,
@@ -781,24 +744,6 @@ static int32_t run_contract_training_step_impl(
             case OP_CONV_BLOCK_BWD: {
                 if (op->layer_idx < 0 || op->layer_idx >= ctx->num_layers) return -3;
                 LayerBinding* L = &ctx->layers[op->layer_idx];
-                const int64_t conv_out_h =
-                    (L->H + 2 * L->conv_pad - L->k_h) / L->conv_stride + 1;
-                const int64_t conv_out_w =
-                    (L->W_in + 2 * L->conv_pad - L->k_w) / L->conv_stride + 1;
-                // Bwd kernels are NCHW — convert any leftover blocked caches.
-                ensure_nchw_from_nChw8c(
-                    L->out_conv, ctx->N, L->C_out, conv_out_h, conv_out_w,
-                    L->conv_out_w_stride, &g_out_conv_nChw8c[op->layer_idx]);
-                ensure_nchw_from_nChw8c(
-                    L->out_pool, ctx->N, L->C_out, L->pool_out_h, L->pool_out_w,
-                    L->pool_out_w, &g_out_pool_nChw8c[op->layer_idx]);
-                if (op->layer_idx > 0) {
-                    LayerBinding* Prev = &ctx->layers[op->layer_idx - 1];
-                    ensure_nchw_from_nChw8c(
-                        Prev->out_pool, ctx->N, Prev->C_out,
-                        Prev->pool_out_h, Prev->pool_out_w, Prev->pool_out_w,
-                        &g_out_pool_nChw8c[op->layer_idx - 1]);
-                }
                 // Layer 0's dx is d(loss)/d(input image): no upstream consumer.
                 // Passing null makes the backward skip the dx solve entirely.
                 const bool need_dx = (op->layer_idx != 0);

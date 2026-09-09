@@ -116,7 +116,7 @@ def print_terminal_report(
     print(f"{'Convolution Kernels (H x W)':<36} | {f'{kernel_size}x{kernel_size}':<23} | {f'{kernel_size}x{kernel_size}':<23}")
     print(f"{'Padding / Stride':<36} | {f'pad={padding}, stride={stride}':<23} | {f'pad={padding}, stride={stride}':<23}")
     print(f"{'Channel Topology':<36} | {filter_desc:<23} | {filter_desc:<23}")
-    print(f"{'Underlying Engine Algorithm':<36} | {'oneDNN / MKL (mkldnn)':<23} | {'AVX2 / im2col (OpenMP)':<23}")
+    print(f"{'Underlying Engine Algorithm':<36} | {'PyTorch CPU (MKL)':<23} | {'AVX2 / im2col (OpenMP)':<23}")
     print(f"{'Data Batch Size':<36} | {batch_size:<23d} | {batch_size:<23d}")
     print(f"{'Active Hardware Threads':<36} | {torch_threads:<23d} | {custom_threads:<23d}")
     print(f"{'Total Trainable Parameters':<36} | {t_res.get('params', 0):<23,d} | {c_res.get('params', 0):<23,d}")

@@ -54,6 +54,3 @@ output/
 logs/
 tmp/
 test_run.log
-
-# oneDNN source checkout (build with ninja; install → third_party/onednn_install)
-oneDNN/

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Diagnostic: side-by-side forward layout/ops for native vs Torch/oneDNN.
+"""Diagnostic: side-by-side forward layout/ops for native vs Torch.
 
-Uses ML_ENGINE_FWD_TRACE=1 and ONEDNN_VERBOSE=1. Does not change kernels beyond
-what those env flags already enable. Run:
+Uses ML_ENGINE_FWD_TRACE=1. Does not change kernels beyond what that env
+flag already enables. Run:
 
-  ML_ENGINE_FWD_TRACE=1 ONEDNN_VERBOSE=1 OMP_NUM_THREADS=4 \\
+  ML_ENGINE_FWD_TRACE=1 OMP_NUM_THREADS=4 \\
     .venv/bin/python scripts/fwd_layout_trace.py
 """
 from __future__ import annotations
@@ -18,8 +18,6 @@ import torch.nn.functional as F
 
 os.environ.setdefault("OMP_NUM_THREADS", "4")
 os.environ["ML_ENGINE_FWD_TRACE"] = "1"
-# Ensure oneDNN verbose even if parent did not set it.
-os.environ.setdefault("ONEDNN_VERBOSE", "1")
 
 from config.constants import EngineBackend
 from utils.conv_dispatch import conv2d_forward, init_engine_backend, sync_native_thread_policy
@@ -65,12 +63,12 @@ def run_case(tag: str, N: int, Cin: int, Cout: int, H: int, W: int, K: int, pad:
         flush=True,
     )
 
-    print("\n----- TORCH / oneDNN (ONEDNN_VERBOSE + strides) -----", flush=True)
+    print("\n----- TORCH (strides) -----", flush=True)
     xt = torch.from_numpy(x.copy())
     Wt = torch.from_numpy(Wn.copy())
     _fmt_tensor("x before", xt)
     _fmt_tensor("W before", Wt)
-    print("[TORCH_TRACE] op: F.conv2d → oneDNN may reorder + jit:avx2 + reorder", flush=True)
+    print("[TORCH_TRACE] op: F.conv2d", flush=True)
     yt = F.conv2d(xt, Wt, None, stride=1, padding=pad)
     _fmt_tensor("y after", yt)
     print(
@@ -85,17 +83,14 @@ def main() -> None:
     sync_native_thread_policy(4)
     torch.set_num_threads(4)
     print(
-        f"torch={torch.__version__} mkldnn={torch.backends.mkldnn.is_available()} "
-        f"ONEDNN_VERBOSE={os.environ.get('ONEDNN_VERBOSE')} "
+        f"torch={torch.__version__} "
         f"ML_ENGINE_FWD_TRACE={os.environ.get('ML_ENGINE_FWD_TRACE')}",
         flush=True,
     )
-    # L1 pad2 — the gap case (Cin%8==0 → OC-mimo path)
     run_case("L1_pad2", 2, 8, 16, 13, 13, 7, 2)
-    # L0 pad2 — Cin=3 → OW specialists
     run_case("L0_pad2", 2, 3, 8, 28, 28, 7, 2)
 
 
 if __name__ == "__main__":
     main()
-    sys.stdout.flush()
+    sys.exit(0)

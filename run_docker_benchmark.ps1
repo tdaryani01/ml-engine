@@ -3,9 +3,6 @@ param(
     [string]$Action = "All",
     [int[]]$SampleKernels = @(1, 3, 4, 7),
     [int]$Cores = 4,
-    [ValidateRange(0, 2)]
-    [int]$OneDnnVerbose = 0,
-    [switch]$VerboseTracing,
     [switch]$NoCache,
     [int]$KMin = 1,
     [int]$KMax = 7,
@@ -104,12 +101,6 @@ if ($ThreadCount -ne $Cores) {
     Write-Warning "config num_threads=$ThreadCount differs from -Cores $Cores; using config value for OMP env."
 }
 
-# Determine oneDNN verbosity level
-$VerboseLevel = $OneDnnVerbose
-if ($VerboseTracing -and $VerboseLevel -eq 0) {
-    $VerboseLevel = 1
-}
-
 function Stop-ExistingBenchmarkContainers {
     $ids = @(
         docker ps -q --filter "ancestor=$PyTorchImg" 2>$null
@@ -184,13 +175,6 @@ function Get-RuntimeProfileSummary {
 
 function Get-DockerEnvOverrides {
     $overrides = @{}
-    if ($OneDnnVerbose -ne 0 -or $VerboseTracing) {
-        $level = $OneDnnVerbose
-        if ($VerboseTracing -and $level -eq 0) {
-            $level = 1
-        }
-        $overrides["ONEDNN_VERBOSE"] = "$level"
-    }
     return $overrides
 }
 
@@ -379,19 +363,6 @@ function Run-Benchmarks {
 
     $EnvOverrides = Get-DockerEnvOverrides
     $RuntimeEnvFile = Write-RuntimeEnvFile -Threads $ThreadCount -Overrides $EnvOverrides
-
-    $OnednnDisplay = $EnvOverrides["ONEDNN_VERBOSE"]
-    if (-not $OnednnDisplay) {
-        $OnednnDisplay = (& python $RuntimeScript --threads $ThreadCount --platform linux --format json | ConvertFrom-Json).ONEDNN_VERBOSE
-    }
-
-    Write-Host ""
-    Write-Host "==================================================================" -ForegroundColor Yellow
-    Write-Host "  DOCKER CONVERGENCE BENCHMARK ORCHESTRATOR - ISOLATED RUN" -ForegroundColor Yellow
-    Write-Host "  Hardware Allocation  : $Cores Dedicated Cores (cpuset: $CpuSet)" -ForegroundColor Yellow
-    Write-Host "  OpenMP Thread Count  : $ThreadCount" -ForegroundColor Yellow
-    Write-Host "  Runtime OMP Profile  : $(Get-RuntimeProfileSummary -Threads $ThreadCount)" -ForegroundColor Yellow
-    Write-Host "  oneDNN Verbose Level : $OnednnDisplay (config/runtime.yaml)" -ForegroundColor Yellow
     Write-Host "==================================================================" -ForegroundColor Yellow
 
     # 1. Run PyTorch in isolation

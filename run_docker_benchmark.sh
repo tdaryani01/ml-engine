@@ -18,8 +18,6 @@
 #   --cores N              N physical cores for --cpuset-cpus (default 4).
 #                          Picks one logical CPU per core (e.g. 0,2,4,6), not
 #                          SMT siblings 0-(N-1) which are only N/2 real cores.
-#   --onednn-verbose N     ONEDNN_VERBOSE override (0..2)             (default 0)
-#   --verbose-tracing      shorthand for --onednn-verbose 1
 #   --no-cache             docker build --no-cache
 #   --k-min N / --k-max N  sweep kernel range                        (default 1..7)
 #   --pad N                sweep pad                                  (default 1)
@@ -46,8 +44,6 @@ CONFIG_PATH="$ROOT/config/config.yaml"
 
 ACTION="all"
 CORES=4
-ONEDNN_VERBOSE=0
-VERBOSE_TRACING=0
 NO_CACHE=0
 K_MIN=1
 K_MAX=7
@@ -73,8 +69,6 @@ while [[ $# -gt 0 ]]; do
       ACTION="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"; shift ;;
     --action) ACTION="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')"; shift 2 ;;
     --cores) CORES="$2"; shift 2 ;;
-    --onednn-verbose) ONEDNN_VERBOSE="$2"; shift 2 ;;
-    --verbose-tracing) VERBOSE_TRACING=1; shift ;;
     --no-cache) NO_CACHE=1; shift ;;
     --k-min) K_MIN="$2"; shift 2 ;;
     --k-max) K_MAX="$2"; shift 2 ;;
@@ -90,10 +84,6 @@ case "$ACTION" in
   *) echo "[ERROR] unknown action: $ACTION" >&2; exit 1 ;;
 esac
 
-if (( ONEDNN_VERBOSE < 0 || ONEDNN_VERBOSE > 2 )); then
-  echo "[ERROR] --onednn-verbose must be 0..2" >&2
-  exit 1
-fi
 if (( CORES < 1 )); then
   echo "[ERROR] --cores must be >= 1" >&2
   exit 1
@@ -208,11 +198,6 @@ if [[ "$THREAD_COUNT" != "$CORES" ]]; then
   echo "[!] config num_threads=$THREAD_COUNT differs from --cores $CORES; using config value for OMP env." >&2
 fi
 
-VERBOSE_LEVEL="$ONEDNN_VERBOSE"
-if (( VERBOSE_TRACING == 1 && VERBOSE_LEVEL == 0 )); then
-  VERBOSE_LEVEL=1
-fi
-
 test_docker_endpoint() {
   if docker info >/dev/null 2>&1; then
     return 0
@@ -282,12 +267,8 @@ build_matrix_container() {
 
 write_runtime_env_file() {
   local env_file="$DIAG_DIR/.runtime.env"
-  local -a override_args=()
-  if (( VERBOSE_LEVEL != 0 )); then
-    override_args+=(--override "ONEDNN_VERBOSE=$VERBOSE_LEVEL")
-  fi
   if ! "$PYTHON" "$RUNTIME_SCRIPT" --threads "$THREAD_COUNT" --platform linux \
-      --format docker-args "${override_args[@]+"${override_args[@]}"}" > "$env_file"; then
+      --format docker-args > "$env_file"; then
     echo "[ERROR] Failed to load config/runtime.yaml" >&2
     exit 1
   fi
@@ -307,21 +288,6 @@ print(f"wait={env.get('OMP_WAIT_POLICY', 'default')}, spin={env.get('GOMP_SPINCO
 PY
 }
 
-onednn_display() {
-  if (( VERBOSE_LEVEL != 0 )); then
-    printf '%s' "$VERBOSE_LEVEL"
-    return
-  fi
-  "$PYTHON" - "$RUNTIME_SCRIPT" "$THREAD_COUNT" <<'PY'
-import json, subprocess, sys
-script, threads = sys.argv[1], sys.argv[2]
-out = subprocess.run(
-    [sys.executable, script, "--threads", threads, "--platform", "linux", "--format", "json"],
-    capture_output=True, text=True, check=True,
-).stdout
-print(json.loads(out).get("ONEDNN_VERBOSE", "0"))
-PY
-}
 
 # Usage:
 #   invoke_docker_run NAME IMAGE ENV_FILE [docker-run-extra...] -- [container-cmd...]
@@ -405,7 +371,6 @@ run_benchmarks() {
 
   banner "DOCKER CONVERGENCE BENCHMARK ORCHESTRATOR - ISOLATED RUN" \
     "Runtime OMP Profile  : $(runtime_profile_summary)" \
-    "oneDNN Verbose Level : $(onednn_display) (config/runtime.yaml)"
 
   echo
   echo "[+] Executing PyTorch Isolated Benchmark Container..."

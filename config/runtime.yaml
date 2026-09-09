@@ -30,7 +30,6 @@ env:
   OMP_DYNAMIC: "false"
   OMP_MAX_ACTIVE_LEVELS: "1"
   PYTHONUNBUFFERED: "1"
-  ONEDNN_VERBOSE: "0"
   # OpenMP team: "auto" (async => N-1) or a pin like "4".
   OMP_NUM_THREADS: "4"
   # OMP_THREAD_LIMIT: "4"

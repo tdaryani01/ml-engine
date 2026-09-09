@@ -2,7 +2,7 @@
 """Diagnostic: time native vs Torch per CNN layer (fwd + fused bwd).
 
 Ledger-free kernel probe — isolates whether L0 (Cin=3) or L1 (Cin%8==0)
-still loses to oneDNN on the current K. Not a training-loop bench.
+still loses to Torch on the current K. Not a training-loop bench.
 """
 from __future__ import annotations
 

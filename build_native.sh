@@ -61,7 +61,6 @@ fi
 
 SOURCES=(
   src/native/conv_fallback.cpp
-  src/native/conv_onednn_fwd.cpp
   src/native/conv_dispatcher.cpp
   src/native/omp_config.cpp
   src/native/im2col.cpp
@@ -71,15 +70,6 @@ SOURCES=(
   src/native/contract_runner.cpp
 )
 
-ONEDNN_ROOT="${ONEDNN_ROOT:-$ROOT/third_party/onednn_install}"
-ONEDNN_INC="$ONEDNN_ROOT/include"
-ONEDNN_LIB="$ONEDNN_ROOT/lib"
-if [[ ! -f "$ONEDNN_LIB/libdnnl.so" ]]; then
-  echo "[build] missing $ONEDNN_LIB/libdnnl.so" >&2
-  echo "[build] build oneDNN first (ninja):" >&2
-  echo "[build]   cmake -G Ninja -S oneDNN -B oneDNN/build-ninja -DCMAKE_BUILD_TYPE=Release -DDNNL_BUILD_TESTS=OFF -DDNNL_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX=third_party/onednn_install && cmake --build oneDNN/build-ninja -j && cmake --install oneDNN/build-ninja" >&2
-  exit 1
-fi
 
 mkdir -p "$BUILD_DIR" "$BIN_DIR"
 
@@ -100,7 +90,6 @@ COMMON=(
   -fopenmp
   -I.
   -Isrc/native
-  -I"$ONEDNN_INC"
   -pthread
   -pipe
 )
@@ -178,7 +167,7 @@ for src in "${SOURCES[@]}"; do
 done
 
 echo "[build] link $BUILT_SO"
-LINK_EXTRA=(-fopenmp -ldl -pthread -L"$ONEDNN_LIB" -ldnnl -Wl,-rpath,"$BIN_DIR")
+LINK_EXTRA=(-fopenmp -ldl -pthread)
 # LTO needs the same -flto flag on the link line.
 if [[ " ${CXXFLAGS[*]} " == *" -flto=auto "* ]] || [[ " ${CXXFLAGS[*]} " == *" -flto "* ]]; then
   LINK_EXTRA+=(-flto=auto)
@@ -191,12 +180,8 @@ if [[ ! -f "$BUILT_SO" ]]; then
 fi
 
 cp -f "$BUILT_SO" "$OUT_SO"
-# Runtime: ship libdnnl next to conv_kernels.so (rpath=$BIN_DIR)
-cp -f "$ONEDNN_LIB/libdnnl.so" "$BIN_DIR/libdnnl.so"
-cp -af "$ONEDNN_LIB/libdnnl.so."* "$BIN_DIR/" 2>/dev/null || true
 echo "[build] Wrote $BUILT_SO"
 echo "[build] Copied -> $OUT_SO"
-echo "[build] Copied oneDNN -> $BIN_DIR/libdnnl.so"
 
 # Optional OpenBLAS from scripts/build_openblas.sh (Linux .so).
 # Windows still uses bin/libopenblas.dll from build_native.ps1 / build_openblas.ps1.

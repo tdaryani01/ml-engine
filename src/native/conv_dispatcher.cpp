@@ -31,21 +31,6 @@ void conv2d_backward_fallback_avx2(
     int64_t conv_out_w_stride, float inv_m, int64_t dx_prezeroed, int64_t dw_prezeroed
 );
 
-extern "C" int32_t conv_block_forward_nChw8c_pipeline(
-    const float* x, const float* W, const float* bias,
-    float* out_conv, float* out_pool, uint8_t* argmax,
-    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
-    int64_t C_out, int64_t k_h, int64_t k_w, int64_t stride, int64_t pad,
-    int64_t conv_out_w_stride, int64_t pool_size, int64_t pool_stride,
-    int32_t src_nChw8c, int32_t keep_pool_nChw8c,
-    int32_t* out_conv_is_nChw8c, int32_t* out_pool_is_nChw8c
-);
-
-extern "C" void ensure_nchw_from_nChw8c(
-    float* buf, int64_t N, int64_t C, int64_t H, int64_t W, int64_t W_stride,
-    int32_t* is_nChw8c_flag
-);
-
 // -----------------------------------------------------------------------------
 // Telemetry & Route Logging
 // -----------------------------------------------------------------------------
@@ -149,8 +134,8 @@ ML_ENGINE_EXPORT void log_engine_runtime_diagnostics(
     (void)i5; (void)i6; (void)i7;
 }
 
-// Optional blocked-layout flags for contract (nullptr = legacy NCHW-only).
-ML_ENGINE_EXPORT int32_t direct_conv_block_forward_avx2_ex(
+// NCHW block forward (conv + optional pool).
+ML_ENGINE_EXPORT int32_t direct_conv_block_forward_avx2(
     const float* x,
     const float* W,
     const float* bias,
@@ -160,11 +145,7 @@ ML_ENGINE_EXPORT int32_t direct_conv_block_forward_avx2_ex(
     int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
     int64_t C_out, int64_t k_h, int64_t k_w,
     int64_t conv_stride, int64_t conv_pad, int64_t conv_out_w_stride,
-    int64_t pool_size, int64_t pool_stride,
-    int32_t src_nChw8c,
-    int32_t keep_pool_nChw8c,
-    int32_t* out_conv_is_nChw8c,
-    int32_t* out_pool_is_nChw8c
+    int64_t pool_size, int64_t pool_stride
 ) {
     try {
         if (!x || !W || !out_conv) {
@@ -175,21 +156,6 @@ ML_ENGINE_EXPORT int32_t direct_conv_block_forward_avx2_ex(
             std::fprintf(stderr, "[ENGINE_ERROR] Invalid tensor shape in direct_conv_block_forward_avx2 [N=%lld, Cin=%lld, H=%lld, Win=%lld, Cout=%lld]\n",
                          (long long)N, (long long)C_in, (long long)H, (long long)W_in, (long long)C_out);
             return -2;
-        }
-
-        if (out_conv_is_nChw8c) *out_conv_is_nChw8c = 0;
-        if (out_pool_is_nChw8c) *out_pool_is_nChw8c = 0;
-
-        // Blocked Ohwi/OIhw + nChw8c sketch (inspired by oneDNN layouts); NCHW
-        // only if keep_pool_nChw8c==0. Gated off when it loses A/B.
-        if (conv_block_forward_nChw8c_pipeline(
-                x, W, bias, out_conv, out_pool, argmax_buf,
-                N, C_in, H, W_in, W_in_stride, C_out,
-                k_h, k_w, conv_stride, conv_pad, conv_out_w_stride,
-                pool_size, pool_stride, src_nChw8c, keep_pool_nChw8c,
-                out_conv_is_nChw8c, out_pool_is_nChw8c)) {
-            log_routing_decision("FWD", "ONEDNN_FMT_PIPELINE", k_h, k_w, conv_stride, conv_pad);
-            return 0;
         }
 
         dispatch_forward(
@@ -281,26 +247,6 @@ ML_ENGINE_EXPORT int32_t direct_conv_block_forward_avx2_ex(
         std::fprintf(stderr, "[ENGINE_EXCEPTION] direct_conv_block_forward_avx2 caught unknown native exception.\n");
         return -100;
     }
-}
-
-ML_ENGINE_EXPORT int32_t direct_conv_block_forward_avx2(
-    const float* x,
-    const float* W,
-    const float* bias,
-    float* out_conv,
-    float* out_pool,
-    uint8_t* argmax_buf,
-    int64_t N, int64_t C_in, int64_t H, int64_t W_in, int64_t W_in_stride,
-    int64_t C_out, int64_t k_h, int64_t k_w,
-    int64_t conv_stride, int64_t conv_pad, int64_t conv_out_w_stride,
-    int64_t pool_size, int64_t pool_stride
-) {
-    return direct_conv_block_forward_avx2_ex(
-        x, W, bias, out_conv, out_pool, argmax_buf,
-        N, C_in, H, W_in, W_in_stride, C_out, k_h, k_w,
-        conv_stride, conv_pad, conv_out_w_stride, pool_size, pool_stride,
-        /*src_nChw8c=*/0, /*keep_pool_nChw8c=*/0,
-        /*out_conv_is_nChw8c=*/nullptr, /*out_pool_is_nChw8c=*/nullptr);
 }
 
 ML_ENGINE_EXPORT int32_t direct_conv_block_backward_avx2(

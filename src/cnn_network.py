@@ -637,7 +637,7 @@ class CNNNetwork:
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
         X = processed_data
         # Val/bench tensors are often (N,C,H,32) with logical W=28. Torch is dense
-        # 28 — crop once here so oneDNN/ConvBlock skip per-call densify copies.
+        # 28 — crop once here so ConvBlock can skip per-call densify copies.
         logical = getattr(self, "input_logical_w", None)
         if (
             X.ndim == 4
