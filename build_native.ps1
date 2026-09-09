@@ -30,7 +30,8 @@ $SourceFiles = @(
     "src\native\im2col.cpp",
     "src\native\im2col_telemetry.cpp",
     "src\native\blas_dynamic.cpp",
-    "src\native\conv_im2col_gemm.cpp"
+    "src\native\conv_im2col_gemm.cpp",
+    "src\native\contract_runner.cpp"
 )
 
 $Selected = switch ($Mode) {
@@ -155,6 +156,37 @@ function Publish-OpenBlasToBin {
 
 Publish-OpenBlasToBin
 
+function Verify-BinManifest {
+    $required = @(@{ Name = "conv_kernels.dll"; Path = $OutDll })
+    $optional = @(
+        @{ Name = "libopenblas.dll"; Path = (Join-Path $BinDir "libopenblas.dll") }
+        @{ Name = "openblas_build.json"; Path = (Join-Path $BinDir "openblas_build.json") }
+    )
+    $missing = @()
+    foreach ($item in $required) {
+        if (-not (Test-Path $item.Path)) {
+            $missing += $item.Name
+        }
+    }
+    if ($missing.Count -gt 0) {
+        Write-Error "[build] bin manifest incomplete (missing required): $($missing -join ', ')"
+    }
+    $builtHash = (Get-FileHash $BuiltDll -Algorithm SHA256).Hash
+    $outHash = (Get-FileHash $OutDll -Algorithm SHA256).Hash
+    if ($builtHash -ne $outHash) {
+        Write-Error "[build] bin/conv_kernels.dll does not match build/native output (copy stale or failed)"
+    }
+    Write-Host "[build] bin manifest:" -ForegroundColor Cyan
+    Get-ChildItem $BinDir -File | ForEach-Object {
+        Write-Host ("  {0,-22} {1,10:N0} bytes  {2}" -f $_.Name, $_.Length, $_.LastWriteTime) -ForegroundColor DarkGray
+    }
+    foreach ($item in $optional) {
+        if (-not (Test-Path $item.Path)) {
+            Write-Host "[build] optional missing: $($item.Name) (build/openblas not present or copy failed)" -ForegroundColor Yellow
+        }
+    }
+}
+
 Write-Host "[build] Wrote $BuiltDll" -ForegroundColor Green
 Write-Host "[build] Copied -> $OutDll" -ForegroundColor Green
 if (Test-Path $BuiltPdb) {
@@ -173,6 +205,8 @@ if ($Selected -eq "Debug") {
         }
     }
 }
+
+Verify-BinManifest
 
 if ($RunTests) {
     python (Join-Path $Root "run_tests.py")

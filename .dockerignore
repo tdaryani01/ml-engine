@@ -1,0 +1,51 @@
+# Keep Docker build context tiny (target: a few MB, not hundreds).
+.git
+.venv
+.cursor
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.obj
+**/*.o
+**/*.pstat
+**/*.prof
+**/*.log
+**/*.npy
+.ri
+yappi.pstat
+
+# Profiler / diagnostic dumps
+diagnostics_output
+benchmark_diagnostics
+profiler_results
+uprof_reports
+uprof_reports_*
+uprof_sessions
+uprof_configs
+
+build
+third_party
+bin/*.so
+!bin/libopenblas.so
+bin/*.dll
+!bin/openblas_build.json
+
+# Not needed inside benchmark images
+docs
+option_b_verify
+testing
+agent-transcripts
+*.md
+!requirements*.txt
+
+# Dataset artifacts: mount data/ at run time; keep generators out of context
+data/shards
+data/generators
+
+# Misc host junk / huge trees
+tmp
+diagnostics_output/**
+.bench_tmp_*
+run_docker_benchmark.ps1
+profile_engine.ps1
+profile_engine.sh

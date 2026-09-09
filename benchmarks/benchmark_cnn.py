@@ -7,6 +7,7 @@ import ctypes
 import getpass
 import platform
 import warnings
+import multiprocessing as mp
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
@@ -34,9 +35,10 @@ from src.data.base_loader import BaseDataLoader
 from src.data.in_memory_provider import InMemoryDataProvider
 from utils.engine_ops import create_engine_context
 from config.schema import (
-    PipelineConfig, MetaConfig, IngestionConfig, ArchitectureConfig, 
+    PipelineConfig, MetaConfig, IngestionConfig, ArchitectureConfig,
     OptimizationConfig, RegularizationConfig, TransformationsConfig,
-    FourierConfig, PersistenceConfig, DiagnosticsConfig, SplitConfig
+    FourierConfig, PersistenceConfig, DiagnosticsConfig, SplitConfig,
+    LedgerSettings,
 )
 
 
@@ -99,7 +101,8 @@ def extract_layer_specs(cnn_config: dict) -> list:
                 "out_channels": out_c,
                 "kernel_size": int(item.get("kernel_size", 3)),
                 "stride": int(item.get("stride", 1)),
-                "padding": int(item.get("pad", item.get("padding", 0))),
+                "padding": int(item.get("pad") if item.get("pad") is not None
+                               else (item.get("padding") if item.get("padding") is not None else 0)),
                 "pool_size": 0,
                 "pool_stride": 0
             })
@@ -232,7 +235,7 @@ def create_torch_model_class():
                 feat_out = self.features(dummy)
                 flattened_dim = feat_out.numel()
 
-            dense_hidden = cnn_config.get("dense_hidden", [64]) if cnn_config else [64]
+            dense_hidden = cnn_config.get("dense_head", [64]) if cnn_config else [64]
             if isinstance(dense_hidden, int):
                 dense_hidden = [dense_hidden]
 
@@ -381,7 +384,8 @@ def load_benchmark_data(config_path: str = None):
             figure_height=4,
             plot_style="default",
             output_format="png"
-        )
+        ),
+        ledger=LedgerSettings(**(cfg_dict.get("ledger") or {})),
     )
 
     loader = BaseDataLoader.create_loader(typed_cfg)
@@ -490,7 +494,9 @@ def run_pytorch_benchmark(
     torch_forward_counts = 0
     torch_backward_counts = 0
 
-    settings = load_runtime_settings(num_threads=num_threads)
+    settings = load_runtime_settings(
+        num_threads=num_threads, native_async_submit=False
+    )
     log_runtime_settings(settings, EngineBackend.NUMPY, prefix="[Benchmark PyTorch]")
 
     with training_threadpool(settings, EngineBackend.NUMPY):
@@ -572,6 +578,19 @@ def reset_benchmark_data_provider(data_provider) -> None:
     data_provider.reset_epoch()
 
 
+def _ledger_setup_from_config(config_path: str | None = None) -> tuple[LedgerSettings, str]:
+    """Hydrate ledger + output_dir from config.yaml (noop store, contract flags, etc.)."""
+    if config_path is None:
+        config_path = os.path.join(project_root, "config", "config.yaml")
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg_dict = yaml.safe_load(f) or {}
+    ledger_settings = LedgerSettings(**(cfg_dict.get("ledger") or {}))
+    output_dir = str(
+        (cfg_dict.get("meta") or {}).get("output_dir", "diagnostics_output")
+    )
+    return ledger_settings, output_dir
+
+
 def run_custom_engine_benchmark(
     data_provider: InMemoryDataProvider,
     X_train: np.ndarray,
@@ -590,21 +609,30 @@ def run_custom_engine_benchmark(
     patience: int,
     min_delta: float,
     backend: EngineBackend = EngineBackend.NATIVE,
-    num_threads: int = 4
+    num_threads: int = 4,
+    config_path: str | None = None,
+    ledger_settings: LedgerSettings | None = None,
+    output_dir: str | None = None,
 ) -> dict:
+    # Always honor config.yaml ledger (enabled + noop + contract) unless caller overrides.
+    if ledger_settings is None or output_dir is None:
+        cfg_ledger, cfg_output_dir = _ledger_setup_from_config(config_path)
+        if ledger_settings is None:
+            ledger_settings = cfg_ledger
+        if output_dir is None:
+            output_dir = cfg_output_dir
+
     engine_ctx = create_engine_context(backend)
 
     native_lib = engine_ctx.native_lib or (
         load_native_telemetry_lib() if backend == EngineBackend.NATIVE else None
     )
-    verified_threads = num_threads
-    if native_lib and hasattr(native_lib, "get_omp_threads"):
-        try:
-            verified_threads = native_lib.get_omp_threads()
-        except Exception:
-            pass
+    settings = load_runtime_settings(
+        config_path=config_path, num_threads=num_threads
+    )
+    planned_threads = settings.omp_threads_for(backend)
 
-    print(f"[2/2] Setting up and executing Custom Engine [{backend.value}] benchmark run ({verified_threads} Threads active)...")
+    print(f"[2/2] Setting up and executing Custom Engine [{backend.value}] benchmark run ({planned_threads} Threads configured)...")
     
     if native_lib and hasattr(native_lib, "reset_thread_execution_stats"):
         native_lib.reset_thread_execution_stats()
@@ -641,35 +669,51 @@ def run_custom_engine_benchmark(
     )
 
     model = controller.model
-    orig_forward = model._forward
-    orig_backward = model.backward
-    orig_predict = model.predict
-
     forward_counter = [0]
     backward_counter = [0]
 
-    def counted_forward(X, training=True, **kwargs):
+    # Contract fit uses run_contract_train_step (fused fwd+bwd), not _forward/backward.
+    if hasattr(model, "run_contract_train_step"):
+        _orig_contract_step = model.run_contract_train_step
+
+        def _counted_contract_step(*args, **kwargs):
+            forward_counter[0] += 1
+            backward_counter[0] += 1
+            return _orig_contract_step(*args, **kwargs)
+
+        model.run_contract_train_step = _counted_contract_step
+
+    # Non-contract train_step: forward_train then _compute_grads_from_cache.
+    if hasattr(model, "forward_train"):
+        _orig_forward_train = model.forward_train
+
+        def _counted_forward_train(*args, **kwargs):
+            forward_counter[0] += 1
+            return _orig_forward_train(*args, **kwargs)
+
+        model.forward_train = _counted_forward_train
+
+    if hasattr(model, "_compute_grads_from_cache"):
+        _orig_grads = model._compute_grads_from_cache
+
+        def _counted_grads(*args, **kwargs):
+            backward_counter[0] += 1
+            return _orig_grads(*args, **kwargs)
+
+        model._compute_grads_from_cache = _counted_grads
+
+    _orig_predict = model.predict
+
+    def _counted_predict(processed_data, *args, **kwargs):
         forward_counter[0] += 1
-        return orig_forward(X, training=training, **kwargs)
+        return _orig_predict(processed_data, *args, **kwargs)
 
-    def counted_backward(*args, **kwargs):
-        backward_counter[0] += 1
-        return orig_backward(*args, **kwargs)
-
-    def counted_predict(processed_data, *args, **kwargs):
-        forward_counter[0] += 1
-        return orig_predict(processed_data, *args, **kwargs)
-
-    model._forward = counted_forward
-    model.backward = counted_backward
-    model.predict = counted_predict
+    model.predict = _counted_predict
 
     custom_total_params = extract_custom_engine_param_count(controller)
 
-    settings = load_runtime_settings(num_threads=num_threads)
-    log_runtime_settings(settings, backend, prefix="[Benchmark Custom]")
-
     with training_threadpool(settings, backend):
+        log_runtime_settings(settings, backend, prefix="[Benchmark Custom]")
         t0_train = time.perf_counter()
         train_history, val_history = controller.fit(
             steps=data_provider.recomment_steps(),
@@ -677,9 +721,14 @@ def run_custom_engine_benchmark(
             model_type=task_type,
             early_stopping_enabled=early_stopping_enabled,
             patience=patience,
-            min_delta=min_delta
+            min_delta=min_delta,
+            ledger_settings=ledger_settings,
+            output_dir=output_dir,
         )
         custom_train_time = time.perf_counter() - t0_train
+        # Snapshot before post-fit predict/inf so counts match Torch (train+val only).
+        custom_forward_counts = forward_counter[0]
+        custom_backward_counts = backward_counter[0]
 
         t0_inf = time.perf_counter()
         for _ in range(100):
@@ -713,12 +762,12 @@ def run_custom_engine_benchmark(
 
     return {
         "params": custom_total_params,
-        "threads_verified": verified_threads,
+        "threads_verified": planned_threads,
         "epochs_completed": custom_epochs_completed,
         "best_epoch": custom_best_epoch,
         "early_stopped": custom_early_stopped,
-        "forward_counts": forward_counter[0],
-        "backward_counts": backward_counter[0],
+        "forward_counts": custom_forward_counts,
+        "backward_counts": custom_backward_counts,
         "train_loss": float(final_custom_train_loss),
         "val_loss": float(final_custom_val_loss),
         "val_acc": float(final_custom_val_acc),
@@ -845,9 +894,71 @@ def print_head_to_head_report(*args, **kwargs) -> str:
     return report
 
 
-def run_cnn_benchmark(config_path: str = None):
+def format_single_engine_report(
+    res: dict,
+    *,
+    engine: str,
+    epochs: int,
+    n_train: int,
+    n_val: int,
+    backend,
+) -> str:
+    backend_value = backend.value if hasattr(backend, "value") else str(backend)
+    if engine == "pytorch":
+        col = f"PyTorch CNN ({res['threads_verified']}T)"
+        title = "PYTORCH-ONLY BENCHMARK REPORT"
+    else:
+        col = f"Custom [{backend_value}] ({res['threads_verified']}T)"
+        title = "CUSTOM-ONLY BENCHMARK REPORT"
+    throughput = (n_train * res["epochs_completed"]) / res["train_time"]
+    lines = [
+        "",
+        "=" * 80,
+        title.center(80),
+        "=" * 80,
+        f"{'Performance Metric':<32} | {col:<20}",
+        "-" * 80,
+        f"{'Active Hardware Threads':<32} | {res['threads_verified']:<20d}",
+        f"{'Total Trainable Parameters':<32} | {res['params']:<20,d}",
+        f"{'Target Epochs':<32} | {epochs:<20d}",
+        f"{'Epochs Completed':<32} | {res['epochs_completed']:<20d}",
+        f"{'Best Validation Epoch':<32} | {res['best_epoch']:<20d}",
+        f"{'Early Stopping Triggered':<32} | {str(res['early_stopped']):<20}",
+        f"{'Forward Pass Count':<32} | {res['forward_counts']:<20,d}",
+        f"{'Backward Pass Count':<32} | {res['backward_counts']:<20,d}",
+        f"{'Final Training Loss':<32} | {res['train_loss']:<20.6f}",
+        f"{'Final Validation Loss':<32} | {res['val_loss']:<20.6f}",
+        f"{'Final Validation Accuracy':<32} | {res['val_acc'] * 100:>19.2f}%",
+        "-" * 80,
+        f"{'Total Training Time':<32} | {res['train_time']:>18.3f} s",
+        f"{'Training Throughput':<32} | {throughput:>14.1f} smp/s",
+        (
+            f"{'Time per Epoch':<32} | "
+            f"{(res['train_time'] / res['epochs_completed']) * 1000:>16.2f} ms"
+        ),
+        (
+            f"{'Val Inference Latency (Batch)':<32} | "
+            f"{res['inf_time'] * 1000:>16.3f} ms"
+        ),
+        (
+            f"{'Per-Sample Inference Latency':<32} | "
+            f"{(res['inf_time'] / n_val) * 1000:>16.4f} ms"
+        ),
+        "=" * 80,
+    ]
+    return "\n".join(lines)
+
+
+def print_single_engine_report(*args, **kwargs) -> str:
+    report = format_single_engine_report(*args, **kwargs)
+    print(report)
+    return report
+
+
+def _benchmark_common_from_config(config_path: str = None):
+    """Load config + data once per process. Used by parent (banner) and engine children."""
     data_provider, cfg_dict = load_benchmark_data(config_path)
-    
+
     data_path = cfg_dict["ingestion"]["data_file_path"]
     raw_model_type = cfg_dict["architecture"]["model_type"]
     task_type = resolve_model_type(raw_model_type)
@@ -868,6 +979,10 @@ def run_cnn_benchmark(config_path: str = None):
     patience = int(cfg_dict["optimization"].get("patience", 10))
     min_delta = float(cfg_dict["optimization"].get("min_delta", 1e-4))
     lr_scheduler_type = cfg_dict["optimization"].get("lr_scheduler", "none")
+    ledger_settings = LedgerSettings(**(cfg_dict.get("ledger") or {}))
+    output_dir = str(
+        (cfg_dict.get("meta") or {}).get("output_dir", "diagnostics_output")
+    )
 
     specs = extract_layer_specs(cnn_dict)
     if cnn_dict:
@@ -878,75 +993,163 @@ def run_cnn_benchmark(config_path: str = None):
             bench_input_shape = raw_shape
         validate_cnn_spatial_geometry(bench_input_shape, specs)
 
-    print(format_system_banner(
-        data_path=data_path,
-        backend=backend,
-        epochs=epochs,
-        batch_size=batch_size,
-        lr_init=lr_init,
-        lam_l2=lam_l2,
-        lam_l1=lam_l1,
-        lr_scheduler_type=lr_scheduler_type,
-        early_stopping_enabled=early_stopping_enabled,
-        patience=patience,
-        min_delta=min_delta,
-        num_threads=num_threads,
-        specs=specs,
-    ))
-
     X_train = data_provider.splits[DataKeys.X_TRAIN]
     y_train = data_provider.splits[DataKeys.Y_TRAIN]
     X_val, y_val = data_provider.get_validation_set()
-
     y_train_classes = np.argmax(y_train, axis=1) if y_train.ndim > 1 else y_train.ravel()
     y_val_classes = np.argmax(y_val, axis=1) if y_val.ndim > 1 else y_val.ravel()
 
-    t_res = run_pytorch_benchmark(
-        X_train=X_train,
-        y_train_classes=y_train_classes,
-        X_val=X_val,
-        y_val_classes=y_val_classes,
-        num_classes=num_classes,
-        batch_size=batch_size,
-        epochs=epochs,
-        lr_init=lr_init,
-        lam_l2=lam_l2,
-        early_stopping_enabled=early_stopping_enabled,
-        patience=patience,
-        min_delta=min_delta,
-        cnn_dict=cnn_dict,
-        num_threads=num_threads
-    )
+    return {
+        "data_provider": data_provider,
+        "data_path": data_path,
+        "task_type": task_type,
+        "backend": backend,
+        "num_classes": num_classes,
+        "batch_size": batch_size,
+        "lr_init": lr_init,
+        "epochs": epochs,
+        "num_threads": num_threads,
+        "lam_l2": lam_l2,
+        "lam_l1": lam_l1,
+        "cnn_dict": cnn_dict,
+        "early_stopping_enabled": early_stopping_enabled,
+        "patience": patience,
+        "min_delta": min_delta,
+        "lr_scheduler_type": lr_scheduler_type,
+        "ledger_settings": ledger_settings,
+        "output_dir": output_dir,
+        "specs": specs,
+        "X_train": X_train,
+        "y_train": y_train,
+        "X_val": X_val,
+        "y_val": y_val,
+        "y_train_classes": y_train_classes,
+        "y_val_classes": y_val_classes,
+    }
 
-    c_res = run_custom_engine_benchmark(
-        data_provider=data_provider,
-        X_train=X_train,
-        y_train=y_train,
-        X_val=X_val,
-        y_val=y_val,
-        y_val_classes=y_val_classes,
-        cnn_dict=cnn_dict,
-        num_classes=num_classes,
-        task_type=task_type,
-        epochs=epochs,
-        lr_init=lr_init,
-        lam_l1=lam_l1,
-        lam_l2=lam_l2,
-        early_stopping_enabled=early_stopping_enabled,
-        patience=patience,
-        min_delta=min_delta,
-        backend=backend,
-        num_threads=num_threads
-    )
 
-    n_val_samples = len(X_val)
-    print_head_to_head_report(
-        t_res, c_res,
-        epochs=epochs,
-        n_train=len(X_train),
-        n_val=n_val_samples,
-        backend=backend,
-    )
+def pytorch_benchmark_child(config_path, result_queue) -> None:
+    """Fresh process: load data, run PyTorch only, exit. No custom native state."""
+    try:
+        c = _benchmark_common_from_config(config_path)
+        t_res = run_pytorch_benchmark(
+            X_train=c["X_train"],
+            y_train_classes=c["y_train_classes"],
+            X_val=c["X_val"],
+            y_val_classes=c["y_val_classes"],
+            num_classes=c["num_classes"],
+            batch_size=c["batch_size"],
+            epochs=c["epochs"],
+            lr_init=c["lr_init"],
+            lam_l2=c["lam_l2"],
+            early_stopping_enabled=c["early_stopping_enabled"],
+            patience=c["patience"],
+            min_delta=c["min_delta"],
+            cnn_dict=c["cnn_dict"],
+            num_threads=c["num_threads"],
+        )
+        result_queue.put(("ok", t_res))
+    except Exception as exc:
+        result_queue.put(("err", f"{type(exc).__name__}: {exc}"))
+
+
+def custom_benchmark_child(config_path, result_queue) -> None:
+    """Fresh process: load data, run custom only. Never imports torch training path."""
+    try:
+        c = _benchmark_common_from_config(config_path)
+        c_res = run_custom_engine_benchmark(
+            data_provider=c["data_provider"],
+            X_train=c["X_train"],
+            y_train=c["y_train"],
+            X_val=c["X_val"],
+            y_val=c["y_val"],
+            y_val_classes=c["y_val_classes"],
+            cnn_dict=c["cnn_dict"],
+            num_classes=c["num_classes"],
+            task_type=c["task_type"],
+            epochs=c["epochs"],
+            lr_init=c["lr_init"],
+            lam_l1=c["lam_l1"],
+            lam_l2=c["lam_l2"],
+            early_stopping_enabled=c["early_stopping_enabled"],
+            patience=c["patience"],
+            min_delta=c["min_delta"],
+            backend=c["backend"],
+            num_threads=c["num_threads"],
+            config_path=config_path,
+            ledger_settings=c["ledger_settings"],
+            output_dir=c["output_dir"],
+        )
+        result_queue.put(("ok", c_res))
+    except Exception as exc:
+        result_queue.put(("err", f"{type(exc).__name__}: {exc}"))
+
+
+def run_benchmark_child(target, config_path, label: str):
+    """Spawn an isolated interpreter for one engine; wait until it fully exits."""
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=target, args=(config_path, result_queue), name=label)
+    proc.start()
+    status, payload = result_queue.get()
+    proc.join()
+    if proc.exitcode != 0:
+        raise RuntimeError(f"{label} exited with code {proc.exitcode}")
+    if status != "ok":
+        raise RuntimeError(f"{label} failed: {payload}")
+    return payload
+
+
+def run_cnn_benchmark(config_path: str = None, target: str = "both"):
+    # Parent only prints the banner. Each engine runs in its own spawned process so
+    # torch / wheel-OpenBLAS / MKL thread pools cannot leak into the custom run
+    # (and vice versa).
+    if target not in ("pytorch", "custom", "both"):
+        raise ValueError(f"target must be pytorch|custom|both, got {target!r}")
+
+    c = _benchmark_common_from_config(config_path)
+
+    print(format_system_banner(
+        data_path=c["data_path"],
+        backend=c["backend"],
+        epochs=c["epochs"],
+        batch_size=c["batch_size"],
+        lr_init=c["lr_init"],
+        lam_l2=c["lam_l2"],
+        lam_l1=c["lam_l1"],
+        lr_scheduler_type=c["lr_scheduler_type"],
+        early_stopping_enabled=c["early_stopping_enabled"],
+        patience=c["patience"],
+        min_delta=c["min_delta"],
+        num_threads=c["num_threads"],
+        specs=c["specs"],
+    ))
+    print(f"[Benchmark] target={target} (each engine in its own spawned process)")
+
+    t_res = None
+    c_res = None
+    if target in ("pytorch", "both"):
+        t_res = run_benchmark_child(pytorch_benchmark_child, config_path, "benchmark-pytorch")
+    if target in ("custom", "both"):
+        c_res = run_benchmark_child(custom_benchmark_child, config_path, "benchmark-custom")
+
+    if t_res is not None and c_res is not None:
+        print_head_to_head_report(
+            t_res, c_res,
+            epochs=c["epochs"],
+            n_train=len(c["X_train"]),
+            n_val=len(c["X_val"]),
+            backend=c["backend"],
+        )
+    else:
+        print_single_engine_report(
+            t_res if t_res is not None else c_res,
+            engine="pytorch" if t_res is not None else "custom",
+            epochs=c["epochs"],
+            n_train=len(c["X_train"]),
+            n_val=len(c["X_val"]),
+            backend=c["backend"],
+        )
 
 
 if __name__ == "__main__":
@@ -958,5 +1161,11 @@ if __name__ == "__main__":
         default=None,
         help="Path to YAML config (default: config/config.yaml)",
     )
+    parser.add_argument(
+        "--target",
+        choices=("pytorch", "custom", "both"),
+        default="both",
+        help="Which engine to run (default: both, each in a separate process)",
+    )
     args = parser.parse_args()
-    run_cnn_benchmark(config_path=args.config)
+    run_cnn_benchmark(config_path=args.config, target=args.target)

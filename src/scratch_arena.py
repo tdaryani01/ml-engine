@@ -126,6 +126,7 @@ class ScratchArena:
             if scratch.dx_buffer is not None:
                 scratch.dx_buffer[:n].fill(0.0)
 
+    
     def conv_block(self, layer_idx: int) -> ConvBlockScratch:
         if layer_idx not in self.conv_blocks:
             self.conv_blocks[layer_idx] = ConvBlockScratch()
@@ -141,6 +142,7 @@ class ScratchArena:
             self.maxpool[layer_idx] = MaxPoolScratch()
         return self.maxpool[layer_idx]
 
+    
     def ensure_conv_block_train(
         self,
         layer_idx: int,
@@ -251,7 +253,8 @@ class ScratchArena:
         scratch = self.conv_block(layer_idx)
         conv_out_h = (H + 2 * conv_pad - k_h) // conv_stride + 1
         conv_out_w = (W_logical + 2 * conv_pad - k_w) // conv_stride + 1
-        conv_out_w_stride = _round_up_simd(conv_out_w)
+        # Eval/predict: dense W like Torch (no SIMD pad). Train path still rounds.
+        conv_out_w_stride = conv_out_w
         pool_out_h = (conv_out_h - pool_size) // pool_stride + 1
         pool_out_w = (conv_out_w - pool_size) // pool_stride + 1
 
@@ -260,6 +263,7 @@ class ScratchArena:
             scratch.eval_cached_dtype == dtype
             and N <= scratch.eval_max_n
             and scratch.eval_out_conv_buffer is not None
+            and scratch.eval_out_conv_buffer.shape[3] == conv_out_w_stride
         ):
             return scratch
 

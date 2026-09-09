@@ -1,4 +1,4 @@
-﻿param (
+param (
     [string]$TargetScript = "run_pipeline.py",
     [string[]]$TargetCommand = @(),
     [switch]$EnableCProfile,

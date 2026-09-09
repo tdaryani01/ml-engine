@@ -93,6 +93,22 @@ class PersistenceConfig:
     model_asset_path: str
 
 @dataclass(frozen=True)
+class LedgerSettings:
+    """Phase E: append-only training document log (optional during fit)."""
+    enabled: bool = False
+    path: str = "training_ledger"
+    branch_id: str = "main"
+    checkpoint_every_steps: int = 50
+    checkpoint_on_local_best: bool = True
+    contract_list_enabled: bool = False  # Phase F: CNN contract-list path (off until proven)
+    # Independent of ledger I/O: native async submit for contract steps.
+    # Keep false on Linux for strict OMP thread caps unless measured.
+    native_async_submit: bool = False
+    # Pluggable persistence. Default = file_streaming (current SyncJournalWriter path).
+    # noop = tests / Docker (engine+contract, no journal I/O). Future: cache, queue, redis.
+    store_backend: str = "file_streaming"
+
+@dataclass(frozen=True)
 class DiagnosticsConfig:
     """Defines plotting and output properties for pipeline diagnostics."""
     enabled: bool
@@ -114,3 +130,4 @@ class PipelineConfig:
     transformations: TransformationsConfig
     persistence: PersistenceConfig
     diagnostics: DiagnosticsConfig
+    ledger: LedgerSettings = field(default_factory=LedgerSettings)

@@ -74,6 +74,7 @@ def load_production_config(file_path="config/config.yaml") -> PipelineConfig:
     # 4. Parse Remaining Nested Primitives
     fourier_obj = FourierConfig(**raw["transformations"]["fourier_expansion"])
     transform_obj = TransformationsConfig(fourier_expansion=fourier_obj)
+    ledger_obj = LedgerSettings(**raw.get("ledger", {}))
     
     return PipelineConfig(
         meta=MetaConfig(**raw["meta"]),
@@ -83,5 +84,6 @@ def load_production_config(file_path="config/config.yaml") -> PipelineConfig:
         regularization=RegularizationConfig(**raw["regularization"]),
         transformations=transform_obj,
         persistence=PersistenceConfig(**raw["persistence"]),
-        diagnostics=DiagnosticsConfig(**raw["diagnostics"])
+        diagnostics=DiagnosticsConfig(**raw["diagnostics"]),
+        ledger=ledger_obj,
     )

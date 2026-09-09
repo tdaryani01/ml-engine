@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import logging
 import os
@@ -81,6 +82,34 @@ class RuntimeSettings:
     env: Dict[str, str] = field(default_factory=dict)
     blas_threads: Dict[str, Optional[int]] = field(default_factory=dict)
     docker: Dict[str, object] = field(default_factory=dict)
+    omp_thread_limit: Optional[int] = None
+    # Resolved OpenMP team size. None => derive from num_threads / async
+    # (tests and callers that build RuntimeSettings by hand).
+    omp_threads: Optional[int] = None
+    # When True (config.yaml ledger.native_async_submit): default OMP team is
+    # num_threads-1 unless runtime OMP_NUM_THREADS pins a normal integer.
+    # OMP_THREAD_LIMIT / threadpoolctl stay at num_threads (full budget).
+    native_async_submit: bool = False
+
+    def effective_omp_threads(self) -> int:
+        """OpenMP team size (runtime OMP_NUM_THREADS auto|N, then async default)."""
+        if self.omp_threads is not None:
+            return int(self.omp_threads)
+        if self.native_async_submit:
+            return max(1, self.num_threads - 1)
+        return self.num_threads
+
+    def effective_omp_thread_limit(self) -> int:
+        """Hard OpenMP / threadpoolctl cap (OMP_THREAD_LIMIT).
+
+        Stays at the full machine budget (num_threads) even when async reserves
+        one thread for the main/Python driver — OMP team size is separate
+        (effective_omp_threads). So async + OMP_NUM_THREADS=auto with
+        num_threads=4 → limit=4, OMP_NUM_THREADS=3 (1 main + 3 OMP).
+        """
+        if self.omp_thread_limit is not None:
+            return int(self.omp_thread_limit)
+        return self.num_threads
 
     def blas_threads_for(self, backend: EngineBackend) -> int:
         key_map = {
@@ -91,25 +120,42 @@ class RuntimeSettings:
         key = key_map[backend]
         raw = self.blas_threads.get(key)
         if raw is None:
-            return self.num_threads
+            return self.effective_omp_threads()
         return int(raw)
 
     def omp_threads_for(self, backend: EngineBackend) -> int:
         """LLVM OpenMP thread count (shared with OpenBLAS for conv backends)."""
-        return self.num_threads
+        return self.effective_omp_threads()
 
     def process_env(self) -> Dict[str, str]:
         """Process-wide env before NumPy/SciPy first touch.
 
-        USE_OPENMP=1 OpenBLAS shares LLVM OMP — set OPENBLAS_NUM_THREADS=OMP_NUM_THREADS.
-        MKL/numba stay serial to avoid extra pools.
+        OPENBLAS_NUM_THREADS is process-global: numpy's and scipy's own,
+        separately-vendored OpenBLAS builds read it too (verified via
+        threadpoolctl -- this process loads three distinct OpenBLAS instances:
+        ours, numpy's, and scipy's). Our own bin/libopenblas.so does not need
+        this env var at all -- its thread count is set via a direct runtime
+        call (sync_openblas_thread_policy -> openblas_set_num_threads on our
+        loaded handle), independent of the environment. Mirroring OMP_NUM_THREADS
+        into this var here, before numpy/scipy have even been imported, makes
+        their separate pthreads pools latch onto that thread count at their own
+        first lazy init; a later per-backend cap back to 1 (threadpool_limits)
+        does not kill the already-spawned OS threads, leaving them alive as
+        low-utilization stragglers for the rest of the process (measured: a
+        3-thread config produced 8 live OS threads in uProf). Keep this var
+        serial here; conv backends never raise it, and non-conv backends that
+        legitimately want BLAS parallelism (e.g. NUMPY) get the correct value
+        later from _apply_fit_thread_env, before their own fit() runs.
         """
         merged = dict(self.env)
-        n = str(self.num_threads)
-        merged.setdefault("OMP_NUM_THREADS", n)
-        merged.setdefault("OMP_THREAD_LIMIT", n)
-        merged.setdefault("OPENBLAS_NUM_THREADS", n)
+        n = str(self.effective_omp_threads())
+        limit = str(self.effective_omp_thread_limit())
         serial = "1"
+        # Caller/runtime.yaml may already have set these; only fill gaps.
+        # Prefer values already resolved in load_runtime_settings (auto|N).
+        merged.setdefault("OMP_NUM_THREADS", n)
+        merged.setdefault("OMP_THREAD_LIMIT", limit)
+        merged.setdefault("OPENBLAS_NUM_THREADS", serial)
         for key in (
             "MKL_NUM_THREADS",
             "VECLIB_MAXIMUM_THREADS",
@@ -127,15 +173,107 @@ def _load_yaml(path: Path) -> dict:
         return yaml.safe_load(handle) or {}
 
 
+def _parse_positive_int(raw: object, *, field_name: str) -> int:
+    try:
+        value = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"{field_name} must be >= 1, got {value}")
+    return value
+
+
+def _optional_positive_int(raw: object, *, field_name: str) -> Optional[int]:
+    if raw is None:
+        return None
+    return _parse_positive_int(raw, field_name=field_name)
+
+
+def _parse_omp_num_threads_spec(raw: object) -> Optional[object]:
+    """Parse runtime OMP_NUM_THREADS: unset, \"auto\", or a positive int.
+
+    Returns None (unset), the string \"auto\", or an int >= 1.
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if text == "":
+        return None
+    if text.lower() == "auto":
+        return "auto"
+    return _parse_positive_int(text, field_name="runtime env OMP_NUM_THREADS")
+
+
+def _resolve_omp_team_size(
+    *,
+    num_threads: int,
+    native_async: bool,
+    omp_spec: Optional[object],
+) -> int:
+    """Resolve OpenMP team size from OMP_NUM_THREADS auto|N + async flag.
+
+    - unset or \"auto\": async → num_threads-1, sync → num_threads
+    - normal int N: use N as OMP_NUM_THREADS
+    """
+    if omp_spec is None or omp_spec == "auto":
+        if native_async:
+            return max(1, num_threads - 1)
+        return num_threads
+    return int(omp_spec)
+
+
 def _resolve_num_threads(
     config_path: Path,
+    runtime_raw: Mapping[str, object],
+    env: Mapping[str, str],
     *,
     num_threads: Optional[int] = None,
 ) -> int:
+    """Resolve full thread budget (OMP_THREAD_LIMIT default / machine budget).
+
+    Priority:
+      1. explicit load_runtime_settings(num_threads=...) / CLI --threads
+      2. runtime.yaml top-level num_threads (if provided)
+      3. config.yaml optimization.num_threads (default 4)
+
+    OMP_NUM_THREADS in runtime.yaml is not a budget source — it is the OpenMP
+    team size policy (\"auto\" | N); see _resolve_omp_team_size.
+    """
+    del env  # budget ignores OMP_NUM_THREADS; kept in signature for call sites
     if num_threads is not None:
-        return int(num_threads)
+        return _parse_positive_int(num_threads, field_name="num_threads")
+
+    rt_threads = _optional_positive_int(
+        runtime_raw.get("num_threads"),
+        field_name="runtime.num_threads",
+    )
+    if rt_threads is not None:
+        return rt_threads
+
     cfg = _load_yaml(config_path)
-    return int(cfg.get("optimization", {}).get("num_threads", 4))
+    return _parse_positive_int(
+        cfg.get("optimization", {}).get("num_threads", 4),
+        field_name="optimization.num_threads",
+    )
+
+
+def _resolve_omp_thread_limit(
+    runtime_raw: Mapping[str, object],
+    env: Mapping[str, str],
+) -> Optional[int]:
+    """Optional OMP_THREAD_LIMIT override; None means mirror num_threads."""
+    rt_limit = _optional_positive_int(
+        runtime_raw.get("omp_thread_limit"),
+        field_name="runtime.omp_thread_limit",
+    )
+    if rt_limit is not None:
+        return rt_limit
+
+    env_limit = env.get("OMP_THREAD_LIMIT")
+    if env_limit is not None and str(env_limit).strip() != "":
+        return _parse_positive_int(env_limit, field_name="runtime env OMP_THREAD_LIMIT")
+
+    return None
 
 
 def _merge_env_sections(raw: Mapping[str, object], platform: str) -> Dict[str, str]:
@@ -163,12 +301,17 @@ def load_runtime_settings(
     *,
     num_threads: Optional[int] = None,
     platform: Optional[str] = None,
+    native_async_submit: Optional[bool] = None,
 ) -> RuntimeSettings:
     cfg_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
     rt_path = Path(runtime_path) if runtime_path else DEFAULT_RUNTIME_PATH
     raw = _load_yaml(rt_path)
-    threads = _resolve_num_threads(cfg_path, num_threads=num_threads)
     resolved_platform = platform or detect_platform()
+    env = _merge_env_sections(raw, resolved_platform)
+    threads = _resolve_num_threads(
+        cfg_path, raw, env, num_threads=num_threads
+    )
+    omp_limit = _resolve_omp_thread_limit(raw, env)
 
     blas_section = raw.get("blas_threads") or {}
     if not isinstance(blas_section, Mapping):
@@ -178,12 +321,41 @@ def load_runtime_settings(
     if not isinstance(docker_section, Mapping):
         raise ValueError("runtime.docker must be a mapping")
 
+    cfg = _load_yaml(cfg_path)
+    ledger = cfg.get("ledger") or {}
+    native_async = (
+        bool(ledger.get("native_async_submit", False))
+        if isinstance(ledger, Mapping)
+        else False
+    )
+    if native_async_submit is not None:
+        native_async = bool(native_async_submit)
+
+    # OMP_NUM_THREADS: "auto" (or unset) | normal int. Async+auto => N-1.
+    omp_spec = _parse_omp_num_threads_spec(env.get("OMP_NUM_THREADS"))
+    omp_threads = _resolve_omp_team_size(
+        num_threads=threads,
+        native_async=native_async,
+        omp_spec=omp_spec,
+    )
+    # Cap stays at full budget (threadpoolctl / OMP_THREAD_LIMIT); team size is
+    # omp_threads. Async+auto: e.g. limit=4, OMP_NUM_THREADS=3.
+    omp_cap = omp_limit if omp_limit is not None else threads
+
+    # Keep resolved numeric values in env (never leave "auto" for libgomp).
+    env = dict(env)
+    env["OMP_NUM_THREADS"] = str(omp_threads)
+    env["OMP_THREAD_LIMIT"] = str(omp_cap)
+
     return RuntimeSettings(
         num_threads=threads,
         platform=resolved_platform,
-        env=_merge_env_sections(raw, resolved_platform),
+        env=env,
         blas_threads={str(k): (None if v is None else int(v)) for k, v in blas_section.items()},
         docker=dict(docker_section),
+        omp_thread_limit=omp_limit,
+        omp_threads=omp_threads,
+        native_async_submit=native_async,
     )
 
 
@@ -204,31 +376,95 @@ def apply_process_env(
     return applied
 
 
+@contextmanager
+def current_thread_omp_threads(num_threads: int) -> Iterator[None]:
+    """Temporarily set libgomp's nthreads-var for the current Python thread.
+
+    This is intentionally not `configure_native_threads()`: that API updates the
+    process-wide native policy. OpenMP's `omp_set_num_threads` updates the
+    current task's nthreads-var, which lets validation/predict run serially on
+    the Python thread while a persistent native async worker owns the parallel
+    conv team.
+    """
+    if sys.platform == "win32":
+        yield
+        return
+
+    try:
+        libgomp = ctypes.CDLL("libgomp.so.1")
+        libgomp.omp_get_max_threads.restype = ctypes.c_int
+        libgomp.omp_set_num_threads.argtypes = [ctypes.c_int]
+        previous = int(libgomp.omp_get_max_threads())
+    except Exception:
+        yield
+        return
+
+    libgomp.omp_set_num_threads(max(1, int(num_threads)))
+    try:
+        yield
+    finally:
+        libgomp.omp_set_num_threads(max(1, previous))
+
+
 def _shared_omp_fit(backend: EngineBackend) -> bool:
-    """native / im2col+gemm: one LLVM OMP pool for conv, im2col, and GEMM."""
-    return backend in _CONV_BACKENDS
+    """True only when native/im2col+gemm actually share one LLVM OMP pool with GEMM.
+
+    Requires both: backend is a conv backend, AND bin/libopenblas was built with
+    USE_OPENMP=1 and is loaded (native_blas_unified_omp()). If bin/libopenblas.so
+    is missing or not unified (e.g. Docker image built without it), numpy's own
+    wheel-vendored OpenBLAS is a *second*, uncoordinated pthread pool -- mirroring
+    the OMP thread count into it double-counts hardware threads (measured: a
+    4-thread config produced 7 live OS threads in that case).
+    """
+    if backend not in _CONV_BACKENDS:
+        return False
+    from utils.conv_dispatch import native_blas_unified_omp
+    return native_blas_unified_omp()
 
 
 def _apply_fit_thread_env(settings: RuntimeSettings, backend: EngineBackend) -> Dict[str, str]:
     """Backend-specific thread caps during fit."""
     omp = settings.omp_threads_for(backend)
-    shared = _shared_omp_fit(backend)
+    omp_limit = settings.effective_omp_thread_limit()
+    is_conv_backend = backend in _CONV_BACKENDS
     serial = "1"
+    # OPENBLAS_NUM_THREADS is a *process-global* env var: every OpenBLAS build
+    # loaded in the process reads it at its own first lazy init, not just ours.
+    # This process has up to three separate OpenBLAS instances (verified via
+    # threadpoolctl): our own bin/libopenblas.so (openmp-threaded, unified with
+    # the conv OMP pool when native_blas_unified_omp() is True) plus numpy's and
+    # scipy's independently-vendored copies (pthreads-threaded, never unified).
+    # Our own library's thread count is set via a direct runtime call
+    # (sync_openblas_thread_policy -> openblas_set_num_threads on our loaded
+    # handle, see blas_dynamic.cpp) and does NOT need this env var at all. If we
+    # mirror `omp` into it here, numpy's/scipy's separate pthreads pools read
+    # the same value at their own lazy init and spawn that many OS threads;
+    # threadpool_limits() later caps their *active* thread count back to 1, but
+    # the already-spawned idle pthreads don't get killed -- they stick around
+    # as extra, low-utilization OS threads for the rest of the process
+    # (measured: 3 configured OMP threads -> 8 live threads in uProf, with the
+    # extra ones tracking 1:1 with numpy's + scipy's separate OpenBLAS pools).
+    # Keep this env var serial always; it never legitimately needs to be >1.
+    if is_conv_backend:
+        openblas_env = serial
+        blas_env = serial
+    else:
+        openblas_env = str(settings.blas_threads_for(backend))
+        blas_env = openblas_env
     overrides = {
         "OMP_NUM_THREADS": str(omp),
-        "OMP_THREAD_LIMIT": str(omp),
-        "OPENBLAS_NUM_THREADS": str(omp if shared else settings.blas_threads_for(backend)),
+        "OMP_THREAD_LIMIT": str(omp_limit),
+        "OPENBLAS_NUM_THREADS": openblas_env,
     }
     if omp > 1:
         # LLVM OpenMP on Windows honors KMP_DEVICE_THREAD_LIMIT; =1 causes OMP warning #96.
         overrides["KMP_DEVICE_THREAD_LIMIT"] = str(omp)
-    blas_env = serial if shared else str(settings.blas_threads_for(backend))
     overrides.update({
         "MKL_NUM_THREADS": blas_env,
         "NUMEXPR_NUM_THREADS": blas_env,
         "VECLIB_MAXIMUM_THREADS": blas_env,
     })
-    if backend in _CONV_BACKENDS:
+    if is_conv_backend:
         overrides["NUMBA_NUM_THREADS"] = serial
     for key, value in overrides.items():
         os.environ[key] = value
@@ -287,7 +523,12 @@ def log_runtime_settings(
     blas = settings.blas_threads_for(backend)
     omp = settings.omp_threads_for(backend)
     shared = _shared_omp_fit(backend)
-    openblas_fit = omp if shared else blas
+    is_conv_backend = backend in _CONV_BACKENDS
+    # For conv backends, process-global BLAS env vars stay serial so numpy/scipy
+    # wheel BLAS pools cannot spawn extra pthreads. Our own bin/libopenblas.so,
+    # when present and unified, is controlled by a direct native runtime call.
+    openblas_fit = omp if (is_conv_backend and shared) else (1 if is_conv_backend else blas)
+    scipy_blas_fit = 1 if is_conv_backend else blas
     if settings.platform == "windows":
         kmp_limit = os.environ.get("KMP_DEVICE_THREAD_LIMIT", "?")
         tune = (
@@ -312,10 +553,15 @@ def log_runtime_settings(
         policy = "conv_omp"
     else:
         policy = backend.value
+    async_note = (
+        f" async_reserve=1 (omp={omp} of {settings.num_threads})"
+        if settings.native_async_submit
+        else ""
+    )
     msg = (
         f"{prefix} platform={settings.platform} num_threads={settings.num_threads} "
-        f"backend={backend.value} policy={policy} omp_during_fit={omp} "
-        f"openblas_during_fit={openblas_fit} scipy_blas_during_fit={1 if shared else blas} "
+        f"backend={backend.value} policy={policy} omp_during_fit={omp}{async_note} "
+        f"openblas_during_fit={openblas_fit} scipy_blas_during_fit={scipy_blas_fit} "
         f"dll_omp={dll_omp_s} im2col_cap={im2col_cap_s} unified_omp={unified_s} {tune}"
     )
     print(msg)
@@ -360,10 +606,13 @@ def training_threadpool(
 
     prev_numba_threads: Optional[int] = None
     if backend in _CONV_BACKENDS:
-        import numba
-
-        prev_numba_threads = numba.get_num_threads()
-        numba.set_num_threads(1)
+        try:
+            import numba
+        except ImportError:
+            numba = None  # type: ignore[assignment]
+        if numba is not None:
+            prev_numba_threads = numba.get_num_threads()
+            numba.set_num_threads(1)
 
     prev_env = {key: os.environ.get(key) for key in _FIT_THREAD_ENV_KEYS}
     _apply_fit_thread_env(settings, backend)
@@ -416,8 +665,11 @@ def configure_runtime(
     if backend in _CONV_BACKENDS:
         from utils.conv_dispatch import bootstrap_im2col_gemm_runtime
         bootstrap_im2col_gemm_runtime()
-        import numba
-        numba.set_num_threads(1)
+        try:
+            import numba
+            numba.set_num_threads(1)
+        except ImportError:
+            pass
     _apply_fit_thread_env(settings, backend)
     _sync_native_dll_threads(settings, backend)
     if log:

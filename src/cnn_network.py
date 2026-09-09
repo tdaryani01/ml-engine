@@ -1,18 +1,17 @@
 # src/cnn_network.py
-import builtins
 import logging
+
 import numpy as np
 from config.constants import EngineBackend
+from src.contract import cnn_contract_factory
 from src.scratch_arena import ScratchArena
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten, ConvBlock
+from src.trainable_model import TrainableModel
 from src.training_cache import ForwardCache, new_forward_cache
 from utils.engine_ops import create_engine_context
 
-if 'profile' not in builtins.__dict__:
-    builtins.__dict__['profile'] = lambda x: x
 
-
-class CNNNetwork:
+class CNNNetwork(TrainableModel):
     """
     Modular Convolutional Neural Network engine.
     Automatically identifies and constructs fused ConvBlocks (Conv2D -> ReLU -> MaxPool2D)
@@ -22,17 +21,28 @@ class CNNNetwork:
                  backend: EngineBackend = EngineBackend.NATIVE,
                  engine_ctx=None,
                  lam_l1: float = 0.01, lam_l2: float = 0.01, p_dropout: float = 0.0,
-                 max_norm: float = 5.0, task_type: str = "multiclass", **kwargs):
+                 max_norm: float = 5.0, task_type: str = "multiclass",
+                 input_logical_w: int | None = None, **kwargs):
+        contract_list_enabled = bool(kwargs.pop("contract_list_enabled", False))
+        native_async_submit = bool(kwargs.pop("native_async_submit", False))
+        contract_factory = kwargs.pop("contract_factory", None) or cnn_contract_factory
+        super().__init__(
+            optimizer_instance,
+            lam_l1=lam_l1,
+            lam_l2=lam_l2,
+            p_dropout=p_dropout,
+            max_norm=max_norm,
+            contract_list_enabled=False,
+            native_async_submit=native_async_submit,
+            contract_factory=contract_factory,
+            **kwargs,
+        )
         self.engine_ctx = engine_ctx or create_engine_context(backend)
         self.backend = self.engine_ctx.backend
         self.scratch_arena = ScratchArena(self.backend)
-        self.optimizer = optimizer_instance
-        self.lam_l1 = lam_l1
-        self.lam_l2 = lam_l2
-        self.p_dropout = p_dropout
-        self.max_norm = max_norm
         self.task_type = task_type
-        self.diagnostic_counter = 0
+        # Logical W before SIMD row pad (e.g. 28 in stride-32, 124 in stride-128).
+        self.input_logical_w = input_logical_w
 
         self.layers = []
         self.weights = []
@@ -69,6 +79,9 @@ class CNNNetwork:
             if isinstance(layer, (ConvBlock, Conv2D)):
                 self._layer_param_idx[li] = self.param_layers.index(layer)
         self._train_cache: ForwardCache | None = None
+        # Contract needs layer indices — enable after spatial/dense build.
+        if contract_list_enabled:
+            self.enable_contract_list(native_async_submit=native_async_submit)
 
     @property
     def layer_sizes(self) -> list:
@@ -363,6 +376,7 @@ class CNNNetwork:
             return float(-np.sum(y * np.log(clipped) + (1.0 - y) * np.log(1.0 - clipped)) / m)
         return float(np.sum((output - y) ** 2) / (2.0 * m))
 
+    
     def compute_total_loss(self, output: np.ndarray, y: np.ndarray) -> float:
         raw_cost = self.calculate_raw_cost(output, y)
         m = y.shape[0]
@@ -486,6 +500,7 @@ class CNNNetwork:
         loss = self.compute_total_loss(output, y)
         return loss, grad_weights, grad_biases, m, None, None
 
+    
     def _apply_grads(
         self,
         grad_weights,
@@ -515,4 +530,17 @@ class CNNNetwork:
         return self._backward_from_cache(cache, y, active_lr)
 
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
-        return self._forward(processed_data, training=False)
+        X = processed_data
+        # Crop SIMD W-halo for Torch densify / paths that want logical width only.
+        logical = getattr(self, "input_logical_w", None)
+        if logical is None and X.ndim == 4 and X.shape[3] == 32:
+            logical = 28
+        if X.ndim == 4 and logical is not None and X.shape[3] > int(logical):
+            X = np.ascontiguousarray(X[:, :, :, : int(logical)])
+
+        if (
+            self._contract_runtime is not None
+            and self._contract_runtime.uses_async_forward()
+        ):
+            return self._contract_runtime.run_async_forward(X)
+        return self._forward(X, training=False)

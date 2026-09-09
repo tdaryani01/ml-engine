@@ -1,22 +1,27 @@
 # src/base_network.py
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 import logging
 import numpy as np
 
-class BaseNeuralNetwork(ABC):
+from src.trainable_model import TrainableModel
+
+class BaseNeuralNetwork(TrainableModel):
     """
-    Abstract base class for a custom multi-layer neural network implemented from scratch using NumPy.
-    Supports L1/L2 regularization, dropout, batch normalization, and configurable optimizers.
+    Dense MLP trainable model (NumPy). Shares TrainableModel with CNN for
+    session/engine/contract attachment; subclasses supply task heads.
     """
-    def __init__(self, layer_sizes, optimizer_instance, lam_l1=0.01, lam_l2=0.01, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9, max_norm=5.0) -> None:
-        self.optimizer = optimizer_instance  
-        self.lam_l1 = lam_l1
-        self.lam_l2 = lam_l2
-        self.p_dropout = p_dropout
+    def __init__(self, layer_sizes, optimizer_instance, lam_l1=0.01, lam_l2=0.01, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9, max_norm=5.0, **kwargs) -> None:
+        super().__init__(
+            optimizer_instance,
+            lam_l1=lam_l1,
+            lam_l2=lam_l2,
+            p_dropout=p_dropout,
+            max_norm=max_norm,
+            **kwargs,
+        )
         self.layer_sizes = layer_sizes
         self.use_batch_norm = use_batch_norm
         self.bn_momentum = bn_momentum
-        self.max_norm = max_norm
         self.eps = 1e-5
         
         self.weights = []
@@ -27,8 +32,6 @@ class BaseNeuralNetwork(ABC):
         self.betas = []
         self.running_means = []
         self.running_vars = []
-        
-        self.diagnostic_counter = 0
         
         # Initialize weights and biases using Xavier/Glorot uniform initialization
         for i in range(len(layer_sizes) - 1):

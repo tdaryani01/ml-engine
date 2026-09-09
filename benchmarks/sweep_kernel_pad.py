@@ -24,6 +24,7 @@ from benchmarks.benchmark_cnn import (
     validate_cnn_spatial_geometry,
 )
 from config.constants import DataKeys
+from config.schema import LedgerSettings
 
 
 class _Tee(TextIO):
@@ -236,6 +237,11 @@ def run_sweep(
     min_delta = float(cfg_dict["optimization"].get("min_delta", 1e-4))
     lr_scheduler_type = cfg_dict["optimization"].get("lr_scheduler", "none")
     data_path = cfg_dict["ingestion"]["data_file_path"]
+    # Match bare-metal / docker: ledger from config (noop + contract_list_enabled).
+    ledger_settings = LedgerSettings(**(cfg_dict.get("ledger") or {}))
+    output_dir = str(
+        (cfg_dict.get("meta") or {}).get("output_dir", "diagnostics_output")
+    )
 
     X_train = data_provider.splits[DataKeys.X_TRAIN]
     y_train = data_provider.splits[DataKeys.Y_TRAIN]
@@ -359,6 +365,9 @@ def run_sweep(
                     min_delta=min_delta,
                     backend=backend,
                     num_threads=num_threads,
+                    config_path=config_path,
+                    ledger_settings=ledger_settings,
+                    output_dir=output_dir,
                 )
 
                 print(format_head_to_head_report(

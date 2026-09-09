@@ -9,6 +9,7 @@ from src.serializer import ModelSerializer
 from src.schedulers import StepDecay, ExponentialDecay
 from src.training_session import TrainingSession
 from config.constants import ModelType, LRHierarchy, EngineBackend
+from config.schema import LedgerSettings
 
 
 class ModelController:
@@ -143,13 +144,66 @@ class ModelController:
         model_type: ModelType,
         early_stopping_enabled: bool = True,
         patience: int = 15,
-        min_delta: float = 1e-5
+        min_delta: float = 1e-5,
+        ledger_settings: LedgerSettings | None = None,
+        output_dir: str = "diagnostics_output",
+        max_epochs: int | None = None,
     ) -> Tuple[List[float], List[float]]:
         """Executes the training loop via TrainingSession (Phase C boundary)."""
         if self.model is None:
             raise ValueError("[Model Controller] Execution Error: Cannot call fit before initializing the network.")
         if self.data_provider is None:
             raise ValueError("[Model Controller] Execution Error: No data_provider bound to controller.")
+
+        engine = None
+        if ledger_settings is not None and ledger_settings.enabled:
+            import os
+
+            from src.ledger import LedgerConfig
+            from src.training_engine import create_training_engine
+
+            ledger_dir = os.path.join(output_dir, ledger_settings.path)
+            arch_id = model_type.name if hasattr(model_type, "name") else str(model_type)
+            engine = create_training_engine(
+                ledger_dir,
+                branch_id=ledger_settings.branch_id,
+                model_instance_id=ledger_settings.branch_id,
+                architecture_id=arch_id,
+                config=LedgerConfig(
+                    checkpoint_every_steps=ledger_settings.checkpoint_every_steps,
+                    checkpoint_on_local_best=ledger_settings.checkpoint_on_local_best,
+                    contract_list_enabled=ledger_settings.contract_list_enabled,
+                    native_async_submit=ledger_settings.native_async_submit,
+                    store_backend=ledger_settings.store_backend,
+                ),
+            )
+            logging.info("[Model Controller] Training ledger enabled: %s", ledger_dir)
+            try:
+                session = engine.start_session(
+                    model=self.model,
+                    data_provider=self.data_provider,
+                    initial_lr=self.initial_lr,
+                    scheduler=self.scheduler,
+                    predict_fn=self.predict,
+                    steps_completed=self.steps_completed,
+                    steps=steps,
+                    source_mode=source_mode,
+                    model_type=model_type,
+                    early_stopping_enabled=early_stopping_enabled,
+                    patience=patience,
+                    min_delta=min_delta,
+                    compute_r2_score=self.compute_r2_score,
+                    max_epochs=max_epochs,
+                )
+                results = engine.run()
+                hist = results.get(session.session_id)
+                if hist is None:
+                    hist = (list(session.train_history), list(session.val_history))
+                self.train_history, self.val_history = hist
+                self.steps_completed = session.steps_completed
+            finally:
+                engine.close()
+            return self.train_history, self.val_history
 
         session = TrainingSession(
             model=self.model,
@@ -159,6 +213,7 @@ class ModelController:
             predict_fn=self.predict,
         )
         session.steps_completed = self.steps_completed
+
         self.train_history, self.val_history = session.fit(
             steps=steps,
             source_mode=source_mode,
@@ -167,6 +222,8 @@ class ModelController:
             patience=patience,
             min_delta=min_delta,
             compute_r2_score=self.compute_r2_score,
+            engine=None,
+            max_epochs=max_epochs,
         )
         self.steps_completed = session.steps_completed
         return self.train_history, self.val_history

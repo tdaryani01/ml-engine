@@ -388,7 +388,7 @@ void im2col_one_row(
 
 extern "C" {
 
-__declspec(dllexport) int32_t im2col_avx2(
+ML_ENGINE_EXPORT int32_t im2col_avx2(
     const float* x,
     float* out,
     int64_t N,
@@ -456,7 +456,7 @@ __declspec(dllexport) int32_t im2col_avx2(
     return 0;
 }
 
-__declspec(dllexport) int32_t col2im_avx2(
+ML_ENGINE_EXPORT int32_t col2im_avx2(
     const float* col,
     float* dx,
     int64_t N,

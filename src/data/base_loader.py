@@ -32,12 +32,17 @@ class BaseDataLoader(ABC):
         is_cnn = (cfg.architecture.model_type == ModelType.CNN)
 
         if is_cnn:
-            cnn_cfg = getattr(cfg.architecture, "cnn", {})
+            cnn_cfg = getattr(cfg.architecture, "cnn", None) or {}
+            if hasattr(cnn_cfg, "input_shape"):
+                input_shape = list(cnn_cfg.input_shape)
+            else:
+                input_shape = list(cnn_cfg.get("input_shape", [3, 128, 128]))
             return ImageCSVLoader(
                 csv_path=cfg.ingestion.data_file_path,
-                input_shape=cnn_cfg.get("input_shape", [1, 28, 28]),
+                input_shape=input_shape,
                 num_classes=cfg.architecture.num_classes,
-                val_split=cfg.ingestion.splits.val
+                val_split=cfg.ingestion.splits.val,
+                train_split=cfg.ingestion.splits.train,
             )
 
         source_mode = getattr(cfg.ingestion, "source_mode", None)

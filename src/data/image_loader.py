@@ -32,8 +32,11 @@ def _pad_simd_width(X: np.ndarray, target_align: int = 8) -> np.ndarray:
 
 class ImageCSVLoader(BaseDataLoader):
     """
-    Parses flattened CSV image datasets into 4D spatial tensors (N, Channels, Height, Width_aligned)
-    and one-hot encoded label matrices.
+    Parses flattened CSV *or* NPZ image datasets into 4D spatial tensors
+    (N, Channels, Height, Width_aligned) and one-hot encoded label matrices.
+
+    NPZ schema (preferred for >=64²): keys `X` (N,C,H,W float32) and `y` (N,) int.
+    CSV schema: flattened pixels + trailing `target` column.
     """
 
     def __init__(
@@ -42,27 +45,52 @@ class ImageCSVLoader(BaseDataLoader):
         input_shape: List[int],
         num_classes: int,
         val_split: float = 0.15,
+        train_split: Optional[float] = None,
         random_state: int = 42
     ):
         self.csv_path = csv_path
         self.input_shape = input_shape
         self.num_classes = num_classes
         self.val_split = val_split
+        # If train_split is set, use train+val counts; leftover (e.g. test) is dropped.
+        # If None, all non-val samples go to train (legacy behavior).
+        self.train_split = train_split
         self.random_state = random_state
 
-    def load_splits(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _load_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
         if not os.path.exists(self.csv_path):
-            raise FileNotFoundError(f"[Image Loader Error] CSV dataset file not found at: {self.csv_path}")
+            raise FileNotFoundError(f"[Image Loader Error] Dataset file not found at: {self.csv_path}")
 
         channels, height, width = self.input_shape
         expected_features = channels * height * width
+        path_lower = self.csv_path.lower()
+
+        if path_lower.endswith(".npz"):
+            logger.info(f"[Image Loader] Ingesting NPZ image dataset from: {self.csv_path}")
+            with np.load(self.csv_path) as blob:
+                if "X" not in blob or "y" not in blob:
+                    raise ValueError("[Image Loader Error] NPZ must contain arrays 'X' and 'y'.")
+                X = np.asarray(blob["X"], dtype=np.float32)
+                y_raw = np.asarray(blob["y"], dtype=np.int32).reshape(-1)
+            if X.ndim != 4:
+                raise ValueError(f"[Image Loader Error] NPZ X must be NCHW, got shape {X.shape}")
+            if tuple(X.shape[1:]) != (channels, height, width):
+                raise ValueError(
+                    f"[Image Loader Error] NPZ spatial shape {X.shape[1:]} != input_shape "
+                    f"{(channels, height, width)}"
+                )
+            if X.shape[0] != y_raw.shape[0]:
+                raise ValueError("[Image Loader Error] NPZ X/y length mismatch.")
+            return X, y_raw
 
         logger.info(f"[Image Loader] Ingesting CSV image dataset from: {self.csv_path}")
-        logger.info(f"[Image Loader] Expected Shape: ({channels}, {height}, {width}) | Total Features: {expected_features}")
+        logger.info(
+            f"[Image Loader] Expected Shape: ({channels}, {height}, {width}) | "
+            f"Total Features: {expected_features}"
+        )
 
         pixels = []
         labels = []
-
         with open(self.csv_path, "r", encoding="utf-8") as f:
             reader = csv.reader(f)
             next(reader)  # Skip header
@@ -74,33 +102,51 @@ class ImageCSVLoader(BaseDataLoader):
 
         X_raw = np.array(pixels, dtype=np.float32)
         y_raw = np.array(labels, dtype=np.int32)
-        n_samples = X_raw.shape[0]
-
         if X_raw.shape[1] != expected_features:
             raise ValueError(
                 f"[Image Loader Error] Feature dimension mismatch! CSV has {X_raw.shape[1]} features, "
                 f"but input_shape requires {expected_features}."
             )
+        X = X_raw.reshape(X_raw.shape[0], channels, height, width)
+        return X, y_raw
 
-        # Reshape to 4D spatial tensors and pad width to SIMD boundary
-        X = X_raw.reshape(n_samples, channels, height, width)
+    def load_splits(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        channels, height, width = self.input_shape
+        X, y_raw = self._load_arrays()
+        n_samples = X.shape[0]
+
+        # Pad width to SIMD boundary
         X = _pad_simd_width(X, target_align=8)
 
         # One-hot encode targets
         y = np.zeros((n_samples, self.num_classes), dtype=np.float32)
+        if y_raw.min() < 0 or y_raw.max() >= self.num_classes:
+            raise ValueError(
+                f"[Image Loader Error] Label out of range for num_classes={self.num_classes}: "
+                f"[{y_raw.min()}, {y_raw.max()}]"
+            )
         y[np.arange(n_samples), y_raw] = 1.0
 
         # Partition Train / Validation
+        rng = np.random.default_rng(self.random_state)
         indices = np.arange(n_samples)
-        np.random.shuffle(indices)
+        rng.shuffle(indices)
 
         val_count = int(n_samples * self.val_split)
-        val_idx, train_idx = indices[:val_count], indices[val_count:]
+        if self.train_split is not None:
+            train_count = int(n_samples * self.train_split)
+            train_idx = indices[:train_count]
+            val_idx = indices[train_count : train_count + val_count]
+        else:
+            val_idx, train_idx = indices[:val_count], indices[val_count:]
 
         X_train, y_train = X[train_idx], y[train_idx]
         X_val, y_val = X[val_idx], y[val_idx]
 
-        logger.info(f"[Image Loader] Dataset loaded: Train={X_train.shape}, Val={X_val.shape}")
+        logger.info(
+            f"[Image Loader] Dataset loaded ({channels}x{height}x{width}): "
+            f"Train={X_train.shape}, Val={X_val.shape}"
+        )
         return X_train, y_train, X_val, y_val
 
 

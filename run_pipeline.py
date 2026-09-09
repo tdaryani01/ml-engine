@@ -1,4 +1,11 @@
 # run_pipeline.py
+import builtins
+
+try:
+    profile  # noqa: F821 — injected by kernprof -l
+except NameError:
+    builtins.profile = lambda f: f
+
 import logging
 import sys
 
@@ -25,7 +32,7 @@ from utils.diagnostics import NeuralNetworkDiagnostics
 
 import numpy as np
 
-@profile
+
 def execute_training_pipeline():
     """Hydrates configuration, initializes logging, sets up data providers, builds network topology, and executes training."""
     # 1. Hydrate the immutable, typed configuration object from YAML
@@ -134,7 +141,9 @@ def execute_training_pipeline():
             model_type=cfg.architecture.model_type,
             early_stopping_enabled=cfg.optimization.early_stopping_enabled,
             patience=cfg.optimization.patience,
-            min_delta=cfg.optimization.min_delta
+            min_delta=cfg.optimization.min_delta,
+            ledger_settings=cfg.ledger,
+            output_dir=cfg.meta.output_dir,
         )
 
         if cfg.architecture.backend == EngineBackend.IM2COL_GEMM:

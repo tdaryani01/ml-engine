@@ -1,0 +1,6 @@
+# Head-to-head sweeps need native + Torch in one process.
+# Isolated `run` still uses separate pytorch / custom images.
+FROM ml-engine-custom-bench:latest
+
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu \
+    torch

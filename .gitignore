@@ -32,8 +32,16 @@ diagnostics_output/
 benchmark_diagnostics/
 profiler_results/
 uprof_reports/
+uprof_reports_*/
+uprof_sessions/
+.ri
+option_b_verify/*.npy
+option_b_verify/option_d_microbench
 *.log
 *.prof
+*.lprof
+*.pstat
+*.callgrind
 *.dat
 
 # Vendored sources and local CMake/make trees (not tracked)

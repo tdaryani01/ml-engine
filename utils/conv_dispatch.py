@@ -597,7 +597,10 @@ def init_engine_backend(backend: EngineBackend = EngineBackend.NATIVE):
             ctypes.c_int64,   # 22. pool_stride
             ctypes.c_int64,   # 23. pool_out_h
             ctypes.c_int64,   # 24. pool_out_w
-            ctypes.c_float    # 25. inv_m
+            ctypes.c_float,   # 25. inv_m
+            ctypes.c_int64,   # 26. d_conv_prezeroed
+            ctypes.c_int64,   # 27. dx_prezeroed
+            ctypes.c_int64,   # 28. dw_prezeroed
         ]
 
         # 3. Direct Conv2D Standalone Primitives
@@ -823,7 +826,7 @@ def _pack_w_gemm_fwd(W: np.ndarray, buf: np.ndarray | None = None) -> np.ndarray
 # -----------------------------------------------------------------------------
 # Composite Block Routines
 # -----------------------------------------------------------------------------
-# @profile
+# 
 def conv_block_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
                        out_conv_buf: np.ndarray, out_pool_buf: np.ndarray, argmax_buf: np.ndarray,
                        conv_stride: int = 1, conv_pad: int = 1,
@@ -881,7 +884,7 @@ def conv_block_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
     )
     return out_pool, out_conv, argmax, col
 
-# @profile
+# 
 def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
                         x: np.ndarray, W: np.ndarray, conv_act: np.ndarray,
                         d_conv_buf: np.ndarray, dx_buf: np.ndarray, dW_buf: np.ndarray, db_buf: np.ndarray,
@@ -922,7 +925,10 @@ def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
                 int(conv_stride), int(conv_pad), int(conv_out_w_stride),
                 int(pool_size), int(pool_stride),
                 int(pool_out_h), int(pool_out_w),
-                ctypes.c_float(inv_m)
+                ctypes.c_float(inv_m),
+                0,  # d_conv_prezeroed (sync path zeros in native)
+                0,  # dx_prezeroed
+                0,  # dw_prezeroed
             )
             if status == 0:
                 return dx_buf, dW_buf, db_buf
@@ -960,7 +966,7 @@ def conv_block_backward(dout_pool: np.ndarray, argmax_buf: np.ndarray,
 # -----------------------------------------------------------------------------
 # Standalone Layer Routines
 # -----------------------------------------------------------------------------
-# @profile
+# 
 def conv2d_forward(x: np.ndarray, W: np.ndarray, bias: np.ndarray,
                    stride: int, pad: int, out_buf: np.ndarray,
                    col_buf: np.ndarray = None, gemm_buf: np.ndarray = None,

@@ -13,6 +13,6 @@ tmp/
 __pycache__/
 benchmark_diagnostics/
 bin/
-data/
+/data/samples/
 diagnostics_output/
 uprof_reports/
