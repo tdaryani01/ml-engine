@@ -1,4 +1,4 @@
-// mhsa_kernels.cpp — Naive causal MHSA forward/backward; BLAS for projections.
+// mhsa_kernels.cpp — Naive multi-layer causal MHSA; BLAS for projections.
 #include "mhsa_kernels.h"
 #include "blas_dynamic.h"
 
@@ -11,7 +11,7 @@ namespace {
 constexpr float kEps = 1e-5f;
 
 inline float gelu(float x) {
-    const float k = 0.7978845608f;  // sqrt(2/pi)
+    const float k = 0.7978845608f;
     const float x3 = x * x * x;
     return 0.5f * x * (1.0f + std::tanh(k * (x + 0.044715f * x3)));
 }
@@ -51,16 +51,14 @@ void layernorm_rows(
     }
 }
 
-// dy → dx, accumulates dgamma/dbeta. Uses y as LN output (to recover xhat).
 void layernorm_rows_bwd(
-    const float* x, const float* y, const float* gamma,
+    const float* x, const float* /*y*/, const float* gamma,
     const float* dy, float* dx,
     float* dgamma, float* dbeta,
     int64_t rows, int64_t D
 ) {
     for (int64_t r = 0; r < rows; ++r) {
         const float* xr = x + r * D;
-        const float* yr = y + r * D;
         const float* dyr = dy + r * D;
         float* dxr = dx + r * D;
 
@@ -75,18 +73,15 @@ void layernorm_rows_bwd(
         var /= static_cast<float>(D);
         const float inv = 1.0f / std::sqrt(var + kEps);
 
-        // xhat from y: (y - beta) / gamma, with safe gamma
         float sum_dy = 0.0f;
         float sum_dy_xhat = 0.0f;
         for (int64_t d = 0; d < D; ++d) {
             const float xhat = (xr[d] - mean) * inv;
-            const float g = gamma[d];
             dgamma[d] += dyr[d] * xhat;
             dbeta[d] += dyr[d];
-            const float dxhat = dyr[d] * g;
+            const float dxhat = dyr[d] * gamma[d];
             sum_dy += dxhat;
             sum_dy_xhat += dxhat * xhat;
-            (void)yr;
         }
         const float inv_D = 1.0f / static_cast<float>(D);
         for (int64_t d = 0; d < D; ++d) {
@@ -100,9 +95,7 @@ void layernorm_rows_bwd(
 void add_bias_rows(float* y, const float* b, int64_t rows, int64_t cols) {
     for (int64_t r = 0; r < rows; ++r) {
         float* yr = y + r * cols;
-        for (int64_t c = 0; c < cols; ++c) {
-            yr[c] += b[c];
-        }
+        for (int64_t c = 0; c < cols; ++c) yr[c] += b[c];
     }
 }
 
@@ -113,9 +106,7 @@ void residual_add(float* y, const float* x, int64_t n) {
 void accumulate_bias_grad(const float* dy, float* db, int64_t rows, int64_t cols) {
     for (int64_t r = 0; r < rows; ++r) {
         const float* yr = dy + r * cols;
-        for (int64_t c = 0; c < cols; ++c) {
-            db[c] += yr[c];
-        }
+        for (int64_t c = 0; c < cols; ++c) db[c] += yr[c];
     }
 }
 
@@ -130,72 +121,64 @@ int32_t require_blas_ready() {
     return 0;
 }
 
+bool layer_ok_fwd(const MhsaLayerBind* L) {
+    return L && L->W_qkv && L->b_qkv && L->W_o && L->b_o && L->W_ff1 && L->b_ff1 &&
+           L->W_ff2 && L->b_ff2 && L->ln1_gamma && L->ln1_beta && L->ln2_gamma &&
+           L->ln2_beta && L->qkv && L->scores && L->attn_out && L->ln1_out && L->h1 &&
+           L->ln2_out && L->ffn_pre && L->ffn_h && L->O;
+}
+
+bool layer_ok_bwd(const MhsaLayerBind* L) {
+    return layer_ok_fwd(L) && L->dW_qkv && L->db_qkv && L->dW_o && L->db_o &&
+           L->dW_ff1 && L->db_ff1 && L->dW_ff2 && L->db_ff2 && L->d_ln1_gamma &&
+           L->d_ln1_beta && L->d_ln2_gamma && L->d_ln2_beta;
+}
+
 bool bind_ok_fwd(const MhsaBinding* m) {
-    return m && m->W_qkv && m->O && m->qkv && m->scores && m->attn_out &&
-           m->ln1_out && m->h1 && m->ln2_out && m->ffn_pre && m->ffn_h && m->scratch &&
-           m->ln1_gamma && m->ln1_beta && m->ln2_gamma && m->ln2_beta &&
-           m->W_o && m->W_ff1 && m->W_ff2 && m->b_qkv && m->b_o && m->b_ff1 && m->b_ff2;
+    if (!m || m->num_layers < 1 || m->num_layers > MHSA_MAX_LAYERS || !m->scratch) {
+        return false;
+    }
+    for (int64_t li = 0; li < m->num_layers; ++li) {
+        if (!layer_ok_fwd(&m->layers[li])) return false;
+    }
+    return true;
 }
 
 bool bind_ok_bwd(const MhsaBinding* m) {
-    return bind_ok_fwd(m) && m->dO && m->d_qkv &&
-           m->dW_qkv && m->db_qkv && m->dW_o && m->db_o &&
-           m->dW_ff1 && m->db_ff1 && m->dW_ff2 && m->db_ff2 &&
-           m->d_ln1_gamma && m->d_ln1_beta && m->d_ln2_gamma && m->d_ln2_beta;
+    if (!bind_ok_fwd(m) || !m->dO || !m->d_qkv || !m->d_stream) return false;
+    for (int64_t li = 0; li < m->num_layers; ++li) {
+        if (!layer_ok_bwd(&m->layers[li])) return false;
+    }
+    return true;
 }
 
-}  // namespace
-
-extern "C" {
-
-int32_t mhsa_block_forward(const float* X, MhsaBinding* m) {
-    if (!X || !bind_ok_fwd(m)) {
-        return -2;
-    }
-    const int32_t br = require_blas_ready();
-    if (br != 0) return br;
-
-    const int64_t B = m->B;
-    const int64_t T = m->T;
-    const int64_t D = m->D;
-    const int64_t H = m->H;
-    const int64_t Dh = m->d_head;
-    const int64_t Hff = m->ffn_hidden;
+// One Pre-LN block: X -> L->O
+int32_t layer_forward(
+    const float* X, MhsaLayerBind* L, float* scratch,
+    int64_t B, int64_t T, int64_t D, int64_t H, int64_t Dh, int64_t Hff
+) {
     const int64_t rows = B * T;
-    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1) {
-        return -3;
-    }
-
-    // Pre-LN:
-    //   h1 = X + Wo(Attn(LN1(X)))
-    //   O  = h1 + FFN(LN2(h1))
-    layernorm_rows(X, m->ln1_out, m->ln1_gamma, m->ln1_beta, rows, D);
-
-    blas_gemm_forward(m->ln1_out, m->W_qkv, m->qkv, rows, 3 * D, D);
-    add_bias_rows(m->qkv, m->b_qkv, rows, 3 * D);
+    layernorm_rows(X, L->ln1_out, L->ln1_gamma, L->ln1_beta, rows, D);
+    blas_gemm_forward(L->ln1_out, L->W_qkv, L->qkv, rows, 3 * D, D);
+    add_bias_rows(L->qkv, L->b_qkv, rows, 3 * D);
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(Dh));
-    std::memset(m->attn_out, 0, static_cast<size_t>(rows * D) * sizeof(float));
+    std::memset(L->attn_out, 0, static_cast<size_t>(rows * D) * sizeof(float));
 
     for (int64_t b = 0; b < B; ++b) {
         for (int64_t h = 0; h < H; ++h) {
             for (int64_t i = 0; i < T; ++i) {
-                float* score_row =
-                    m->scores + (((b * H + h) * T + i) * T);
+                float* score_row = L->scores + (((b * H + h) * T + i) * T);
                 float max_s = -1e30f;
                 for (int64_t j = 0; j < T; ++j) {
                     if (j > i) {
                         score_row[j] = -1e30f;
                         continue;
                     }
-                    const float* q =
-                        m->qkv + ((b * T + i) * 3 * D) + (0 * D) + (h * Dh);
-                    const float* k =
-                        m->qkv + ((b * T + j) * 3 * D) + (1 * D) + (h * Dh);
+                    const float* q = L->qkv + ((b * T + i) * 3 * D) + (h * Dh);
+                    const float* k = L->qkv + ((b * T + j) * 3 * D) + D + (h * Dh);
                     float dot = 0.0f;
-                    for (int64_t d = 0; d < Dh; ++d) {
-                        dot += q[d] * k[d];
-                    }
+                    for (int64_t d = 0; d < Dh; ++d) dot += q[d] * k[d];
                     const float s = dot * scale;
                     score_row[j] = s;
                     if (s > max_s) max_s = s;
@@ -207,19 +190,15 @@ int32_t mhsa_block_forward(const float* X, MhsaBinding* m) {
                     sum_exp += e;
                 }
                 const float inv = 1.0f / sum_exp;
-                for (int64_t j = 0; j <= i; ++j) {
-                    score_row[j] *= inv;
-                }
-                for (int64_t j = i + 1; j < T; ++j) {
-                    score_row[j] = 0.0f;
-                }
+                for (int64_t j = 0; j <= i; ++j) score_row[j] *= inv;
+                for (int64_t j = i + 1; j < T; ++j) score_row[j] = 0.0f;
 
-                float* out = m->attn_out + (b * T + i) * D + (h * Dh);
+                float* out = L->attn_out + (b * T + i) * D + (h * Dh);
                 for (int64_t d = 0; d < Dh; ++d) {
                     float acc = 0.0f;
                     for (int64_t j = 0; j <= i; ++j) {
                         const float* v =
-                            m->qkv + ((b * T + j) * 3 * D) + (2 * D) + (h * Dh);
+                            L->qkv + ((b * T + j) * 3 * D) + (2 * D) + (h * Dh);
                         acc += score_row[j] * v[d];
                     }
                     out[d] = acc;
@@ -228,28 +207,147 @@ int32_t mhsa_block_forward(const float* X, MhsaBinding* m) {
         }
     }
 
-    blas_gemm_forward(m->attn_out, m->W_o, m->scratch, rows, D, D);
-    add_bias_rows(m->scratch, m->b_o, rows, D);
-    std::memcpy(m->h1, m->scratch, static_cast<size_t>(rows * D) * sizeof(float));
-    residual_add(m->h1, X, rows * D);
+    blas_gemm_forward(L->attn_out, L->W_o, scratch, rows, D, D);
+    add_bias_rows(scratch, L->b_o, rows, D);
+    std::memcpy(L->h1, scratch, static_cast<size_t>(rows * D) * sizeof(float));
+    residual_add(L->h1, X, rows * D);
 
-    layernorm_rows(m->h1, m->ln2_out, m->ln2_gamma, m->ln2_beta, rows, D);
-    blas_gemm_forward(m->ln2_out, m->W_ff1, m->ffn_pre, rows, Hff, D);
-    add_bias_rows(m->ffn_pre, m->b_ff1, rows, Hff);
+    layernorm_rows(L->h1, L->ln2_out, L->ln2_gamma, L->ln2_beta, rows, D);
+    blas_gemm_forward(L->ln2_out, L->W_ff1, L->ffn_pre, rows, Hff, D);
+    add_bias_rows(L->ffn_pre, L->b_ff1, rows, Hff);
+    for (int64_t i = 0; i < rows * Hff; ++i) L->ffn_h[i] = gelu(L->ffn_pre[i]);
+    blas_gemm_forward(L->ffn_h, L->W_ff2, scratch, rows, D, Hff);
+    add_bias_rows(scratch, L->b_ff2, rows, D);
+    std::memcpy(L->O, L->h1, static_cast<size_t>(rows * D) * sizeof(float));
+    residual_add(L->O, scratch, rows * D);
+    return 0;
+}
+
+// d_out -> d_in (written to d_in_out). May clobber L->O and L->ffn_h.
+int32_t layer_backward(
+    const float* X, MhsaLayerBind* L, const float* d_out, float* d_in_out,
+    float* scratch, float* d_qkv, float* tmp_D,
+    int64_t B, int64_t T, int64_t D, int64_t H, int64_t Dh, int64_t Hff
+) {
+    const int64_t rows = B * T;
+    const size_t bytes_D = static_cast<size_t>(rows * D) * sizeof(float);
+
+    float* d_ffn_out = scratch;
+    std::memcpy(d_ffn_out, d_out, bytes_D);
+
+    blas_gemm_weight_grad_rm(L->ffn_h, d_ffn_out, L->dW_ff2, rows, D, Hff, 1.0f);
+    accumulate_bias_grad(d_ffn_out, L->db_ff2, rows, D);
+
+    float* d_ffn_h = L->ffn_h;
+    blas_gemm_input_grad_rm(d_ffn_out, L->W_ff2, d_ffn_h, rows, D, Hff);
     for (int64_t i = 0; i < rows * Hff; ++i) {
-        m->ffn_h[i] = gelu(m->ffn_pre[i]);
+        d_ffn_h[i] = gelu_bwd(L->ffn_pre[i], d_ffn_h[i]);
     }
-    blas_gemm_forward(m->ffn_h, m->W_ff2, m->scratch, rows, D, Hff);
-    add_bias_rows(m->scratch, m->b_ff2, rows, D);
-    std::memcpy(m->O, m->h1, static_cast<size_t>(rows * D) * sizeof(float));
-    residual_add(m->O, m->scratch, rows * D);
+
+    blas_gemm_weight_grad_rm(L->ln2_out, d_ffn_h, L->dW_ff1, rows, Hff, D, 1.0f);
+    accumulate_bias_grad(d_ffn_h, L->db_ff1, rows, Hff);
+
+    float* d_ln2_out = tmp_D;
+    blas_gemm_input_grad_rm(d_ffn_h, L->W_ff1, d_ln2_out, rows, Hff, D);
+
+    float* dh1 = scratch;
+    layernorm_rows_bwd(
+        L->h1, L->ln2_out, L->ln2_gamma, d_ln2_out, dh1,
+        L->d_ln2_gamma, L->d_ln2_beta, rows, D);
+    residual_add(dh1, d_out, rows * D);
+
+    blas_gemm_weight_grad_rm(L->attn_out, dh1, L->dW_o, rows, D, D, 1.0f);
+    accumulate_bias_grad(dh1, L->db_o, rows, D);
+
+    float* d_attn_out = tmp_D;
+    blas_gemm_input_grad_rm(dh1, L->W_o, d_attn_out, rows, D, D);
+
+    // Residual path into d_in
+    std::memcpy(d_in_out, dh1, bytes_D);
+
+    std::memset(d_qkv, 0, static_cast<size_t>(rows * 3 * D) * sizeof(float));
+    const float scale = 1.0f / std::sqrt(static_cast<float>(Dh));
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t h = 0; h < H; ++h) {
+            for (int64_t i = 0; i < T; ++i) {
+                const float* score_row = L->scores + (((b * H + h) * T + i) * T);
+                const float* dout = d_attn_out + (b * T + i) * D + (h * Dh);
+
+                for (int64_t j = 0; j <= i; ++j) {
+                    float* dv = d_qkv + ((b * T + j) * 3 * D) + (2 * D) + (h * Dh);
+                    const float p = score_row[j];
+                    for (int64_t d = 0; d < Dh; ++d) dv[d] += p * dout[d];
+                }
+
+                float sum_p_dp = 0.0f;
+                float* dp_row = L->ffn_h;
+                for (int64_t j = 0; j <= i; ++j) {
+                    const float* v = L->qkv + ((b * T + j) * 3 * D) + (2 * D) + (h * Dh);
+                    float s = 0.0f;
+                    for (int64_t d = 0; d < Dh; ++d) s += dout[d] * v[d];
+                    dp_row[j] = s;
+                    sum_p_dp += score_row[j] * s;
+                }
+                for (int64_t j = 0; j <= i; ++j) {
+                    const float ds = score_row[j] * (dp_row[j] - sum_p_dp);
+                    const float d_dot = ds * scale;
+                    float* dq = d_qkv + ((b * T + i) * 3 * D) + (h * Dh);
+                    float* dk = d_qkv + ((b * T + j) * 3 * D) + D + (h * Dh);
+                    const float* q = L->qkv + ((b * T + i) * 3 * D) + (h * Dh);
+                    const float* k = L->qkv + ((b * T + j) * 3 * D) + D + (h * Dh);
+                    for (int64_t d = 0; d < Dh; ++d) {
+                        dq[d] += d_dot * k[d];
+                        dk[d] += d_dot * q[d];
+                    }
+                }
+            }
+        }
+    }
+
+    blas_gemm_weight_grad_rm(L->ln1_out, d_qkv, L->dW_qkv, rows, 3 * D, D, 1.0f);
+    accumulate_bias_grad(d_qkv, L->db_qkv, rows, 3 * D);
+
+    float* d_ln1_out = tmp_D;
+    blas_gemm_input_grad_rm(d_qkv, L->W_qkv, d_ln1_out, rows, 3 * D, D);
+
+    float* dX_ln = L->attn_out;
+    layernorm_rows_bwd(
+        X, L->ln1_out, L->ln1_gamma, d_ln1_out, dX_ln,
+        L->d_ln1_gamma, L->d_ln1_beta, rows, D);
+    residual_add(d_in_out, dX_ln, rows * D);
+    return 0;
+}
+
+}  // namespace
+
+extern "C" {
+
+int32_t mhsa_block_forward(const float* X, MhsaBinding* m) {
+    if (!X || !bind_ok_fwd(m)) return -2;
+    const int32_t br = require_blas_ready();
+    if (br != 0) return br;
+
+    const int64_t B = m->B;
+    const int64_t T = m->T;
+    const int64_t D = m->D;
+    const int64_t H = m->H;
+    const int64_t Dh = m->d_head;
+    const int64_t Hff = m->ffn_hidden;
+    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1) return -3;
+
+    const float* cur = X;
+    for (int64_t li = 0; li < m->num_layers; ++li) {
+        const int32_t st = layer_forward(
+            cur, &m->layers[li], m->scratch, B, T, D, H, Dh, Hff);
+        if (st != 0) return st;
+        cur = m->layers[li].O;
+    }
+    m->O = m->layers[m->num_layers - 1].O;
     return 0;
 }
 
 int32_t mhsa_action_forward(MhsaBinding* m) {
-    if (!m || !m->O || !m->W_act || !m->actions || !m->scratch) {
-        return -2;
-    }
+    if (!m || !m->O || !m->W_act || !m->actions || !m->scratch) return -2;
     const int32_t br = require_blas_ready();
     if (br != 0) return br;
 
@@ -257,26 +355,21 @@ int32_t mhsa_action_forward(MhsaBinding* m) {
     const int64_t T = m->T;
     const int64_t D = m->D;
     const int64_t A = m->action_dim;
-    if (B < 1 || T < 1 || D < 1 || A < 1) {
-        return -3;
-    }
+    if (B < 1 || T < 1 || D < 1 || A < 1) return -3;
 
     for (int64_t b = 0; b < B; ++b) {
         const float* src = m->O + (b * T + (T - 1)) * D;
-        float* dst = m->scratch + b * D;
-        std::memcpy(dst, src, static_cast<size_t>(D) * sizeof(float));
+        std::memcpy(m->scratch + b * D, src, static_cast<size_t>(D) * sizeof(float));
     }
     blas_gemm_forward(m->scratch, m->W_act, m->actions, B, A, D);
     add_bias_rows(m->actions, m->b_act, B, A);
-    for (int64_t i = 0; i < B * A; ++i) {
-        m->actions[i] = std::tanh(m->actions[i]);
-    }
+    for (int64_t i = 0; i < B * A; ++i) m->actions[i] = std::tanh(m->actions[i]);
     return 0;
 }
 
 int32_t mhsa_action_backward(MhsaBinding* m) {
     if (!m || !m->O || !m->W_act || !m->actions || !m->y || !m->scratch ||
-        !m->dW_act || !m->db_act || !m->dO) {
+        !m->dW_act || !m->db_act || !m->dO || !m->d_qkv) {
         return -2;
     }
     const int32_t br = require_blas_ready();
@@ -286,57 +379,40 @@ int32_t mhsa_action_backward(MhsaBinding* m) {
     const int64_t T = m->T;
     const int64_t D = m->D;
     const int64_t A = m->action_dim;
-    if (B < 1 || T < 1 || D < 1 || A < 1) {
-        return -3;
-    }
+    if (B < 1 || T < 1 || D < 1 || A < 1) return -3;
 
-    // loss = mean((tanh(z) - y)^2); d_a = 2/(B*A) * (a - y); dz = da * (1-a^2)
     const float inv = 2.0f / static_cast<float>(B * A);
     float loss = 0.0f;
-    // Reuse first B*A of d_qkv or allocate via scratch for dz: use actions buffer sibling —
-    // write dz into beginning of d_qkv if present, else stack via scratch after last-token pack.
-    float* dz = m->d_qkv;  // [B, A] fits in leading slice of [B*T, 3D]
-    if (!dz) {
-        return -2;
-    }
+    float* dz = m->d_qkv;
     for (int64_t i = 0; i < B * A; ++i) {
         const float diff = m->actions[i] - m->y[i];
         loss += diff * diff;
-        const float da = inv * diff;
-        dz[i] = da * (1.0f - m->actions[i] * m->actions[i]);
+        dz[i] = inv * diff * (1.0f - m->actions[i] * m->actions[i]);
     }
-    if (m->loss_out) {
-        m->loss_out[0] = loss / static_cast<float>(B * A);
-    }
+    if (m->loss_out) m->loss_out[0] = loss / static_cast<float>(B * A);
 
-    // Last-token pack into scratch [B, D]
     for (int64_t b = 0; b < B; ++b) {
         const float* src = m->O + (b * T + (T - 1)) * D;
-        float* dst = m->scratch + b * D;
-        std::memcpy(dst, src, static_cast<size_t>(D) * sizeof(float));
+        std::memcpy(m->scratch + b * D, src, static_cast<size_t>(D) * sizeof(float));
     }
-
-    // dW_act = X^T @ dz  (dz already mean-scaled)
     blas_gemm_weight_grad_rm(m->scratch, dz, m->dW_act, B, A, D, 1.0f);
     accumulate_bias_grad(dz, m->db_act, B, A);
 
-    // d_last = dz @ W_act^T
-    float* d_last = m->scratch;  // reuse [B, D] — overwrite packed X after param grad
+    float* d_last = m->scratch;
     blas_gemm_input_grad_rm(dz, m->W_act, d_last, B, A, D);
 
     std::memset(m->dO, 0, static_cast<size_t>(B * T * D) * sizeof(float));
     for (int64_t b = 0; b < B; ++b) {
-        float* dst = m->dO + (b * T + (T - 1)) * D;
-        const float* src = d_last + b * D;
-        std::memcpy(dst, src, static_cast<size_t>(D) * sizeof(float));
+        std::memcpy(
+            m->dO + (b * T + (T - 1)) * D,
+            d_last + b * D,
+            static_cast<size_t>(D) * sizeof(float));
     }
     return 0;
 }
 
 int32_t mhsa_block_backward(const float* X, MhsaBinding* m) {
-    if (!X || !bind_ok_bwd(m)) {
-        return -2;
-    }
+    if (!X || !bind_ok_bwd(m)) return -2;
     const int32_t br = require_blas_ready();
     if (br != 0) return br;
 
@@ -347,125 +423,35 @@ int32_t mhsa_block_backward(const float* X, MhsaBinding* m) {
     const int64_t Dh = m->d_head;
     const int64_t Hff = m->ffn_hidden;
     const int64_t rows = B * T;
-    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1) {
-        return -3;
+    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1) return -3;
+
+    // d_cur starts as action dO; after each layer becomes that layer's dX.
+    float* d_cur = m->dO;
+    float* d_next = m->d_stream;
+    // tmp_D: reuse first layer's O only after that layer's fwd outputs for
+    // higher layers are no longer needed — allocate via layers[0].O is unsafe
+    // for multi-layer. Use a slice of scratch? scratch is used inside layer_bwd.
+    // Use layers[num_layers-1].O as tmp only when processing that layer, then
+    // for lower layers use that layer's own O (already consumed as X for next).
+    for (int64_t li = m->num_layers - 1; li >= 0; --li) {
+        const float* X_l = (li == 0) ? X : m->layers[li - 1].O;
+        float* tmp_D = m->layers[li].O;  // safe: this layer's O not needed as X anymore
+        const int32_t st = layer_backward(
+            X_l, &m->layers[li], d_cur, d_next,
+            m->scratch, m->d_qkv, tmp_D,
+            B, T, D, H, Dh, Hff);
+        if (st != 0) return st;
+        // Swap carriers for next lower layer
+        float* tmp = d_cur;
+        d_cur = d_next;
+        d_next = tmp;
+        // After first swap: d_cur has dX of layer li; d_next is old dO buffer.
+        // Next iteration reads d_cur as d_out. Good.
+        (void)rows;
     }
-
-    // --- FFN bwd: O = h1 + (ffn_h @ W_ff2 + b); ffn_h = gelu(ffn_pre) ---
-    // d_ffn_out = dO; dh1 += dO
-    float* d_ffn_out = m->scratch;  // [rows, D]
-    std::memcpy(d_ffn_out, m->dO, static_cast<size_t>(rows * D) * sizeof(float));
-
-    blas_gemm_weight_grad_rm(m->ffn_h, d_ffn_out, m->dW_ff2, rows, D, Hff, 1.0f);
-    accumulate_bias_grad(d_ffn_out, m->db_ff2, rows, D);
-
-    // d_ffn_h reuses ffn_h (post-gelu no longer needed after dW_ff2)
-    float* d_ffn_h = m->ffn_h;
-    blas_gemm_input_grad_rm(d_ffn_out, m->W_ff2, d_ffn_h, rows, D, Hff);
-
-    // gelu bwd into d_ffn_pre (overwrite d_ffn_h in place using ffn_pre values)
-    for (int64_t i = 0; i < rows * Hff; ++i) {
-        d_ffn_h[i] = gelu_bwd(m->ffn_pre[i], d_ffn_h[i]);
-    }
-
-    blas_gemm_weight_grad_rm(m->ln2_out, d_ffn_h, m->dW_ff1, rows, Hff, D, 1.0f);
-    accumulate_bias_grad(d_ffn_h, m->db_ff1, rows, Hff);
-
-    // d_ln2_out = d_ffn_h @ W_ff1^T → use O as temp (O not needed after)
-    float* d_ln2_out = m->O;
-    blas_gemm_input_grad_rm(d_ffn_h, m->W_ff1, d_ln2_out, rows, Hff, D);
-
-    // LN2 bwd: dh1_from_ln + residual dO
-    float* dh1 = m->scratch;
-    layernorm_rows_bwd(
-        m->h1, m->ln2_out, m->ln2_gamma, d_ln2_out, dh1,
-        m->d_ln2_gamma, m->d_ln2_beta, rows, D);
-    residual_add(dh1, m->dO, rows * D);
-
-    // --- Attn out projection: h1 = X + (attn_out @ W_o + b) ---
-    // d_attn_proj = dh1
-    float* d_attn_proj = dh1;
-    blas_gemm_weight_grad_rm(m->attn_out, d_attn_proj, m->dW_o, rows, D, D, 1.0f);
-    accumulate_bias_grad(d_attn_proj, m->db_o, rows, D);
-
-    float* d_attn_out = m->O;  // reuse
-    blas_gemm_input_grad_rm(d_attn_proj, m->W_o, d_attn_out, rows, D, D);
-
-    // dX from residual
-    if (m->dX) {
-        std::memcpy(m->dX, dh1, static_cast<size_t>(rows * D) * sizeof(float));
-    }
-
-    // --- Causal attention bwd into d_qkv ---
-    std::memset(m->d_qkv, 0, static_cast<size_t>(rows * 3 * D) * sizeof(float));
-    const float scale = 1.0f / std::sqrt(static_cast<float>(Dh));
-
-    for (int64_t b = 0; b < B; ++b) {
-        for (int64_t h = 0; h < H; ++h) {
-            for (int64_t i = 0; i < T; ++i) {
-                const float* score_row =
-                    m->scores + (((b * H + h) * T + i) * T);
-                const float* dout =
-                    d_attn_out + (b * T + i) * D + (h * Dh);
-
-                // dV[j] += P[i,j] * dout[i]
-                for (int64_t j = 0; j <= i; ++j) {
-                    float* dv =
-                        m->d_qkv + ((b * T + j) * 3 * D) + (2 * D) + (h * Dh);
-                    const float p = score_row[j];
-                    for (int64_t d = 0; d < Dh; ++d) {
-                        dv[d] += p * dout[d];
-                    }
-                }
-
-                // dP[j] = sum_d dout[d] * V[j,d]
-                // Softmax bwd: ds = P * (dP - sum(P*dP))
-                float sum_p_dp = 0.0f;
-                float* dp_row = m->ffn_h;  // temp T-vector (ffn_h no longer needed)
-                for (int64_t j = 0; j <= i; ++j) {
-                    const float* v =
-                        m->qkv + ((b * T + j) * 3 * D) + (2 * D) + (h * Dh);
-                    float s = 0.0f;
-                    for (int64_t d = 0; d < Dh; ++d) {
-                        s += dout[d] * v[d];
-                    }
-                    dp_row[j] = s;
-                    sum_p_dp += score_row[j] * s;
-                }
-                for (int64_t j = 0; j <= i; ++j) {
-                    const float ds = score_row[j] * (dp_row[j] - sum_p_dp);
-                    const float d_dot = ds * scale;
-                    float* dq =
-                        m->d_qkv + ((b * T + i) * 3 * D) + (0 * D) + (h * Dh);
-                    float* dk =
-                        m->d_qkv + ((b * T + j) * 3 * D) + (1 * D) + (h * Dh);
-                    const float* q =
-                        m->qkv + ((b * T + i) * 3 * D) + (0 * D) + (h * Dh);
-                    const float* k =
-                        m->qkv + ((b * T + j) * 3 * D) + (1 * D) + (h * Dh);
-                    for (int64_t d = 0; d < Dh; ++d) {
-                        dq[d] += d_dot * k[d];
-                        dk[d] += d_dot * q[d];
-                    }
-                }
-            }
-        }
-    }
-
-    // QKV projection bwd
-    blas_gemm_weight_grad_rm(m->ln1_out, m->d_qkv, m->dW_qkv, rows, 3 * D, D, 1.0f);
-    accumulate_bias_grad(m->d_qkv, m->db_qkv, rows, 3 * D);
-
-    float* d_ln1_out = m->O;
-    blas_gemm_input_grad_rm(m->d_qkv, m->W_qkv, d_ln1_out, rows, 3 * D, D);
-
-    float* dX_ln = m->attn_out;  // attn_out done
-    layernorm_rows_bwd(
-        X, m->ln1_out, m->ln1_gamma, d_ln1_out, dX_ln,
-        m->d_ln1_gamma, m->d_ln1_beta, rows, D);
 
     if (m->dX) {
-        residual_add(m->dX, dX_ln, rows * D);
+        std::memcpy(m->dX, d_cur, static_cast<size_t>(rows * D) * sizeof(float));
     }
     return 0;
 }

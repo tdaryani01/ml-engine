@@ -45,6 +45,7 @@ class MHSAConfig:
     max_seq_len: int
     action_dim: int
     ffn_mult: int = 4
+    num_layers: int = 1
 
 
 @dataclass(frozen=True)

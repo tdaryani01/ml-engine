@@ -1,4 +1,4 @@
-// mhsa_kernels.h — Causal MHSA bind + naive fwd/bwd kernels.
+// mhsa_kernels.h — Causal MHSA bind + naive multi-layer fwd/bwd.
 #pragma once
 
 #include <cstdint>
@@ -7,46 +7,23 @@
 extern "C" {
 #endif
 
-// Composed bind (alongside LayerBinding / DenseBinding — not a CNN subclass).
-struct MhsaBinding {
-    int64_t B;
-    int64_t T;
-    int64_t D;
-    int64_t H;
-    int64_t d_head;
-    int64_t action_dim;
-    int64_t ffn_hidden;
+enum { MHSA_MAX_LAYERS = 8 };
 
+// Per Pre-LN block (MHSA + FFN).
+struct MhsaLayerBind {
     float* W_qkv;  // [D, 3D]
-    float* b_qkv;  // [3D]
-    float* W_o;    // [D, D]
-    float* b_o;    // [D]
+    float* b_qkv;
+    float* W_o;  // [D, D]
+    float* b_o;
     float* W_ff1;  // [D, ffn_hidden]
-    float* b_ff1;  // [ffn_hidden]
+    float* b_ff1;
     float* W_ff2;  // [ffn_hidden, D]
-    float* b_ff2;  // [D]
-    float* W_act;  // [D, action_dim]
-    float* b_act;  // [action_dim]
-
+    float* b_ff2;
     float* ln1_gamma;  // [D]
     float* ln1_beta;
     float* ln2_gamma;
     float* ln2_beta;
 
-    // Workspace (caller-owned, float32, contiguous)
-    float* qkv;       // [B*T, 3D]
-    float* scores;    // [B*H*T*T] softmax probs (causal)
-    float* attn_out;  // [B*T, D] head concat before Wo
-    float* ln1_out;   // [B*T, D]
-    float* h1;        // [B*T, D] post-attn residual
-    float* ln2_out;   // [B*T, D]
-    float* ffn_pre;   // [B*T, ffn_hidden] pre-GELU
-    float* ffn_h;     // [B*T, ffn_hidden] post-GELU
-    float* O;         // [B*T, D] residual stream out
-    float* scratch;   // [B*T, D] temp
-    float* actions;   // [B, action_dim]
-
-    // Gradients (caller-owned; zeroed by caller each step)
     float* dW_qkv;
     float* db_qkv;
     float* dW_o;
@@ -55,31 +32,61 @@ struct MhsaBinding {
     float* db_ff1;
     float* dW_ff2;
     float* db_ff2;
-    float* dW_act;
-    float* db_act;
     float* d_ln1_gamma;
     float* d_ln1_beta;
     float* d_ln2_gamma;
     float* d_ln2_beta;
-    float* dO;     // [B*T, D]
-    float* dX;     // [B*T, D] optional (may be null)
-    float* d_qkv;  // [B*T, 3D] temp for attn bwd
 
-    // Targets / loss (action head)
-    float* y;         // [B, action_dim]
-    float* loss_out;  // optional scalar
+    // Per-layer workspace (caller-owned)
+    float* qkv;       // [B*T, 3D]
+    float* scores;    // [B*H*T*T]
+    float* attn_out;  // [B*T, D]
+    float* ln1_out;   // [B*T, D]
+    float* h1;        // [B*T, D]
+    float* ln2_out;   // [B*T, D]
+    float* ffn_pre;   // [B*T, ffn_hidden]
+    float* ffn_h;     // [B*T, ffn_hidden]
+    float* O;         // [B*T, D] block output (next layer input)
 };
 
-// X: [B*T, D] row-major. Writes O and saved intermediates in `m`.
+struct MhsaBinding {
+    int64_t B;
+    int64_t T;
+    int64_t D;
+    int64_t H;
+    int64_t d_head;
+    int64_t action_dim;
+    int64_t ffn_hidden;
+    int64_t num_layers;  // 1..MHSA_MAX_LAYERS
+
+    MhsaLayerBind layers[MHSA_MAX_LAYERS];
+
+    float* W_act;  // [D, action_dim]
+    float* b_act;
+    float* dW_act;
+    float* db_act;
+
+    float* scratch;   // [B*T, D]
+    float* actions;   // [B, action_dim]
+    float* dO;        // [B*T, D] incoming to top block / between layers
+    float* dX;        // [B*T, D] optional grad w.r.t. model input
+    float* d_qkv;     // [B*T, 3D] attn bwd temp
+    float* d_stream;  // [B*T, D] interlayer grad carrier
+
+    float* y;         // [B, action_dim]
+    float* loss_out;  // optional scalar
+
+    // Final residual stream (alias of layers[num_layers-1].O after fwd)
+    float* O;
+};
+
+// X: [B*T, D]. Runs num_layers Pre-LN blocks; sets m->O to last block out.
 int32_t mhsa_block_forward(const float* X, MhsaBinding* m);
 
-// Reads m->O last token → m->actions.
 int32_t mhsa_action_forward(MhsaBinding* m);
-
-// MSE on tanh actions → dO (last token). Uses m->y; writes m->loss_out if set.
 int32_t mhsa_action_backward(MhsaBinding* m);
 
-// dO → param grads (+ dX if non-null). Requires intermediates from forward.
+// Backprop through layers[num_layers-1] .. layers[0].
 int32_t mhsa_block_backward(const float* X, MhsaBinding* m);
 
 #ifdef __cplusplus

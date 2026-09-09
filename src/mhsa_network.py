@@ -1,5 +1,5 @@
 # src/mhsa_network.py
-"""Thin causal MHSA model shell — weights + contract; compute is native (stubs for now)."""
+"""Thin causal MHSA model shell — stacked Pre-LN blocks + action head (native)."""
 from __future__ import annotations
 
 import logging
@@ -15,10 +15,10 @@ from utils.engine_ops import create_engine_context
 
 class MHSANetwork(TrainableModel):
     """
-    Causal multi-head self-attention + continuous action head.
+    Stacked causal Pre-LN MHSA+FFN blocks + continuous action head.
 
     Python owns parameter storage and compiles the MHSA contract list.
-    Forward/backward live in native ``mhsa_kernels`` (stubs until implemented).
+    Forward/backward live in native ``mhsa_kernels``.
     """
 
     def __init__(
@@ -30,6 +30,7 @@ class MHSANetwork(TrainableModel):
         action_dim: int,
         optimizer_instance: Any,
         ffn_mult: int = 4,
+        num_layers: int = 1,
         backend: EngineBackend = EngineBackend.NATIVE,
         engine_ctx=None,
         lam_l1: float = 0.01,
@@ -43,6 +44,9 @@ class MHSANetwork(TrainableModel):
             raise ValueError(
                 f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
             )
+        num_layers = int(num_layers)
+        if num_layers < 1 or num_layers > 8:
+            raise ValueError(f"num_layers must be in 1..8, got {num_layers}")
         kwargs.pop("p_dropout", None)
         kwargs.pop("use_batch_norm", None)
         kwargs.pop("bn_momentum", None)
@@ -67,14 +71,23 @@ class MHSANetwork(TrainableModel):
         self.action_dim = int(action_dim)
         self.ffn_mult = int(ffn_mult)
         self.ffn_hidden = self.d_model * self.ffn_mult
+        self.num_layers = num_layers
 
         self.weights: list[np.ndarray] = []
         self.biases: list[np.ndarray] = []
+        self.ln1_gamma: list[np.ndarray] = []
+        self.ln1_beta: list[np.ndarray] = []
+        self.ln2_gamma: list[np.ndarray] = []
+        self.ln2_beta: list[np.ndarray] = []
         self._init_parameters()
 
-        # Param bank indices for contract / ledger (stable order).
-        # 0 W_qkv, 1 W_o, 2 W_ff1, 3 W_ff2, 4 W_act
-        self._param_names = ["W_qkv", "W_o", "W_ff1", "W_ff2", "W_act"]
+        # Per layer: W_qkv, W_o, W_ff1, W_ff2; then W_act.
+        self._param_names: list[str] = []
+        for li in range(self.num_layers):
+            self._param_names.extend(
+                [f"L{li}.W_qkv", f"L{li}.W_o", f"L{li}.W_ff1", f"L{li}.W_ff2"]
+            )
+        self._param_names.append("W_act")
 
         if contract_list_enabled:
             if self.backend != EngineBackend.NATIVE:
@@ -82,8 +95,8 @@ class MHSANetwork(TrainableModel):
             self.enable_contract_list(native_async_submit=native_async_submit)
 
         logging.info(
-            "[MHSA] d_model=%d heads=%d d_head=%d T_max=%d action_dim=%d ffn=%d "
-            "(native block+action fwd/bwd)",
+            "[MHSA] layers=%d d_model=%d heads=%d d_head=%d T_max=%d action_dim=%d ffn=%d",
+            self.num_layers,
             self.d_model,
             self.num_heads,
             self.d_head,
@@ -100,26 +113,35 @@ class MHSANetwork(TrainableModel):
         D = self.d_model
         Hff = self.ffn_hidden
         A = self.action_dim
-        # Row-major [in, out] to match dense GEMM habits elsewhere.
-        self.weights = [
-            self._xavier(D, 3 * D),  # W_qkv
-            self._xavier(D, D),  # W_o
-            self._xavier(D, Hff),  # W_ff1
-            self._xavier(Hff, D),  # W_ff2
-            self._xavier(D, A),  # W_act
-        ]
-        self.biases = [
-            np.zeros((1, 3 * D), dtype=np.float64),
-            np.zeros((1, D), dtype=np.float64),
-            np.zeros((1, Hff), dtype=np.float64),
-            np.zeros((1, D), dtype=np.float64),
-            np.zeros((1, A), dtype=np.float64),
-        ]
-        # LayerNorm scale/bias for attn block and FFN block (stored after dense biases).
-        self.ln1_gamma = np.ones((1, D), dtype=np.float64)
-        self.ln1_beta = np.zeros((1, D), dtype=np.float64)
-        self.ln2_gamma = np.ones((1, D), dtype=np.float64)
-        self.ln2_beta = np.zeros((1, D), dtype=np.float64)
+        self.weights = []
+        self.biases = []
+        self.ln1_gamma = []
+        self.ln1_beta = []
+        self.ln2_gamma = []
+        self.ln2_beta = []
+        for _ in range(self.num_layers):
+            self.weights.extend(
+                [
+                    self._xavier(D, 3 * D),
+                    self._xavier(D, D),
+                    self._xavier(D, Hff),
+                    self._xavier(Hff, D),
+                ]
+            )
+            self.biases.extend(
+                [
+                    np.zeros((1, 3 * D), dtype=np.float64),
+                    np.zeros((1, D), dtype=np.float64),
+                    np.zeros((1, Hff), dtype=np.float64),
+                    np.zeros((1, D), dtype=np.float64),
+                ]
+            )
+            self.ln1_gamma.append(np.ones((1, D), dtype=np.float64))
+            self.ln1_beta.append(np.zeros((1, D), dtype=np.float64))
+            self.ln2_gamma.append(np.ones((1, D), dtype=np.float64))
+            self.ln2_beta.append(np.zeros((1, D), dtype=np.float64))
+        self.weights.append(self._xavier(D, A))
+        self.biases.append(np.zeros((1, A), dtype=np.float64))
 
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
         """X (B,T,D) → continuous actions (B, action_dim) via native MHSA forward."""
@@ -128,11 +150,20 @@ class MHSANetwork(TrainableModel):
         return self._contract_runtime.run_mhsa_forward(processed_data)
 
     def calculate_raw_cost(self, output: np.ndarray, y: np.ndarray) -> float:
-        """MSE on continuous actions."""
         return float(np.mean((output - y) ** 2))
 
     def compute_total_loss(self, output: np.ndarray, y: np.ndarray) -> float:
         return self.calculate_raw_cost(output, y)
+
+    def _ln_param_lists(self) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        gammas: list[np.ndarray] = []
+        betas: list[np.ndarray] = []
+        for li in range(self.num_layers):
+            gammas.append(self.ln1_gamma[li])
+            gammas.append(self.ln2_gamma[li])
+            betas.append(self.ln1_beta[li])
+            betas.append(self.ln2_beta[li])
+        return gammas, betas
 
     def _apply_grads(
         self,
@@ -143,6 +174,7 @@ class MHSANetwork(TrainableModel):
         grad_gammas=None,
         grad_betas=None,
     ) -> None:
+        gammas, betas = self._ln_param_lists()
         self.optimizer.update(
             self.weights,
             self.biases,
@@ -151,8 +183,8 @@ class MHSANetwork(TrainableModel):
             m_samples,
             self.lam_l2,
             lr,
-            gammas=[self.ln1_gamma, self.ln2_gamma],
-            betas=[self.ln1_beta, self.ln2_beta],
+            gammas=gammas,
+            betas=betas,
             grad_gammas=grad_gammas,
             grad_betas=grad_betas,
         )
