@@ -370,4 +370,24 @@ void blas_gemm_backward_input(const float* dout_trans, const float* W_2d, float*
     im2col_telemetry::record_gemm_bwd_x();
 }
 
+void blas_gemm_weight_grad_rm(const float* X, const float* dY, float* dW,
+                              int64_t m, int64_t n, int64_t k, float scale) {
+    // dW[k,n] (same storage as W in blas_gemm_forward) = scale * X^T @ dY
+    const int ni = static_cast<int>(n);
+    const int ki = static_cast<int>(k);
+    const int mi = static_cast<int>(m);
+    call_sgemm('N', 'T', ni, ki, mi, scale, dY, ni, X, ki, 0.0f, dW, ni);
+    im2col_telemetry::record_gemm_bwd_w();
+}
+
+void blas_gemm_input_grad_rm(const float* dY, const float* W, float* dX,
+                             int64_t m, int64_t n, int64_t k) {
+    // dX[m,k] = dY[m,n] @ W[k,n]^T
+    const int ni = static_cast<int>(n);
+    const int ki = static_cast<int>(k);
+    const int mi = static_cast<int>(m);
+    call_sgemm('T', 'N', ki, mi, ni, 1.0f, W, ni, dY, ni, 0.0f, dX, ki);
+    im2col_telemetry::record_gemm_bwd_x();
+}
+
 }  // extern "C"

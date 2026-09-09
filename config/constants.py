@@ -12,6 +12,7 @@ class ModelType(Enum):
     MULTI_CLASS = auto()
     REGRESSION = auto()
     CNN = auto()  # <-- Added for Convolutional Networks
+    MHSA = auto()  # Causal multi-head self-attention + action head
 
 
 class IngestionMode(Enum):

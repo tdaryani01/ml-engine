@@ -22,6 +22,14 @@ void blas_gemm_param_grad(const float* dout_trans, const float* col, float* dW_f
 void blas_gemm_backward_input(const float* dout_trans, const float* W_2d, float* dcol,
                               int64_t m_dim, int64_t n_dim, int64_t k_dim);
 
+// Row-major dense grads matching blas_gemm_forward(X, W, Y, m, n, k) with W[k, n]:
+//   dW[k, n] = scale * X[m, k]^T @ dY[m, n]
+//   dX[m, k] = dY[m, n] @ W[k, n]^T
+void blas_gemm_weight_grad_rm(const float* X, const float* dY, float* dW,
+                              int64_t m, int64_t n, int64_t k, float scale);
+void blas_gemm_input_grad_rm(const float* dY, const float* W, float* dX,
+                             int64_t m, int64_t n, int64_t k);
+
 ML_ENGINE_EXPORT int32_t blas_runtime_ready();
 
 // 1 when bin/libopenblas.dll was built with USE_OPENMP=1 (shared LLVM OMP with conv_kernels).

@@ -38,6 +38,16 @@ class CNNConfig:
     dense_head: List[int] = field(default_factory=list)  # Intermediate dense layer dimensions
 
 @dataclass(frozen=True)
+class MHSAConfig:
+    """Causal MHSA geometry (active when model_type is MHSA)."""
+    d_model: int
+    num_heads: int
+    max_seq_len: int
+    action_dim: int
+    ffn_mult: int = 4
+
+
+@dataclass(frozen=True)
 class ArchitectureConfig:
     """Defines structural topology settings for the neural network model."""
     model_type: ModelType                      # Enforced Enum Type!
@@ -48,6 +58,7 @@ class ArchitectureConfig:
     use_batch_norm: bool = True
     bn_momentum: float = 0.9
     cnn: Optional[CNNConfig] = None            # Populated when model_type is CNN
+    mhsa: Optional[MHSAConfig] = None          # Populated when model_type is MHSA
 
 @dataclass(frozen=True)
 class OptimizationConfig:

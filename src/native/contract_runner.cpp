@@ -2,6 +2,7 @@
 #include "export.h"
 #include "native_tenant.h"
 #include "omp_config.h"
+#include "mhsa_kernels.h"
 #include <immintrin.h>
 #include <cstdint>
 #include <cstring>
@@ -72,6 +73,10 @@ enum ContractOpcode : int32_t {
     OP_ADAM_APPLY = 11,
     OP_CONV_BLOCK_FWD = 20,
     OP_CONV_BLOCK_BWD = 21,
+    OP_MHSA_BLOCK_FWD = 30,
+    OP_MHSA_BLOCK_BWD = 31,
+    OP_MHSA_ACTION_FWD = 32,
+    OP_MHSA_ACTION_BWD = 33,
 };
 
 struct ContractOpRow {
@@ -181,6 +186,9 @@ struct ContractExecCtx {
     DenseBinding dense[8];
     AdamBinding adam;
     float* loss_out;
+    // MHSA (composed; unused when has_mhsa==0)
+    int32_t has_mhsa;
+    MhsaBinding mhsa;
 };
 
 static void softmax_cross_entropy_loss(
@@ -510,6 +518,10 @@ const char* contract_opcode_name(int32_t opcode) {
         case OP_ADAM_APPLY: return "ADAM_APPLY";
         case OP_CONV_BLOCK_FWD: return "CONV_BLOCK_FWD";
         case OP_CONV_BLOCK_BWD: return "CONV_BLOCK_BWD";
+        case OP_MHSA_BLOCK_FWD: return "MHSA_BLOCK_FWD";
+        case OP_MHSA_BLOCK_BWD: return "MHSA_BLOCK_BWD";
+        case OP_MHSA_ACTION_FWD: return "MHSA_ACTION_FWD";
+        case OP_MHSA_ACTION_BWD: return "MHSA_ACTION_BWD";
         default: return "UNKNOWN";
     }
 }
@@ -529,6 +541,8 @@ bool is_training_contract(const ContractOpRow* ops, int32_t op_count) {
     for (int32_t i = 0; i < op_count; ++i) {
         if (ops[i].opcode == OP_CONV_BLOCK_BWD ||
             ops[i].opcode == OP_DENSE_BWD ||
+            ops[i].opcode == OP_MHSA_BLOCK_BWD ||
+            ops[i].opcode == OP_MHSA_ACTION_BWD ||
             ops[i].opcode == OP_ADAM_APPLY) {
             return true;
         }
@@ -772,6 +786,33 @@ static int32_t run_contract_training_step_impl(
                     adam_apply_all(ctx);
                 }
                 break;
+            case OP_MHSA_BLOCK_FWD: {
+                if (!ctx->has_mhsa) return -20;
+                int32_t st = mhsa_block_forward(ctx->X, &ctx->mhsa);
+                if (st != 0) return st;
+                ctx->act = ctx->mhsa.O;
+                break;
+            }
+            case OP_MHSA_BLOCK_BWD: {
+                if (!ctx->has_mhsa) return -21;
+                int32_t st = mhsa_block_backward(ctx->X, &ctx->mhsa);
+                if (st != 0) return st;
+                if (ctx->mhsa.dX) ctx->act = ctx->mhsa.dX;
+                break;
+            }
+            case OP_MHSA_ACTION_FWD: {
+                if (!ctx->has_mhsa) return -22;
+                int32_t st = mhsa_action_forward(&ctx->mhsa);
+                if (st != 0) return st;
+                ctx->act = ctx->mhsa.actions;
+                break;
+            }
+            case OP_MHSA_ACTION_BWD: {
+                if (!ctx->has_mhsa) return -23;
+                int32_t st = mhsa_action_backward(&ctx->mhsa);
+                if (st != 0) return st;
+                break;
+            }
             default:
                 std::fprintf(stderr, "[CONTRACT] unsupported opcode %d\n", op->opcode);
                 return -10;

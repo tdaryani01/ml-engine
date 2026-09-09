@@ -31,7 +31,8 @@ $SourceFiles = @(
     "src\native\im2col_telemetry.cpp",
     "src\native\blas_dynamic.cpp",
     "src\native\conv_im2col_gemm.cpp",
-    "src\native\contract_runner.cpp"
+    "src\native\contract_runner.cpp",
+    "src\native\mhsa_kernels.cpp"
 )
 
 $Selected = switch ($Mode) {

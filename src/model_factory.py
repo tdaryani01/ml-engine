@@ -5,6 +5,7 @@ from config.constants import EngineBackend
 from utils.engine_ops import create_engine_context
 from src.models import BinaryClassificationNetwork, RegressionNetwork, MultiClassNetwork
 from src.cnn_network import CNNNetwork
+from src.mhsa_network import MHSANetwork
 from src.spatial_layers import Conv2D, MaxPool2D, Flatten
 from src.optimizers import AdamOptimizer, SGDOptimizer
 
@@ -14,7 +15,8 @@ class ModelFactory:
         "binary_classification": BinaryClassificationNetwork,
         "regression": RegressionNetwork,
         "multi_class": MultiClassNetwork,
-        "cnn": CNNNetwork
+        "cnn": CNNNetwork,
+        "mhsa": MHSANetwork,
     }
 
     @classmethod
@@ -136,6 +138,42 @@ class ModelFactory:
                 **factory_kwargs
             )
 
+        # --- MHSA INSTANTIATION ROUTE ---
+        if normalized_type == "mhsa":
+            mhsa_config = factory_kwargs.pop("mhsa_config", None)
+            if mhsa_config is None:
+                raise ValueError(
+                    "[Factory] 'mhsa_config' dictionary is required when initializing an MHSA model."
+                )
+            if hasattr(mhsa_config, "d_model"):
+                d_model = mhsa_config.d_model
+                num_heads = mhsa_config.num_heads
+                max_seq_len = mhsa_config.max_seq_len
+                action_dim = mhsa_config.action_dim
+                ffn_mult = getattr(mhsa_config, "ffn_mult", 4)
+            else:
+                d_model = mhsa_config["d_model"]
+                num_heads = mhsa_config["num_heads"]
+                max_seq_len = mhsa_config["max_seq_len"]
+                action_dim = mhsa_config["action_dim"]
+                ffn_mult = mhsa_config.get("ffn_mult", 4)
+
+            factory_kwargs.pop("use_batch_norm", None)
+            factory_kwargs.pop("bn_momentum", None)
+            factory_kwargs.pop("cnn_config", None)
+            engine_ctx = create_engine_context(backend_val)
+            return model_class(
+                d_model=int(d_model),
+                num_heads=int(num_heads),
+                max_seq_len=int(max_seq_len),
+                action_dim=int(action_dim),
+                ffn_mult=int(ffn_mult),
+                backend=backend_val,
+                engine_ctx=engine_ctx,
+                **factory_kwargs,
+            )
+
         # --- MLP/STANDARD INSTANTIATION ROUTE ---
         factory_kwargs.pop("cnn_config", None)
+        factory_kwargs.pop("mhsa_config", None)
         return model_class(layer_sizes=layer_sizes, **factory_kwargs)
