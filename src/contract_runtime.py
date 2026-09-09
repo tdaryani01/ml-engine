@@ -499,6 +499,17 @@ class ContractRuntime:
             lb.conv_pad = layer.conv_pad
             lb.pool_size = layer.pool_size
             lb.pool_stride = layer.pool_stride
+            # Must match train out_conv buffer (SIMD halo). Native no longer
+            # overwrites this — it used to round_up here and that broke dense eval.
+            lb.conv_out_w_stride = int(scratch.out_conv_buffer.shape[3])
+            conv_out_h = (
+                cur_h + 2 * layer.conv_pad - layer.k_h
+            ) // layer.conv_stride + 1
+            conv_out_w = (
+                cur_w_log + 2 * layer.conv_pad - layer.k_w
+            ) // layer.conv_stride + 1
+            lb.pool_out_h = (conv_out_h - layer.pool_size) // layer.pool_stride + 1
+            lb.pool_out_w = (conv_out_w - layer.pool_size) // layer.pool_stride + 1
             lb.ms_w = _ptr(opt.ms_w[w_idx])
             lb.vs_w = _ptr(opt.vs_w[w_idx])
             lb.ms_b = _ptr(opt.ms_b[w_idx].reshape(-1))
@@ -931,7 +942,9 @@ class ContractRuntime:
             conv_out_w = (
                 cur_w_log + 2 * layer.conv_pad - layer.k_w
             ) // layer.conv_stride + 1
-            lb.conv_out_w_stride = _round_up_simd(conv_out_w)
+            # Match ensure_conv_block_eval: dense W (no SIMD halo). Rounding here
+            # made native write past the eval buffer → heap corruption.
+            lb.conv_out_w_stride = conv_out_w
             lb.pool_out_h = (
                 conv_out_h - layer.pool_size
             ) // layer.pool_stride + 1
@@ -1015,6 +1028,7 @@ class ContractRuntime:
         self._pending_token = token
         if not self._wait_reap_native(-1):
             raise RuntimeError("async forward wait returned without completion")
+        self._invalidate_input_pad_stage()
         return np.copy(slot.output[:m])
 
     
@@ -1493,6 +1507,8 @@ class ContractRuntime:
             loss += (self.model.lam_l1 / submitted.m) * l1_sum
         gw = grad_weights
         gb = grad_biases
+        # X for this step is no longer guaranteed live / unique at this address.
+        self._invalidate_input_pad_stage(submitted.slot_idx)
         return loss, gw, gb, submitted.m
 
     def run_step(
@@ -1529,6 +1545,10 @@ class ContractRuntime:
             ctypes.c_int32(self.contract.op_count),
             ctypes.byref(ctx),
         )
+        # Drop staged x_pad / brgemm packs keyed on this step's X pointer so a
+        # later allocation that reuses the address cannot false-hit stale pads
+        # (breaks subsequent non-contract sync forwards).
+        self._invalidate_input_pad_stage()
         if status != 0:
             raise RuntimeError(f"run_contract_training_step failed with status {status}")
 

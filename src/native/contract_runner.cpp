@@ -702,7 +702,13 @@ static int32_t run_contract_training_step_impl(
                 const float* x_in = (op->layer_idx == 0) ? ctx->X : ctx->act;
                 L->x_cache = const_cast<float*>(x_in);
                 const int64_t conv_out_w = (L->W_in + 2 * L->conv_pad - L->k_w) / L->conv_stride + 1;
-                L->conv_out_w_stride = round_up_simd(conv_out_w);
+                // Trust Python bind: train uses SIMD-padded stride, eval/predict
+                // uses dense stride matching ensure_conv_block_eval. Overwriting
+                // with round_up_simd here made forward write past dense eval
+                // buffers (heap corruption / async predict abort).
+                if (L->conv_out_w_stride < conv_out_w) {
+                    return -2;
+                }
                 const int64_t conv_out_h = (L->H + 2 * L->conv_pad - L->k_h) / L->conv_stride + 1;
                 L->pool_out_h = (conv_out_h - L->pool_size) / L->pool_stride + 1;
                 L->pool_out_w = (conv_out_w - L->pool_size) / L->pool_stride + 1;

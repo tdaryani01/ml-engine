@@ -383,4 +383,5 @@ All Phase E planning questions resolved. See decisions log.
 | 2026-09-02 | This phase: early stopping = manager; defer auto-fork / E6 policy layer |
 | 2026-09-07 | `store_backend`: default `file_streaming`; `noop` for tests; `cache`/`queue`/`redis` reserved |
 | 2026-09-07 | Sync path: skip async wait/poll; stage packs with OMP when async is off |
-| 2026-09-07 | **Open bug:** async predict/`run_async_forward` heap-aborts; see [phase-e-reference.md Known open bugs](./phase-e-reference.md#known-open-bugs); suite must not skip it |
+| 2026-09-07 | **Open bug:** async predict/`run_async_forward` heap-aborts; see [phase-e-reference.md](./phase-e-reference.md#known-open-bugs) |
+| 2026-09-09 | **Closed:** async predict abort (stride bind + staged x_pad invalidate); see phase-e-reference |

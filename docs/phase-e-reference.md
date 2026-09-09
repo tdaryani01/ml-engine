@@ -252,16 +252,16 @@ Scratch buffers, activations, dataset blobs, DLL handles, global backend singlet
 
 ## Known open bugs
 
-### Async contract forward crash (`test_contract_async_forward_matches_direct_predict`)
+*(none currently tracked — async contract forward heap abort closed 2026-09-09)*
+
+### Closed: Async contract forward crash (`test_contract_async_forward_matches_direct_predict`)
 
 | | |
 |--|--|
-| **Symptom** | Hard abort when `native_async_submit=true` and `predict()` routes through `ContractRuntime.run_async_forward` (forward-only submit to the native async worker). Observed: glibc `corrupted size vs. prev_size` → process abort (exit 134 / signal -6). |
-| **Repro** | Full suite (`run_tests.py`) or `testing/test_contract.py` alone. Isolates to this test after prior contract tests pass. |
-| **Observed** | 2026-09-07 full suite: 18/19 modules pass; Contract fails only on this case. Still fails after forcing main-thread pack path serial — **not** explained by the sync OMP prep-pack change. |
-| **Not broken** | Async *training* submit/reap (`test_contract_async_submit_reaps`, busy pushback, engine finalize) passes. Sync contract path (`native_async_submit=false`, current default in `config.yaml`) is unaffected. |
-| **Root cause** | Unknown. Not diagnosed. |
-| **Policy** | Keep the test in the default suite — no skip/bypass. Formal runs must surface this. Default/bench configs stay on sync submit until closed. |
+| **Symptom** | Hard abort when `native_async_submit=true` and `predict()` routes through `ContractRuntime.run_async_forward`. glibc `corrupted size vs. prev_size` / double-free; also order-dependent sync/contract weight mismatch after a prior contract step. |
+| **Root cause** | (1) `contract_runner` overwrote `conv_out_w_stride` with `round_up_simd` even for dense eval buffers → write past end. (2) Sync `_bind_conv_layers` never set stride (relied on that overwrite). (3) Staged `x_pad` left valid after the step so a recycled `X` pointer false-hit stale pads. |
+| **Fix** | Trust Python-bound stride; set stride from train/eval buffers; invalidate staged pads after sync invoke / async reap / async forward. |
+| **Closed** | 2026-09-09 — `testing/test_contract.py` and full `run_tests.py` green. |
 
 ---
 
@@ -283,4 +283,5 @@ Scratch buffers, activations, dataset blobs, DLL handles, global backend singlet
 | 2026-09-07 | Sync contract: no wait/poll loops when `native_async_submit=false`; prep packs use OMP |
 | 2026-09-07 | Predict densifies logical W once (e.g. 32→28) so fwd skips per-conv strided copies |
 | 2026-09-07 | BRGEMM dX planar scatter uses pointer-bump (same math; avoids `c*spatial` imul) |
-| 2026-09-07 | **Open bug:** async predict/`run_async_forward` heap-aborts (`corrupted size vs. prev_size`); tracked in [Known open bugs](#known-open-bugs); suite must not skip it |
+| 2026-09-07 | **Open bug:** async predict/`run_async_forward` heap-aborts (`corrupted size vs. prev_size`); suite must not skip it |
+| 2026-09-09 | **Closed:** async predict abort — trust bound `conv_out_w_stride`, set stride in sync bind, invalidate staged x_pad after step (see Known open bugs) |
