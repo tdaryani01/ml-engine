@@ -4,7 +4,7 @@
 # SYSTEM META CONFIGURATION
 # =====================================================================
 meta:
-  pipeline_name: "synthetic_spatial_cnn_run"
+  pipeline_name: "mhsa_cue_recall_quick"
   stage: "development"
   suppress_logging: false
   logging_level: "warning"
@@ -15,8 +15,8 @@ meta:
 # =====================================================================
 ingestion:
   source_mode: "csv"                 # IngestionMode: "csv" or "stream"
-  data_file_path: "data/samples/csv/synthetic_shapes_128.npz"
-  feature_names: "auto"              # Unused for CNN NPZ path; tabular CSV still uses column names
+  data_file_path: "data/samples/mhsa/cue_recall_quick.npz"
+  feature_names: "auto"
   splits:
     train: 0.70
     val: 0.15
@@ -29,42 +29,26 @@ ingestion:
 # NETWORK ARCHITECTURE CONFIGURATION
 # =====================================================================
 architecture:
-  model_type: "cnn"                  # Options: "multi_class", "binary_classification", "regression", "cnn"
-  backend: "native"                  # Options: "native" | "im2col+gemm" | "numpy"
-  num_classes: 4                     # 4 Synthetic Classes: Circle, Square, Cross, Diamond
-  hidden_layers: []                  # Dense MLP hidden layers (bypassed for CNN)
-  p_dropout: 0.1                     # Regularization dropout rate
-  use_batch_norm: false              #
-  bn_momentum: 0.9                   #
+  model_type: "mhsa"                 # Options: "multi_class", "binary_classification", "regression", "cnn", "mhsa"
+  backend: "native"                  # MHSA requires native
+  num_classes: 4                     # action_dim (continuous)
+  hidden_layers: []
+  p_dropout: 0.0
+  use_batch_norm: false
+  bn_momentum: 0.9
 
   # -------------------------------------------------------------------
-  # CNN SPECIFIC PIPELINE CONFIGURATION (Active when model_type: "cnn")
+  # MHSA (matches cue_recall_quick.npz: T=32, D=64, A=4)
+  # For sanity stress: swap data_file_path to cue_recall_sanity.npz and
+  # set d_model=256, max_seq_len=128, num_heads=8, num_layers=4.
   # -------------------------------------------------------------------
-  cnn:
-    input_shape: [3, 128, 128]       # [Channels, Height, Width] — procedural shapes @ 128²
-    spatial_pipeline:
-      - type: "conv"
-        in_channels: 3
-        out_channels: 8
-        kernel_size: 7
-        stride: 1
-        pad: 1
-      - type: "relu"
-      - type: "pool"
-        pool_size: 2
-        stride: 2
-      - type: "conv"
-        in_channels: 8
-        out_channels: 16
-        kernel_size: 7
-        stride: 1
-        pad: 1
-      - type: "relu"
-      - type: "pool"
-        pool_size: 2
-        stride: 2
-      - type: "flatten"
-    dense_head: [64]                 # Hidden dense dims between Flatten and Output classes
+  mhsa:
+    d_model: 64
+    num_heads: 4
+    max_seq_len: 32
+    action_dim: 4
+    ffn_mult: 4
+    num_layers: 2
 
 # =====================================================================
 # OPTIMIZATION LOOP CONTROLS
@@ -76,24 +60,21 @@ optimization:
   epochs_full_dataset: 5
   steps_streaming: 31
   batch_size: 32
-  learning_rate: 0.001               # Initial learning rate for Adam
-  
-  # Learning Rate Schedule
+  learning_rate: 0.001
+
   lr_scheduler: "exponential"
   scheduler_decay_rate: 0.98
   scheduler_epochs_per_drop: 10
   scheduler_drop_ratio: 0.5
 
-  # Early Stopping Monitor
   early_stopping_enabled: false
   patience: 10
   min_delta: 1.0e-04
 
-  # Numerical Defensive Guardrails
   gradient_clipping_max_norm: 5.0
 
 # =====================================================================
-# TRAINING LEDGER (Phase E — append-only document log during fit)
+# TRAINING LEDGER
 # =====================================================================
 ledger:
   enabled: true
@@ -103,24 +84,18 @@ ledger:
   checkpoint_every_steps: 50
   checkpoint_on_local_best: true
   contract_list_enabled: true
-  # Native async contract submit (independent of ledger I/O). false = sync native
-  # on the caller thread (strict OMP team). true = persistent native worker.
-  # With async, OMP_NUM_THREADS defaults to auto (num_threads-1) unless runtime
-  # yaml sets a normal int. OMP_THREAD_LIMIT stays at the full budget.
   native_async_submit: false
-  # Pluggable ledger store. Default file_streaming = current stream writer.
-  # noop = tests (no disk). Future: cache | queue | redis.
 
 # =====================================================================
-# REGULARIZATION STRAIN MATRIX
+# REGULARIZATION
 # =====================================================================
 regularization:
   lam_l1: 1.0e-05
-  lam_l2: 1.0e-04                    # L2 weight decay penalty
+  lam_l2: 1.0e-04
   sparsity_tolerance: 1.0e-05
 
 # =====================================================================
-# PIPELINE FEATURE TRANSLATION TRANSFORMATIONS
+# TRANSFORMATIONS
 # =====================================================================
 transformations:
   fourier_expansion:
@@ -128,14 +103,14 @@ transformations:
     num_frequencies: 4
 
 # =====================================================================
-# PERSISTENCE & LIFECYCLE MANAGEMENT
+# PERSISTENCE
 # =====================================================================
 persistence:
-  load_saved_model: false             # Set to false for clean CNN training run
-  model_asset_path: "deployed_cnn_model.npz"
+  load_saved_model: false
+  model_asset_path: "deployed_mhsa_model.npz"
 
 # =====================================================================
-# DIAGNOSTICS & REPORTING
+# DIAGNOSTICS
 # =====================================================================
 diagnostics:
   enabled: true

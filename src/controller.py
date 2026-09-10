@@ -62,7 +62,9 @@ class ModelController:
         bn_momentum: float = 0.9,
         max_norm: float = 5.0,
         cnn_config: Optional[Dict[str, Any]] = None,
-        backend: EngineBackend = EngineBackend.NATIVE
+        mhsa_config: Optional[Dict[str, Any]] = None,
+        backend: EngineBackend = EngineBackend.NATIVE,
+        contract_list_enabled: bool = False,
     ) -> None:
         """
         Builds and initializes network topology. 
@@ -107,7 +109,9 @@ class ModelController:
             bn_momentum=bn_momentum,
             max_norm=max_norm,
             backend=self.backend,
-            cnn_config=cnn_config
+            cnn_config=cnn_config,
+            mhsa_config=mhsa_config,
+            contract_list_enabled=contract_list_enabled,
         )
 
         # FORENSIC HOOK: INIT TRACE

@@ -51,8 +51,10 @@ def execute_training_pipeline():
     logging.warning(experiment_summary())
 
     is_cnn = (cfg.architecture.model_type == ModelType.CNN)
+    is_mhsa = (cfg.architecture.model_type == ModelType.MHSA)
     source_mode = cfg.ingestion.source_mode
     cnn_cfg = getattr(cfg.architecture, "cnn", None) if is_cnn else None
+    mhsa_cfg = getattr(cfg.architecture, "mhsa", None) if is_mhsa else None
 
     # 4. Resolve Data Provider via Factory Loader or Stream Provider
     if source_mode == IngestionMode.STREAM:
@@ -80,12 +82,15 @@ def execute_training_pipeline():
             loader=loader,
             batch_size=cfg.optimization.batch_size,
             epochs=cfg.optimization.epochs_full_dataset,
-            normalize_features=(not is_cnn)
+            normalize_features=(not is_cnn and not is_mhsa)
         )
         steps = data_provider.recomment_steps()
 
         if is_cnn:
-            input_dim = int(np.prod(cnn_cfg["input_shape"]))
+            input_dim = int(np.prod(cnn_cfg["input_shape"] if isinstance(cnn_cfg, dict) else cnn_cfg.input_shape))
+        elif is_mhsa:
+            X0 = data_provider.splits[DataKeys.X_TRAIN]
+            input_dim = int(np.prod(X0.shape[1:]))
         else:
             input_dim = (
                 len(cfg.ingestion.feature_names) 
@@ -109,7 +114,7 @@ def execute_training_pipeline():
         input_dim=input_dim,
         output_dim=cfg.architecture.num_classes,
         model_type=cfg.architecture.model_type,
-        hidden_layers=cfg.architecture.hidden_layers if not is_cnn else [],
+        hidden_layers=cfg.architecture.hidden_layers if not is_cnn and not is_mhsa else [],
         optimizer_name=cfg.optimization.optimizer,
         lam_l1=cfg.regularization.lam_l1,
         lam_l2=cfg.regularization.lam_l2,
@@ -118,7 +123,9 @@ def execute_training_pipeline():
         bn_momentum=cfg.architecture.bn_momentum,
         max_norm=cfg.optimization.gradient_clipping_max_norm,
         cnn_config=cnn_cfg if is_cnn else None,
-        backend=cfg.architecture.backend
+        mhsa_config=mhsa_cfg if is_mhsa else None,
+        backend=cfg.architecture.backend,
+        contract_list_enabled=bool(getattr(cfg.ledger, "contract_list_enabled", False)),
     )
 
     # 7. Pretrained Model Hydration

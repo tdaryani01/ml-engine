@@ -23,13 +23,34 @@ class BaseDataLoader(ABC):
     @classmethod
     def create_loader(cls, cfg: Any) -> "BaseDataLoader":
         """
-        Factory method to resolve and instantiate the correct BaseDataLoader 
+        Factory method to resolve and instantiate the correct BaseDataLoader
         based on the provided pipeline configuration.
         """
         from src.data.tabular_loader import TabularCSVLoader
         from src.data.image_loader import ImageCSVLoader
+        from src.data.mhsa_loader import MHSANpzLoader
 
-        is_cnn = (cfg.architecture.model_type == ModelType.CNN)
+        is_cnn = cfg.architecture.model_type == ModelType.CNN
+        is_mhsa = cfg.architecture.model_type == ModelType.MHSA
+
+        if is_mhsa:
+            mhsa_cfg = getattr(cfg.architecture, "mhsa", None) or {}
+            if hasattr(mhsa_cfg, "d_model"):
+                d_model = int(mhsa_cfg.d_model)
+                max_seq_len = int(mhsa_cfg.max_seq_len)
+                action_dim = int(mhsa_cfg.action_dim)
+            else:
+                d_model = int(mhsa_cfg["d_model"])
+                max_seq_len = int(mhsa_cfg["max_seq_len"])
+                action_dim = int(mhsa_cfg["action_dim"])
+            return MHSANpzLoader(
+                cfg.ingestion.data_file_path,
+                d_model=d_model,
+                max_seq_len=max_seq_len,
+                action_dim=action_dim,
+                val_split=cfg.ingestion.splits.val,
+                train_split=cfg.ingestion.splits.train,
+            )
 
         if is_cnn:
             cnn_cfg = getattr(cfg.architecture, "cnn", None) or {}
@@ -45,14 +66,11 @@ class BaseDataLoader(ABC):
                 train_split=cfg.ingestion.splits.train,
             )
 
-        source_mode = getattr(cfg.ingestion, "source_mode", None)
-        
-        # Default tabular CSV ingestion
         return TabularCSVLoader(
             data_file_path=cfg.ingestion.data_file_path,
             feature_names=cfg.ingestion.feature_names,
             train_split=cfg.ingestion.splits.train,
             val_split=cfg.ingestion.splits.val,
             model_type=cfg.architecture.model_type,
-            num_classes=cfg.architecture.num_classes
+            num_classes=cfg.architecture.num_classes,
         )
