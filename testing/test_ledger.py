@@ -150,6 +150,71 @@ def test_e4_file_ledger_store_push_scan():
     print("[PASSED] E4: FileLedgerStore push/scan")
 
 
+def test_drop_imported_prefix_keeps_valid_head_and_reopens():
+    """File store rolls imported prefix; journal head stays decodable; appends resume."""
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = FileLedgerStore(tmp)
+        try:
+            from src.ledger import STEP_METRICS
+
+            for i in range(1, 4):
+                store.push(
+                    LedgerDocument(
+                        doc_type=STEP_METRICS,
+                        branch_id="main",
+                        model_instance_id="t",
+                        architecture_id="mlp",
+                        body={"step_id": i, "train_loss": 0.1 * i, "version": i},
+                        version=i,
+                        step_id=i,
+                    )
+                )
+            store.flush()
+            path = store.journal_path
+            data = path.read_bytes()
+            import struct
+
+            (rec_len,) = struct.unpack_from("<I", data, 0)
+            through = 4 + rec_len
+            # TM importer signal — store owns the roll.
+            Path(str(path) + ".tm_imported_through").write_text(
+                f"{through}\n", encoding="utf-8"
+            )
+            assert store.maybe_drop_imported_prefix() == through
+            assert not Path(str(path) + ".tm_imported_through").exists()
+            assert Path(str(path) + ".tm_prefix_dropped").is_file()
+
+            from src.ledger_wire import MAGIC
+
+            tail = path.read_bytes()
+            assert len(tail) >= 8
+            assert tail[4:8] == MAGIC
+            docs = list(store.scan())
+            assert len(docs) == 2
+            assert docs[0].body["step_id"] == 2
+            store.push(
+                LedgerDocument(
+                    doc_type=STEP_METRICS,
+                    branch_id="main",
+                    model_instance_id="t",
+                    architecture_id="mlp",
+                    body={"step_id": 99, "train_loss": 0.0, "version": 99},
+                    version=99,
+                    step_id=99,
+                )
+            )
+            store.flush()
+            docs2 = list(store.scan())
+            assert len(docs2) == 3
+            assert docs2[-1].body["step_id"] == 99
+            assert path.read_bytes()[4:8] == MAGIC
+        finally:
+            _close_store(store)
+    print("[PASSED] drop_imported_prefix keeps valid head")
+
+
 def test_e4_checkpoint_put_get():
     with tempfile.TemporaryDirectory() as tmp:
         store = FileLedgerStore(tmp)
@@ -612,6 +677,7 @@ PHASE_E_TESTS = [
     test_e1_document_round_trip,
     test_e2_train_step_result_to_bytes,
     test_e4_file_ledger_store_push_scan,
+    test_drop_imported_prefix_keeps_valid_head_and_reopens,
     test_e4_checkpoint_put_get,
     test_e3_engine_matches_train_and_apply,
     test_e5_replay_from_checkpoint,

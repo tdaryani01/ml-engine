@@ -78,15 +78,44 @@ optimization:
 # =====================================================================
 # TRAINING LEDGER
 # =====================================================================
+# store_backend chooses how docs are stored/loaded on the engine:
+#   noop            — discard (benches)
+#   file_streaming  — local journal (stable train path; importer job → TM DB)
+#   file_sync       — fsync each push (tests)
+#   http_tm         — optional: POST JSON to TM API (not the default fleet path)
 ledger:
   enabled: true
   path: "training_ledger"
-  store_backend: noop
+  store_backend: file_streaming
   branch_id: "main"
   checkpoint_every_steps: 50
   checkpoint_on_local_best: true
   contract_list_enabled: true
   native_async_submit: false
+
+# =====================================================================
+# TRAINING MANAGER (sibling control plane — optional)
+# =====================================================================
+# Fire-and-forget HTTP register + heartbeat from the engine useful-work /
+# idle-park path (works with ledger on or off).
+# interval_s / idle_sleep_s should stay under training-manager
+# config/registry.heartbeat_ttl_s (default 60).
+# When ledger.enabled is false, capabilities omit "ledger" and the fleet
+# label is annotated "(no ledger)".
+# instance_id must match ledger model_instance_id so importer + fleet filter align.
+training_manager:
+  enabled: true
+  uri: "http://127.0.0.1:8000"
+  instance_id: "engine-local-1"
+  kind: "engine"
+  label: "local ml-engine"
+  advertise_url: "http://127.0.0.1:0"
+  capabilities: ["train_step", "ledger", "start", "pause", "resume", "restore", "shutdown", "cancel"]
+  interval_s: 10
+  timeout_s: 0.5
+  idle_sleep_s: 10
+  # After fit drains, keep process alive: sleep → check work → idle heartbeat.
+  park_when_idle: true
 
 # =====================================================================
 # REGULARIZATION

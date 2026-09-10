@@ -196,6 +196,7 @@ def assemble(cfg: dict[str, Any], *, seed: int = 0) -> DrawApp:
         channels=C,
         sigma=float(cl.get("sigma", 0.1)),
         action_scale=float(cl.get("action_scale", 0.85)),
+        continuity_weight=float(cl.get("continuity_weight", 0.0)),
     )
     loss_fn = CanvasReconstructionLoss(
         terminal_only=bool(cl.get("terminal_loss", True)),

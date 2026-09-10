@@ -564,7 +564,6 @@ def log_runtime_settings(
         f"openblas_during_fit={openblas_fit} scipy_blas_during_fit={scipy_blas_fit} "
         f"dll_omp={dll_omp_s} im2col_cap={im2col_cap_s} unified_omp={unified_s} {tune}"
     )
-    print(msg)
     logger.info(msg)
     if logger.isEnabledFor(logging.DEBUG):
         try:

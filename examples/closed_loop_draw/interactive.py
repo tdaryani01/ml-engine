@@ -138,6 +138,11 @@ class DrawInteractiveApp:
                     if self.app.loss_fn.edt_enabled
                     else ""
                 )
+                + (
+                    f"+cont×{self.app.env.continuity_weight:g}"
+                    if getattr(self.app.env, "continuity_weight", 0) > 0
+                    else ""
+                )
             ),
             padding=(8, 0),
         )

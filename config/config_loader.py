@@ -75,7 +75,9 @@ def load_production_config(file_path="config/config.yaml") -> PipelineConfig:
     fourier_obj = FourierConfig(**raw["transformations"]["fourier_expansion"])
     transform_obj = TransformationsConfig(fourier_expansion=fourier_obj)
     ledger_obj = LedgerSettings(**raw.get("ledger", {}))
-    
+    tm_raw = dict(raw.get("training_manager") or {})
+    training_manager_obj = TrainingManagerSettings(**tm_raw)
+
     return PipelineConfig(
         meta=MetaConfig(**raw["meta"]),
         ingestion=ingestion_obj,
@@ -86,4 +88,5 @@ def load_production_config(file_path="config/config.yaml") -> PipelineConfig:
         persistence=PersistenceConfig(**raw["persistence"]),
         diagnostics=DiagnosticsConfig(**raw["diagnostics"]),
         ledger=ledger_obj,
+        training_manager=training_manager_obj,
     )

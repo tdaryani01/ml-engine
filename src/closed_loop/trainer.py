@@ -158,6 +158,13 @@ class ClosedLoopTrainer:
             if t < max_steps:
                 action_embs.append(self.action_embed.forward(A))
 
+        # Optional app-layer action-chain prior (e.g. stroke continuity).
+        dA_cont: list[np.ndarray] | None = None
+        cont_loss = 0.0
+        if hasattr(self.env, "continuity_loss_and_action_grads"):
+            cont_loss, dA_cont = self.env.continuity_loss_and_action_grads()  # type: ignore[attr-defined]
+            total_loss += float(cont_loss)
+
         mhsa_acc = self._new_mhsa_grad_acc()
         dG_acc = np.zeros_like(goal, dtype=np.float32)
         dA_emb_pending: list[np.ndarray | None] = [None] * max(0, max_steps - 1)
@@ -185,6 +192,9 @@ class ClosedLoopTrainer:
                 dA = self.env.action_grad(
                     self.loss_fn.step_obs_grad(obs, target, ti)
                 )
+
+            if dA_cont is not None:
+                dA = dA + dA_cont[ti]
 
             if t < max_steps and dA_emb_pending[ti] is not None:
                 self.action_embed.forward(A_list[ti])
@@ -232,9 +242,13 @@ class ClosedLoopTrainer:
                 grad_betas=mhsa_acc["dln_b"],
             )
 
+        extras: dict[str, Any] = {"step_losses": step_losses}
+        if cont_loss:
+            extras["continuity_loss"] = float(cont_loss)
+
         return RolloutResult(
             total_loss=float(total_loss),
             actions=actions,
             seq_lens=[int(x.shape[1]) for x in Xs],
-            extras={"step_losses": step_losses},
+            extras=extras,
         )

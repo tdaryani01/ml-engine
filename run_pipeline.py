@@ -150,6 +150,7 @@ def execute_training_pipeline():
             patience=cfg.optimization.patience,
             min_delta=cfg.optimization.min_delta,
             ledger_settings=cfg.ledger,
+            training_manager=cfg.training_manager,
             output_dir=cfg.meta.output_dir,
         )
 

@@ -194,6 +194,10 @@ class SyncFileLedgerStore:
             return None
         return document_from_bytes(records[0])
 
+    def maybe_drop_imported_prefix(self) -> int | None:
+        """If TM wrote journal.bin.tm_imported_through, roll the WAL prefix (same-thread)."""
+        return _maybe_drop_imported_prefix(self)
+
 
 class StreamingFileLedgerStore:
     """
@@ -320,6 +324,12 @@ class StreamingFileLedgerStore:
         if not records:
             return None
         return document_from_bytes(records[0])
+
+    def maybe_drop_imported_prefix(self) -> int | None:
+        """If TM wrote journal.bin.tm_imported_through, roll the WAL prefix (same-thread)."""
+        if self._closed:
+            return None
+        return _maybe_drop_imported_prefix(self)
 
 
 class NoopLedgerStore:
@@ -451,6 +461,58 @@ class QueueLedgerStore:
         )
 
 
+def _close_journal_append(store: object) -> None:
+    writer = getattr(store, "_writer", None)
+    if writer is not None:
+        writer.close()
+        return
+    fh = getattr(store, "_fh", None)
+    if fh is not None:
+        fh.close()
+
+
+def _reopen_journal_append(store: object) -> None:
+    path = Path(store.journal_path)  # type: ignore[attr-defined]
+    if hasattr(store, "_writer"):
+        store._writer = _open_async_writer(path)  # type: ignore[attr-defined]
+        return
+    if hasattr(store, "_fh"):
+        store._fh = open(path, "ab", buffering=0)  # type: ignore[attr-defined]
+
+
+def _maybe_drop_imported_prefix(store: object) -> int | None:
+    """Roll journal.bin after TM import marker. Owns flush/close/rewrite/reopen + signals."""
+    path = Path(getattr(store, "journal_path"))
+    marker = Path(str(path) + ".tm_imported_through")
+    if not marker.is_file() or not path.is_file():
+        return None
+    try:
+        through = int(marker.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    if through <= 0:
+        return None
+
+    flush = getattr(store, "flush", None)
+    if callable(flush):
+        flush()
+    _close_journal_append(store)
+    try:
+        size = path.stat().st_size
+        if through >= size:
+            path.write_bytes(b"")
+        else:
+            path.write_bytes(path.read_bytes()[through:])
+        marker.unlink(missing_ok=True)
+        # Importer must reset its byte cursor — remaining file is a new base at 0.
+        Path(str(path) + ".tm_prefix_dropped").write_text(
+            str(int(through)) + "\n", encoding="utf-8"
+        )
+    finally:
+        _reopen_journal_append(store)
+    return through
+
+
 def _encode_queue_item(item: _QueueItem) -> bytes:
     if isinstance(item, bytes):
         return item
@@ -476,14 +538,23 @@ def _open_async_writer(path: Path):
 FileLedgerStore = StreamingFileLedgerStore
 
 
-def create_ledger_store(backend: str, root: str | Path) -> LedgerStore:
+def create_ledger_store(
+    backend: str,
+    root: str | Path,
+    **kwargs: object,
+) -> LedgerStore:
     """Factory for ledger persistence backends.
 
     Known keys:
       file_streaming | streaming | async  — SyncJournalWriter / overlapped (default)
       file_sync | sync | file             — fsync every push (tests)
       noop | null | none | discard        — NoopJournalWriter, no disk (tests/bench)
+      http_tm | tm_http | training_manager — POST JSON docs to Training Manager API
       cache | queue | redis               — reserved; NotImplementedError for now
+
+    Extra kwargs (http_tm):
+      http_tm_uri: str — Training Manager base URL (required)
+      timeout_s: float — POST timeout (default 0.5)
     """
     key = backend.strip().lower()
     if key in ("file_sync", "sync", "file"):
@@ -492,6 +563,12 @@ def create_ledger_store(backend: str, root: str | Path) -> LedgerStore:
         return StreamingFileLedgerStore(root)
     if key in ("noop", "null", "none", "discard"):
         return NoopLedgerStore(root)
+    if key in ("http_tm", "tm_http", "training_manager"):
+        from src.ledger_store_http_tm import HttpTmLedgerStore
+
+        uri = str(kwargs.get("http_tm_uri") or kwargs.get("uri") or "")
+        timeout_s = float(kwargs.get("timeout_s", 0.5) or 0.5)
+        return HttpTmLedgerStore(root, uri=uri, timeout_s=timeout_s)
     if key in ("cache",):
         return CacheLedgerStore(root)
     if key in ("queue",):

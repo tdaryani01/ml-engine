@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections import deque
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from typing import Any, Callable, Optional
 import numpy as np
 
 from src.ledger import BatchRef, LedgerConfig, TrainingLedger, VERDICT_HEALTHY
+from src.manager_heartbeat import ManagerCommand, ManagerHeartbeat, decode_checkpoint_blob
 from src.training_session import SessionStatus, TrainStepResult, TrainingSession
 
 try:
@@ -223,6 +225,7 @@ class TrainingEngine:
         ledger: TrainingLedger,
         config: LedgerConfig | None = None,
         session: TrainingSession | None = None,
+        manager_heartbeat: ManagerHeartbeat | None = None,
     ):
         self.sessions: list[TrainingSession] = []
         self._current_session: TrainingSession | None = None
@@ -233,8 +236,103 @@ class TrainingEngine:
         self._prefetch_depth = int(getattr(config, "prefetch_depth", 4) or 4)
         self._ledger_lock = threading.RLock()
         self._deferred: deque[Callable[[], None]] = deque()
+        self._manager_heartbeat = manager_heartbeat
+        self._stop = threading.Event()
+        self._paused = threading.Event()
+        self._work_poll: Callable[[], bool] | None = None
+        self._restore_inflight: dict[str, threading.Thread] = {}
+        self._restore_ready: dict[str, Any] = {}
+        self._restore_lock = threading.Lock()
+        self._last_status_line: str | None = None
+        self._restored_checkpoint_version: int | None = None
+        # After fit completes sessions are dropped; keep the model so TM restore
+        # can still apply weights while parked idle.
+        self._held_model_for_restore: Any | None = None
+        # Sticky desired=running from a prior process must not auto-train.
+        # Only an explicit start/resume command in *this* process authorizes run.
+        self._run_authorized: bool = False
+        # Sticky desired=stopped / redelivered shutdown must not kill a new process.
+        self._process_started_at: float = time.time()
+        self._shutdown_accepted: bool = False
         if session is not None:
             self._register_session(session, activate=True)
+
+    def request_stop(self) -> None:
+        """Wake the idle park loop and exit ``run`` on the next check."""
+        self._stop.set()
+        self._emit_engine_status("stopped")
+
+    def request_pause(self) -> None:
+        self._paused.set()
+        self._publish_manager_metrics("paused")
+        self._emit_engine_status("paused")
+
+    def request_resume(self) -> None:
+        self._paused.clear()
+        self._publish_manager_metrics("training")
+        self._emit_engine_status("training")
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused.is_set()
+
+    def _emit_engine_status(
+        self,
+        state: str,
+        *,
+        force: bool = False,
+        note: str | None = None,
+    ) -> None:
+        """Print a compact run-state line (status changes only). Details stay in logs."""
+        hb = self._manager_heartbeat
+        desired = None if hb is None else hb.desired_state
+        ckpt = int(self.ledger.version)
+        loss = None
+        sess = self._current_session
+        if sess is not None and sess._epoch_losses:
+            loss = float(sess._epoch_losses[-1])
+        parts = [f"status={state}", f"checkpoint=v{ckpt}"]
+        if self._restored_checkpoint_version is not None:
+            parts.append(f"restored_from=v{self._restored_checkpoint_version}")
+        if desired is not None:
+            parts.append(f"desired={desired}")
+        if loss is not None:
+            parts.append(f"loss={loss:.4f}")
+        if note:
+            parts.append(note)
+        line = "[Engine] " + " ".join(parts)
+        if not force and line == self._last_status_line:
+            return
+        self._last_status_line = line
+        print(line, flush=True)
+        logging.info("%s", line)
+
+    def _publish_manager_metrics(self, state: str, session: TrainingSession | None = None) -> None:
+        hb = self._manager_heartbeat
+        if hb is None:
+            return
+        # Once training advances past a restore point, stop advertising it as tip.
+        if (
+            self._restored_checkpoint_version is not None
+            and int(self.ledger.version) > int(self._restored_checkpoint_version)
+        ):
+            self._restored_checkpoint_version = None
+        sess = session if session is not None else self._current_session
+        metrics: dict[str, Any] = {
+            "state": state,
+            "checkpoint_version": int(self.ledger.version),
+        }
+        if self._restored_checkpoint_version is not None:
+            metrics["restored_from_checkpoint"] = int(
+                self._restored_checkpoint_version
+            )
+        if sess is not None and sess._epoch_losses:
+            metrics["loss"] = float(sess._epoch_losses[-1])
+        hb.set_metrics(metrics)
+
+    def set_work_poll(self, poll: Callable[[], bool] | None) -> None:
+        """Optional hook: return True when external work was queued (TM jobs later)."""
+        self._work_poll = poll
 
     @property
     def session(self) -> TrainingSession | None:
@@ -260,6 +358,8 @@ class TrainingEngine:
         self.sessions.append(session)
         self._current_session = session
         self._sessions_started += 1
+        if getattr(session, "model", None) is not None:
+            self._held_model_for_restore = session.model
         return session
 
     def _require_session(self, session: TrainingSession | None = None) -> TrainingSession:
@@ -287,6 +387,8 @@ class TrainingEngine:
         sess = self.get_session(session_id)
         if sess is None:
             return None
+        if self._manager_heartbeat is not None and getattr(sess, "model", None) is not None:
+            self._held_model_for_restore = sess.model
         sess.status = SessionStatus.FINISHED
         self.sessions = [s for s in self.sessions if s.session_id != session_id]
         if self._current_session is sess:
@@ -327,6 +429,8 @@ class TrainingEngine:
             if rt is not None and hasattr(rt, "close"):
                 rt.close()
         hist = (list(sess.train_history), list(sess.val_history))
+        if self._manager_heartbeat is not None and getattr(sess, "model", None) is not None:
+            self._held_model_for_restore = sess.model
         sess.detach_model_ownership()
         self.drop_session(session_id)
         return hist
@@ -466,7 +570,7 @@ class TrainingEngine:
             session.session_id = session_id
         session._fit_kwargs = dict(fit_kwargs)
         self._register_session(session, activate=activate)
-        logging.info(
+        logging.debug(
             "[TrainingEngine] Session %s registered status=%s (total=%d)",
             session.session_id,
             session.status.value,
@@ -475,46 +579,456 @@ class TrainingEngine:
         return session
 
     def run(
-        self, *, activate_pending: bool = False
+        self,
+        *,
+        activate_pending: bool = False,
+        park_when_idle: bool | None = None,
     ) -> dict[str, tuple[list[float], list[float]]]:
         """
-        Drive all ACTIVE sessions to completion (round-robin one epoch each).
+        Drive ACTIVE sessions to completion (round-robin one epoch each).
 
         Finished sessions are dropped; results keyed by session_id.
+
+        When a Training Manager heartbeat client is attached, the engine
+        **parks idle** until the manager queues ``start`` / ``resume``
+        in this process (not merely sticky desired_state from a prior run).
+        Pause / restore / shutdown are honored in idle.
         """
+        hb = self._manager_heartbeat
+        if hb is not None:
+            # TM-managed: always park; never auto-train on boot.
+            park = True
+        elif park_when_idle is None:
+            park = False
+        else:
+            park = bool(park_when_idle)
+
         if activate_pending:
             for s in self.sessions:
                 if s.status == SessionStatus.PENDING:
                     s.status = SessionStatus.ACTIVE
 
         results: dict[str, tuple[list[float], list[float]]] = {}
+        self._stop.clear()
+        boot_state = "idle" if hb is not None else "training"
+        self._maybe_manager_heartbeat(state=boot_state)
+        self._emit_engine_status(boot_state, force=True)
+
+        while not self._stop.is_set():
+            self.drain_manager_commands(allow_restore=True)
+            self._maybe_truncate_imported_journal()
+            self._apply_manager_desired_state()
+
+            if self._stop.is_set():
+                break
+
+            if not self._manager_allows_training():
+                state = "paused" if self._paused.is_set() else "idle"
+                self._maybe_manager_heartbeat(state=state)
+                self._emit_engine_status(state)
+                sleep_s = (
+                    float(getattr(hb._cfg, "idle_sleep_s", 10.0)) if hb else 10.0
+                )
+                if self._stop.wait(timeout=max(0.1, sleep_s)):
+                    break
+                continue
+
+            if self._paused.is_set():
+                self._maybe_manager_heartbeat(state="paused")
+                self._emit_engine_status("paused")
+                sleep_s = (
+                    float(getattr(hb._cfg, "idle_sleep_s", 10.0)) if hb else 10.0
+                )
+                if self._stop.wait(timeout=max(0.1, sleep_s)):
+                    break
+                continue
+
+            self._arm_pending_fits()
+            progressed = self._drive_active_epochs(results)
+            if progressed:
+                self.drain_manager_commands(allow_restore=False)
+                self._maybe_manager_heartbeat(state="training")
+                self._emit_engine_status("training")
+                continue
+
+            if not park:
+                break
+
+            # Idle: sleep, wake, check work, idle heartbeat, repeat.
+            sleep_s = float(getattr(hb._cfg, "idle_sleep_s", 10.0)) if hb else 10.0
+            if self._stop.wait(timeout=max(0.1, sleep_s)):
+                break
+            self.drain_manager_commands(allow_restore=True)
+            self._apply_manager_desired_state()
+            if self._paused.is_set() or not self._manager_allows_training():
+                continue
+            if self._check_for_work():
+                self._maybe_manager_heartbeat(state="training")
+                self._emit_engine_status("training")
+                continue
+            self._idle_heartbeat()
+            self._emit_engine_status("idle")
+        return results
+
+    def _manager_allows_training(self) -> bool:
+        """Without TM, always allow. With TM, only after Start/Resume in this process
+        and manager desired_state=running."""
+        hb = self._manager_heartbeat
+        if hb is None:
+            return True
+        if not self._run_authorized:
+            return False
+        desired = hb.desired_state
+        if desired is None:
+            return False  # boot: wait for Start
+        return str(desired).strip().lower() == "running"
+
+    def _apply_manager_desired_state(self) -> None:
+        hb = self._manager_heartbeat
+        if hb is None:
+            return
+        desired = (hb.desired_state or "").strip().lower()
+        if desired == "stopped":
+            # Only stop if *this* process accepted a shutdown command.
+            # Sticky desired=stopped from a prior run must not kill boot.
+            if not self._shutdown_accepted:
+                logging.warning(
+                    "[TrainingEngine] ignoring sticky desired=stopped "
+                    "(no shutdown command in this process)"
+                )
+                return
+            if not self._paused.is_set():
+                self._paused.set()
+                self._publish_manager_metrics("paused")
+                self._emit_engine_status("paused", note="shutdown_pause")
+            self.request_stop()
+        elif desired == "paused":
+            if not self._paused.is_set():
+                self.request_pause()
+        elif desired == "running":
+            if self._paused.is_set():
+                self.request_resume()
+        elif desired in ("idle", ""):
+            # Idle is not paused — clear local pause if manager wants idle.
+            if self._paused.is_set():
+                self._paused.clear()
+                self._publish_manager_metrics("idle")
+                self._emit_engine_status("idle")
+        # None: leave local pause alone; training gated by _manager_allows_training
+
+    def drain_manager_commands(self, *, allow_restore: bool) -> None:
+        """Apply TM commands at a safe point. Never blocks on network I/O."""
+        hb = self._manager_heartbeat
+        if hb is None:
+            return
+        self._finish_ready_restores()
+        self._maybe_auto_restore_from_manager(allow_restore=allow_restore)
+        self._apply_manager_desired_state()
+        for cmd in hb.poll_commands():
+            action = cmd.action.strip().lower()
+            try:
+                if action in ("start", "resume"):
+                    self._run_authorized = True
+                    hb.set_desired_state("running")
+                    self.request_resume()
+                    hb.mark_command_seen(cmd.id)
+                    hb.queue_ack(cmd.id, ok=True)
+                elif action == "pause":
+                    hb.set_desired_state("paused")
+                    self.request_pause()
+                    hb.mark_command_seen(cmd.id)
+                    hb.queue_ack(cmd.id, ok=True)
+                elif action == "cancel":
+                    self._run_authorized = False
+                    hb.set_desired_state("idle")
+                    self._paused.clear()
+                    self._publish_manager_metrics("idle")
+                    self._emit_engine_status("idle", force=True, note="start_cancelled")
+                    hb.mark_command_seen(cmd.id)
+                    hb.queue_ack(cmd.id, ok=True)
+                elif action == "shutdown":
+                    # Redelivered pre-boot shutdowns: ack and ignore.
+                    created = float(cmd.created_at or 0.0)
+                    if created > 0.0 and created < (self._process_started_at - 2.0):
+                        logging.warning(
+                            "[TrainingEngine] ignoring stale shutdown id=%s "
+                            "created_at=%.3f process_started=%.3f",
+                            cmd.id,
+                            created,
+                            self._process_started_at,
+                        )
+                        hb.mark_command_seen(cmd.id)
+                        hb.queue_ack(
+                            cmd.id, ok=True, detail="ignored_stale_pre_boot_shutdown"
+                        )
+                        continue
+                    self._shutdown_accepted = True
+                    hb.set_desired_state("stopped")
+                    # Pause before exiting.
+                    if not self._paused.is_set():
+                        self._paused.set()
+                        self._publish_manager_metrics("paused")
+                        self._emit_engine_status("paused", note="shutdown_pause")
+                    self.request_stop()
+                    hb.mark_command_seen(cmd.id)
+                    hb.queue_ack(cmd.id, ok=True)
+                elif action == "restore":
+                    # Do not flip sticky desired to paused — restore is weight sync.
+                    if not self._paused.is_set() and not allow_restore:
+                        self._paused.set()
+                    self._start_restore_async(cmd)
+                else:
+                    hb.mark_command_seen(cmd.id)
+                    hb.queue_ack(cmd.id, ok=False, detail=f"unknown action {action}")
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("[TrainingEngine] command %s failed", cmd.id)
+                hb.mark_command_seen(cmd.id)
+                hb.queue_ack(cmd.id, ok=False, detail=str(exc))
+
+    def _maybe_auto_restore_from_manager(self, *, allow_restore: bool) -> None:
+        """Boot-only: if local ledger is still v0 and TM advertises a blob, pull it.
+
+        Never fights an explicit restore or a settled local tip — that caused
+        1150↔1250 restore loops when ``active_checkpoint`` was stale across HBs.
+        """
+        hb = self._manager_heartbeat
+        if hb is None or not allow_restore:
+            return
+        if int(self.ledger.version) > 0:
+            return
+        if self._restored_checkpoint_version is not None:
+            return
+        with self._restore_lock:
+            if self._restore_inflight or self._restore_ready:
+                return
+        active = hb.active_checkpoint
+        if not isinstance(active, dict):
+            return
+        blob_key = active.get("blob_key")
+        version = active.get("version")
+        if not blob_key or version is None:
+            return
+        try:
+            version_i = int(version)
+        except (TypeError, ValueError):
+            return
+        if version_i <= 0:
+            return
+        fake = ManagerCommand(
+            id=f"auto-restore-v{version_i}",
+            action="restore",
+            payload={"version": version_i, "blob_key": str(blob_key)},
+            created_at=0.0,
+        )
+        self._start_restore_async(fake)
+
+    def _start_restore_async(self, cmd: ManagerCommand) -> None:
+        hb = self._manager_heartbeat
+        if hb is None:
+            return
+        blob_key = cmd.payload.get("blob_key")
+        if not blob_key:
+            hb.mark_command_seen(cmd.id)
+            if not str(cmd.id).startswith("auto-restore-"):
+                hb.queue_ack(cmd.id, ok=False, detail="missing blob_key")
+            return
+        # One restore at a time — overlapping 1150/1250 was the ping-pong.
+        with self._restore_lock:
+            busy = bool(self._restore_inflight or self._restore_ready)
+        if busy:
+            if str(cmd.id).startswith("auto-restore-"):
+                return
+            # Explicit: leave unseen so a later drain can retry after current finishes.
+            return
+        # Silent hold only — never advertise "paused" for restore (desired stays as-is).
+        self._paused.set()
+        with self._restore_lock:
+            if cmd.id in self._restore_inflight or cmd.id in self._restore_ready:
+                return
+            hb.mark_command_seen(cmd.id)
+
+            def _worker() -> None:
+                try:
+                    data = hb.fetch_blob(str(blob_key))
+                    if data is None:
+                        raise RuntimeError(f"blob not found: {blob_key}")
+                    with self._restore_lock:
+                        self._restore_ready[cmd.id] = (cmd, data)
+                except Exception as exc:  # noqa: BLE001
+                    with self._restore_lock:
+                        self._restore_ready[cmd.id] = (cmd, exc)
+                finally:
+                    with self._restore_lock:
+                        self._restore_inflight.pop(cmd.id, None)
+
+            t = threading.Thread(
+                target=_worker, name=f"tm-restore-{cmd.id[:8]}", daemon=True
+            )
+            self._restore_inflight[cmd.id] = t
+            t.start()
+
+    def _recover_after_restore_hold(self) -> None:
+        """Clear silent restore hold and re-align with sticky desired_state."""
+        hb = self._manager_heartbeat
+        desired = (
+            ""
+            if hb is None
+            else (hb.desired_state or "").strip().lower()
+        )
+        if desired == "running":
+            self._paused.clear()
+            # Park loop will publish training/idle from actual work; don't lie "paused".
+            state = "training" if self._manager_allows_training() else "idle"
+            self._publish_manager_metrics(state)
+            self._emit_engine_status(state, force=True, note="after_restore_hold")
+        elif desired == "paused":
+            self._paused.set()
+            self._publish_manager_metrics("paused")
+            self._emit_engine_status("paused", force=True, note="after_restore_hold")
+        else:
+            self._paused.clear()
+            self._publish_manager_metrics("idle")
+            self._emit_engine_status("idle", force=True, note="after_restore_hold")
+
+    def _finish_ready_restores(self) -> None:
+        hb = self._manager_heartbeat
+        if hb is None:
+            return
+        with self._restore_lock:
+            ready = dict(self._restore_ready)
+            self._restore_ready.clear()
+        for cmd_id, packed in ready.items():
+            cmd, payload = packed
+            auto = str(cmd_id).startswith("auto-restore-")
+            if isinstance(payload, BaseException):
+                if not auto:
+                    hb.queue_ack(cmd_id, ok=False, detail=str(payload))
+                fail = f"[Engine] restore FAILED: {payload}"
+                print(fail, flush=True)
+                logging.error("%s", fail)
+                self._recover_after_restore_hold()
+                continue
+            try:
+                body = decode_checkpoint_blob(payload)
+                sess = self._current_session
+                if sess is None and self.sessions:
+                    sess = self.sessions[0]
+                model = None if sess is None else getattr(sess, "model", None)
+                if model is None:
+                    model = self._held_model_for_restore
+                if model is None:
+                    raise RuntimeError(
+                        "no session/model to restore into "
+                        "(train once or keep a parked session before restore)"
+                    )
+                from src.ledger import restore_model_checkpoint
+
+                restore_model_checkpoint(model, body)
+                version = cmd.payload.get("version")
+                version_i: int | None = None
+                if version is not None:
+                    try:
+                        version_i = int(version)
+                        self.ledger.version = version_i
+                    except (TypeError, ValueError):
+                        version_i = None
+                if version_i is not None:
+                    self._restored_checkpoint_version = version_i
+                blob_key = cmd.payload.get("blob_key")
+                report = (
+                    f"[Engine] RESTORED to checkpoint v{version_i if version_i is not None else version}"
+                    f" (blob={blob_key})"
+                )
+                print(report, flush=True)
+                logging.info("%s", report)
+                # Pin local active tip so a stale HB active cannot immediately
+                # auto-restore a different version on the next drain.
+                if version_i is not None and blob_key:
+                    hb.set_active_checkpoint(
+                        {"version": version_i, "blob_key": str(blob_key)}
+                    )
+                if not auto:
+                    hb.queue_ack(cmd_id, ok=True, detail=f"restored version={version}")
+                self._recover_after_restore_hold()
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("[TrainingEngine] restore apply failed")
+                fail = f"[Engine] restore FAILED: {exc}"
+                print(fail, flush=True)
+                if not auto:
+                    hb.queue_ack(cmd_id, ok=False, detail=str(exc))
+                self._recover_after_restore_hold()
+
+    def _maybe_truncate_imported_journal(self) -> None:
+        """Ask the file store to roll an already-imported journal prefix (if any)."""
+        store = getattr(self.ledger, "store", None)
+        if store is None:
+            return
+        roll = getattr(store, "maybe_drop_imported_prefix", None)
+        if not callable(roll):
+            return
+        try:
+            through = roll()
+        except OSError:
+            logging.exception("[TrainingEngine] journal prefix roll failed")
+            return
+        if through is not None:
+            logging.debug(
+                "[TrainingEngine] journal prefix rolled through=%s", through
+            )
+
+    def _arm_pending_fits(self) -> None:
         for s in self.sessions:
             if s.status != SessionStatus.ACTIVE:
                 continue
             if not s._fit_ready and s._fit_kwargs:
                 self._begin_registered_fit(s)
 
-        while True:
-            progressed = False
-            for s in list(self.sessions):
-                if s.status != SessionStatus.ACTIVE:
-                    continue
-                if s._fit_done:
-                    results[s.session_id] = (list(s.train_history), list(s.val_history))
-                    self.drop_session(s.session_id)
-                    progressed = True
-                    continue
-                if not s._fit_ready:
-                    continue
-                self._current_session = s
-                more = s.advance_fit_epoch()
+    def _drive_active_epochs(
+        self, results: dict[str, tuple[list[float], list[float]]]
+    ) -> bool:
+        progressed = False
+        for s in list(self.sessions):
+            if s.status != SessionStatus.ACTIVE:
+                continue
+            if s._fit_done:
+                results[s.session_id] = (list(s.train_history), list(s.val_history))
+                self.drop_session(s.session_id)
                 progressed = True
-                if not more:
-                    results[s.session_id] = (list(s.train_history), list(s.val_history))
-                    self.drop_session(s.session_id)
-            if not progressed:
-                break
-        return results
+                continue
+            if not s._fit_ready:
+                continue
+            self._current_session = s
+            more = s.advance_fit_epoch()
+            progressed = True
+            if not more:
+                results[s.session_id] = (list(s.train_history), list(s.val_history))
+                self.drop_session(s.session_id)
+        return progressed
+
+    def _check_for_work(self) -> bool:
+        """True if there is (or was just accepted) training work to drive."""
+        if self._work_poll is not None:
+            try:
+                if self._work_poll():
+                    return True
+            except Exception:
+                logging.exception("[TrainingEngine] work_poll failed")
+        for s in self.sessions:
+            if s.status == SessionStatus.PENDING and s._fit_kwargs:
+                s.status = SessionStatus.ACTIVE
+                return True
+            if s.status == SessionStatus.ACTIVE and (
+                s._fit_ready or (not s._fit_done and s._fit_kwargs)
+            ):
+                return True
+        return False
+
+    def _idle_heartbeat(self) -> None:
+        hb = self._manager_heartbeat
+        if hb is None:
+            return
+        self._publish_manager_metrics("idle")
+        hb.maybe_ping(force=True)
 
     def _begin_registered_fit(self, session: TrainingSession) -> None:
         kw = dict(session._fit_kwargs)
@@ -548,7 +1062,22 @@ class TrainingEngine:
             self._service_ledger()
             did = True
         did = self._ensure_contract_ready(session) or did
+        self.drain_manager_commands(allow_restore=False)
+        did = self._maybe_manager_heartbeat(session, state="training") or did
         return did
+
+    def _maybe_manager_heartbeat(
+        self,
+        session: TrainingSession | None = None,
+        *,
+        state: str = "training",
+    ) -> bool:
+        hb = self._manager_heartbeat
+        if hb is None:
+            return False
+        effective = "paused" if self._paused.is_set() else state
+        self._publish_manager_metrics(effective, session)
+        return hb.maybe_ping()
 
     def _ensure_contract_ready(self, session: TrainingSession | None = None) -> bool:
         """Compile/enable contract list if configured and not yet ready."""
@@ -703,8 +1232,10 @@ class TrainingEngine:
             loss = self._finalize_if_ready(sess)
             sess._flag_step_done = False
             if loss is not None:
+                self._maybe_manager_heartbeat(sess, state="training")
                 return loss
         self._service_ledger()
+        self._maybe_manager_heartbeat(sess, state="training")
         return None
 
     def run_training_loop(
@@ -843,6 +1374,7 @@ class TrainingEngine:
             raise RuntimeError("async contract path requires tick/submit loop, not run_step")
 
         self._ledger_io_tick()
+        self._maybe_manager_heartbeat(sess, state="training")
         step_id = sess.reserve_step_id()
         base_version = self.ledger.version
         result = sess.train_step(step.X, step.y, step.lr, step_id=step_id)
@@ -1176,6 +1708,8 @@ def create_training_engine(
     model_instance_id: str = "default",
     architecture_id: str = "unknown",
     config: LedgerConfig | None = None,
+    manager_heartbeat: ManagerHeartbeat | None = None,
+    store_kwargs: dict[str, Any] | None = None,
 ) -> TrainingEngine:
     """Open ledger store and return a TrainingEngine (session optional / attached later)."""
     from pathlib import Path
@@ -1185,7 +1719,7 @@ def create_training_engine(
     root = Path(ledger_dir)
     root.mkdir(parents=True, exist_ok=True)
     backend = getattr(config, "store_backend", "file_streaming") if config else "file_streaming"
-    store = create_ledger_store(backend, root)
+    store = create_ledger_store(backend, root, **(store_kwargs or {}))
     impl = type(store).__name__
     if impl == "SyncFileLedgerStore":
         logging.warning(
@@ -1207,4 +1741,9 @@ def create_training_engine(
         model_instance_id=model_instance_id,
         architecture_id=architecture_id,
     )
-    return TrainingEngine(ledger=ledger, config=config, session=session)
+    return TrainingEngine(
+        ledger=ledger,
+        config=config,
+        session=session,
+        manager_heartbeat=manager_heartbeat,
+    )

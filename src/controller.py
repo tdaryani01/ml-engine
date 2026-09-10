@@ -150,6 +150,7 @@ class ModelController:
         patience: int = 15,
         min_delta: float = 1e-5,
         ledger_settings: LedgerSettings | None = None,
+        training_manager: Any | None = None,
         output_dir: str = "diagnostics_output",
         max_epochs: int | None = None,
     ) -> Tuple[List[float], List[float]]:
@@ -160,28 +161,80 @@ class ModelController:
             raise ValueError("[Model Controller] Execution Error: No data_provider bound to controller.")
 
         engine = None
-        if ledger_settings is not None and ledger_settings.enabled:
+        ledger_on = ledger_settings is not None and ledger_settings.enabled
+        from src.manager_heartbeat import maybe_from_settings
+        from src.training_engine import create_training_engine
+
+        hb = maybe_from_settings(training_manager, ledger_enabled=ledger_on)
+        if ledger_on or hb is not None:
             import os
 
             from src.ledger import LedgerConfig
-            from src.training_engine import create_training_engine
 
-            ledger_dir = os.path.join(output_dir, ledger_settings.path)
+            ls = ledger_settings or LedgerSettings()
+            ledger_dir = os.path.join(output_dir, ls.path if ledger_on else "training_ledger_noop")
             arch_id = model_type.name if hasattr(model_type, "name") else str(model_type)
+            # Fleet identity: TM instance_id must match ledger model_instance_id for tape filter.
+            tm_instance_id = None
+            if training_manager is not None:
+                tm_instance_id = getattr(training_manager, "instance_id", None)
+                if tm_instance_id is None and isinstance(training_manager, dict):
+                    tm_instance_id = training_manager.get("instance_id")
+            model_instance_id = str(tm_instance_id or ls.branch_id)
+
+            if ledger_on:
+                eng_cfg = LedgerConfig(
+                    checkpoint_every_steps=ls.checkpoint_every_steps,
+                    checkpoint_on_local_best=ls.checkpoint_on_local_best,
+                    contract_list_enabled=ls.contract_list_enabled,
+                    native_async_submit=ls.native_async_submit,
+                    store_backend=ls.store_backend,
+                )
+            else:
+                # TM connect without a journal: noop store, no contract-list path.
+                eng_cfg = LedgerConfig(store_backend="noop")
+
+            store_kwargs: dict = {}
+            backend_key = str(eng_cfg.store_backend).strip().lower()
+            if backend_key in ("http_tm", "tm_http", "training_manager"):
+                uri = ""
+                timeout_s = 0.5
+                if training_manager is not None:
+                    uri = str(getattr(training_manager, "uri", "") or "")
+                    if not uri and isinstance(training_manager, dict):
+                        uri = str(training_manager.get("uri") or "")
+                    timeout_s = float(
+                        getattr(training_manager, "timeout_s", 0.5)
+                        if not isinstance(training_manager, dict)
+                        else training_manager.get("timeout_s", 0.5)
+                    )
+                if not uri:
+                    raise ValueError(
+                        "ledger.store_backend=http_tm requires training_manager.uri"
+                    )
+                store_kwargs = {"http_tm_uri": uri, "timeout_s": timeout_s}
+
             engine = create_training_engine(
                 ledger_dir,
-                branch_id=ledger_settings.branch_id,
-                model_instance_id=ledger_settings.branch_id,
+                branch_id=ls.branch_id,
+                model_instance_id=model_instance_id,
                 architecture_id=arch_id,
-                config=LedgerConfig(
-                    checkpoint_every_steps=ledger_settings.checkpoint_every_steps,
-                    checkpoint_on_local_best=ledger_settings.checkpoint_on_local_best,
-                    contract_list_enabled=ledger_settings.contract_list_enabled,
-                    native_async_submit=ledger_settings.native_async_submit,
-                    store_backend=ledger_settings.store_backend,
-                ),
+                config=eng_cfg,
+                manager_heartbeat=hb,
+                store_kwargs=store_kwargs or None,
             )
-            logging.info("[Model Controller] Training ledger enabled: %s", ledger_dir)
+            if ledger_on:
+                logging.info(
+                    "[Model Controller] Training ledger enabled: %s backend=%s instance_id=%s",
+                    ledger_dir,
+                    eng_cfg.store_backend,
+                    model_instance_id,
+                )
+            elif hb is not None:
+                logging.info(
+                    "[Model Controller] Training Manager heartbeats enabled (ledger off): %s",
+                    getattr(training_manager, "uri", None),
+                )
             try:
                 session = engine.start_session(
                     model=self.model,

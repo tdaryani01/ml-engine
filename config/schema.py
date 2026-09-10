@@ -123,6 +123,35 @@ class LedgerSettings:
     store_backend: str = "file_streaming"
 
 @dataclass(frozen=True)
+class TrainingManagerSettings:
+    """Optional fire-and-forget heartbeats to sibling training-manager control plane."""
+    enabled: bool = False
+    uri: str = "http://127.0.0.1:8000"
+    instance_id: str = "engine-local-1"
+    kind: str = "engine"
+    label: str | None = None
+    advertise_url: str = "http://127.0.0.1:0"
+    capabilities: List[str] = field(
+        default_factory=lambda: [
+            "train_step",
+            "ledger",
+            "start",
+            "pause",
+            "resume",
+            "restore",
+            "shutdown",
+            "cancel",
+        ]
+    )
+    interval_s: float = 10.0
+    timeout_s: float = 0.5
+    # Idle park: sleep this long between wake/check/idle-heartbeat cycles.
+    # Manager marks the instance down after ~60s without a heartbeat.
+    idle_sleep_s: float = 10.0
+    # After training drains, keep the process alive in the idle park loop.
+    park_when_idle: bool = True
+
+@dataclass(frozen=True)
 class DiagnosticsConfig:
     """Defines plotting and output properties for pipeline diagnostics."""
     enabled: bool
@@ -145,3 +174,6 @@ class PipelineConfig:
     persistence: PersistenceConfig
     diagnostics: DiagnosticsConfig
     ledger: LedgerSettings = field(default_factory=LedgerSettings)
+    training_manager: TrainingManagerSettings = field(
+        default_factory=TrainingManagerSettings
+    )

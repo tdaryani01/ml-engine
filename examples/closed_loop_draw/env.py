@@ -14,6 +14,10 @@ class SoftCanvasEnv:
     step(A): C <- clip(C + soft_stroke(action_scale * A), 0, 1)
     ``action_scale`` < 1 keeps tanh actions off the ±1 cliff so ∂tanh stays alive.
     Stores a stack for reverse ``backward_step``.
+
+    Optional ``continuity_weight``: soft prior
+    ``w * mean_t ||end_t - start_{t+1}||^2`` on scaled endpoints (shape-agnostic).
+    Exposed via ``continuity_loss_and_action_grads`` for the closed-loop trainer.
     """
 
     def __init__(
@@ -24,12 +28,16 @@ class SoftCanvasEnv:
         channels: int = 1,
         sigma: float = 0.08,
         action_scale: float = 0.85,
+        continuity_weight: float = 0.0,
     ) -> None:
         self.height = int(height)
         self.width = int(width)
         self.channels = int(channels)
         self.sigma = float(sigma)
         self.action_scale = float(action_scale)
+        self.continuity_weight = float(continuity_weight)
+        if self.continuity_weight < 0.0:
+            raise ValueError("continuity_weight must be >= 0")
         self.canvas: np.ndarray | None = None
         self.stack: list[dict] = []
 
@@ -75,6 +83,44 @@ class SoftCanvasEnv:
 
     def obs_after(self, t: int) -> np.ndarray:
         return np.array(self.stack[t]["after"], copy=True)
+
+    def continuity_loss_and_action_grads(
+        self,
+    ) -> tuple[float, list[np.ndarray]]:
+        """
+        Soft polyline prior on the current stack.
+
+        L = w * mean_{pairs,batch} ||end_t - start_{t+1}||^2  (scaled coords).
+        Returns (L, dA_raw per step) with ∂L/∂raw_action (pre-scale).
+        """
+        T = len(self.stack)
+        dAs = [
+            np.zeros_like(self.stack[t]["action"], dtype=np.float32) for t in range(T)
+        ]
+        if self.continuity_weight <= 0.0 or T < 2:
+            return 0.0, dAs
+
+        w = float(self.continuity_weight)
+        scale = float(self.action_scale)
+        total = 0.0
+        n_pairs = T - 1
+        for t in range(n_pairs):
+            end_t = self.stack[t]["scaled_action"][:, 2:4].astype(np.float64)
+            start_n = self.stack[t + 1]["scaled_action"][:, 0:2].astype(np.float64)
+            diff = end_t - start_n  # (B, 2)
+            B = float(diff.shape[0])
+            # mean over batch of ||diff||^2, then average over pairs outside
+            pair_loss = float(np.mean(np.sum(diff * diff, axis=1)))
+            total += pair_loss
+            # ∂/∂end_t (scaled) = 2 * diff / B for mean over batch of sum_sq
+            # mean_b sum_i diff_i^2 → ∂/∂diff = 2 diff / B
+            g = (2.0 * diff) / B
+            # L_total = w * mean_pairs(pair_loss) → each pair gets w / n_pairs
+            g *= w / float(n_pairs)
+            dAs[t][:, 2:4] += (g * scale).astype(np.float32)
+            dAs[t + 1][:, 0:2] -= (g * scale).astype(np.float32)
+
+        return float(w * total / float(n_pairs)), dAs
 
     def backward_step(
         self, t: int, d_after: np.ndarray
