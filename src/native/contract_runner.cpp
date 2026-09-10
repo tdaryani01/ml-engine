@@ -432,6 +432,71 @@ static void adam_update_tensor(
     }
 }
 
+static void adam_apply_mhsa(ContractExecCtx* ctx, float decay_factor) {
+    if (!ctx->has_mhsa) return;
+    MhsaBinding* m = &ctx->mhsa;
+    AdamBinding* a = &ctx->adam;
+    const int64_t D = m->D;
+    const int64_t Hff = m->ffn_hidden;
+    const int64_t A = m->action_dim;
+    if (D < 1 || Hff < 1 || A < 1 || m->num_layers < 1) return;
+
+    for (int64_t li = 0; li < m->num_layers; ++li) {
+        MhsaLayerBind* L = &m->layers[li];
+        if (!L->ms_W_qkv || !L->vs_W_qkv) continue;
+        adam_update_tensor(
+            L->W_qkv, L->dW_qkv, L->ms_W_qkv, L->vs_W_qkv,
+            nullptr, nullptr, nullptr, D * 3 * D, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            L->b_qkv, L->db_qkv, L->ms_b_qkv, L->vs_b_qkv,
+            nullptr, nullptr, nullptr, 3 * D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->W_o, L->dW_o, L->ms_W_o, L->vs_W_o,
+            nullptr, nullptr, nullptr, D * D, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            L->b_o, L->db_o, L->ms_b_o, L->vs_b_o,
+            nullptr, nullptr, nullptr, D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->W_ff1, L->dW_ff1, L->ms_W_ff1, L->vs_W_ff1,
+            nullptr, nullptr, nullptr, D * Hff, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            L->b_ff1, L->db_ff1, L->ms_b_ff1, L->vs_b_ff1,
+            nullptr, nullptr, nullptr, Hff, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->W_ff2, L->dW_ff2, L->ms_W_ff2, L->vs_W_ff2,
+            nullptr, nullptr, nullptr, Hff * D, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            L->b_ff2, L->db_ff2, L->ms_b_ff2, L->vs_b_ff2,
+            nullptr, nullptr, nullptr, D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->ln1_gamma, L->d_ln1_gamma, L->ms_ln1_g, L->vs_ln1_g,
+            nullptr, nullptr, nullptr, D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->ln1_beta, L->d_ln1_beta, L->ms_ln1_b, L->vs_ln1_b,
+            nullptr, nullptr, nullptr, D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->ln2_gamma, L->d_ln2_gamma, L->ms_ln2_g, L->vs_ln2_g,
+            nullptr, nullptr, nullptr, D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->ln2_beta, L->d_ln2_beta, L->ms_ln2_b, L->vs_ln2_b,
+            nullptr, nullptr, nullptr, D, a, ctx->lr, 0.0f);
+    }
+
+    if (m->ms_W_act && m->vs_W_act) {
+        adam_update_tensor(
+            m->W_act, m->dW_act, m->ms_W_act, m->vs_W_act,
+            nullptr, nullptr, nullptr, D * A, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            m->b_act, m->db_act, m->ms_b_act, m->vs_b_act,
+            nullptr, nullptr, nullptr, A, a, ctx->lr, 0.0f);
+    }
+    if (m->pos && m->d_pos && m->ms_pos && m->vs_pos && m->max_seq_len > 0) {
+        adam_update_tensor(
+            m->pos, m->d_pos, m->ms_pos, m->vs_pos,
+            nullptr, nullptr, nullptr, m->max_seq_len * D, a, ctx->lr, decay_factor);
+    }
+}
+
 static void adam_apply_all(ContractExecCtx* ctx) {
     AdamBinding* a = &ctx->adam;
     a->t += 1;
@@ -464,6 +529,8 @@ static void adam_apply_all(ContractExecCtx* ctx) {
             d->b_next, d->ms_b_next, d->vs_b_next,
             d->fan_out, a, ctx->lr, 0.0f);
     }
+
+    adam_apply_mhsa(ctx, decay_factor);
 }
 
 #if defined(ML_ENGINE_PROFILE_CONTRACT_THREADS) && defined(__linux__) && defined(_OPENMP)

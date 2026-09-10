@@ -37,6 +37,32 @@ struct MhsaLayerBind {
     float* d_ln2_gamma;
     float* d_ln2_beta;
 
+    // Adam moments (null → skip ADAM_APPLY for this layer)
+    float* ms_W_qkv;
+    float* vs_W_qkv;
+    float* ms_b_qkv;
+    float* vs_b_qkv;
+    float* ms_W_o;
+    float* vs_W_o;
+    float* ms_b_o;
+    float* vs_b_o;
+    float* ms_W_ff1;
+    float* vs_W_ff1;
+    float* ms_b_ff1;
+    float* vs_b_ff1;
+    float* ms_W_ff2;
+    float* vs_W_ff2;
+    float* ms_b_ff2;
+    float* vs_b_ff2;
+    float* ms_ln1_g;
+    float* vs_ln1_g;
+    float* ms_ln1_b;
+    float* vs_ln1_b;
+    float* ms_ln2_g;
+    float* vs_ln2_g;
+    float* ms_ln2_b;
+    float* vs_ln2_b;
+
     // Per-layer workspace (caller-owned)
     float* qkv;       // [B*T, 3D]
     float* scores;    // [B*H*T*T]
@@ -65,6 +91,17 @@ struct MhsaBinding {
     float* b_act;
     float* dW_act;
     float* db_act;
+    float* ms_W_act;
+    float* vs_W_act;
+    float* ms_b_act;
+    float* vs_b_act;
+
+    // Learned absolute positions [max_seq_len, D] (null → disabled)
+    float* pos;
+    float* d_pos;
+    float* ms_pos;
+    float* vs_pos;
+    int64_t max_seq_len;
 
     float* scratch;   // [B*T, D]
     float* actions;   // [B, action_dim]

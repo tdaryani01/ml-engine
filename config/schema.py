@@ -46,6 +46,7 @@ class MHSAConfig:
     action_dim: int
     ffn_mult: int = 4
     num_layers: int = 1
+    use_pos_encoding: bool = True
 
 
 @dataclass(frozen=True)

@@ -49,6 +49,7 @@ architecture:
     action_dim: 4
     ffn_mult: 4
     num_layers: 2
+    use_pos_encoding: true
 
 # =====================================================================
 # OPTIMIZATION LOOP CONTROLS

@@ -453,6 +453,16 @@ int32_t mhsa_block_backward(const float* X, MhsaBinding* m) {
     if (m->dX) {
         std::memcpy(m->dX, d_cur, static_cast<size_t>(rows * D) * sizeof(float));
     }
+    // Grad w.r.t. learned positions: sum over batch (X was X_tok + pos).
+    if (m->pos && m->d_pos && m->max_seq_len >= T) {
+        for (int64_t t = 0; t < T; ++t) {
+            float* dp = m->d_pos + t * D;
+            for (int64_t b = 0; b < B; ++b) {
+                const float* dx = d_cur + (b * T + t) * D;
+                for (int64_t d = 0; d < D; ++d) dp[d] += dx[d];
+            }
+        }
+    }
     return 0;
 }
 

@@ -150,6 +150,30 @@ class MhsaLayerBind(ctypes.Structure):
         ("d_ln1_beta", ctypes.c_void_p),
         ("d_ln2_gamma", ctypes.c_void_p),
         ("d_ln2_beta", ctypes.c_void_p),
+        ("ms_W_qkv", ctypes.c_void_p),
+        ("vs_W_qkv", ctypes.c_void_p),
+        ("ms_b_qkv", ctypes.c_void_p),
+        ("vs_b_qkv", ctypes.c_void_p),
+        ("ms_W_o", ctypes.c_void_p),
+        ("vs_W_o", ctypes.c_void_p),
+        ("ms_b_o", ctypes.c_void_p),
+        ("vs_b_o", ctypes.c_void_p),
+        ("ms_W_ff1", ctypes.c_void_p),
+        ("vs_W_ff1", ctypes.c_void_p),
+        ("ms_b_ff1", ctypes.c_void_p),
+        ("vs_b_ff1", ctypes.c_void_p),
+        ("ms_W_ff2", ctypes.c_void_p),
+        ("vs_W_ff2", ctypes.c_void_p),
+        ("ms_b_ff2", ctypes.c_void_p),
+        ("vs_b_ff2", ctypes.c_void_p),
+        ("ms_ln1_g", ctypes.c_void_p),
+        ("vs_ln1_g", ctypes.c_void_p),
+        ("ms_ln1_b", ctypes.c_void_p),
+        ("vs_ln1_b", ctypes.c_void_p),
+        ("ms_ln2_g", ctypes.c_void_p),
+        ("vs_ln2_g", ctypes.c_void_p),
+        ("ms_ln2_b", ctypes.c_void_p),
+        ("vs_ln2_b", ctypes.c_void_p),
         ("qkv", ctypes.c_void_p),
         ("scores", ctypes.c_void_p),
         ("attn_out", ctypes.c_void_p),
@@ -179,6 +203,15 @@ class MhsaBinding(ctypes.Structure):
         ("b_act", ctypes.c_void_p),
         ("dW_act", ctypes.c_void_p),
         ("db_act", ctypes.c_void_p),
+        ("ms_W_act", ctypes.c_void_p),
+        ("vs_W_act", ctypes.c_void_p),
+        ("ms_b_act", ctypes.c_void_p),
+        ("vs_b_act", ctypes.c_void_p),
+        ("pos", ctypes.c_void_p),
+        ("d_pos", ctypes.c_void_p),
+        ("ms_pos", ctypes.c_void_p),
+        ("vs_pos", ctypes.c_void_p),
+        ("max_seq_len", ctypes.c_int64),
         ("scratch", ctypes.c_void_p),
         ("actions", ctypes.c_void_p),
         ("dO", ctypes.c_void_p),
@@ -935,6 +968,9 @@ class ContractRuntime:
         )
 
     def _ensure_async_resources(self, X: np.ndarray, m: int) -> None:
+        if self._mhsa_mode:
+            self._ensure_mhsa_async_resources(X)
+            return
         opt = self.model.optimizer
         if not opt._setup_done:
             opt.setup(self.model.weights, self.model.biases)
@@ -968,9 +1004,38 @@ class ContractRuntime:
         self._invalidate_input_pad_stage()
         self._slots = [self._make_async_slot(X, cap), self._make_async_slot(X, cap)]
 
+    def _ensure_mhsa_async_resources(self, X: np.ndarray) -> None:
+        """Single-flight MHSA async: shared live banks + two ctx shells."""
+        if X.ndim != 3:
+            raise ValueError(f"MHSA async expects (B,T,D); got {X.shape}")
+        B, T = int(X.shape[0]), int(X.shape[1])
+        self._ensure_mhsa_workspace(B, T)
+        if self._slots and getattr(self._slots[0], "mhsa_ready", False):
+            return
+        if self._submitted is not None or self._completed is not None:
+            raise RuntimeError("cannot resize MHSA async slots while a result is owned")
+        self._parameter_banks = []
+        self._slots = [self._make_mhsa_async_slot(), self._make_mhsa_async_slot()]
+
+    def _make_mhsa_async_slot(self) -> _ExecutionSlot:
+        assert self._mhsa_ws is not None
+        slot = _ExecutionSlot(
+            ctx=ContractExecCtx(),
+            buffers=ContractBuffers(dense_layers=[], batch_cap=0),
+            conv_grads=[],
+            loss_scalar=self._mhsa_ws["loss"],
+            owners=[],
+            d_conv_buffers=[],
+            dx_buffers=[],
+        )
+        slot.mhsa_ready = True  # type: ignore[attr-defined]
+        return slot
+
     def _bind_slot_parameter_banks(
         self, slot: _ExecutionSlot, input_bank_idx: int, output_bank_idx: int
     ) -> None:
+        if self._mhsa_mode:
+            return
         from src.spatial_layers import ConvBlock
 
         src = self._parameter_banks[input_bank_idx]
@@ -1010,6 +1075,9 @@ class ContractRuntime:
             d.vs_b_next = _ptr(dst.vs_b[w_idx].reshape(-1))
 
     def _publish_parameter_bank(self, bank_idx: int, adam_t: int) -> None:
+        if self._mhsa_mode:
+            self.model.optimizer.t = int(adam_t)
+            return
         bank = self._parameter_banks[bank_idx]
         self._published_bank_idx = bank_idx
         self.model.weights = bank.weights
@@ -1396,7 +1464,8 @@ class ContractRuntime:
 
         slot = self._slots[prepared.slot_idx]
         slot.ctx.adam.t = int(self.model.optimizer.t)
-        self._stage_dx_wt(prepared.slot_idx, slot)
+        if not self._mhsa_mode:
+            self._stage_dx_wt(prepared.slot_idx, slot)
         self._submit_native(slot.ctx, prepared.step_token)
         self._submitted = _SubmittedStep(
             slot_idx=prepared.slot_idx,
@@ -1424,6 +1493,10 @@ class ContractRuntime:
         """Prepare the inactive execution slot while the current job runs."""
         if not (self._async_enabled and self._engine_driven):
             raise RuntimeError("prepare_step is only valid in engine-driven async mode")
+        if self._mhsa_mode:
+            return self._prepare_mhsa_step(
+                X, y, lr, apply_adam=apply_adam, step_token=step_token
+            )
         if self._prepared is not None:
             return self._prepared.X is X and self._prepared.y is y
 
@@ -1481,6 +1554,50 @@ class ContractRuntime:
             slot_idx=slot_idx,
             input_bank_idx=input_bank_idx,
             output_bank_idx=output_bank_idx,
+            m=m,
+            dtype=X.dtype,
+            X=X,
+            y=y,
+            apply_adam=apply_adam,
+            step_token=token,
+        )
+        return True
+
+    def _prepare_mhsa_step(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+        lr: float,
+        *,
+        apply_adam: bool = False,
+        step_token: int | None = None,
+    ) -> bool:
+        """Single-flight MHSA prepare (no dual-bank overlap yet)."""
+        if self._prepared is not None:
+            return self._prepared.X is X and self._prepared.y is y
+        # Live f32 banks + in-place Adam: only one native step at a time.
+        if self._submitted is not None or self._completed is not None:
+            return False
+
+        X = np.ascontiguousarray(X)
+        y = np.ascontiguousarray(y)
+        m = int(X.shape[0])
+        self._ensure_mhsa_async_resources(X)
+        slot_idx = 0
+        slot = self._slots[slot_idx]
+        ctx = self._bind_mhsa(X, y, apply_adam=apply_adam)
+        ctx.lr = float(lr)
+        ctx.skip_adam = 0 if apply_adam else 1
+        ctx.adam.t = int(self.model.optimizer.t)
+        self._zero_mhsa_grads()
+        slot.ctx = ctx
+        slot.loss_scalar = self._mhsa_ws["loss"]
+
+        token = int(step_token if step_token is not None else self.model.optimizer.t + 1)
+        self._prepared = _PreparedStep(
+            slot_idx=slot_idx,
+            input_bank_idx=0,
+            output_bank_idx=0,
             m=m,
             dtype=X.dtype,
             X=X,
@@ -1636,6 +1753,12 @@ class ContractRuntime:
     def _finish_submitted(
         self, submitted: _SubmittedStep
     ) -> tuple[float, list[np.ndarray], list[np.ndarray], int]:
+        if self._mhsa_mode:
+            assert self._mhsa_ws is not None and self._mhsa_dw_f32 is not None
+            assert self._mhsa_db_f32 is not None
+            loss = float(self._mhsa_ws["loss"][0])
+            return loss, self._mhsa_dw_f32, self._mhsa_db_f32, submitted.m
+
         slot = self._slots[submitted.slot_idx]
         grad_weights: list[np.ndarray | None] = [None] * len(self.model.weights)
         grad_biases: list[np.ndarray | None] = [None] * len(self.model.biases)
@@ -1698,30 +1821,40 @@ class ContractRuntime:
             "X": np.zeros((rows, D), dtype=np.float32),
             "y": np.zeros((B, A), dtype=np.float32),
             "loss": np.zeros(1, dtype=np.float32),
+            "d_pos": np.zeros((int(m.max_seq_len), D), dtype=np.float32),
         }
-        self._mhsa_w_f32 = [
-            np.ascontiguousarray(w, dtype=np.float32) for w in m.weights
-        ]
-        self._mhsa_b_f32 = [
-            np.ascontiguousarray(b.reshape(-1), dtype=np.float32) for b in m.biases
-        ]
+        # Live f32 parameter banks (native Adam mutates these in place).
+        for i, w in enumerate(m.weights):
+            if w.dtype != np.float32 or not w.flags["C_CONTIGUOUS"]:
+                m.weights[i] = np.ascontiguousarray(w, dtype=np.float32)
+        for i, b in enumerate(m.biases):
+            flat = np.ascontiguousarray(b.reshape(-1), dtype=np.float32)
+            m.biases[i] = flat.reshape(1, -1)
+        for li in range(L):
+            m.ln1_gamma[li] = np.ascontiguousarray(
+                m.ln1_gamma[li].reshape(1, -1), dtype=np.float32
+            )
+            m.ln1_beta[li] = np.ascontiguousarray(
+                m.ln1_beta[li].reshape(1, -1), dtype=np.float32
+            )
+            m.ln2_gamma[li] = np.ascontiguousarray(
+                m.ln2_gamma[li].reshape(1, -1), dtype=np.float32
+            )
+            m.ln2_beta[li] = np.ascontiguousarray(
+                m.ln2_beta[li].reshape(1, -1), dtype=np.float32
+            )
+
+        self._mhsa_w_f32 = m.weights
+        self._mhsa_b_f32 = [b.reshape(-1) for b in m.biases]
         self._mhsa_ln_f32 = []
         self._mhsa_dln_f32 = []
         for li in range(L):
             self._mhsa_ln_f32.append(
                 {
-                    "ln1_g": np.ascontiguousarray(
-                        m.ln1_gamma[li].reshape(-1), dtype=np.float32
-                    ),
-                    "ln1_b": np.ascontiguousarray(
-                        m.ln1_beta[li].reshape(-1), dtype=np.float32
-                    ),
-                    "ln2_g": np.ascontiguousarray(
-                        m.ln2_gamma[li].reshape(-1), dtype=np.float32
-                    ),
-                    "ln2_b": np.ascontiguousarray(
-                        m.ln2_beta[li].reshape(-1), dtype=np.float32
-                    ),
+                    "ln1_g": m.ln1_gamma[li].reshape(-1),
+                    "ln1_b": m.ln1_beta[li].reshape(-1),
+                    "ln2_g": m.ln2_gamma[li].reshape(-1),
+                    "ln2_b": m.ln2_beta[li].reshape(-1),
                 }
             )
             self._mhsa_dln_f32.append(
@@ -1734,6 +1867,8 @@ class ContractRuntime:
             )
         self._mhsa_dw_f32 = [np.zeros_like(w) for w in self._mhsa_w_f32]
         self._mhsa_db_f32 = [np.zeros_like(b) for b in self._mhsa_b_f32]
+        if hasattr(m, "ensure_adam_moments"):
+            m.ensure_adam_moments()
 
     def _zero_mhsa_grads(self) -> None:
         assert self._mhsa_dw_f32 is not None and self._mhsa_db_f32 is not None
@@ -1750,9 +1885,10 @@ class ContractRuntime:
         self._mhsa_ws["d_stream"].fill(0.0)
         self._mhsa_ws["d_qkv"].fill(0.0)
         self._mhsa_ws["loss"].fill(0.0)
+        self._mhsa_ws["d_pos"].fill(0.0)
 
     def _bind_mhsa(
-        self, X: np.ndarray, y: np.ndarray | None = None
+        self, X: np.ndarray, y: np.ndarray | None = None, *, apply_adam: bool = False
     ) -> ContractExecCtx:
         """Bind MHSA geometry + float32 banks into ContractExecCtx.mhsa."""
         if X.ndim != 3:
@@ -1770,25 +1906,16 @@ class ContractRuntime:
         assert self._mhsa_dw_f32 is not None and self._mhsa_db_f32 is not None
         assert self._mhsa_dln_f32 is not None and self._mhsa_ln_f32 is not None
         L = int(m.num_layers)
-        for i, w in enumerate(m.weights):
-            self._mhsa_w_f32[i] = np.ascontiguousarray(w, dtype=np.float32)
-        for i, b in enumerate(m.biases):
-            self._mhsa_b_f32[i] = np.ascontiguousarray(b.reshape(-1), dtype=np.float32)
-        for li in range(L):
-            self._mhsa_ln_f32[li]["ln1_g"] = np.ascontiguousarray(
-                m.ln1_gamma[li].reshape(-1), dtype=np.float32
-            )
-            self._mhsa_ln_f32[li]["ln1_b"] = np.ascontiguousarray(
-                m.ln1_beta[li].reshape(-1), dtype=np.float32
-            )
-            self._mhsa_ln_f32[li]["ln2_g"] = np.ascontiguousarray(
-                m.ln2_gamma[li].reshape(-1), dtype=np.float32
-            )
-            self._mhsa_ln_f32[li]["ln2_b"] = np.ascontiguousarray(
-                m.ln2_beta[li].reshape(-1), dtype=np.float32
-            )
+        # Live banks already point at model params; no per-step f64→f32 copy.
 
         Xf = np.ascontiguousarray(X.reshape(B * T, D_in), dtype=np.float32)
+        if getattr(m, "use_pos_encoding", False) and m.pos_embed is not None:
+            # X ← X + pos[:T] (broadcast over batch)
+            pos = np.ascontiguousarray(m.pos_embed[:T], dtype=np.float32)
+            Xf = Xf.reshape(B, T, D_in)
+            Xf = np.ascontiguousarray(Xf + pos[None, :, :], dtype=np.float32).reshape(
+                B * T, D_in
+            )
         ws["X"] = Xf
         if y is not None:
             yf = np.ascontiguousarray(y, dtype=np.float32)
@@ -1798,12 +1925,16 @@ class ContractRuntime:
                 )
             ws["y"] = yf
 
+        opt = m.optimizer
+        if apply_adam and hasattr(m, "ensure_adam_moments"):
+            m.ensure_adam_moments()
+
         ctx = ContractExecCtx()
         ctx.N = B
         ctx.lr = 0.0
         ctx.lam_l2 = float(getattr(m, "lam_l2", 0.0))
         ctx.max_norm = float(getattr(m, "max_norm", 5.0))
-        ctx.skip_adam = 1
+        ctx.skip_adam = 0 if apply_adam else 1
         ctx.X = _ptr(Xf)
         ctx.y = _ptr(ws["y"]) if y is not None else None
         ctx.act = None
@@ -1812,6 +1943,10 @@ class ContractRuntime:
         ctx.num_dense = 0
         ctx.loss_out = _ptr(ws["loss"])
         ctx.has_mhsa = 1
+        ctx.adam.beta1 = float(opt.beta1)
+        ctx.adam.beta2 = float(opt.beta2)
+        ctx.adam.eps = float(opt.eps)
+        ctx.adam.t = int(opt.t)
 
         mb = ctx.mhsa
         mb.B = B
@@ -1826,6 +1961,14 @@ class ContractRuntime:
         b = self._mhsa_b_f32
         dw = self._mhsa_dw_f32
         db = self._mhsa_db_f32
+        ms_w = getattr(opt, "ms_w", None) if apply_adam else None
+        vs_w = getattr(opt, "vs_w", None) if apply_adam else None
+        ms_b = getattr(opt, "ms_b", None) if apply_adam else None
+        vs_b = getattr(opt, "vs_b", None) if apply_adam else None
+        ms_g = getattr(opt, "ms_g", None) if apply_adam else None
+        vs_g = getattr(opt, "vs_g", None) if apply_adam else None
+        ms_beta = getattr(opt, "ms_beta", None) if apply_adam else None
+        vs_beta = getattr(opt, "vs_beta", None) if apply_adam else None
         for li in range(L):
             base = 4 * li
             lb = mb.layers[li]
@@ -1844,6 +1987,20 @@ class ContractRuntime:
             lb.ln2_gamma, lb.ln2_beta = _ptr(ln["ln2_g"]), _ptr(ln["ln2_b"])
             lb.d_ln1_gamma, lb.d_ln1_beta = _ptr(dln["ln1_g"]), _ptr(dln["ln1_b"])
             lb.d_ln2_gamma, lb.d_ln2_beta = _ptr(dln["ln2_g"]), _ptr(dln["ln2_b"])
+            if ms_w is not None:
+                g0 = 2 * li
+                lb.ms_W_qkv, lb.vs_W_qkv = _ptr(ms_w[base + 0]), _ptr(vs_w[base + 0])
+                lb.ms_b_qkv, lb.vs_b_qkv = _ptr(ms_b[base + 0]), _ptr(vs_b[base + 0])
+                lb.ms_W_o, lb.vs_W_o = _ptr(ms_w[base + 1]), _ptr(vs_w[base + 1])
+                lb.ms_b_o, lb.vs_b_o = _ptr(ms_b[base + 1]), _ptr(vs_b[base + 1])
+                lb.ms_W_ff1, lb.vs_W_ff1 = _ptr(ms_w[base + 2]), _ptr(vs_w[base + 2])
+                lb.ms_b_ff1, lb.vs_b_ff1 = _ptr(ms_b[base + 2]), _ptr(vs_b[base + 2])
+                lb.ms_W_ff2, lb.vs_W_ff2 = _ptr(ms_w[base + 3]), _ptr(vs_w[base + 3])
+                lb.ms_b_ff2, lb.vs_b_ff2 = _ptr(ms_b[base + 3]), _ptr(vs_b[base + 3])
+                lb.ms_ln1_g, lb.vs_ln1_g = _ptr(ms_g[g0]), _ptr(vs_g[g0])
+                lb.ms_ln1_b, lb.vs_ln1_b = _ptr(ms_beta[g0]), _ptr(vs_beta[g0])
+                lb.ms_ln2_g, lb.vs_ln2_g = _ptr(ms_g[g0 + 1]), _ptr(vs_g[g0 + 1])
+                lb.ms_ln2_b, lb.vs_ln2_b = _ptr(ms_beta[g0 + 1]), _ptr(vs_beta[g0 + 1])
             lb.qkv = _ptr(lws["qkv"])
             lb.scores = _ptr(lws["scores"])
             lb.attn_out = _ptr(lws["attn_out"])
@@ -1857,6 +2014,21 @@ class ContractRuntime:
         act_i = 4 * L
         mb.W_act, mb.b_act = _ptr(w[act_i]), _ptr(b[act_i])
         mb.dW_act, mb.db_act = _ptr(dw[act_i]), _ptr(db[act_i])
+        if ms_w is not None:
+            mb.ms_W_act, mb.vs_W_act = _ptr(ms_w[act_i]), _ptr(vs_w[act_i])
+            mb.ms_b_act, mb.vs_b_act = _ptr(ms_b[act_i]), _ptr(vs_b[act_i])
+        if getattr(m, "use_pos_encoding", False) and m.pos_embed is not None:
+            mb.pos = _ptr(m.pos_embed)
+            mb.d_pos = _ptr(ws["d_pos"])
+            mb.max_seq_len = int(m.max_seq_len)
+            if apply_adam and m._ms_pos is not None:
+                mb.ms_pos, mb.vs_pos = _ptr(m._ms_pos), _ptr(m._vs_pos)
+        else:
+            mb.pos = None
+            mb.d_pos = None
+            mb.ms_pos = None
+            mb.vs_pos = None
+            mb.max_seq_len = 0
         mb.scratch = _ptr(ws["scratch"])
         mb.actions = _ptr(ws["actions"])
         mb.dO = _ptr(ws["dO"])
@@ -1901,10 +2073,11 @@ class ContractRuntime:
         if self._mhsa_mode:
             X = np.ascontiguousarray(X)
             y = np.ascontiguousarray(y)
-            ctx = self._bind_mhsa(X, y)
+            ctx = self._bind_mhsa(X, y, apply_adam=apply_adam)
             self._zero_mhsa_grads()
             ctx.lr = float(lr)
-            ctx.skip_adam = 1
+            ctx.skip_adam = 0 if apply_adam else 1
+            ctx.adam.t = int(self.model.optimizer.t)
             self._activate_tenant()
             status = self._lib.run_contract_training_step(
                 ctypes.cast(self._ops, ctypes.POINTER(ContractOpRow)),
@@ -1917,34 +2090,13 @@ class ContractRuntime:
             assert self._mhsa_db_f32 is not None and self._mhsa_dln_f32 is not None
             m = int(X.shape[0])
             loss = float(self._mhsa_ws["loss"][0])
+            if apply_adam:
+                self.model.optimizer.t = int(ctx.adam.t)
+                return loss, self._mhsa_dw_f32, self._mhsa_db_f32, m
             grad_weights = [np.array(g, dtype=np.float64) for g in self._mhsa_dw_f32]
             grad_biases = [
                 np.array(g, dtype=np.float64).reshape(1, -1) for g in self._mhsa_db_f32
             ]
-            grad_gammas = []
-            grad_betas = []
-            for dln in self._mhsa_dln_f32:
-                grad_gammas.append(
-                    np.array(dln["ln1_g"], dtype=np.float64).reshape(1, -1)
-                )
-                grad_gammas.append(
-                    np.array(dln["ln2_g"], dtype=np.float64).reshape(1, -1)
-                )
-                grad_betas.append(
-                    np.array(dln["ln1_b"], dtype=np.float64).reshape(1, -1)
-                )
-                grad_betas.append(
-                    np.array(dln["ln2_b"], dtype=np.float64).reshape(1, -1)
-                )
-            if apply_adam:
-                self.model._apply_grads(
-                    grad_weights,
-                    grad_biases,
-                    m,
-                    lr,
-                    grad_gammas=grad_gammas,
-                    grad_betas=grad_betas,
-                )
             return loss, grad_weights, grad_biases, m
 
         X = np.ascontiguousarray(X)

@@ -55,6 +55,8 @@ def _make_mhsa(
             "action_dim": action_dim,
             "ffn_mult": ffn_mult,
             "num_layers": num_layers,
+            # Pos adds noise to tiny FD probes; exercise it in a dedicated smoke.
+            "use_pos_encoding": False,
         },
         contract_list_enabled=True,
         lam_l2=0.0,
@@ -352,6 +354,44 @@ def _run_fd(model, *, seed: int) -> None:
         _close(model)
 
 
+def test_mhsa_pos_encoding_adam():
+    model = _make_mhsa(d_model=8, num_heads=2, max_seq_len=4, action_dim=2, seed=3)
+    # Rebuild with pos on (factory helper forces False for FD).
+    from src.model_factory import ModelFactory
+    from config.constants import EngineBackend
+
+    _close(model)
+    np.random.seed(3)
+    model = ModelFactory.create_model(
+        "mhsa",
+        layer_sizes=[2],
+        backend=EngineBackend.NATIVE,
+        optimizer="adam",
+        mhsa_config={
+            "d_model": 8,
+            "num_heads": 2,
+            "max_seq_len": 4,
+            "action_dim": 2,
+            "ffn_mult": 2,
+            "num_layers": 1,
+            "use_pos_encoding": True,
+        },
+        contract_list_enabled=True,
+        lam_l2=0.0,
+        lam_l1=0.0,
+    )
+    try:
+        assert model.pos_embed is not None and model.pos_embed.shape == (4, 8)
+        p0 = model.pos_embed.copy()
+        X = np.random.randn(2, 3, 8)
+        y = np.random.randn(2, 2)
+        model.run_contract_train_step(X, y, lr=1e-2, apply_adam=True)
+        assert not np.allclose(p0, model.pos_embed)
+        print("[PASSED] mhsa: learned pos encoding + native adam")
+    finally:
+        _close(model)
+
+
 def test_mhsa_finite_diff_grads_l1():
     _run_fd(_make_mhsa(num_layers=1, seed=7), seed=7)
     print("[PASSED] mhsa: finite-diff grads L=1")
@@ -371,6 +411,7 @@ if __name__ == "__main__":
     test_mhsa_t1_and_causal_scores()
     test_mhsa_loss_matches_predict_mse()
     test_mhsa_adam_loss_decreases()
+    test_mhsa_pos_encoding_adam()
     test_mhsa_finite_diff_grads_l1()
     test_mhsa_finite_diff_grads_l2()
     print("[SUCCESS] MHSA tests passed")

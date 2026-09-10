@@ -31,6 +31,7 @@ class MHSANetwork(TrainableModel):
         optimizer_instance: Any,
         ffn_mult: int = 4,
         num_layers: int = 1,
+        use_pos_encoding: bool = True,
         backend: EngineBackend = EngineBackend.NATIVE,
         engine_ctx=None,
         lam_l1: float = 0.01,
@@ -72,6 +73,7 @@ class MHSANetwork(TrainableModel):
         self.ffn_mult = int(ffn_mult)
         self.ffn_hidden = self.d_model * self.ffn_mult
         self.num_layers = num_layers
+        self.use_pos_encoding = bool(use_pos_encoding)
 
         self.weights: list[np.ndarray] = []
         self.biases: list[np.ndarray] = []
@@ -79,6 +81,9 @@ class MHSANetwork(TrainableModel):
         self.ln1_beta: list[np.ndarray] = []
         self.ln2_gamma: list[np.ndarray] = []
         self.ln2_beta: list[np.ndarray] = []
+        self.pos_embed: np.ndarray | None = None
+        self._ms_pos: np.ndarray | None = None
+        self._vs_pos: np.ndarray | None = None
         self._init_parameters()
 
         # Per layer: W_qkv, W_o, W_ff1, W_ff2; then W_act.
@@ -95,7 +100,8 @@ class MHSANetwork(TrainableModel):
             self.enable_contract_list(native_async_submit=native_async_submit)
 
         logging.info(
-            "[MHSA] layers=%d d_model=%d heads=%d d_head=%d T_max=%d action_dim=%d ffn=%d",
+            "[MHSA] layers=%d d_model=%d heads=%d d_head=%d T_max=%d action_dim=%d "
+            "ffn=%d pos=%s",
             self.num_layers,
             self.d_model,
             self.num_heads,
@@ -103,11 +109,12 @@ class MHSANetwork(TrainableModel):
             self.max_seq_len,
             self.action_dim,
             self.ffn_hidden,
+            self.use_pos_encoding,
         )
 
     def _xavier(self, rows: int, cols: int) -> np.ndarray:
         limit = np.sqrt(6.0 / (rows + cols))
-        return np.random.uniform(-limit, limit, (rows, cols)).astype(np.float64)
+        return np.random.uniform(-limit, limit, (rows, cols)).astype(np.float32)
 
     def _init_parameters(self) -> None:
         D = self.d_model
@@ -130,18 +137,40 @@ class MHSANetwork(TrainableModel):
             )
             self.biases.extend(
                 [
-                    np.zeros((1, 3 * D), dtype=np.float64),
-                    np.zeros((1, D), dtype=np.float64),
-                    np.zeros((1, Hff), dtype=np.float64),
-                    np.zeros((1, D), dtype=np.float64),
+                    np.zeros((1, 3 * D), dtype=np.float32),
+                    np.zeros((1, D), dtype=np.float32),
+                    np.zeros((1, Hff), dtype=np.float32),
+                    np.zeros((1, D), dtype=np.float32),
                 ]
             )
-            self.ln1_gamma.append(np.ones((1, D), dtype=np.float64))
-            self.ln1_beta.append(np.zeros((1, D), dtype=np.float64))
-            self.ln2_gamma.append(np.ones((1, D), dtype=np.float64))
-            self.ln2_beta.append(np.zeros((1, D), dtype=np.float64))
+            self.ln1_gamma.append(np.ones((1, D), dtype=np.float32))
+            self.ln1_beta.append(np.zeros((1, D), dtype=np.float32))
+            self.ln2_gamma.append(np.ones((1, D), dtype=np.float32))
+            self.ln2_beta.append(np.zeros((1, D), dtype=np.float32))
         self.weights.append(self._xavier(D, A))
-        self.biases.append(np.zeros((1, A), dtype=np.float64))
+        self.biases.append(np.zeros((1, A), dtype=np.float32))
+        if self.use_pos_encoding:
+            # Small init so early steps stay near token features.
+            self.pos_embed = (
+                np.random.randn(self.max_seq_len, D).astype(np.float32) * 0.02
+            )
+            self._ms_pos = np.zeros_like(self.pos_embed)
+            self._vs_pos = np.zeros_like(self.pos_embed)
+        else:
+            self.pos_embed = None
+            self._ms_pos = None
+            self._vs_pos = None
+
+    def ensure_adam_moments(self) -> None:
+        """Allocate Adam m/v on live f32 banks (weights, biases, LN, pos)."""
+        opt = self.optimizer
+        if not getattr(opt, "_setup_done", False):
+            gammas, betas = self._ln_param_lists()
+            opt.setup(self.weights, self.biases, gammas, betas)
+        if self.use_pos_encoding and self.pos_embed is not None:
+            if self._ms_pos is None or self._ms_pos.shape != self.pos_embed.shape:
+                self._ms_pos = np.zeros_like(self.pos_embed)
+                self._vs_pos = np.zeros_like(self.pos_embed)
 
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
         """X (B,T,D) → continuous actions (B, action_dim) via native MHSA forward."""

@@ -70,6 +70,7 @@ def _mhsa_as_dict(mhsa) -> dict:
             "action_dim": int(mhsa.action_dim),
             "ffn_mult": int(getattr(mhsa, "ffn_mult", 4)),
             "num_layers": int(getattr(mhsa, "num_layers", 1)),
+            "use_pos_encoding": bool(getattr(mhsa, "use_pos_encoding", True)),
         }
     return {
         "d_model": int(mhsa["d_model"]),
@@ -78,6 +79,7 @@ def _mhsa_as_dict(mhsa) -> dict:
         "action_dim": int(mhsa["action_dim"]),
         "ffn_mult": int(mhsa.get("ffn_mult", 4)),
         "num_layers": int(mhsa.get("num_layers", 1)),
+        "use_pos_encoding": bool(mhsa.get("use_pos_encoding", True)),
     }
 
 
@@ -124,6 +126,13 @@ def create_torch_mhsa_class():
             )
             self.action = nn.Linear(d_model, action_dim)
             self._max_seq_len = int(mhsa["max_seq_len"])
+            self.use_pos = bool(mhsa.get("use_pos_encoding", True))
+            if self.use_pos:
+                self.pos_embed = nn.Parameter(
+                    torch.randn(self._max_seq_len, d_model) * 0.02
+                )
+            else:
+                self.register_parameter("pos_embed", None)
             self.register_buffer(
                 "_causal_mask",
                 torch.triu(
@@ -136,6 +145,8 @@ def create_torch_mhsa_class():
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             # x: (B, T, D)
             t = x.shape[1]
+            if self.use_pos and self.pos_embed is not None:
+                x = x + self.pos_embed[:t]
             mask = self._causal_mask[:t, :t]
             for block in self.blocks:
                 x = block(x, mask)
@@ -156,6 +167,9 @@ def _mhsa_param_count(controller: ModelController) -> int:
         for m in mats:
             if m is not None:
                 total += int(np.asarray(m).size)
+    pos = getattr(model, "pos_embed", None)
+    if pos is not None:
+        total += int(np.asarray(pos).size)
     return total if total > 0 else extract_custom_engine_param_count(controller)
 
 
