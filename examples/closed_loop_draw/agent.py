@@ -78,7 +78,11 @@ class DrawingExpertAgent:
         self._shutdown_accepted = False
         self._traj = 0
         self._last_loss: float | None = None
+        self._last_ink_miss: float | None = None
         self._process_started_at = time.time()
+        self._sigma = float(cl.get("sigma", 0.06))
+        self._max_steps = int(cl.get("max_steps", 10))
+        self._continuity_weight = float(cl.get("continuity_weight", 0.0))
 
     def close(self) -> None:
         self.app.close()
@@ -88,9 +92,15 @@ class DrawingExpertAgent:
             "state": state,
             "traj": self._traj,
             "command_id": self.command_id,
+            "sigma": self._sigma,
+            "max_steps": self._max_steps,
+            "continuity_weight": self._continuity_weight,
+            "lr": float(self.lr),
         }
         if self._last_loss is not None:
             metrics["loss"] = float(self._last_loss)
+        if self._last_ink_miss is not None:
+            metrics["ink_miss"] = float(self._last_ink_miss)
         self.hb.set_metrics(metrics)
         self.hb.maybe_ping(force=True)
 
@@ -174,6 +184,14 @@ class DrawingExpertAgent:
         )
         self._traj += 1
         self._last_loss = float(result.total_loss)
+        canvas = self.app.env.canvas
+        if canvas is not None:
+            try:
+                self._last_ink_miss = float(
+                    self.app.loss_fn.ink_miss(canvas, self.target)
+                )
+            except Exception:  # noqa: BLE001
+                self._last_ink_miss = None
         return self._last_loss
 
     def run(self) -> None:
