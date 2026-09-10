@@ -153,6 +153,7 @@ class ModelFactory:
                 ffn_mult = getattr(mhsa_config, "ffn_mult", 4)
                 num_layers = getattr(mhsa_config, "num_layers", 1)
                 use_pos_encoding = bool(getattr(mhsa_config, "use_pos_encoding", True))
+                use_input_proj = bool(getattr(mhsa_config, "use_input_proj", False))
             else:
                 d_model = mhsa_config["d_model"]
                 num_heads = mhsa_config["num_heads"]
@@ -161,6 +162,7 @@ class ModelFactory:
                 ffn_mult = mhsa_config.get("ffn_mult", 4)
                 num_layers = mhsa_config.get("num_layers", 1)
                 use_pos_encoding = bool(mhsa_config.get("use_pos_encoding", True))
+                use_input_proj = bool(mhsa_config.get("use_input_proj", False))
 
             factory_kwargs.pop("use_batch_norm", None)
             factory_kwargs.pop("bn_momentum", None)
@@ -174,6 +176,7 @@ class ModelFactory:
                 ffn_mult=int(ffn_mult),
                 num_layers=int(num_layers),
                 use_pos_encoding=use_pos_encoding,
+                use_input_proj=use_input_proj,
                 backend=backend_val,
                 engine_ctx=engine_ctx,
                 **factory_kwargs,

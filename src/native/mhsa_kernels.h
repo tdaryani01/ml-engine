@@ -1,4 +1,4 @@
-// mhsa_kernels.h — Causal MHSA bind + naive multi-layer fwd/bwd.
+// mhsa_kernels.h — Causal MHSA bind + multi-layer fwd/bwd (BLAS projections + attn).
 #pragma once
 
 #include <cstdint>
@@ -73,6 +73,50 @@ struct MhsaLayerBind {
     float* ffn_pre;   // [B*T, ffn_hidden]
     float* ffn_h;     // [B*T, ffn_hidden]
     float* O;         // [B*T, D] block output (next layer input)
+
+    // Contiguous [T, Dh] packs for GEMM attention (may be shared across layers)
+    float* q_pack;    // [T * Dh]
+    float* k_pack;    // [T * Dh]
+    float* v_pack;    // [T * Dh]
+    float* d_scores;  // [T * T] softmax-attn bwd temp
+
+    // Dual-bank Adam write destinations (null → in-place)
+    float* W_qkv_next;
+    float* b_qkv_next;
+    float* W_o_next;
+    float* b_o_next;
+    float* W_ff1_next;
+    float* b_ff1_next;
+    float* W_ff2_next;
+    float* b_ff2_next;
+    float* ln1_gamma_next;
+    float* ln1_beta_next;
+    float* ln2_gamma_next;
+    float* ln2_beta_next;
+    float* ms_W_qkv_next;
+    float* vs_W_qkv_next;
+    float* ms_b_qkv_next;
+    float* vs_b_qkv_next;
+    float* ms_W_o_next;
+    float* vs_W_o_next;
+    float* ms_b_o_next;
+    float* vs_b_o_next;
+    float* ms_W_ff1_next;
+    float* vs_W_ff1_next;
+    float* ms_b_ff1_next;
+    float* vs_b_ff1_next;
+    float* ms_W_ff2_next;
+    float* vs_W_ff2_next;
+    float* ms_b_ff2_next;
+    float* vs_b_ff2_next;
+    float* ms_ln1_g_next;
+    float* vs_ln1_g_next;
+    float* ms_ln1_b_next;
+    float* vs_ln1_b_next;
+    float* ms_ln2_g_next;
+    float* vs_ln2_g_next;
+    float* ms_ln2_b_next;
+    float* vs_ln2_b_next;
 };
 
 struct MhsaBinding {
@@ -115,15 +159,45 @@ struct MhsaBinding {
 
     // Final residual stream (alias of layers[num_layers-1].O after fwd)
     float* O;
+
+    // Optional input projection X @ W_in + b_in (null W_in → disabled)
+    float* W_in;   // [D, D]
+    float* b_in;   // [D]
+    float* dW_in;
+    float* db_in;
+    float* ms_W_in;
+    float* vs_W_in;
+    float* ms_b_in;
+    float* vs_b_in;
+    float* W_in_next;
+    float* b_in_next;
+    float* ms_W_in_next;
+    float* vs_W_in_next;
+    float* ms_b_in_next;
+    float* vs_b_in_next;
+    // [B*T, D] after optional proj (+pos); required when W_in or pos is set
+    float* X_emb;
+
+    // Dual-bank Adam destinations for action + pos (null → in-place)
+    float* W_act_next;
+    float* b_act_next;
+    float* ms_W_act_next;
+    float* vs_W_act_next;
+    float* ms_b_act_next;
+    float* vs_b_act_next;
+    float* pos_next;
+    float* ms_pos_next;
+    float* vs_pos_next;
 };
 
-// X: [B*T, D]. Runs num_layers Pre-LN blocks; sets m->O to last block out.
+// X: [B*T, D] raw tokens. Runs optional input proj + pos, then num_layers
+// Pre-LN blocks; sets m->O to last block out.
 int32_t mhsa_block_forward(const float* X, MhsaBinding* m);
 
 int32_t mhsa_action_forward(MhsaBinding* m);
 int32_t mhsa_action_backward(MhsaBinding* m);
 
-// Backprop through layers[num_layers-1] .. layers[0].
+// Backprop through layers[num_layers-1] .. layers[0], then pos / input proj.
 int32_t mhsa_block_backward(const float* X, MhsaBinding* m);
 
 #ifdef __cplusplus

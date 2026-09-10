@@ -183,6 +183,46 @@ class MhsaLayerBind(ctypes.Structure):
         ("ffn_pre", ctypes.c_void_p),
         ("ffn_h", ctypes.c_void_p),
         ("O", ctypes.c_void_p),
+        ("q_pack", ctypes.c_void_p),
+        ("k_pack", ctypes.c_void_p),
+        ("v_pack", ctypes.c_void_p),
+        ("d_scores", ctypes.c_void_p),
+        ("W_qkv_next", ctypes.c_void_p),
+        ("b_qkv_next", ctypes.c_void_p),
+        ("W_o_next", ctypes.c_void_p),
+        ("b_o_next", ctypes.c_void_p),
+        ("W_ff1_next", ctypes.c_void_p),
+        ("b_ff1_next", ctypes.c_void_p),
+        ("W_ff2_next", ctypes.c_void_p),
+        ("b_ff2_next", ctypes.c_void_p),
+        ("ln1_gamma_next", ctypes.c_void_p),
+        ("ln1_beta_next", ctypes.c_void_p),
+        ("ln2_gamma_next", ctypes.c_void_p),
+        ("ln2_beta_next", ctypes.c_void_p),
+        ("ms_W_qkv_next", ctypes.c_void_p),
+        ("vs_W_qkv_next", ctypes.c_void_p),
+        ("ms_b_qkv_next", ctypes.c_void_p),
+        ("vs_b_qkv_next", ctypes.c_void_p),
+        ("ms_W_o_next", ctypes.c_void_p),
+        ("vs_W_o_next", ctypes.c_void_p),
+        ("ms_b_o_next", ctypes.c_void_p),
+        ("vs_b_o_next", ctypes.c_void_p),
+        ("ms_W_ff1_next", ctypes.c_void_p),
+        ("vs_W_ff1_next", ctypes.c_void_p),
+        ("ms_b_ff1_next", ctypes.c_void_p),
+        ("vs_b_ff1_next", ctypes.c_void_p),
+        ("ms_W_ff2_next", ctypes.c_void_p),
+        ("vs_W_ff2_next", ctypes.c_void_p),
+        ("ms_b_ff2_next", ctypes.c_void_p),
+        ("vs_b_ff2_next", ctypes.c_void_p),
+        ("ms_ln1_g_next", ctypes.c_void_p),
+        ("vs_ln1_g_next", ctypes.c_void_p),
+        ("ms_ln1_b_next", ctypes.c_void_p),
+        ("vs_ln1_b_next", ctypes.c_void_p),
+        ("ms_ln2_g_next", ctypes.c_void_p),
+        ("vs_ln2_g_next", ctypes.c_void_p),
+        ("ms_ln2_b_next", ctypes.c_void_p),
+        ("vs_ln2_b_next", ctypes.c_void_p),
     ]
 
 
@@ -221,6 +261,30 @@ class MhsaBinding(ctypes.Structure):
         ("y", ctypes.c_void_p),
         ("loss_out", ctypes.c_void_p),
         ("O", ctypes.c_void_p),
+        ("W_in", ctypes.c_void_p),
+        ("b_in", ctypes.c_void_p),
+        ("dW_in", ctypes.c_void_p),
+        ("db_in", ctypes.c_void_p),
+        ("ms_W_in", ctypes.c_void_p),
+        ("vs_W_in", ctypes.c_void_p),
+        ("ms_b_in", ctypes.c_void_p),
+        ("vs_b_in", ctypes.c_void_p),
+        ("W_in_next", ctypes.c_void_p),
+        ("b_in_next", ctypes.c_void_p),
+        ("ms_W_in_next", ctypes.c_void_p),
+        ("vs_W_in_next", ctypes.c_void_p),
+        ("ms_b_in_next", ctypes.c_void_p),
+        ("vs_b_in_next", ctypes.c_void_p),
+        ("X_emb", ctypes.c_void_p),
+        ("W_act_next", ctypes.c_void_p),
+        ("b_act_next", ctypes.c_void_p),
+        ("ms_W_act_next", ctypes.c_void_p),
+        ("vs_W_act_next", ctypes.c_void_p),
+        ("ms_b_act_next", ctypes.c_void_p),
+        ("vs_b_act_next", ctypes.c_void_p),
+        ("pos_next", ctypes.c_void_p),
+        ("ms_pos_next", ctypes.c_void_p),
+        ("vs_pos_next", ctypes.c_void_p),
     ]
 
 
@@ -396,6 +460,35 @@ class _ParameterBank:
 
 
 @dataclass
+class _MhsaParameterBank:
+    """Dual-bank MHSA params + Adam moments (weights/biases/LN/pos/W_in)."""
+
+    weights: list[np.ndarray]
+    biases: list[np.ndarray]
+    ln1_gamma: list[np.ndarray]
+    ln1_beta: list[np.ndarray]
+    ln2_gamma: list[np.ndarray]
+    ln2_beta: list[np.ndarray]
+    ms_w: list[np.ndarray]
+    vs_w: list[np.ndarray]
+    ms_b: list[np.ndarray]
+    vs_b: list[np.ndarray]
+    ms_g: list[np.ndarray]
+    vs_g: list[np.ndarray]
+    ms_beta: list[np.ndarray]
+    vs_beta: list[np.ndarray]
+    pos_embed: np.ndarray | None = None
+    ms_pos: np.ndarray | None = None
+    vs_pos: np.ndarray | None = None
+    W_in: np.ndarray | None = None
+    b_in: np.ndarray | None = None
+    ms_W_in: np.ndarray | None = None
+    vs_W_in: np.ndarray | None = None
+    ms_b_in: np.ndarray | None = None
+    vs_b_in: np.ndarray | None = None
+
+
+@dataclass
 class _ExecutionSlot:
     ctx: ContractExecCtx
     buffers: ContractBuffers
@@ -537,7 +630,9 @@ class ContractRuntime:
             ),
             self.contract.op_count,
         )
-        self._mhsa_ws: dict[str, np.ndarray] | None = None
+        self._mhsa_ws: dict[str, Any] | None = None
+        self._mhsa_workspaces: list[dict[str, Any]] = []
+        self._mhsa_banks: list[_MhsaParameterBank] = []
         self._mhsa_w_f32: list[np.ndarray] | None = None
         self._mhsa_b_f32: list[np.ndarray] | None = None
         self._mhsa_ln_f32: list[dict[str, np.ndarray]] | None = None
@@ -1005,31 +1100,170 @@ class ContractRuntime:
         self._slots = [self._make_async_slot(X, cap), self._make_async_slot(X, cap)]
 
     def _ensure_mhsa_async_resources(self, X: np.ndarray) -> None:
-        """Single-flight MHSA async: shared live banks + two ctx shells."""
+        """Dual-bank MHSA async: two param banks + two B/T workspaces + two slots."""
         if X.ndim != 3:
             raise ValueError(f"MHSA async expects (B,T,D); got {X.shape}")
         B, T = int(X.shape[0]), int(X.shape[1])
         self._ensure_mhsa_workspace(B, T)
-        if self._slots and getattr(self._slots[0], "mhsa_ready", False):
+        if (
+            self._mhsa_banks
+            and len(self._mhsa_workspaces) == 2
+            and self._slots
+            and getattr(self._slots[0], "mhsa_ready", False)
+        ):
+            # Refresh workspace geometry if B/T changed.
+            for wi in range(2):
+                self._ensure_mhsa_workspace_slot(B, T, wi)
             return
         if self._submitted is not None or self._completed is not None:
             raise RuntimeError("cannot resize MHSA async slots while a result is owned")
-        self._parameter_banks = []
-        self._slots = [self._make_mhsa_async_slot(), self._make_mhsa_async_slot()]
 
-    def _make_mhsa_async_slot(self) -> _ExecutionSlot:
-        assert self._mhsa_ws is not None
+        m = self.model
+        if hasattr(m, "ensure_adam_moments"):
+            m.ensure_adam_moments()
+        opt = m.optimizer
+        bank0 = self._snapshot_mhsa_bank_from_model()
+        bank1 = self._clone_mhsa_bank_empty(bank0)
+        self._mhsa_banks = [bank0, bank1]
+        self._published_bank_idx = 0
+
+        ws0 = self._mhsa_ws
+        assert ws0 is not None
+        ws1 = self._alloc_mhsa_workspace_buffers(B, T)
+        # Move sync-shared grads into ws0; give ws1 private grads.
+        ws0["dW"] = self._mhsa_dw_f32
+        ws0["db"] = self._mhsa_db_f32
+        ws0["dln"] = self._mhsa_dln_f32
+        D = int(m.d_model)
+        L = int(m.num_layers)
+        ws1["dW"] = [np.zeros_like(w) for w in m.weights]
+        ws1["db"] = [np.zeros_like(b.reshape(-1)) for b in m.biases]
+        ws1["dln"] = [
+            {
+                "ln1_g": np.zeros(D, dtype=np.float32),
+                "ln1_b": np.zeros(D, dtype=np.float32),
+                "ln2_g": np.zeros(D, dtype=np.float32),
+                "ln2_b": np.zeros(D, dtype=np.float32),
+            }
+            for _ in range(L)
+        ]
+        self._mhsa_workspaces = [ws0, ws1]
+        self._slots = [
+            self._make_mhsa_async_slot(0),
+            self._make_mhsa_async_slot(1),
+        ]
+
+    def _make_mhsa_async_slot(self, ws_idx: int = 0) -> _ExecutionSlot:
+        ws = self._mhsa_workspaces[ws_idx] if self._mhsa_workspaces else self._mhsa_ws
+        assert ws is not None
         slot = _ExecutionSlot(
             ctx=ContractExecCtx(),
             buffers=ContractBuffers(dense_layers=[], batch_cap=0),
             conv_grads=[],
-            loss_scalar=self._mhsa_ws["loss"],
+            loss_scalar=ws["loss"],
             owners=[],
             d_conv_buffers=[],
             dx_buffers=[],
         )
         slot.mhsa_ready = True  # type: ignore[attr-defined]
+        slot.mhsa_ws_idx = ws_idx  # type: ignore[attr-defined]
         return slot
+
+    def _snapshot_mhsa_bank_from_model(self) -> _MhsaParameterBank:
+        m = self.model
+        opt = m.optimizer
+        return _MhsaParameterBank(
+            weights=list(m.weights),
+            biases=list(m.biases),
+            ln1_gamma=list(m.ln1_gamma),
+            ln1_beta=list(m.ln1_beta),
+            ln2_gamma=list(m.ln2_gamma),
+            ln2_beta=list(m.ln2_beta),
+            ms_w=list(opt.ms_w),
+            vs_w=list(opt.vs_w),
+            ms_b=list(opt.ms_b),
+            vs_b=list(opt.vs_b),
+            ms_g=list(opt.ms_g),
+            vs_g=list(opt.vs_g),
+            ms_beta=list(opt.ms_beta),
+            vs_beta=list(opt.vs_beta),
+            pos_embed=m.pos_embed,
+            ms_pos=m._ms_pos,
+            vs_pos=m._vs_pos,
+            W_in=getattr(m, "W_in", None),
+            b_in=getattr(m, "b_in", None),
+            ms_W_in=getattr(m, "_ms_W_in", None),
+            vs_W_in=getattr(m, "_vs_W_in", None),
+            ms_b_in=getattr(m, "_ms_b_in", None),
+            vs_b_in=getattr(m, "_vs_b_in", None),
+        )
+
+    def _clone_mhsa_bank_empty(self, src: _MhsaParameterBank) -> _MhsaParameterBank:
+        def _clone_opt(arr: np.ndarray | None) -> np.ndarray | None:
+            return None if arr is None else np.empty_like(arr)
+
+        return _MhsaParameterBank(
+            weights=[np.empty_like(a) for a in src.weights],
+            biases=[np.empty_like(a) for a in src.biases],
+            ln1_gamma=[np.empty_like(a) for a in src.ln1_gamma],
+            ln1_beta=[np.empty_like(a) for a in src.ln1_beta],
+            ln2_gamma=[np.empty_like(a) for a in src.ln2_gamma],
+            ln2_beta=[np.empty_like(a) for a in src.ln2_beta],
+            ms_w=[np.empty_like(a) for a in src.ms_w],
+            vs_w=[np.empty_like(a) for a in src.vs_w],
+            ms_b=[np.empty_like(a) for a in src.ms_b],
+            vs_b=[np.empty_like(a) for a in src.vs_b],
+            ms_g=[np.empty_like(a) for a in src.ms_g],
+            vs_g=[np.empty_like(a) for a in src.vs_g],
+            ms_beta=[np.empty_like(a) for a in src.ms_beta],
+            vs_beta=[np.empty_like(a) for a in src.vs_beta],
+            pos_embed=_clone_opt(src.pos_embed),
+            ms_pos=_clone_opt(src.ms_pos),
+            vs_pos=_clone_opt(src.vs_pos),
+            W_in=_clone_opt(src.W_in),
+            b_in=_clone_opt(src.b_in),
+            ms_W_in=_clone_opt(src.ms_W_in),
+            vs_W_in=_clone_opt(src.vs_W_in),
+            ms_b_in=_clone_opt(src.ms_b_in),
+            vs_b_in=_clone_opt(src.vs_b_in),
+        )
+
+    def _ensure_mhsa_workspace_slot(self, B: int, T: int, wi: int) -> None:
+        if wi >= len(self._mhsa_workspaces):
+            return
+        ws = self._mhsa_workspaces[wi]
+        m = self.model
+        D = int(m.d_model)
+        H = int(m.num_heads)
+        Hff = int(m.ffn_hidden)
+        A = int(m.action_dim)
+        L = int(m.num_layers)
+        key = (B, T, D, H, Hff, A, L)
+        if ws.get("_key") == key:
+            return
+        fresh = self._alloc_mhsa_workspace_buffers(B, T)
+        fresh["dW"] = ws.get("dW") or [np.zeros_like(w) for w in m.weights]
+        fresh["db"] = ws.get("db") or [np.zeros_like(b.reshape(-1)) for b in m.biases]
+        if "dln" in ws:
+            fresh["dln"] = ws["dln"]
+        else:
+            fresh["dln"] = [
+                {
+                    "ln1_g": np.zeros(D, dtype=np.float32),
+                    "ln1_b": np.zeros(D, dtype=np.float32),
+                    "ln2_g": np.zeros(D, dtype=np.float32),
+                    "ln2_b": np.zeros(D, dtype=np.float32),
+                }
+                for _ in range(L)
+            ]
+        self._mhsa_workspaces[wi] = fresh
+        if wi == 0:
+            self._mhsa_ws = fresh
+            self._mhsa_dw_f32 = fresh["dW"]
+            self._mhsa_db_f32 = fresh["db"]
+            self._mhsa_dln_f32 = fresh["dln"]
+        if self._slots and wi < len(self._slots):
+            self._slots[wi].loss_scalar = fresh["loss"]
 
     def _bind_slot_parameter_banks(
         self, slot: _ExecutionSlot, input_bank_idx: int, output_bank_idx: int
@@ -1076,6 +1310,45 @@ class ContractRuntime:
 
     def _publish_parameter_bank(self, bank_idx: int, adam_t: int) -> None:
         if self._mhsa_mode:
+            if self._mhsa_banks:
+                bank = self._mhsa_banks[bank_idx]
+                self._published_bank_idx = bank_idx
+                m = self.model
+                m.weights = bank.weights
+                m.biases = bank.biases
+                m.ln1_gamma = bank.ln1_gamma
+                m.ln1_beta = bank.ln1_beta
+                m.ln2_gamma = bank.ln2_gamma
+                m.ln2_beta = bank.ln2_beta
+                m.pos_embed = bank.pos_embed
+                m._ms_pos = bank.ms_pos
+                m._vs_pos = bank.vs_pos
+                m.W_in = bank.W_in
+                m.b_in = bank.b_in
+                m._ms_W_in = bank.ms_W_in
+                m._vs_W_in = bank.vs_W_in
+                m._ms_b_in = bank.ms_b_in
+                m._vs_b_in = bank.vs_b_in
+                opt = m.optimizer
+                opt.ms_w = bank.ms_w
+                opt.vs_w = bank.vs_w
+                opt.ms_b = bank.ms_b
+                opt.vs_b = bank.vs_b
+                opt.ms_g = bank.ms_g
+                opt.vs_g = bank.vs_g
+                opt.ms_beta = bank.ms_beta
+                opt.vs_beta = bank.vs_beta
+                self._mhsa_w_f32 = bank.weights
+                self._mhsa_b_f32 = [b.reshape(-1) for b in bank.biases]
+                self._mhsa_ln_f32 = [
+                    {
+                        "ln1_g": bank.ln1_gamma[li].reshape(-1),
+                        "ln1_b": bank.ln1_beta[li].reshape(-1),
+                        "ln2_g": bank.ln2_gamma[li].reshape(-1),
+                        "ln2_b": bank.ln2_beta[li].reshape(-1),
+                    }
+                    for li in range(int(m.num_layers))
+                ]
             self.model.optimizer.t = int(adam_t)
             return
         bank = self._parameter_banks[bank_idx]
@@ -1572,32 +1845,54 @@ class ContractRuntime:
         apply_adam: bool = False,
         step_token: int | None = None,
     ) -> bool:
-        """Single-flight MHSA prepare (no dual-bank overlap yet)."""
+        """Prepare inactive MHSA slot/bank while a submitted step may still run."""
         if self._prepared is not None:
             return self._prepared.X is X and self._prepared.y is y
-        # Live f32 banks + in-place Adam: only one native step at a time.
-        if self._submitted is not None or self._completed is not None:
-            return False
 
         X = np.ascontiguousarray(X)
         y = np.ascontiguousarray(y)
         m = int(X.shape[0])
         self._ensure_mhsa_async_resources(X)
-        slot_idx = 0
+
+        occupied = {
+            step.slot_idx
+            for step in (self._submitted, self._completed)
+            if step is not None
+        }
+        free_slots = [i for i in range(2) if i not in occupied]
+        if not free_slots:
+            return False
+        slot_idx = free_slots[0]
+
+        input_bank_idx = (
+            self._submitted.output_bank_idx
+            if self._submitted is not None
+            else self._published_bank_idx
+        )
+        output_bank_idx = 1 - input_bank_idx if apply_adam else input_bank_idx
+
         slot = self._slots[slot_idx]
-        ctx = self._bind_mhsa(X, y, apply_adam=apply_adam)
+        ctx = self._bind_mhsa(
+            X,
+            y,
+            apply_adam=apply_adam,
+            slot_idx=slot_idx,
+            input_bank_idx=input_bank_idx,
+            output_bank_idx=output_bank_idx,
+        )
         ctx.lr = float(lr)
         ctx.skip_adam = 0 if apply_adam else 1
         ctx.adam.t = int(self.model.optimizer.t)
-        self._zero_mhsa_grads()
+        self._zero_mhsa_grads(slot_idx=slot_idx)
         slot.ctx = ctx
-        slot.loss_scalar = self._mhsa_ws["loss"]
+        ws = self._mhsa_workspaces[slot_idx]
+        slot.loss_scalar = ws["loss"]
 
         token = int(step_token if step_token is not None else self.model.optimizer.t + 1)
         self._prepared = _PreparedStep(
             slot_idx=slot_idx,
-            input_bank_idx=0,
-            output_bank_idx=0,
+            input_bank_idx=input_bank_idx,
+            output_bank_idx=output_bank_idx,
             m=m,
             dtype=X.dtype,
             X=X,
@@ -1754,10 +2049,17 @@ class ContractRuntime:
         self, submitted: _SubmittedStep
     ) -> tuple[float, list[np.ndarray], list[np.ndarray], int]:
         if self._mhsa_mode:
-            assert self._mhsa_ws is not None and self._mhsa_dw_f32 is not None
-            assert self._mhsa_db_f32 is not None
-            loss = float(self._mhsa_ws["loss"][0])
-            return loss, self._mhsa_dw_f32, self._mhsa_db_f32, submitted.m
+            ws = (
+                self._mhsa_workspaces[submitted.slot_idx]
+                if self._mhsa_workspaces
+                else self._mhsa_ws
+            )
+            assert ws is not None
+            dw = ws.get("dW", self._mhsa_dw_f32)
+            db = ws.get("db", self._mhsa_db_f32)
+            assert dw is not None and db is not None
+            loss = float(ws["loss"][0])
+            return loss, dw, db, submitted.m
 
         slot = self._slots[submitted.slot_idx]
         grad_weights: list[np.ndarray | None] = [None] * len(self.model.weights)
@@ -1783,17 +2085,16 @@ class ContractRuntime:
         self._invalidate_input_pad_stage(submitted.slot_idx)
         return loss, gw, gb, submitted.m
 
-    def _ensure_mhsa_workspace(self, B: int, T: int) -> None:
+    def _alloc_mhsa_workspace_buffers(self, B: int, T: int) -> dict[str, Any]:
         m = self.model
         D = int(m.d_model)
         H = int(m.num_heads)
         Hff = int(m.ffn_hidden)
         A = int(m.action_dim)
         L = int(m.num_layers)
-        key = (B, T, D, H, Hff, A, L)
-        if self._mhsa_ws is not None and self._mhsa_ws.get("_key") == key:
-            return
+        Dh = D // H
         rows = B * T
+        key = (B, T, D, H, Hff, A, L)
         layers_ws = []
         for _ in range(L):
             layers_ws.append(
@@ -1809,7 +2110,7 @@ class ContractRuntime:
                     "O": np.zeros((rows, D), dtype=np.float32),
                 }
             )
-        self._mhsa_ws = {
+        return {
             "_key": key,
             "layers": layers_ws,
             "scratch": np.zeros((rows, D), dtype=np.float32),
@@ -1819,11 +2120,30 @@ class ContractRuntime:
             "dX": np.zeros((rows, D), dtype=np.float32),
             "d_stream": np.zeros((rows, D), dtype=np.float32),
             "X": np.zeros((rows, D), dtype=np.float32),
+            "X_emb": np.zeros((rows, D), dtype=np.float32),
             "y": np.zeros((B, A), dtype=np.float32),
             "loss": np.zeros(1, dtype=np.float32),
             "d_pos": np.zeros((int(m.max_seq_len), D), dtype=np.float32),
+            "dW_in": np.zeros((D, D), dtype=np.float32),
+            "db_in": np.zeros(D, dtype=np.float32),
+            "q_pack": np.zeros((T * Dh,), dtype=np.float32),
+            "k_pack": np.zeros((T * Dh,), dtype=np.float32),
+            "v_pack": np.zeros((T * Dh,), dtype=np.float32),
+            "d_scores": np.zeros((T * T,), dtype=np.float32),
         }
-        # Live f32 parameter banks (native Adam mutates these in place).
+
+    def _ensure_mhsa_workspace(self, B: int, T: int) -> None:
+        m = self.model
+        D = int(m.d_model)
+        H = int(m.num_heads)
+        Hff = int(m.ffn_hidden)
+        A = int(m.action_dim)
+        L = int(m.num_layers)
+        key = (B, T, D, H, Hff, A, L)
+        if self._mhsa_ws is not None and self._mhsa_ws.get("_key") == key:
+            return
+        self._mhsa_ws = self._alloc_mhsa_workspace_buffers(B, T)
+        # Live f32 parameter banks (native Adam mutates these in place on sync).
         for i, w in enumerate(m.weights):
             if w.dtype != np.float32 or not w.flags["C_CONTIGUOUS"]:
                 m.weights[i] = np.ascontiguousarray(w, dtype=np.float32)
@@ -1843,6 +2163,11 @@ class ContractRuntime:
             m.ln2_beta[li] = np.ascontiguousarray(
                 m.ln2_beta[li].reshape(1, -1), dtype=np.float32
             )
+        if getattr(m, "W_in", None) is not None:
+            m.W_in = np.ascontiguousarray(m.W_in, dtype=np.float32)
+            m.b_in = np.ascontiguousarray(m.b_in.reshape(1, -1), dtype=np.float32)
+        if getattr(m, "pos_embed", None) is not None:
+            m.pos_embed = np.ascontiguousarray(m.pos_embed, dtype=np.float32)
 
         self._mhsa_w_f32 = m.weights
         self._mhsa_b_f32 = [b.reshape(-1) for b in m.biases]
@@ -1867,28 +2192,48 @@ class ContractRuntime:
             )
         self._mhsa_dw_f32 = [np.zeros_like(w) for w in self._mhsa_w_f32]
         self._mhsa_db_f32 = [np.zeros_like(b) for b in self._mhsa_b_f32]
+        self._mhsa_ws["dW"] = self._mhsa_dw_f32
+        self._mhsa_ws["db"] = self._mhsa_db_f32
+        self._mhsa_ws["dln"] = self._mhsa_dln_f32
         if hasattr(m, "ensure_adam_moments"):
             m.ensure_adam_moments()
 
-    def _zero_mhsa_grads(self) -> None:
-        assert self._mhsa_dw_f32 is not None and self._mhsa_db_f32 is not None
-        assert self._mhsa_dln_f32 is not None and self._mhsa_ws is not None
-        for dW in self._mhsa_dw_f32:
+    def _zero_mhsa_grads(self, slot_idx: int = 0) -> None:
+        ws = (
+            self._mhsa_workspaces[slot_idx]
+            if self._mhsa_workspaces
+            else self._mhsa_ws
+        )
+        assert ws is not None
+        dw = ws.get("dW", self._mhsa_dw_f32)
+        db = ws.get("db", self._mhsa_db_f32)
+        dln = ws.get("dln", self._mhsa_dln_f32)
+        assert dw is not None and db is not None and dln is not None
+        for dW in dw:
             dW.fill(0.0)
-        for db in self._mhsa_db_f32:
-            db.fill(0.0)
-        for dln in self._mhsa_dln_f32:
-            for v in dln.values():
+        for dbi in db:
+            dbi.fill(0.0)
+        for dln_i in dln:
+            for v in dln_i.values():
                 v.fill(0.0)
-        self._mhsa_ws["dO"].fill(0.0)
-        self._mhsa_ws["dX"].fill(0.0)
-        self._mhsa_ws["d_stream"].fill(0.0)
-        self._mhsa_ws["d_qkv"].fill(0.0)
-        self._mhsa_ws["loss"].fill(0.0)
-        self._mhsa_ws["d_pos"].fill(0.0)
+        ws["dO"].fill(0.0)
+        ws["dX"].fill(0.0)
+        ws["d_stream"].fill(0.0)
+        ws["d_qkv"].fill(0.0)
+        ws["loss"].fill(0.0)
+        ws["d_pos"].fill(0.0)
+        ws["dW_in"].fill(0.0)
+        ws["db_in"].fill(0.0)
 
     def _bind_mhsa(
-        self, X: np.ndarray, y: np.ndarray | None = None, *, apply_adam: bool = False
+        self,
+        X: np.ndarray,
+        y: np.ndarray | None = None,
+        *,
+        apply_adam: bool = False,
+        slot_idx: int = 0,
+        input_bank_idx: int | None = None,
+        output_bank_idx: int | None = None,
     ) -> ContractExecCtx:
         """Bind MHSA geometry + float32 banks into ContractExecCtx.mhsa."""
         if X.ndim != 3:
@@ -1901,21 +2246,73 @@ class ContractRuntime:
             raise ValueError(f"MHSA T={T} exceeds max_seq_len={m.max_seq_len}")
 
         self._ensure_mhsa_workspace(B, T)
-        ws = self._mhsa_ws
-        assert ws is not None and self._mhsa_w_f32 is not None
-        assert self._mhsa_dw_f32 is not None and self._mhsa_db_f32 is not None
-        assert self._mhsa_dln_f32 is not None and self._mhsa_ln_f32 is not None
-        L = int(m.num_layers)
-        # Live banks already point at model params; no per-step f64→f32 copy.
+        if self._mhsa_workspaces:
+            self._ensure_mhsa_workspace_slot(B, T, slot_idx)
+            ws = self._mhsa_workspaces[slot_idx]
+        else:
+            ws = self._mhsa_ws
+        assert ws is not None
 
+        use_banks = bool(self._mhsa_banks) and input_bank_idx is not None
+        if use_banks:
+            assert output_bank_idx is not None
+            src = self._mhsa_banks[input_bank_idx]
+            dst = self._mhsa_banks[output_bank_idx]
+            w = src.weights
+            b = [bb.reshape(-1) for bb in src.biases]
+            ln_f32 = [
+                {
+                    "ln1_g": src.ln1_gamma[li].reshape(-1),
+                    "ln1_b": src.ln1_beta[li].reshape(-1),
+                    "ln2_g": src.ln2_gamma[li].reshape(-1),
+                    "ln2_b": src.ln2_beta[li].reshape(-1),
+                }
+                for li in range(int(m.num_layers))
+            ]
+            pos_embed = src.pos_embed
+            ms_pos, vs_pos = src.ms_pos, src.vs_pos
+            W_in, b_in = src.W_in, src.b_in
+            ms_W_in, vs_W_in = src.ms_W_in, src.vs_W_in
+            ms_b_in, vs_b_in = src.ms_b_in, src.vs_b_in
+            ms_w, vs_w = src.ms_w, src.vs_w
+            ms_b, vs_b = src.ms_b, src.vs_b
+            ms_g, vs_g = src.ms_g, src.vs_g
+            ms_beta, vs_beta = src.ms_beta, src.vs_beta
+            dw = ws["dW"]
+            db = ws["db"]
+            dln = ws["dln"]
+        else:
+            assert self._mhsa_w_f32 is not None
+            assert self._mhsa_dw_f32 is not None and self._mhsa_db_f32 is not None
+            assert self._mhsa_dln_f32 is not None and self._mhsa_ln_f32 is not None
+            w = self._mhsa_w_f32
+            b = self._mhsa_b_f32
+            ln_f32 = self._mhsa_ln_f32
+            dw = self._mhsa_dw_f32
+            db = self._mhsa_db_f32
+            dln = self._mhsa_dln_f32
+            pos_embed = m.pos_embed
+            ms_pos, vs_pos = m._ms_pos, m._vs_pos
+            W_in = getattr(m, "W_in", None)
+            b_in = getattr(m, "b_in", None)
+            ms_W_in = getattr(m, "_ms_W_in", None)
+            vs_W_in = getattr(m, "_vs_W_in", None)
+            ms_b_in = getattr(m, "_ms_b_in", None)
+            vs_b_in = getattr(m, "_vs_b_in", None)
+            dst = None
+            opt = m.optimizer
+            ms_w = getattr(opt, "ms_w", None) if apply_adam else None
+            vs_w = getattr(opt, "vs_w", None) if apply_adam else None
+            ms_b = getattr(opt, "ms_b", None) if apply_adam else None
+            vs_b = getattr(opt, "vs_b", None) if apply_adam else None
+            ms_g = getattr(opt, "ms_g", None) if apply_adam else None
+            vs_g = getattr(opt, "vs_g", None) if apply_adam else None
+            ms_beta = getattr(opt, "ms_beta", None) if apply_adam else None
+            vs_beta = getattr(opt, "vs_beta", None) if apply_adam else None
+
+        L = int(m.num_layers)
+        # Raw tokens only — native applies optional input proj then pos into X_emb.
         Xf = np.ascontiguousarray(X.reshape(B * T, D_in), dtype=np.float32)
-        if getattr(m, "use_pos_encoding", False) and m.pos_embed is not None:
-            # X ← X + pos[:T] (broadcast over batch)
-            pos = np.ascontiguousarray(m.pos_embed[:T], dtype=np.float32)
-            Xf = Xf.reshape(B, T, D_in)
-            Xf = np.ascontiguousarray(Xf + pos[None, :, :], dtype=np.float32).reshape(
-                B * T, D_in
-            )
         ws["X"] = Xf
         if y is not None:
             yf = np.ascontiguousarray(y, dtype=np.float32)
@@ -1957,24 +2354,16 @@ class ContractRuntime:
         mb.action_dim = int(m.action_dim)
         mb.ffn_hidden = int(m.ffn_hidden)
         mb.num_layers = L
-        w = self._mhsa_w_f32
-        b = self._mhsa_b_f32
-        dw = self._mhsa_dw_f32
-        db = self._mhsa_db_f32
-        ms_w = getattr(opt, "ms_w", None) if apply_adam else None
-        vs_w = getattr(opt, "vs_w", None) if apply_adam else None
-        ms_b = getattr(opt, "ms_b", None) if apply_adam else None
-        vs_b = getattr(opt, "vs_b", None) if apply_adam else None
-        ms_g = getattr(opt, "ms_g", None) if apply_adam else None
-        vs_g = getattr(opt, "vs_g", None) if apply_adam else None
-        ms_beta = getattr(opt, "ms_beta", None) if apply_adam else None
-        vs_beta = getattr(opt, "vs_beta", None) if apply_adam else None
+
+        use_pos = bool(getattr(m, "use_pos_encoding", False) and pos_embed is not None)
+        use_proj = bool(getattr(m, "use_input_proj", False) and W_in is not None)
+
         for li in range(L):
             base = 4 * li
             lb = mb.layers[li]
             lws = ws["layers"][li]
-            ln = self._mhsa_ln_f32[li]
-            dln = self._mhsa_dln_f32[li]
+            ln = ln_f32[li]
+            dln_i = dln[li]
             lb.W_qkv, lb.b_qkv = _ptr(w[base + 0]), _ptr(b[base + 0])
             lb.W_o, lb.b_o = _ptr(w[base + 1]), _ptr(b[base + 1])
             lb.W_ff1, lb.b_ff1 = _ptr(w[base + 2]), _ptr(b[base + 2])
@@ -1985,9 +2374,9 @@ class ContractRuntime:
             lb.dW_ff2, lb.db_ff2 = _ptr(dw[base + 3]), _ptr(db[base + 3])
             lb.ln1_gamma, lb.ln1_beta = _ptr(ln["ln1_g"]), _ptr(ln["ln1_b"])
             lb.ln2_gamma, lb.ln2_beta = _ptr(ln["ln2_g"]), _ptr(ln["ln2_b"])
-            lb.d_ln1_gamma, lb.d_ln1_beta = _ptr(dln["ln1_g"]), _ptr(dln["ln1_b"])
-            lb.d_ln2_gamma, lb.d_ln2_beta = _ptr(dln["ln2_g"]), _ptr(dln["ln2_b"])
-            if ms_w is not None:
+            lb.d_ln1_gamma, lb.d_ln1_beta = _ptr(dln_i["ln1_g"]), _ptr(dln_i["ln1_b"])
+            lb.d_ln2_gamma, lb.d_ln2_beta = _ptr(dln_i["ln2_g"]), _ptr(dln_i["ln2_b"])
+            if apply_adam and ms_w is not None:
                 g0 = 2 * li
                 lb.ms_W_qkv, lb.vs_W_qkv = _ptr(ms_w[base + 0]), _ptr(vs_w[base + 0])
                 lb.ms_b_qkv, lb.vs_b_qkv = _ptr(ms_b[base + 0]), _ptr(vs_b[base + 0])
@@ -2001,6 +2390,44 @@ class ContractRuntime:
                 lb.ms_ln1_b, lb.vs_ln1_b = _ptr(ms_beta[g0]), _ptr(vs_beta[g0])
                 lb.ms_ln2_g, lb.vs_ln2_g = _ptr(ms_g[g0 + 1]), _ptr(vs_g[g0 + 1])
                 lb.ms_ln2_b, lb.vs_ln2_b = _ptr(ms_beta[g0 + 1]), _ptr(vs_beta[g0 + 1])
+                if dst is not None:
+                    g0d = 2 * li
+                    lb.W_qkv_next = _ptr(dst.weights[base + 0])
+                    lb.b_qkv_next = _ptr(dst.biases[base + 0].reshape(-1))
+                    lb.W_o_next = _ptr(dst.weights[base + 1])
+                    lb.b_o_next = _ptr(dst.biases[base + 1].reshape(-1))
+                    lb.W_ff1_next = _ptr(dst.weights[base + 2])
+                    lb.b_ff1_next = _ptr(dst.biases[base + 2].reshape(-1))
+                    lb.W_ff2_next = _ptr(dst.weights[base + 3])
+                    lb.b_ff2_next = _ptr(dst.biases[base + 3].reshape(-1))
+                    lb.ln1_gamma_next = _ptr(dst.ln1_gamma[li].reshape(-1))
+                    lb.ln1_beta_next = _ptr(dst.ln1_beta[li].reshape(-1))
+                    lb.ln2_gamma_next = _ptr(dst.ln2_gamma[li].reshape(-1))
+                    lb.ln2_beta_next = _ptr(dst.ln2_beta[li].reshape(-1))
+                    lb.ms_W_qkv_next = _ptr(dst.ms_w[base + 0])
+                    lb.vs_W_qkv_next = _ptr(dst.vs_w[base + 0])
+                    lb.ms_b_qkv_next = _ptr(dst.ms_b[base + 0])
+                    lb.vs_b_qkv_next = _ptr(dst.vs_b[base + 0])
+                    lb.ms_W_o_next = _ptr(dst.ms_w[base + 1])
+                    lb.vs_W_o_next = _ptr(dst.vs_w[base + 1])
+                    lb.ms_b_o_next = _ptr(dst.ms_b[base + 1])
+                    lb.vs_b_o_next = _ptr(dst.vs_b[base + 1])
+                    lb.ms_W_ff1_next = _ptr(dst.ms_w[base + 2])
+                    lb.vs_W_ff1_next = _ptr(dst.vs_w[base + 2])
+                    lb.ms_b_ff1_next = _ptr(dst.ms_b[base + 2])
+                    lb.vs_b_ff1_next = _ptr(dst.vs_b[base + 2])
+                    lb.ms_W_ff2_next = _ptr(dst.ms_w[base + 3])
+                    lb.vs_W_ff2_next = _ptr(dst.vs_w[base + 3])
+                    lb.ms_b_ff2_next = _ptr(dst.ms_b[base + 3])
+                    lb.vs_b_ff2_next = _ptr(dst.vs_b[base + 3])
+                    lb.ms_ln1_g_next = _ptr(dst.ms_g[g0d])
+                    lb.vs_ln1_g_next = _ptr(dst.vs_g[g0d])
+                    lb.ms_ln1_b_next = _ptr(dst.ms_beta[g0d])
+                    lb.vs_ln1_b_next = _ptr(dst.vs_beta[g0d])
+                    lb.ms_ln2_g_next = _ptr(dst.ms_g[g0d + 1])
+                    lb.vs_ln2_g_next = _ptr(dst.vs_g[g0d + 1])
+                    lb.ms_ln2_b_next = _ptr(dst.ms_beta[g0d + 1])
+                    lb.vs_ln2_b_next = _ptr(dst.vs_beta[g0d + 1])
             lb.qkv = _ptr(lws["qkv"])
             lb.scores = _ptr(lws["scores"])
             lb.attn_out = _ptr(lws["attn_out"])
@@ -2010,25 +2437,76 @@ class ContractRuntime:
             lb.ffn_pre = _ptr(lws["ffn_pre"])
             lb.ffn_h = _ptr(lws["ffn_h"])
             lb.O = _ptr(lws["O"])
+            lb.q_pack = _ptr(ws["q_pack"])
+            lb.k_pack = _ptr(ws["k_pack"])
+            lb.v_pack = _ptr(ws["v_pack"])
+            lb.d_scores = _ptr(ws["d_scores"])
 
         act_i = 4 * L
         mb.W_act, mb.b_act = _ptr(w[act_i]), _ptr(b[act_i])
         mb.dW_act, mb.db_act = _ptr(dw[act_i]), _ptr(db[act_i])
-        if ms_w is not None:
+        if apply_adam and ms_w is not None:
             mb.ms_W_act, mb.vs_W_act = _ptr(ms_w[act_i]), _ptr(vs_w[act_i])
             mb.ms_b_act, mb.vs_b_act = _ptr(ms_b[act_i]), _ptr(vs_b[act_i])
-        if getattr(m, "use_pos_encoding", False) and m.pos_embed is not None:
-            mb.pos = _ptr(m.pos_embed)
+            if dst is not None:
+                mb.W_act_next = _ptr(dst.weights[act_i])
+                mb.b_act_next = _ptr(dst.biases[act_i].reshape(-1))
+                mb.ms_W_act_next = _ptr(dst.ms_w[act_i])
+                mb.vs_W_act_next = _ptr(dst.vs_w[act_i])
+                mb.ms_b_act_next = _ptr(dst.ms_b[act_i])
+                mb.vs_b_act_next = _ptr(dst.vs_b[act_i])
+
+        if use_pos:
+            mb.pos = _ptr(pos_embed)
             mb.d_pos = _ptr(ws["d_pos"])
             mb.max_seq_len = int(m.max_seq_len)
-            if apply_adam and m._ms_pos is not None:
-                mb.ms_pos, mb.vs_pos = _ptr(m._ms_pos), _ptr(m._vs_pos)
+            if apply_adam and ms_pos is not None:
+                mb.ms_pos, mb.vs_pos = _ptr(ms_pos), _ptr(vs_pos)
+                if dst is not None and dst.pos_embed is not None:
+                    mb.pos_next = _ptr(dst.pos_embed)
+                    mb.ms_pos_next = _ptr(dst.ms_pos)
+                    mb.vs_pos_next = _ptr(dst.vs_pos)
         else:
             mb.pos = None
             mb.d_pos = None
             mb.ms_pos = None
             mb.vs_pos = None
             mb.max_seq_len = 0
+
+        if use_proj:
+            mb.W_in = _ptr(W_in)
+            mb.b_in = _ptr(b_in.reshape(-1))
+            mb.dW_in = _ptr(ws["dW_in"])
+            mb.db_in = _ptr(ws["db_in"])
+            if apply_adam and ms_W_in is not None:
+                mb.ms_W_in, mb.vs_W_in = _ptr(ms_W_in), _ptr(vs_W_in)
+                mb.ms_b_in, mb.vs_b_in = _ptr(ms_b_in.reshape(-1)), _ptr(
+                    vs_b_in.reshape(-1)
+                )
+                if dst is not None and dst.W_in is not None:
+                    mb.W_in_next = _ptr(dst.W_in)
+                    mb.b_in_next = _ptr(dst.b_in.reshape(-1))
+                    mb.ms_W_in_next = _ptr(dst.ms_W_in)
+                    mb.vs_W_in_next = _ptr(dst.vs_W_in)
+                    mb.ms_b_in_next = _ptr(dst.ms_b_in.reshape(-1))
+                    mb.vs_b_in_next = _ptr(dst.vs_b_in.reshape(-1))
+        else:
+            mb.W_in = None
+            mb.b_in = None
+            mb.dW_in = None
+            mb.db_in = None
+            mb.ms_W_in = None
+            mb.vs_W_in = None
+            mb.ms_b_in = None
+            mb.vs_b_in = None
+            mb.W_in_next = None
+            mb.b_in_next = None
+            mb.ms_W_in_next = None
+            mb.vs_W_in_next = None
+            mb.ms_b_in_next = None
+            mb.vs_b_in_next = None
+
+        mb.X_emb = _ptr(ws["X_emb"]) if (use_pos or use_proj) else None
         mb.scratch = _ptr(ws["scratch"])
         mb.actions = _ptr(ws["actions"])
         mb.dO = _ptr(ws["dO"])
@@ -2055,8 +2533,14 @@ class ContractRuntime:
         )
         if status != 0:
             raise RuntimeError(f"MHSA forward contract failed status={status}")
-        assert self._mhsa_ws is not None
-        return np.copy(self._mhsa_ws["actions"])
+        # Prefer the workspace that `_bind_mhsa` just wired (slot 0 if dual-bank).
+        ws = (
+            self._mhsa_workspaces[0]
+            if self._mhsa_workspaces
+            else self._mhsa_ws
+        )
+        assert ws is not None
+        return np.copy(ws["actions"])
 
     def run_step(
         self,

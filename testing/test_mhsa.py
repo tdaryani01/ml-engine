@@ -392,6 +392,171 @@ def test_mhsa_pos_encoding_adam():
         _close(model)
 
 
+def test_mhsa_input_proj_adam_and_fd():
+    """Input proj: Adam moves W_in; FD checks dW_in / db_in / dX."""
+    from src.model_factory import ModelFactory
+    from config.constants import EngineBackend
+
+    np.random.seed(9)
+    model = ModelFactory.create_model(
+        "mhsa",
+        layer_sizes=[2],
+        backend=EngineBackend.NATIVE,
+        optimizer="adam",
+        mhsa_config={
+            "d_model": 8,
+            "num_heads": 2,
+            "max_seq_len": 4,
+            "action_dim": 2,
+            "ffn_mult": 2,
+            "num_layers": 1,
+            "use_pos_encoding": False,
+            "use_input_proj": True,
+        },
+        contract_list_enabled=True,
+        lam_l2=0.0,
+        lam_l1=0.0,
+    )
+    try:
+        assert model.W_in is not None and model.W_in.shape == (8, 8)
+        w0 = model.W_in.copy()
+        rng = np.random.default_rng(9)
+        X = (rng.standard_normal((2, 3, 8)) * 0.3).astype(np.float64)
+        y = (rng.standard_normal((2, 2)) * 0.3).astype(np.float64)
+        model.run_contract_train_step(X, y, lr=1e-2, apply_adam=True)
+        assert not np.allclose(w0, model.W_in)
+
+        # Fresh model for FD (Adam above moved params).
+        _close(model)
+        np.random.seed(9)
+        model = ModelFactory.create_model(
+            "mhsa",
+            layer_sizes=[2],
+            backend=EngineBackend.NATIVE,
+            optimizer="adam",
+            mhsa_config={
+                "d_model": 8,
+                "num_heads": 2,
+                "max_seq_len": 4,
+                "action_dim": 2,
+                "ffn_mult": 2,
+                "num_layers": 1,
+                "use_pos_encoding": False,
+                "use_input_proj": True,
+            },
+            contract_list_enabled=True,
+            lam_l2=0.0,
+            lam_l1=0.0,
+        )
+        X = (rng.standard_normal((2, 3, 8)) * 0.3).astype(np.float64)
+        y = (rng.standard_normal((2, 2)) * 0.3).astype(np.float64)
+        _, _, _, _, _, dX = _analytic_pack(model, X, y)
+        rt = model._contract_runtime
+        dW_in = np.array(rt._mhsa_ws["dW_in"], dtype=np.float64)
+        db_in = np.array(rt._mhsa_ws["db_in"], dtype=np.float64).reshape(1, -1)
+
+        def fwd_loss() -> float:
+            return _mse(model.predict(X), y)
+
+        eps, tol, cap = 1e-3, 5e-2, 8
+        ok = _fd_check_tensor(
+            "W_in", model.W_in, dW_in, fwd_loss=fwd_loss, eps=eps, tol=tol, rng=rng, cap=cap
+        )
+        ok = (
+            _fd_check_tensor(
+                "b_in",
+                model.b_in,
+                db_in,
+                fwd_loss=fwd_loss,
+                eps=eps,
+                tol=tol,
+                rng=rng,
+                cap=cap,
+            )
+            and ok
+        )
+        max_err = 0.0
+        for coord in _sample_coords(X.shape, rng, cap=8):
+            orig = float(X[coord])
+            X[coord] = orig + eps
+            lp = _mse(model.predict(X), y)
+            X[coord] = orig - eps
+            lm = _mse(model.predict(X), y)
+            X[coord] = orig
+            max_err = max(max_err, _rel_err(float(dX[coord]), (lp - lm) / (2.0 * eps)))
+        ok = (max_err <= tol) and ok
+        print(f"[{'PASSED' if max_err <= tol else 'FAILED'}] mhsa FD dX(proj)     max_rel={max_err:.2e}")
+        assert ok, "MHSA input-proj finite-difference check failed"
+        print("[PASSED] mhsa: input proj adam + FD")
+    finally:
+        _close(model)
+
+
+def test_mhsa_dual_bank_prepare_while_inflight():
+    """Dual-bank async: prepare next step while one is in flight; banks flip."""
+    from src.model_factory import ModelFactory
+    from config.constants import EngineBackend
+
+    np.random.seed(13)
+    model = ModelFactory.create_model(
+        "mhsa",
+        layer_sizes=[2],
+        backend=EngineBackend.NATIVE,
+        optimizer="adam",
+        mhsa_config={
+            "d_model": 8,
+            "num_heads": 2,
+            "max_seq_len": 4,
+            "action_dim": 2,
+            "ffn_mult": 2,
+            "num_layers": 1,
+            "use_pos_encoding": False,
+            "use_input_proj": True,
+        },
+        contract_list_enabled=True,
+        native_async_submit=True,
+        lam_l2=0.0,
+        lam_l1=0.0,
+    )
+    try:
+        rt = model._contract_runtime
+        assert rt is not None
+        if not hasattr(rt._lib, "submit_contract_training_step"):
+            print("[SKIPPED] mhsa dual-bank: submit_contract_training_step missing")
+            return
+        rt.set_engine_driven(True)
+        rng = np.random.default_rng(13)
+        X1 = rng.standard_normal((2, 3, 8)).astype(np.float32)
+        y1 = rng.standard_normal((2, 2)).astype(np.float32)
+        X2 = rng.standard_normal((2, 3, 8)).astype(np.float32)
+        y2 = rng.standard_normal((2, 2)).astype(np.float32)
+        lr = 1e-2
+        w0 = model.W_in.copy()
+
+        assert model.add_training_step(X1, y1, lr, apply_adam=True, step_token=1) == "OK"
+        assert model.contract_busy()
+        assert len(rt._mhsa_banks) == 2
+        assert rt.prepare_step(X2, y2, lr, apply_adam=True, step_token=2)
+        assert rt._prepared is not None
+        assert rt._prepared.input_bank_idx != rt._prepared.output_bank_idx
+        # Free slot while one submitted; prepare must not block on single-flight.
+        assert rt._prepared.slot_idx != rt._submitted.slot_idx
+
+        assert rt.wait_for_completion(timeout=5.0)
+        loss1 = rt.try_reap_step()
+        assert loss1 is not None
+        assert not np.allclose(w0, model.W_in), "publish should move W_in after adam"
+
+        assert model.add_training_step(X2, y2, lr, apply_adam=True, step_token=2) == "OK"
+        assert rt.wait_for_completion(timeout=5.0)
+        loss2 = rt.try_reap_step()
+        assert loss2 is not None
+        assert rt._published_bank_idx in (0, 1)
+        print("[PASSED] mhsa: dual-bank prepare-while-inflight + W_in publish")
+    finally:
+        _close(model)
+
+
 def test_mhsa_finite_diff_grads_l1():
     _run_fd(_make_mhsa(num_layers=1, seed=7), seed=7)
     print("[PASSED] mhsa: finite-diff grads L=1")
@@ -412,6 +577,8 @@ if __name__ == "__main__":
     test_mhsa_loss_matches_predict_mse()
     test_mhsa_adam_loss_decreases()
     test_mhsa_pos_encoding_adam()
+    test_mhsa_input_proj_adam_and_fd()
+    test_mhsa_dual_bank_prepare_while_inflight()
     test_mhsa_finite_diff_grads_l1()
     test_mhsa_finite_diff_grads_l2()
     print("[SUCCESS] MHSA tests passed")

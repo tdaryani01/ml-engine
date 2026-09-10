@@ -47,6 +47,7 @@ class MHSAConfig:
     ffn_mult: int = 4
     num_layers: int = 1
     use_pos_encoding: bool = True
+    use_input_proj: bool = False
 
 
 @dataclass(frozen=True)

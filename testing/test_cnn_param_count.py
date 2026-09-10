@@ -77,8 +77,9 @@ def runtime_trainable_params(model) -> int:
 
 
 def _load_config_cnn() -> tuple[dict, int]:
+    """CNN geometry from config_28.yaml (default config.yaml is MHSA)."""
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    with open(os.path.join(root, "config", "config.yaml"), "r", encoding="utf-8") as f:
+    with open(os.path.join(root, "config", "config_28.yaml"), "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
     arch = cfg["architecture"]
     return dict(arch["cnn"]), int(arch["num_classes"])
@@ -111,7 +112,7 @@ def test_param_count_matches_geometry_all_backends():
     backends = (EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM, EngineBackend.NUMPY)
     cfg_yaml, n_cls = _load_config_cnn()
     variants = [
-        ("config.yaml", cfg_yaml, n_cls),
+        ("config_28.yaml", cfg_yaml, n_cls),
         (
             "dense_head=[]",
             {**cfg_yaml, "dense_head": []},

@@ -32,6 +32,7 @@ class MHSANetwork(TrainableModel):
         ffn_mult: int = 4,
         num_layers: int = 1,
         use_pos_encoding: bool = True,
+        use_input_proj: bool = False,
         backend: EngineBackend = EngineBackend.NATIVE,
         engine_ctx=None,
         lam_l1: float = 0.01,
@@ -74,6 +75,7 @@ class MHSANetwork(TrainableModel):
         self.ffn_hidden = self.d_model * self.ffn_mult
         self.num_layers = num_layers
         self.use_pos_encoding = bool(use_pos_encoding)
+        self.use_input_proj = bool(use_input_proj)
 
         self.weights: list[np.ndarray] = []
         self.biases: list[np.ndarray] = []
@@ -84,6 +86,12 @@ class MHSANetwork(TrainableModel):
         self.pos_embed: np.ndarray | None = None
         self._ms_pos: np.ndarray | None = None
         self._vs_pos: np.ndarray | None = None
+        self.W_in: np.ndarray | None = None
+        self.b_in: np.ndarray | None = None
+        self._ms_W_in: np.ndarray | None = None
+        self._vs_W_in: np.ndarray | None = None
+        self._ms_b_in: np.ndarray | None = None
+        self._vs_b_in: np.ndarray | None = None
         self._init_parameters()
 
         # Per layer: W_qkv, W_o, W_ff1, W_ff2; then W_act.
@@ -101,7 +109,7 @@ class MHSANetwork(TrainableModel):
 
         logging.info(
             "[MHSA] layers=%d d_model=%d heads=%d d_head=%d T_max=%d action_dim=%d "
-            "ffn=%d pos=%s",
+            "ffn=%d pos=%s in_proj=%s",
             self.num_layers,
             self.d_model,
             self.num_heads,
@@ -110,6 +118,7 @@ class MHSANetwork(TrainableModel):
             self.action_dim,
             self.ffn_hidden,
             self.use_pos_encoding,
+            self.use_input_proj,
         )
 
     def _xavier(self, rows: int, cols: int) -> np.ndarray:
@@ -160,9 +169,23 @@ class MHSANetwork(TrainableModel):
             self.pos_embed = None
             self._ms_pos = None
             self._vs_pos = None
+        if self.use_input_proj:
+            self.W_in = self._xavier(D, D)
+            self.b_in = np.zeros((1, D), dtype=np.float32)
+            self._ms_W_in = np.zeros_like(self.W_in)
+            self._vs_W_in = np.zeros_like(self.W_in)
+            self._ms_b_in = np.zeros_like(self.b_in)
+            self._vs_b_in = np.zeros_like(self.b_in)
+        else:
+            self.W_in = None
+            self.b_in = None
+            self._ms_W_in = None
+            self._vs_W_in = None
+            self._ms_b_in = None
+            self._vs_b_in = None
 
     def ensure_adam_moments(self) -> None:
-        """Allocate Adam m/v on live f32 banks (weights, biases, LN, pos)."""
+        """Allocate Adam m/v on live f32 banks (weights, biases, LN, pos, W_in)."""
         opt = self.optimizer
         if not getattr(opt, "_setup_done", False):
             gammas, betas = self._ln_param_lists()
@@ -171,6 +194,15 @@ class MHSANetwork(TrainableModel):
             if self._ms_pos is None or self._ms_pos.shape != self.pos_embed.shape:
                 self._ms_pos = np.zeros_like(self.pos_embed)
                 self._vs_pos = np.zeros_like(self.pos_embed)
+        if self.use_input_proj and self.W_in is not None:
+            if self._ms_W_in is None or self._ms_W_in.shape != self.W_in.shape:
+                self._ms_W_in = np.zeros_like(self.W_in)
+                self._vs_W_in = np.zeros_like(self.W_in)
+            if self.b_in is not None and (
+                self._ms_b_in is None or self._ms_b_in.shape != self.b_in.shape
+            ):
+                self._ms_b_in = np.zeros_like(self.b_in)
+                self._vs_b_in = np.zeros_like(self.b_in)
 
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
         """X (B,T,D) → continuous actions (B, action_dim) via native MHSA forward."""

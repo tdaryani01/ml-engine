@@ -17,7 +17,9 @@ CONFIG_DIR = PROJECT_ROOT / "config"
 
 PRODUCTION_CONFIGS = (
     CONFIG_DIR / "config.yaml",
+    CONFIG_DIR / "config_28.yaml",
     CONFIG_DIR / "config_pad2.yaml",
+    CONFIG_DIR / "config_mhsa_sanity.yaml",
 )
 
 
@@ -45,18 +47,40 @@ def test_production_config_hydrates() -> None:
 
 
 def test_production_config_cnn_invariants() -> None:
+    """CNN production defaults live in config_28 / config_pad2 (config.yaml is MHSA)."""
+    for name in ("config_28.yaml", "config_pad2.yaml"):
+        cfg = load_production_config(str(CONFIG_DIR / name))
+        assert cfg.architecture.model_type == ModelType.CNN, name
+        assert cfg.architecture.backend == EngineBackend.NATIVE, name
+        cnn = cfg.architecture.cnn
+        assert cnn is not None, name
+        if isinstance(cnn, dict):
+            assert cnn.get("input_shape"), name
+            assert cnn.get("spatial_pipeline"), name
+        else:
+            assert cnn.input_shape, name
+            assert cnn.spatial_pipeline, name
+    print("[PASSED] config_28/pad2: CNN + native backend invariants")
+
+
+def test_production_config_mhsa_invariants() -> None:
     cfg = load_production_config(str(CONFIG_DIR / "config.yaml"))
-    assert cfg.architecture.model_type == ModelType.CNN
+    assert cfg.architecture.model_type == ModelType.MHSA
     assert cfg.architecture.backend == EngineBackend.NATIVE
-    cnn = cfg.architecture.cnn
-    assert cnn is not None
-    if isinstance(cnn, dict):
-        assert cnn.get("input_shape")
-        assert cnn.get("spatial_pipeline")
+    mhsa = cfg.architecture.mhsa
+    assert mhsa is not None
+    if isinstance(mhsa, dict):
+        assert int(mhsa.get("d_model", 0)) > 0
+        assert int(mhsa.get("num_heads", 0)) > 0
+        assert int(mhsa.get("max_seq_len", 0)) > 0
+        assert int(mhsa.get("action_dim", 0)) > 0
     else:
-        assert cnn.input_shape
-        assert cnn.spatial_pipeline
-    print("[PASSED] config.yaml: CNN + native backend invariants")
+        assert mhsa.d_model > 0
+        assert mhsa.num_heads > 0
+        assert mhsa.max_seq_len > 0
+        assert mhsa.action_dim > 0
+        assert isinstance(mhsa.use_input_proj, bool)
+    print("[PASSED] config.yaml: MHSA + native backend invariants")
 
 
 def test_production_config_ledger_section() -> None:
@@ -181,6 +205,7 @@ CONFIG_TESTS = [
     test_production_yaml_files_parse,
     test_production_config_hydrates,
     test_production_config_cnn_invariants,
+    test_production_config_mhsa_invariants,
     test_production_config_ledger_section,
     test_runtime_yaml_parses,
     test_runtime_settings_load_default_paths,

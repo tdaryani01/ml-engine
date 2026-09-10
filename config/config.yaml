@@ -50,6 +50,7 @@ architecture:
     ffn_mult: 4
     num_layers: 2
     use_pos_encoding: true
+    use_input_proj: false
 
 # =====================================================================
 # OPTIMIZATION LOOP CONTROLS

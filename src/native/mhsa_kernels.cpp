@@ -1,4 +1,4 @@
-// mhsa_kernels.cpp — Naive multi-layer causal MHSA; BLAS for projections.
+// mhsa_kernels.cpp — Multi-layer causal MHSA; BLAS for projections + attention GEMMs.
 #include "mhsa_kernels.h"
 #include "blas_dynamic.h"
 
@@ -110,6 +110,90 @@ void accumulate_bias_grad(const float* dy, float* db, int64_t rows, int64_t cols
     }
 }
 
+// Pack one head's slice from interleaved qkv [B*T, 3D] into contiguous [T, Dh].
+void pack_qkv_head(
+    const float* qkv, float* dst, int64_t b, int64_t h, int64_t part,
+    int64_t T, int64_t D, int64_t Dh
+) {
+    const int64_t off = part * D + h * Dh;
+    for (int64_t t = 0; t < T; ++t) {
+        std::memcpy(
+            dst + t * Dh,
+            qkv + ((b * T + t) * 3 * D) + off,
+            static_cast<size_t>(Dh) * sizeof(float));
+    }
+}
+
+void pack_dout_head(
+    const float* dout, float* dst, int64_t b, int64_t h,
+    int64_t T, int64_t D, int64_t Dh
+) {
+    for (int64_t t = 0; t < T; ++t) {
+        std::memcpy(
+            dst + t * Dh,
+            dout + (b * T + t) * D + h * Dh,
+            static_cast<size_t>(Dh) * sizeof(float));
+    }
+}
+
+void scatter_head_add(
+    float* qkv_grad, const float* src, int64_t b, int64_t h, int64_t part,
+    int64_t T, int64_t D, int64_t Dh
+) {
+    const int64_t off = part * D + h * Dh;
+    for (int64_t t = 0; t < T; ++t) {
+        float* dst = qkv_grad + ((b * T + t) * 3 * D) + off;
+        const float* s = src + t * Dh;
+        for (int64_t d = 0; d < Dh; ++d) dst[d] += s[d];
+    }
+}
+
+void scatter_attn_out_head(
+    float* attn_out, const float* src, int64_t b, int64_t h,
+    int64_t T, int64_t D, int64_t Dh
+) {
+    for (int64_t t = 0; t < T; ++t) {
+        std::memcpy(
+            attn_out + (b * T + t) * D + h * Dh,
+            src + t * Dh,
+            static_cast<size_t>(Dh) * sizeof(float));
+    }
+}
+
+void causal_softmax_rows(float* S, int64_t T) {
+    for (int64_t i = 0; i < T; ++i) {
+        float* row = S + i * T;
+        float max_s = -1e30f;
+        for (int64_t j = 0; j <= i; ++j) {
+            if (row[j] > max_s) max_s = row[j];
+        }
+        for (int64_t j = i + 1; j < T; ++j) row[j] = -1e30f;
+        float sum_exp = 0.0f;
+        for (int64_t j = 0; j <= i; ++j) {
+            const float e = std::exp(row[j] - max_s);
+            row[j] = e;
+            sum_exp += e;
+        }
+        const float inv = 1.0f / sum_exp;
+        for (int64_t j = 0; j <= i; ++j) row[j] *= inv;
+        for (int64_t j = i + 1; j < T; ++j) row[j] = 0.0f;
+    }
+}
+
+// In-place: dP -> dS for causal softmax; P is probs in scores row.
+void causal_softmax_bwd_rows(const float* P, float* dP, int64_t T) {
+    for (int64_t i = 0; i < T; ++i) {
+        const float* p_row = P + i * T;
+        float* dp_row = dP + i * T;
+        float sum_p_dp = 0.0f;
+        for (int64_t j = 0; j <= i; ++j) sum_p_dp += p_row[j] * dp_row[j];
+        for (int64_t j = 0; j <= i; ++j) {
+            dp_row[j] = p_row[j] * (dp_row[j] - sum_p_dp);
+        }
+        for (int64_t j = i + 1; j < T; ++j) dp_row[j] = 0.0f;
+    }
+}
+
 int32_t require_blas_ready() {
     if (!blas_runtime_ready()) {
         init_openblas_runtime(nullptr);
@@ -125,13 +209,14 @@ bool layer_ok_fwd(const MhsaLayerBind* L) {
     return L && L->W_qkv && L->b_qkv && L->W_o && L->b_o && L->W_ff1 && L->b_ff1 &&
            L->W_ff2 && L->b_ff2 && L->ln1_gamma && L->ln1_beta && L->ln2_gamma &&
            L->ln2_beta && L->qkv && L->scores && L->attn_out && L->ln1_out && L->h1 &&
-           L->ln2_out && L->ffn_pre && L->ffn_h && L->O;
+           L->ln2_out && L->ffn_pre && L->ffn_h && L->O && L->q_pack && L->k_pack &&
+           L->v_pack;
 }
 
 bool layer_ok_bwd(const MhsaLayerBind* L) {
     return layer_ok_fwd(L) && L->dW_qkv && L->db_qkv && L->dW_o && L->db_o &&
            L->dW_ff1 && L->db_ff1 && L->dW_ff2 && L->db_ff2 && L->d_ln1_gamma &&
-           L->d_ln1_beta && L->d_ln2_gamma && L->d_ln2_beta;
+           L->d_ln1_beta && L->d_ln2_gamma && L->d_ln2_beta && L->d_scores;
 }
 
 bool bind_ok_fwd(const MhsaBinding* m) {
@@ -165,45 +250,21 @@ int32_t layer_forward(
     const float scale = 1.0f / std::sqrt(static_cast<float>(Dh));
     std::memset(L->attn_out, 0, static_cast<size_t>(rows * D) * sizeof(float));
 
+    // Per (b,h): S = scale * Q @ K^T (causal softmax) ; O = P @ V via BLAS GEMM.
     for (int64_t b = 0; b < B; ++b) {
         for (int64_t h = 0; h < H; ++h) {
-            for (int64_t i = 0; i < T; ++i) {
-                float* score_row = L->scores + (((b * H + h) * T + i) * T);
-                float max_s = -1e30f;
-                for (int64_t j = 0; j < T; ++j) {
-                    if (j > i) {
-                        score_row[j] = -1e30f;
-                        continue;
-                    }
-                    const float* q = L->qkv + ((b * T + i) * 3 * D) + (h * Dh);
-                    const float* k = L->qkv + ((b * T + j) * 3 * D) + D + (h * Dh);
-                    float dot = 0.0f;
-                    for (int64_t d = 0; d < Dh; ++d) dot += q[d] * k[d];
-                    const float s = dot * scale;
-                    score_row[j] = s;
-                    if (s > max_s) max_s = s;
-                }
-                float sum_exp = 0.0f;
-                for (int64_t j = 0; j <= i; ++j) {
-                    const float e = std::exp(score_row[j] - max_s);
-                    score_row[j] = e;
-                    sum_exp += e;
-                }
-                const float inv = 1.0f / sum_exp;
-                for (int64_t j = 0; j <= i; ++j) score_row[j] *= inv;
-                for (int64_t j = i + 1; j < T; ++j) score_row[j] = 0.0f;
+            float* S = L->scores + ((b * H + h) * T * T);
+            pack_qkv_head(L->qkv, L->q_pack, b, h, /*Q*/ 0, T, D, Dh);
+            pack_qkv_head(L->qkv, L->k_pack, b, h, /*K*/ 1, T, D, Dh);
+            // S[T,T] = Q[T,Dh] @ K[T,Dh]^T
+            blas_gemm_input_grad_rm(L->q_pack, L->k_pack, S, T, Dh, T);
+            for (int64_t i = 0; i < T * T; ++i) S[i] *= scale;
+            causal_softmax_rows(S, T);
 
-                float* out = L->attn_out + (b * T + i) * D + (h * Dh);
-                for (int64_t d = 0; d < Dh; ++d) {
-                    float acc = 0.0f;
-                    for (int64_t j = 0; j <= i; ++j) {
-                        const float* v =
-                            L->qkv + ((b * T + j) * 3 * D) + (2 * D) + (h * Dh);
-                        acc += score_row[j] * v[d];
-                    }
-                    out[d] = acc;
-                }
-            }
+            pack_qkv_head(L->qkv, L->v_pack, b, h, /*V*/ 2, T, D, Dh);
+            // out[T,Dh] = P[T,T] @ V[T,Dh]  (reuse q_pack as out)
+            blas_gemm_forward(S, L->v_pack, L->q_pack, T, Dh, T);
+            scatter_attn_out_head(L->attn_out, L->q_pack, b, h, T, D, Dh);
         }
     }
 
@@ -269,38 +330,29 @@ int32_t layer_backward(
     const float scale = 1.0f / std::sqrt(static_cast<float>(Dh));
     for (int64_t b = 0; b < B; ++b) {
         for (int64_t h = 0; h < H; ++h) {
-            for (int64_t i = 0; i < T; ++i) {
-                const float* score_row = L->scores + (((b * H + h) * T + i) * T);
-                const float* dout = d_attn_out + (b * T + i) * D + (h * Dh);
+            const float* P = L->scores + ((b * H + h) * T * T);
+            float* dS = L->d_scores;
 
-                for (int64_t j = 0; j <= i; ++j) {
-                    float* dv = d_qkv + ((b * T + j) * 3 * D) + (2 * D) + (h * Dh);
-                    const float p = score_row[j];
-                    for (int64_t d = 0; d < Dh; ++d) dv[d] += p * dout[d];
-                }
+            pack_qkv_head(L->qkv, L->v_pack, b, h, /*V*/ 2, T, D, Dh);
+            pack_dout_head(d_attn_out, L->q_pack, b, h, T, D, Dh);  // dO in q_pack
 
-                float sum_p_dp = 0.0f;
-                float* dp_row = L->ffn_h;
-                for (int64_t j = 0; j <= i; ++j) {
-                    const float* v = L->qkv + ((b * T + j) * 3 * D) + (2 * D) + (h * Dh);
-                    float s = 0.0f;
-                    for (int64_t d = 0; d < Dh; ++d) s += dout[d] * v[d];
-                    dp_row[j] = s;
-                    sum_p_dp += score_row[j] * s;
-                }
-                for (int64_t j = 0; j <= i; ++j) {
-                    const float ds = score_row[j] * (dp_row[j] - sum_p_dp);
-                    const float d_dot = ds * scale;
-                    float* dq = d_qkv + ((b * T + i) * 3 * D) + (h * Dh);
-                    float* dk = d_qkv + ((b * T + j) * 3 * D) + D + (h * Dh);
-                    const float* q = L->qkv + ((b * T + i) * 3 * D) + (h * Dh);
-                    const float* k = L->qkv + ((b * T + j) * 3 * D) + D + (h * Dh);
-                    for (int64_t d = 0; d < Dh; ++d) {
-                        dq[d] += d_dot * k[d];
-                        dk[d] += d_dot * q[d];
-                    }
-                }
-            }
+            // dV = P^T @ dO
+            blas_gemm_weight_grad_rm(P, L->q_pack, L->k_pack, T, Dh, T, 1.0f);
+            scatter_head_add(d_qkv, L->k_pack, b, h, /*V*/ 2, T, D, Dh);
+
+            // dP = dO @ V^T
+            blas_gemm_input_grad_rm(L->q_pack, L->v_pack, dS, T, Dh, T);
+            causal_softmax_bwd_rows(P, dS, T);
+            for (int64_t i = 0; i < T * T; ++i) dS[i] *= scale;
+
+            pack_qkv_head(L->qkv, L->q_pack, b, h, /*Q*/ 0, T, D, Dh);
+            pack_qkv_head(L->qkv, L->k_pack, b, h, /*K*/ 1, T, D, Dh);
+
+            // dQ = dS @ K ; dK = dS^T @ Q
+            blas_gemm_forward(dS, L->k_pack, L->v_pack, T, Dh, T);
+            scatter_head_add(d_qkv, L->v_pack, b, h, /*Q*/ 0, T, D, Dh);
+            blas_gemm_weight_grad_rm(dS, L->q_pack, L->v_pack, T, Dh, T, 1.0f);
+            scatter_head_add(d_qkv, L->v_pack, b, h, /*K*/ 1, T, D, Dh);
         }
     }
 
@@ -335,7 +387,33 @@ int32_t mhsa_block_forward(const float* X, MhsaBinding* m) {
     const int64_t Hff = m->ffn_hidden;
     if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1) return -3;
 
-    const float* cur = X;
+    const int64_t rows = B * T;
+    const size_t bytes_D = static_cast<size_t>(rows * D) * sizeof(float);
+    const bool use_proj = (m->W_in != nullptr && m->b_in != nullptr);
+    const bool use_pos = (m->pos != nullptr && m->max_seq_len >= T);
+    if ((use_proj || use_pos) && !m->X_emb) return -2;
+
+    const float* layer0_X = X;
+    if (use_proj) {
+        blas_gemm_forward(X, m->W_in, m->X_emb, rows, D, D);
+        add_bias_rows(m->X_emb, m->b_in, rows, D);
+        layer0_X = m->X_emb;
+    } else if (use_pos) {
+        std::memcpy(m->X_emb, X, bytes_D);
+        layer0_X = m->X_emb;
+    }
+    if (use_pos) {
+        float* emb = m->X_emb;
+        for (int64_t b = 0; b < B; ++b) {
+            for (int64_t t = 0; t < T; ++t) {
+                float* row = emb + (b * T + t) * D;
+                const float* p = m->pos + t * D;
+                for (int64_t d = 0; d < D; ++d) row[d] += p[d];
+            }
+        }
+    }
+
+    const float* cur = layer0_X;
     for (int64_t li = 0; li < m->num_layers; ++li) {
         const int32_t st = layer_forward(
             cur, &m->layers[li], m->scratch, B, T, D, H, Dh, Hff);
@@ -425,36 +503,32 @@ int32_t mhsa_block_backward(const float* X, MhsaBinding* m) {
     const int64_t rows = B * T;
     if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1) return -3;
 
+    const bool use_proj = (m->W_in != nullptr && m->b_in != nullptr);
+    const bool use_pos = (m->pos != nullptr && m->max_seq_len >= T);
+    if ((use_proj || use_pos) && !m->X_emb) return -2;
+    if (use_proj && (!m->dW_in || !m->db_in)) return -2;
+
+    // Layer 0 saw X_emb when proj and/or pos ran; otherwise raw X.
+    const float* X_l0 = (use_proj || use_pos) ? m->X_emb : X;
+
     // d_cur starts as action dO; after each layer becomes that layer's dX.
     float* d_cur = m->dO;
     float* d_next = m->d_stream;
-    // tmp_D: reuse first layer's O only after that layer's fwd outputs for
-    // higher layers are no longer needed — allocate via layers[0].O is unsafe
-    // for multi-layer. Use a slice of scratch? scratch is used inside layer_bwd.
-    // Use layers[num_layers-1].O as tmp only when processing that layer, then
-    // for lower layers use that layer's own O (already consumed as X for next).
     for (int64_t li = m->num_layers - 1; li >= 0; --li) {
-        const float* X_l = (li == 0) ? X : m->layers[li - 1].O;
+        const float* X_l = (li == 0) ? X_l0 : m->layers[li - 1].O;
         float* tmp_D = m->layers[li].O;  // safe: this layer's O not needed as X anymore
         const int32_t st = layer_backward(
             X_l, &m->layers[li], d_cur, d_next,
             m->scratch, m->d_qkv, tmp_D,
             B, T, D, H, Dh, Hff);
         if (st != 0) return st;
-        // Swap carriers for next lower layer
         float* tmp = d_cur;
         d_cur = d_next;
         d_next = tmp;
-        // After first swap: d_cur has dX of layer li; d_next is old dO buffer.
-        // Next iteration reads d_cur as d_out. Good.
-        (void)rows;
     }
 
-    if (m->dX) {
-        std::memcpy(m->dX, d_cur, static_cast<size_t>(rows * D) * sizeof(float));
-    }
-    // Grad w.r.t. learned positions: sum over batch (X was X_tok + pos).
-    if (m->pos && m->d_pos && m->max_seq_len >= T) {
+    // Grad w.r.t. learned positions (added after optional input proj).
+    if (use_pos && m->d_pos) {
         for (int64_t t = 0; t < T; ++t) {
             float* dp = m->d_pos + t * D;
             for (int64_t b = 0; b < B; ++b) {
@@ -462,6 +536,17 @@ int32_t mhsa_block_backward(const float* X, MhsaBinding* m) {
                 for (int64_t d = 0; d < D; ++d) dp[d] += dx[d];
             }
         }
+    }
+
+    if (use_proj) {
+        // dW_in / db_in from X_raw and d_emb; dX = d_emb @ W_in^T.
+        blas_gemm_weight_grad_rm(X, d_cur, m->dW_in, rows, D, D, 1.0f);
+        accumulate_bias_grad(d_cur, m->db_in, rows, D);
+        if (m->dX) {
+            blas_gemm_input_grad_rm(d_cur, m->W_in, m->dX, rows, D, D);
+        }
+    } else if (m->dX) {
+        std::memcpy(m->dX, d_cur, static_cast<size_t>(rows * D) * sizeof(float));
     }
     return 0;
 }

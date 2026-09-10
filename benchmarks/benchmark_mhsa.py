@@ -71,6 +71,7 @@ def _mhsa_as_dict(mhsa) -> dict:
             "ffn_mult": int(getattr(mhsa, "ffn_mult", 4)),
             "num_layers": int(getattr(mhsa, "num_layers", 1)),
             "use_pos_encoding": bool(getattr(mhsa, "use_pos_encoding", True)),
+            "use_input_proj": bool(getattr(mhsa, "use_input_proj", False)),
         }
     return {
         "d_model": int(mhsa["d_model"]),
@@ -80,6 +81,7 @@ def _mhsa_as_dict(mhsa) -> dict:
         "ffn_mult": int(mhsa.get("ffn_mult", 4)),
         "num_layers": int(mhsa.get("num_layers", 1)),
         "use_pos_encoding": bool(mhsa.get("use_pos_encoding", True)),
+        "use_input_proj": bool(mhsa.get("use_input_proj", False)),
     }
 
 
@@ -127,6 +129,11 @@ def create_torch_mhsa_class():
             self.action = nn.Linear(d_model, action_dim)
             self._max_seq_len = int(mhsa["max_seq_len"])
             self.use_pos = bool(mhsa.get("use_pos_encoding", True))
+            self.use_input_proj = bool(mhsa.get("use_input_proj", False))
+            if self.use_input_proj:
+                self.in_proj = nn.Linear(d_model, d_model)
+            else:
+                self.in_proj = None
             if self.use_pos:
                 self.pos_embed = nn.Parameter(
                     torch.randn(self._max_seq_len, d_model) * 0.02
@@ -145,6 +152,8 @@ def create_torch_mhsa_class():
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             # x: (B, T, D)
             t = x.shape[1]
+            if self.in_proj is not None:
+                x = self.in_proj(x)
             if self.use_pos and self.pos_embed is not None:
                 x = x + self.pos_embed[:t]
             mask = self._causal_mask[:t, :t]
@@ -170,6 +179,12 @@ def _mhsa_param_count(controller: ModelController) -> int:
     pos = getattr(model, "pos_embed", None)
     if pos is not None:
         total += int(np.asarray(pos).size)
+    w_in = getattr(model, "W_in", None)
+    if w_in is not None:
+        total += int(np.asarray(w_in).size)
+    b_in = getattr(model, "b_in", None)
+    if b_in is not None:
+        total += int(np.asarray(b_in).size)
     return total if total > 0 else extract_custom_engine_param_count(controller)
 
 
