@@ -630,6 +630,30 @@ class ContractRuntime:
             ),
             self.contract.op_count,
         )
+        # Tail contract for closed-loop: BLOCK_BWD (+ ADAM) after Python fills dO.
+        self._mhsa_do_bwd_ops = None
+        self._mhsa_do_bwd_op_count = 0
+        if self._mhsa_mode:
+            tail_rows = [
+                ContractOpRow(
+                    int(op.opcode),
+                    op.layer_idx,
+                    op.param_idx,
+                    op.flags,
+                    op.i0,
+                    op.i1,
+                    op.i2,
+                )
+                for op in self.contract.ops
+                if op.opcode
+                in (ContractOp.MHSA_BLOCK_BWD, ContractOp.ADAM_APPLY)
+            ]
+            if tail_rows:
+                self._mhsa_do_bwd_op_count = len(tail_rows)
+                self._mhsa_do_bwd_ops = (
+                    ContractOpRow * self._mhsa_do_bwd_op_count
+                )(*tail_rows)
+        self._last_mhsa_dX: np.ndarray | None = None
         self._mhsa_ws: dict[str, Any] | None = None
         self._mhsa_workspaces: list[dict[str, Any]] = []
         self._mhsa_banks: list[_MhsaParameterBank] = []
@@ -2542,6 +2566,117 @@ class ContractRuntime:
         assert ws is not None
         return np.copy(ws["actions"])
 
+    def get_last_dX(self) -> np.ndarray | None:
+        """Copy of ∂L/∂X from the last MHSA block backward, shape (B, T, D)."""
+        if self._last_mhsa_dX is None:
+            return None
+        return np.copy(self._last_mhsa_dX)
+
+    def _mhsa_ws_active(self, slot_idx: int = 0) -> dict[str, Any]:
+        if self._mhsa_workspaces:
+            return self._mhsa_workspaces[slot_idx]
+        assert self._mhsa_ws is not None
+        return self._mhsa_ws
+
+    def _mhsa_action_backward_from_dA(
+        self, dA: np.ndarray, *, slot_idx: int = 0
+    ) -> None:
+        """
+        Fill action-head grads + dO from ∂L/∂actions (post-tanh), without MSE(y).
+
+        Requires a prior forward that left ``actions`` and layer O live in workspace.
+        """
+        ws = self._mhsa_ws_active(slot_idx)
+        m = self.model
+        B = int(ws["actions"].shape[0])
+        A = int(m.action_dim)
+        D = int(m.d_model)
+        # Infer T from O rows.
+        O_flat = ws["layers"][int(m.num_layers) - 1]["O"]
+        rows = int(O_flat.shape[0])
+        if rows % B != 0:
+            raise RuntimeError(f"MHSA O rows {rows} not divisible by B={B}")
+        T = rows // B
+        dA = np.ascontiguousarray(dA, dtype=np.float32).reshape(B, A)
+        actions = ws["actions"].reshape(B, A)
+        dz = dA * (1.0 - actions * actions)
+        W_act = m.weights[-1]
+        if W_act.dtype != np.float32:
+            W_act = W_act.astype(np.float32)
+        O = O_flat.reshape(B, T, D)
+        last = O[:, -1, :]
+        dw = ws.get("dW", self._mhsa_dw_f32)
+        db = ws.get("db", self._mhsa_db_f32)
+        assert dw is not None and db is not None
+        dw[-1] += last.T @ dz
+        db_act = np.sum(dz, axis=0)
+        if db[-1].ndim == 2:
+            db[-1] += db_act.reshape(1, -1)
+        else:
+            db[-1] += db_act.reshape(db[-1].shape)
+        d_last = dz @ W_act.T
+        ws["dO"].fill(0.0)
+        dO = ws["dO"].reshape(B, T, D)
+        dO[:, -1, :] = d_last
+        # Report mean |dA| proxy in loss slot for debugging (not MSE).
+        ws["loss"][0] = float(np.mean(np.abs(dA)))
+
+    def run_mhsa_backward_from_dA(
+        self,
+        X: np.ndarray,
+        dA: np.ndarray,
+        *,
+        apply_adam: bool = False,
+        lr: float = 0.0,
+    ) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray]:
+        """
+        Re-forward X, inject external ∂L/∂actions, run BLOCK_BWD (Adam optional).
+
+        Returns (dW, db, dX) with dX shaped (B, T, D). Does not require y.
+        """
+        if not self._mhsa_mode:
+            raise RuntimeError("run_mhsa_backward_from_dA requires an MHSA contract")
+        if self._mhsa_do_bwd_ops is None or self._mhsa_do_bwd_op_count < 1:
+            raise RuntimeError("MHSA contract missing BLOCK_BWD tail ops")
+        X = np.ascontiguousarray(X, dtype=np.float32)
+        ctx = self._bind_mhsa(X, y=None, apply_adam=apply_adam)
+        self._zero_mhsa_grads()
+        ctx.lr = float(lr)
+        ctx.skip_adam = 0 if apply_adam else 1
+        ctx.adam.t = int(self.model.optimizer.t)
+        self._activate_tenant()
+        status = self._lib.run_contract_training_step(
+            ctypes.cast(self._ops, ctypes.POINTER(ContractOpRow)),
+            ctypes.c_int32(self._forward_op_count),
+            ctypes.byref(ctx),
+        )
+        if status != 0:
+            raise RuntimeError(f"MHSA forward (for dA bwd) failed status={status}")
+        self._mhsa_action_backward_from_dA(dA, slot_idx=0)
+        status = self._lib.run_contract_training_step(
+            ctypes.cast(self._mhsa_do_bwd_ops, ctypes.POINTER(ContractOpRow)),
+            ctypes.c_int32(self._mhsa_do_bwd_op_count),
+            ctypes.byref(ctx),
+        )
+        if status != 0:
+            raise RuntimeError(f"MHSA BLOCK_BWD from dA failed status={status}")
+        if apply_adam:
+            self.model.optimizer.t = int(ctx.adam.t)
+        ws = self._mhsa_ws_active(0)
+        B, T, D = int(X.shape[0]), int(X.shape[1]), int(X.shape[2])
+        dX = np.array(ws["dX"], dtype=np.float32, copy=True).reshape(B, T, D)
+        self._last_mhsa_dX = dX
+        dw = ws.get("dW", self._mhsa_dw_f32)
+        db = ws.get("db", self._mhsa_db_f32)
+        assert dw is not None and db is not None
+        if apply_adam:
+            return dw, db, dX
+        grad_weights = [np.array(g, dtype=np.float64) for g in dw]
+        grad_biases = [
+            np.array(g, dtype=np.float64).reshape(1, -1) for g in db
+        ]
+        return grad_weights, grad_biases, dX
+
     def run_step(
         self,
         X: np.ndarray,
@@ -2574,6 +2709,10 @@ class ContractRuntime:
             assert self._mhsa_db_f32 is not None and self._mhsa_dln_f32 is not None
             m = int(X.shape[0])
             loss = float(self._mhsa_ws["loss"][0])
+            B, T, D = int(X.shape[0]), int(X.shape[1]), int(X.shape[2])
+            self._last_mhsa_dX = np.array(
+                self._mhsa_ws["dX"], dtype=np.float32, copy=True
+            ).reshape(B, T, D)
             if apply_adam:
                 self.model.optimizer.t = int(ctx.adam.t)
                 return loss, self._mhsa_dw_f32, self._mhsa_db_f32, m

@@ -210,6 +210,31 @@ class MHSANetwork(TrainableModel):
             self.enable_contract_list()
         return self._contract_runtime.run_mhsa_forward(processed_data)
 
+    def backward_from_dA(
+        self,
+        X: np.ndarray,
+        dA: np.ndarray,
+        *,
+        apply_adam: bool = False,
+        lr: float = 0.0,
+    ) -> tuple[list, list, np.ndarray]:
+        """
+        External-action backward for closed-loop BPTT.
+
+        Re-forwards ``X``, injects ``dA`` = ∂L/∂actions (post-tanh), runs block
+        bwd. Returns ``(dW, db, dX)`` with ``dX`` shaped (B, T, D).
+        """
+        if self._contract_runtime is None:
+            self.enable_contract_list()
+        return self._contract_runtime.run_mhsa_backward_from_dA(
+            X, dA, apply_adam=apply_adam, lr=lr
+        )
+
+    def get_last_dX(self) -> np.ndarray | None:
+        if self._contract_runtime is None:
+            return None
+        return self._contract_runtime.get_last_dX()
+
     def calculate_raw_cost(self, output: np.ndarray, y: np.ndarray) -> float:
         return float(np.mean((output - y) ** 2))
 
