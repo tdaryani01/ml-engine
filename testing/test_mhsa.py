@@ -16,9 +16,8 @@ from utils.conv_dispatch import bootstrap_im2col_gemm_runtime
 
 
 def _rel_err(analytic: float, numeric: float) -> float:
+    """Same cliff as testing/test_gradient_check.GradientChecker._compute_relative_error."""
     abs_diff = abs(analytic - numeric)
-    if abs(analytic) < 1e-5 and abs(numeric) < 5e-4:
-        return abs_diff if abs_diff > 5e-4 else 0.0
     if abs(analytic) < 1e-7 and abs(numeric) < 1e-7:
         return abs_diff
     return abs_diff / max(abs(analytic) + abs(numeric), 1e-12)
@@ -40,6 +39,7 @@ def _make_mhsa(
     ffn_mult: int = 2,
     num_layers: int = 1,
     seed: int = 0,
+    use_input_proj: bool = False,
 ):
     bootstrap_im2col_gemm_runtime()
     np.random.seed(seed)
@@ -55,8 +55,9 @@ def _make_mhsa(
             "action_dim": action_dim,
             "ffn_mult": ffn_mult,
             "num_layers": num_layers,
-            # Pos adds noise to tiny FD probes; exercise it in a dedicated smoke.
+            # Pos adds noise to tiny probes; exercise it in a dedicated smoke.
             "use_pos_encoding": False,
+            "use_input_proj": use_input_proj,
         },
         contract_list_enabled=True,
         lam_l2=0.0,
@@ -226,130 +227,191 @@ def _analytic_pack(model, X: np.ndarray, y: np.ndarray):
         ln_b.append(np.array(dln["ln1_b"], dtype=np.float64).reshape(1, -1))
         ln_b.append(np.array(dln["ln2_b"], dtype=np.float64).reshape(1, -1))
     dX = np.array(rt._mhsa_ws["dX"], dtype=np.float64).reshape(X.shape)
-    return loss, gw, gb, ln_g, ln_b, dX
+    dW_in = np.array(rt._mhsa_ws["dW_in"], dtype=np.float64)
+    db_in = np.array(rt._mhsa_ws["db_in"], dtype=np.float64).reshape(1, -1)
+    return loss, gw, gb, ln_g, ln_b, dX, dW_in, db_in
 
 
-def _fd_check_tensor(
+def _sync_native_to_torch(model, tm) -> None:
+    """Copy native [fan_in, fan_out] banks into Torch Linear/MHA (weight is [out, in])."""
+    import torch
+
+    L = int(model.num_layers)
+    with torch.no_grad():
+        for li in range(L):
+            base = 4 * li
+            blk = tm.blocks[li]
+            W_qkv, W_o, W_ff1, W_ff2 = (model.weights[base + i] for i in range(4))
+            b_qkv, b_o, b_ff1, b_ff2 = (
+                model.biases[base + i].reshape(-1) for i in range(4)
+            )
+            blk.attn.in_proj_weight.copy_(torch.from_numpy(np.asarray(W_qkv.T)))
+            blk.attn.in_proj_bias.copy_(torch.from_numpy(np.asarray(b_qkv)))
+            blk.attn.out_proj.weight.copy_(torch.from_numpy(np.asarray(W_o.T)))
+            blk.attn.out_proj.bias.copy_(torch.from_numpy(np.asarray(b_o)))
+            blk.ff1.weight.copy_(torch.from_numpy(np.asarray(W_ff1.T)))
+            blk.ff1.bias.copy_(torch.from_numpy(np.asarray(b_ff1)))
+            blk.ff2.weight.copy_(torch.from_numpy(np.asarray(W_ff2.T)))
+            blk.ff2.bias.copy_(torch.from_numpy(np.asarray(b_ff2)))
+            blk.ln1.weight.copy_(
+                torch.from_numpy(np.asarray(model.ln1_gamma[li].reshape(-1)))
+            )
+            blk.ln1.bias.copy_(
+                torch.from_numpy(np.asarray(model.ln1_beta[li].reshape(-1)))
+            )
+            blk.ln2.weight.copy_(
+                torch.from_numpy(np.asarray(model.ln2_gamma[li].reshape(-1)))
+            )
+            blk.ln2.bias.copy_(
+                torch.from_numpy(np.asarray(model.ln2_beta[li].reshape(-1)))
+            )
+        act_i = 4 * L
+        tm.action.weight.copy_(torch.from_numpy(np.asarray(model.weights[act_i].T)))
+        tm.action.bias.copy_(
+            torch.from_numpy(np.asarray(model.biases[act_i].reshape(-1)))
+        )
+        if tm.in_proj is not None and getattr(model, "W_in", None) is not None:
+            tm.in_proj.weight.copy_(torch.from_numpy(np.asarray(model.W_in.T)))
+            tm.in_proj.bias.copy_(
+                torch.from_numpy(np.asarray(model.b_in.reshape(-1)))
+            )
+
+
+def _torch_ref_grads(model, X: np.ndarray, y: np.ndarray):
+    """f64 Torch twin + autograd — same 1e-5 cliff as MLP GradientChecker."""
+    import torch
+
+    from benchmarks.benchmark_mhsa import create_torch_mhsa_class
+
+    mhsa = {
+        "d_model": int(model.d_model),
+        "num_heads": int(model.num_heads),
+        "max_seq_len": int(model.max_seq_len),
+        "action_dim": int(model.action_dim),
+        "ffn_mult": int(model.ffn_mult),
+        "num_layers": int(model.num_layers),
+        "use_pos_encoding": bool(model.use_pos_encoding),
+        "use_input_proj": bool(model.use_input_proj),
+    }
+    tm = create_torch_mhsa_class()(mhsa).double()
+    _sync_native_to_torch(model, tm)
+    Xt = torch.tensor(X, dtype=torch.float64, requires_grad=True)
+    yt = torch.tensor(y, dtype=torch.float64)
+    pred = tm(Xt)
+    loss = torch.mean((pred - yt) ** 2)
+    loss.backward()
+
+    L = int(model.num_layers)
+    gw = []
+    gb = []
+    ln_g = []
+    ln_b = []
+    for li in range(L):
+        blk = tm.blocks[li]
+        gw.extend(
+            [
+                blk.attn.in_proj_weight.grad.T.detach().numpy(),
+                blk.attn.out_proj.weight.grad.T.detach().numpy(),
+                blk.ff1.weight.grad.T.detach().numpy(),
+                blk.ff2.weight.grad.T.detach().numpy(),
+            ]
+        )
+        gb.extend(
+            [
+                blk.attn.in_proj_bias.grad.detach().numpy().reshape(1, -1),
+                blk.attn.out_proj.bias.grad.detach().numpy().reshape(1, -1),
+                blk.ff1.bias.grad.detach().numpy().reshape(1, -1),
+                blk.ff2.bias.grad.detach().numpy().reshape(1, -1),
+            ]
+        )
+        ln_g.append(blk.ln1.weight.grad.detach().numpy().reshape(1, -1))
+        ln_g.append(blk.ln2.weight.grad.detach().numpy().reshape(1, -1))
+        ln_b.append(blk.ln1.bias.grad.detach().numpy().reshape(1, -1))
+        ln_b.append(blk.ln2.bias.grad.detach().numpy().reshape(1, -1))
+    gw.append(tm.action.weight.grad.T.detach().numpy())
+    gb.append(tm.action.bias.grad.detach().numpy().reshape(1, -1))
+    dX = Xt.grad.detach().numpy()
+    dW_in = None
+    db_in = None
+    if tm.in_proj is not None:
+        dW_in = tm.in_proj.weight.grad.T.detach().numpy()
+        db_in = tm.in_proj.bias.grad.detach().numpy().reshape(1, -1)
+    return gw, gb, ln_g, ln_b, dX, dW_in, db_in
+
+
+def _grad_check_tensor(
     name: str,
-    tensor: np.ndarray,
-    grad: np.ndarray,
+    analytic: np.ndarray,
+    reference: np.ndarray,
     *,
-    fwd_loss,
-    eps: float,
     tol: float,
-    rng: np.random.Generator,
-    cap: int,
 ) -> bool:
-    assert tensor.shape == grad.shape
+    """Tight check: rtol=tol (1e-5) with atol=1e-7 for f32-native vs f64-Torch."""
+    assert analytic.shape == reference.shape, (name, analytic.shape, reference.shape)
+    a = np.asarray(analytic, dtype=np.float64)
+    r = np.asarray(reference, dtype=np.float64)
+    # Per-element cliff matching GradientChecker relative error, plus an absolute
+    # floor: native banks are f32 so sub-1e-7 abs deltas vs Torch.double are noise.
+    atol = 1e-7
     max_err = 0.0
     worst = None
-    for coord in _sample_coords(tensor.shape, rng, cap):
-        orig = float(tensor[coord])
-        tensor[coord] = orig + eps
-        lp = fwd_loss()
-        tensor[coord] = orig - eps
-        lm = fwd_loss()
-        tensor[coord] = orig
-        g_num = (lp - lm) / (2.0 * eps)
-        g_ana = float(grad[coord])
-        err = _rel_err(g_ana, g_num)
+    flat_a = a.reshape(-1)
+    flat_r = r.reshape(-1)
+    for i in range(flat_a.size):
+        ga, gn = float(flat_a[i]), float(flat_r[i])
+        abs_diff = abs(ga - gn)
+        if abs_diff <= atol:
+            err = 0.0
+        else:
+            err = _rel_err(ga, gn)
         if err > max_err:
             max_err = err
-            worst = (coord, g_ana, g_num)
+            worst = (np.unravel_index(i, a.shape), ga, gn)
     ok = max_err <= tol
     tag = "PASSED" if ok else "FAILED"
-    print(f"[{tag}] mhsa FD {name:<14} max_rel={max_err:.2e} (tol={tol:.0e})")
+    print(
+        f"[{tag}] mhsa grad {name:<14} max_rel={max_err:.2e} "
+        f"(tol={tol:.0e}, atol={atol:.0e})"
+    )
     if not ok and worst is not None:
         c, ga, gn = worst
-        print(f"  └── worst {c}: ana={ga:+.6e} num={gn:+.6e}")
+        print(f"  └── worst {c}: native={ga:+.6e} torch64={gn:+.6e}")
     return ok
 
 
-def _run_fd(model, *, seed: int) -> None:
+def _run_grad_check(model, *, seed: int) -> None:
+    """Native analytic vs Torch.double autograd at GradientChecker tol=1e-5.
+
+    Classic central-diff through f32 native predict floors ~1e-3 and cannot
+    honestly hit the MLP 1e-5 cliff; the f64 twin is the tight reference.
+    """
     try:
         rng = np.random.default_rng(seed)
         X = (rng.standard_normal((2, 3, model.d_model)) * 0.3).astype(np.float64)
         y = (rng.standard_normal((2, model.action_dim)) * 0.3).astype(np.float64)
-        _, gw, gb, ln_g, ln_b, _ = _analytic_pack(model, X, y)
-
-        def fwd_loss() -> float:
-            return _mse(model.predict(X), y)
-
-        eps, tol, cap = 1e-3, 5e-2, 6
+        _, gw, gb, ln_g, ln_b, dX, dW_in, db_in = _analytic_pack(model, X, y)
+        ref_gw, ref_gb, ref_ln_g, ref_ln_b, ref_dX, ref_dW_in, ref_db_in = (
+            _torch_ref_grads(model, X, y)
+        )
+        tol = 1e-5
         ok = True
-        for i, (W, dW) in enumerate(zip(model.weights, gw)):
+        for i, (dW, rW) in enumerate(zip(gw, ref_gw)):
+            ok = _grad_check_tensor(model._param_names[i], dW, rW, tol=tol) and ok
+        for i, (db, rb) in enumerate(zip(gb, ref_gb)):
             ok = (
-                _fd_check_tensor(
-                    model._param_names[i],
-                    W,
-                    dW,
-                    fwd_loss=fwd_loss,
-                    eps=eps,
-                    tol=tol,
-                    rng=rng,
-                    cap=cap,
-                )
+                _grad_check_tensor(f"b[{model._param_names[i]}]", db, rb, tol=tol)
                 and ok
             )
-        for i, (b, db) in enumerate(zip(model.biases, gb)):
-            ok = (
-                _fd_check_tensor(
-                    f"b[{model._param_names[i]}]",
-                    b,
-                    db,
-                    fwd_loss=fwd_loss,
-                    eps=eps,
-                    tol=tol,
-                    rng=rng,
-                    cap=cap,
-                )
-                and ok
-            )
-        gammas, betas = model._ln_param_lists()
-        for i, (g, dg) in enumerate(zip(gammas, ln_g)):
-            ok = (
-                _fd_check_tensor(
-                    f"ln_g[{i}]",
-                    g,
-                    dg,
-                    fwd_loss=fwd_loss,
-                    eps=eps,
-                    tol=tol,
-                    rng=rng,
-                    cap=cap,
-                )
-                and ok
-            )
-        for i, (b, db) in enumerate(zip(betas, ln_b)):
-            ok = (
-                _fd_check_tensor(
-                    f"ln_b[{i}]",
-                    b,
-                    db,
-                    fwd_loss=fwd_loss,
-                    eps=eps,
-                    tol=tol,
-                    rng=rng,
-                    cap=cap,
-                )
-                and ok
-            )
-
-        _, _, _, _, _, dX2 = _analytic_pack(model, X, y)
-        max_err = 0.0
-        for coord in _sample_coords(X.shape, rng, cap=8):
-            orig = float(X[coord])
-            X[coord] = orig + eps
-            lp = _mse(model.predict(X), y)
-            X[coord] = orig - eps
-            lm = _mse(model.predict(X), y)
-            X[coord] = orig
-            err = _rel_err(float(dX2[coord]), (lp - lm) / (2.0 * eps))
-            max_err = max(max_err, err)
-        p = max_err <= tol
-        print(f"[{'PASSED' if p else 'FAILED'}] mhsa FD dX            max_rel={max_err:.2e}")
-        ok = ok and p
-        assert ok, "MHSA finite-difference gradient check failed"
+        for i, (dg, rg) in enumerate(zip(ln_g, ref_ln_g)):
+            ok = _grad_check_tensor(f"ln_g[{i}]", dg, rg, tol=tol) and ok
+        for i, (db, rb) in enumerate(zip(ln_b, ref_ln_b)):
+            ok = _grad_check_tensor(f"ln_b[{i}]", db, rb, tol=tol) and ok
+        ok = _grad_check_tensor("dX", dX, ref_dX, tol=tol) and ok
+        if model.use_input_proj:
+            assert dW_in is not None and ref_dW_in is not None
+            ok = _grad_check_tensor("W_in", dW_in, ref_dW_in, tol=tol) and ok
+            ok = _grad_check_tensor("b_in", db_in, ref_db_in, tol=tol) and ok
+        assert ok, "MHSA gradient check failed (native vs Torch.double, tol=1e-5)"
     finally:
         _close(model)
 
@@ -393,29 +455,9 @@ def test_mhsa_pos_encoding_adam():
 
 
 def test_mhsa_input_proj_adam_and_fd():
-    """Input proj: Adam moves W_in; FD checks dW_in / db_in / dX."""
-    from src.model_factory import ModelFactory
-    from config.constants import EngineBackend
-
-    np.random.seed(9)
-    model = ModelFactory.create_model(
-        "mhsa",
-        layer_sizes=[2],
-        backend=EngineBackend.NATIVE,
-        optimizer="adam",
-        mhsa_config={
-            "d_model": 8,
-            "num_heads": 2,
-            "max_seq_len": 4,
-            "action_dim": 2,
-            "ffn_mult": 2,
-            "num_layers": 1,
-            "use_pos_encoding": False,
-            "use_input_proj": True,
-        },
-        contract_list_enabled=True,
-        lam_l2=0.0,
-        lam_l1=0.0,
+    """Input proj: Adam moves W_in; grads match Torch.double at tol=1e-5."""
+    model = _make_mhsa(
+        d_model=8, num_heads=2, max_seq_len=4, action_dim=2, seed=9, use_input_proj=True
     )
     try:
         assert model.W_in is not None and model.W_in.shape == (8, 8)
@@ -426,68 +468,17 @@ def test_mhsa_input_proj_adam_and_fd():
         model.run_contract_train_step(X, y, lr=1e-2, apply_adam=True)
         assert not np.allclose(w0, model.W_in)
 
-        # Fresh model for FD (Adam above moved params).
         _close(model)
-        np.random.seed(9)
-        model = ModelFactory.create_model(
-            "mhsa",
-            layer_sizes=[2],
-            backend=EngineBackend.NATIVE,
-            optimizer="adam",
-            mhsa_config={
-                "d_model": 8,
-                "num_heads": 2,
-                "max_seq_len": 4,
-                "action_dim": 2,
-                "ffn_mult": 2,
-                "num_layers": 1,
-                "use_pos_encoding": False,
-                "use_input_proj": True,
-            },
-            contract_list_enabled=True,
-            lam_l2=0.0,
-            lam_l1=0.0,
+        model = _make_mhsa(
+            d_model=8,
+            num_heads=2,
+            max_seq_len=4,
+            action_dim=2,
+            seed=9,
+            use_input_proj=True,
         )
-        X = (rng.standard_normal((2, 3, 8)) * 0.3).astype(np.float64)
-        y = (rng.standard_normal((2, 2)) * 0.3).astype(np.float64)
-        _, _, _, _, _, dX = _analytic_pack(model, X, y)
-        rt = model._contract_runtime
-        dW_in = np.array(rt._mhsa_ws["dW_in"], dtype=np.float64)
-        db_in = np.array(rt._mhsa_ws["db_in"], dtype=np.float64).reshape(1, -1)
-
-        def fwd_loss() -> float:
-            return _mse(model.predict(X), y)
-
-        eps, tol, cap = 1e-3, 5e-2, 8
-        ok = _fd_check_tensor(
-            "W_in", model.W_in, dW_in, fwd_loss=fwd_loss, eps=eps, tol=tol, rng=rng, cap=cap
-        )
-        ok = (
-            _fd_check_tensor(
-                "b_in",
-                model.b_in,
-                db_in,
-                fwd_loss=fwd_loss,
-                eps=eps,
-                tol=tol,
-                rng=rng,
-                cap=cap,
-            )
-            and ok
-        )
-        max_err = 0.0
-        for coord in _sample_coords(X.shape, rng, cap=8):
-            orig = float(X[coord])
-            X[coord] = orig + eps
-            lp = _mse(model.predict(X), y)
-            X[coord] = orig - eps
-            lm = _mse(model.predict(X), y)
-            X[coord] = orig
-            max_err = max(max_err, _rel_err(float(dX[coord]), (lp - lm) / (2.0 * eps)))
-        ok = (max_err <= tol) and ok
-        print(f"[{'PASSED' if max_err <= tol else 'FAILED'}] mhsa FD dX(proj)     max_rel={max_err:.2e}")
-        assert ok, "MHSA input-proj finite-difference check failed"
-        print("[PASSED] mhsa: input proj adam + FD")
+        _run_grad_check(model, seed=9)
+        print("[PASSED] mhsa: input proj adam + grad check")
     finally:
         _close(model)
 
@@ -558,13 +549,13 @@ def test_mhsa_dual_bank_prepare_while_inflight():
 
 
 def test_mhsa_finite_diff_grads_l1():
-    _run_fd(_make_mhsa(num_layers=1, seed=7), seed=7)
-    print("[PASSED] mhsa: finite-diff grads L=1")
+    _run_grad_check(_make_mhsa(num_layers=1, seed=7), seed=7)
+    print("[PASSED] mhsa: grad check L=1 (native vs Torch.double, tol=1e-5)")
 
 
 def test_mhsa_finite_diff_grads_l2():
-    _run_fd(_make_mhsa(num_layers=2, seed=11), seed=11)
-    print("[PASSED] mhsa: finite-diff grads L=2")
+    _run_grad_check(_make_mhsa(num_layers=2, seed=11), seed=11)
+    print("[PASSED] mhsa: grad check L=2 (native vs Torch.double, tol=1e-5)")
 
 
 if __name__ == "__main__":
