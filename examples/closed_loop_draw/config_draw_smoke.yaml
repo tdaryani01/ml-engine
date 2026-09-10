@@ -1,0 +1,25 @@
+# examples/closed_loop_draw/config_draw_smoke.yaml
+# App-layer knobs for the closed-loop draw smoke (not consumed by TrainingSession).
+meta:
+  pipeline_name: closed_loop_draw_smoke
+closed_loop:
+  max_steps: 2
+  batch_size: 2
+  canvas: [1, 28, 28]   # C, H, W
+  num_commands: 6       # circle, line, square, cross, ring, sketch
+  command_id: 0
+  sigma: 0.1
+  target:
+    kind: stock
+mhsa:
+  d_model: 32
+  num_heads: 4
+  action_dim: 4
+  ffn_mult: 2
+  num_layers: 1
+  use_pos_encoding: false
+cnn_encoder:
+  input_shape: [1, 28, 28]
+  feature_dim: 16
+optimization:
+  learning_rate: 0.001

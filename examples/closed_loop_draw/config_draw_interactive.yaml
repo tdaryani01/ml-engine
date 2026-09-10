@@ -1,0 +1,66 @@
+# examples/closed_loop_draw/config_draw_interactive.yaml
+# Live interactive config. Known-good freeze:
+#   config_draw_interactive_known_good.yaml  (blur + Chamfer EDT, 2026-09-10)
+# Base: balanced pixel loss + soft stroke renderer + multi-scale blur + Chamfer EDT.
+meta:
+  pipeline_name: closed_loop_draw_interactive
+  output_dir: diagnostics_output/closed_loop_draw
+
+closed_loop:
+  max_steps: 10
+  batch_size: 8
+  canvas: [1, 28, 28]
+  num_commands: 6
+  command_id: 0
+  sigma: 0.06
+  action_scale: 0.85
+  action_head_scale: 0.1
+  terminal_loss: true
+  loss_kind: balanced
+  fg_alpha: 15.0
+  fg_thresh: 0.05
+  # Catch (multi-scale blur, equal weights, no anneal) + Chamfer EDT snap.
+  loss_blur_sigmas: [3.0, 1.0, 0.0]
+  loss_blur_weights: [1.0, 1.0, 1.0]
+  # mean(C*D_hard(T)) + mean(T*D_soft(C)); tau in pixels.
+  loss_edt_weight: 1.0
+  loss_edt_sym_weight: 1.0
+  loss_edt_soft_tau: 2.0
+  target:
+    kind: stock
+
+mhsa:
+  d_model: 64
+  num_heads: 4
+  action_dim: 4
+  ffn_mult: 2
+  num_layers: 2
+  use_pos_encoding: false
+  use_input_proj: false
+
+cnn_encoder:
+  input_shape: [1, 28, 28]
+  feature_dim: 32
+  dense_head: []
+
+optimization:
+  learning_rate: 0.0005
+  seed: 0
+
+interactive:
+  stroke_delay_s: 0.20
+  train_until_close: true
+  train_rel_tol: 0.08
+  train_abs_tol: 0.01
+  train_min_trajectories: 80
+  train_max_trajectories: 800
+  train_patience: 200
+  train_improve_eps: 0.0005
+  train_lr: 0.0005
+  train_lr_decay: 0.8
+  train_lr_boosts: 2
+  train_trajectories_per_click: 40
+  warmup_trajectories: 60
+  auto_warmup: true
+  preview_every: 1
+  preview_pause_s: 0.04
