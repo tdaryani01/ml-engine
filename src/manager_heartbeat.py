@@ -162,6 +162,43 @@ class ManagerHeartbeat:
             _log.warning("GET blob %s failed: %s", blob_key, exc)
             return None
 
+    def append_ledger_doc(
+        self,
+        *,
+        doc_type: str,
+        body: Mapping[str, Any],
+        branch_id: str = "main",
+        blob_key: str | None = None,
+        timeout_s: float | None = None,
+    ) -> bool:
+        """Blocking POST to TM shared ledger. Returns True on HTTP success."""
+        if not self._cfg.enabled or not self._cfg.uri:
+            return False
+        base = self._cfg.uri.rstrip("/")
+        payload: dict[str, Any] = {
+            "instance_id": self._cfg.instance_id,
+            "doc_type": str(doc_type),
+            "body": dict(body),
+            "branch_id": str(branch_id or "main"),
+        }
+        if blob_key:
+            payload["blob_key"] = str(blob_key)
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            f"{base}/api/ledger/docs",
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        wait = float(timeout_s if timeout_s is not None else max(2.0, float(self._cfg.timeout_s)))
+        try:
+            with urllib.request.urlopen(req, timeout=wait) as resp:
+                resp.read()
+                return 200 <= int(resp.status) < 300
+        except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
+            _log.warning("ledger append %s failed: %s", doc_type, exc)
+            return False
+
     def _worker(self, need_register: bool, metrics: dict[str, Any]) -> None:
         cfg = self._cfg
         base = cfg.uri.rstrip("/")

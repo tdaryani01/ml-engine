@@ -1,6 +1,7 @@
 # examples/closed_loop_draw/config_draw_agent.yaml
-# DrawingExpert student — closed-loop draw under Training Manager dial-out.
+# Draw *student* — closed-loop draw under Training Manager dial-out.
 # Knobs aligned with config_draw_interactive_known_good.yaml (L0 baseline).
+# Teacher/expert lives in training-manager, not in this process.
 meta:
   pipeline_name: closed_loop_draw_agent
   output_dir: diagnostics_output/closed_loop_draw_agent
@@ -44,16 +45,22 @@ optimization:
   learning_rate: 0.0005
   seed: 0
 
-# Sibling Training Manager control plane (must be running).
+# Append step.complete + periodic checkpoint metadata to TM shared ledger.
+ledger:
+  enabled: true
+  branch_id: main
+  checkpoint_every: 25
+
 training_manager:
   enabled: true
   uri: "http://127.0.0.1:8000"
   instance_id: "draw-local-1"
   kind: "closed_loop"
-  label: "DrawingExpert"
+  label: "Draw student"
   advertise_url: "http://127.0.0.1:0"
   capabilities:
     - train_step
+    - ledger
     - start
     - pause
     - resume
