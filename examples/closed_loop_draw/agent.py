@@ -126,9 +126,18 @@ class DrawStudentAgent:
         self._sigma = float(cl.get("sigma", 0.06))
         self._max_steps = int(cl.get("max_steps", 10))
         self._continuity_weight = float(cl.get("continuity_weight", 0.0))
+        self._last_status: str | None = None
 
     def close(self) -> None:
         self.app.close()
+
+    def _set_status(self, state: str, *, loss: float | None = None) -> None:
+        """Publish metrics always; print only when the run status changes."""
+        changed = state != self._last_status
+        self._publish(state)
+        if changed:
+            self._last_status = state
+            _emit(state, loss=loss if loss is not None else self._last_loss, traj=self._traj)
 
     def _publish(self, state: str) -> None:
         metrics: dict = {
@@ -273,6 +282,7 @@ class DrawStudentAgent:
             {"version": int(version) if version is not None else None, "blob_key": str(blob_key)}
         )
         self.hb.queue_ack(cmd.id, ok=True, detail=f"restored v{version}")
+        _emit(f"restored:v{version}", loss=self._last_loss, traj=self._traj)
 
     def _drain_commands(self) -> None:
         hb = self.hb
@@ -438,8 +448,7 @@ class DrawStudentAgent:
 
     def run(self) -> None:
         idle_s = float(self.hb.cfg.idle_sleep_s)
-        _emit("idle")
-        self._publish("idle")
+        self._set_status("idle")
         while not self._stop:
             self._drain_commands()
             self._apply_desired()
@@ -447,15 +456,16 @@ class DrawStudentAgent:
                 break
             if not self._allows_train():
                 state = "paused" if self._paused else "idle"
-                self._publish(state)
+                self._set_status(state)
                 time.sleep(max(0.1, idle_s))
                 continue
             loss = self._train_one()
-            self._publish("training")
-            if self._traj == 1 or self._traj % 10 == 0:
+            prev = self._last_status
+            self._set_status("training", loss=loss)
+            # Progress pings while status stays training.
+            if prev == "training" and self._traj % 10 == 0:
                 _emit("training", loss=loss, traj=self._traj)
-        _emit("stopped", loss=self._last_loss, traj=self._traj)
-        self._publish("stopped")
+        self._set_status("stopped", loss=self._last_loss)
 
 
 DrawingExpertAgent = DrawStudentAgent
