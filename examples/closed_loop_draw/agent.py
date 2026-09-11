@@ -120,13 +120,20 @@ class DrawStudentAgent:
         if not self._ledger_on:
             return
         version = int(self._traj)
+        train = float(self._last_loss) if self._last_loss is not None else None
+        # Until a real holdout exists, ink_miss is the val / quality signal.
+        val = float(self._last_ink_miss) if self._last_ink_miss is not None else None
+        gap = None if train is None or val is None else float(val - train)
         body = {
             "version": version,
             "step_id": version,
-            "train_loss": float(self._last_loss) if self._last_loss is not None else None,
+            "train_loss": train,
+            "val_loss": val,
             "metrics": {
                 "version": version,
-                "train_loss": float(self._last_loss) if self._last_loss is not None else None,
+                "train_loss": train,
+                "val_loss": val,
+                "train_val_gap": gap,
                 "ink_miss": self._last_ink_miss,
                 "command_id": self.command_id,
                 "lr": float(self.lr),
@@ -156,7 +163,7 @@ class DrawStudentAgent:
             is_best = True
         body = {
             "version": version,
-            "val_loss": float(self._last_loss) if self._last_loss is not None else None,
+            "val_loss": float(ink) if ink is not None else None,
             "ink_miss": ink,
             "is_local_best": is_best,
             # Weights stay in-process until restore/blob path lands.
