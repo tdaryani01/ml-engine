@@ -2,12 +2,9 @@
 """
 Draw student: closed-loop draw worker under Training Manager dial-out.
 
-This process is the *student* (learns to draw). The *teacher* lives in
-training-manager (DrawingExpert L0 suggest/apply). Do not confuse the two.
-
-Registers as draw-local-1, idles until Start, trains while desired=running,
-appends step/checkpoint docs to the TM shared ledger, honors pause/resume/
-shutdown. Restore-from-blob is still not implemented.
+Registers, trains while desired=running, appends step/checkpoint docs with
+weight blobs + config snapshots, honors pause/resume/shutdown/restore.
+On train_patience (ES) trip: POST tm-brain/shadow (log decision; no silent apply).
 
 Usage (from ml-engine repo root; TM API must be up):
   .venv/bin/python -m examples.closed_loop_draw.agent
@@ -15,6 +12,7 @@ Usage (from ml-engine repo root; TM API must be up):
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import sys
 import time
@@ -27,6 +25,11 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from examples.closed_loop_draw.assemble import assemble, load_config, make_target
+from examples.closed_loop_draw.draw_checkpoint import (
+    apply_checkpoint_blob,
+    build_checkpoint_blob,
+    load_checkpoint_blob,
+)
 from src.manager_heartbeat import maybe_from_settings
 from utils.conv_dispatch import bootstrap_im2col_gemm_runtime
 
@@ -64,13 +67,38 @@ class DrawStudentAgent:
         self.command_id = int(cl.get("command_id", 0))
         self.command_ids = np.full(self.B, self.command_id, dtype=np.int64)
         self.target = make_target(cfg, batch_size=self.B)
+        # Sealed-ish probe: same geometry family, different params / seed offset.
+        probe_cfg = copy.deepcopy(cfg)
+        probe_cfg.setdefault("closed_loop", {})
+        tgt = dict(probe_cfg["closed_loop"].get("target") or {})
+        tgt["kind"] = tgt.get("kind") or "stock"
+        # Force a distinct probe by bumping seed used only for target generation.
+        self._probe_target = make_target(probe_cfg, batch_size=self.B)
+        # Nudge probe away from train target when both are stock circles.
+        if hasattr(self._probe_target, "shape"):
+            noise = np.random.RandomState(seed + 17).randn(*self._probe_target.shape)
+            self._probe_target = np.clip(
+                self._probe_target + 0.05 * noise.astype(np.float32), 0.0, 1.0
+            )
 
         led = cfg.get("ledger") or {}
         self._ledger_on = bool(led.get("enabled", True))
         self._checkpoint_every = max(1, int(led.get("checkpoint_every", 25)))
         self._branch_id = str(led.get("branch_id", "main"))
 
+        self._train_patience = max(1, int(cl.get("train_patience", 40)))
+        self._es_min_traj = max(1, int(cl.get("es_min_traj", 20)))
+        brain = cfg.get("tm_brain") or {}
+        self._es_shadow = bool(brain.get("shadow_on_es", True))
+        self._es_apply = bool(brain.get("apply_on_es", False))  # never silent; default off
+
         tm = cfg.get("training_manager") or {}
+        caps = list(tm.get("capabilities") or [])
+        if "restore" not in caps:
+            caps.append("restore")
+            tm = dict(tm)
+            tm["capabilities"] = caps
+            cfg["training_manager"] = tm
         self.hb = maybe_from_settings(tm, ledger_enabled=self._ledger_on)
         if self.hb is None:
             raise RuntimeError(
@@ -85,7 +113,14 @@ class DrawStudentAgent:
         self._traj = 0
         self._last_loss: float | None = None
         self._last_ink_miss: float | None = None
+        self._last_probe: float | None = None
         self._best_ink_miss: float | None = None
+        self._best_probe: float | None = None
+        self._stale = 0
+        self._es_tripped = False
+        self._pending_outcome_episode: str | None = None
+        self._outcome_horizon = max(1, int(brain.get("outcome_horizon", 10)))
+        self._outcome_due_traj: int | None = None
         self._checkpoint_version: int | None = None
         self._process_started_at = time.time()
         self._sigma = float(cl.get("sigma", 0.06))
@@ -104,12 +139,17 @@ class DrawStudentAgent:
             "max_steps": self._max_steps,
             "continuity_weight": self._continuity_weight,
             "lr": float(self.lr),
+            "train_patience": int(self._train_patience),
+            "es_stale": int(self._stale),
             "ledger": "on" if self._ledger_on else "off",
         }
         if self._last_loss is not None:
             metrics["loss"] = float(self._last_loss)
         if self._last_ink_miss is not None:
             metrics["ink_miss"] = float(self._last_ink_miss)
+            metrics["val_loss"] = float(self._last_ink_miss)
+        if self._last_probe is not None:
+            metrics["probe_loss"] = float(self._last_probe)
         if self._checkpoint_version is not None:
             metrics["checkpoint_version"] = int(self._checkpoint_version)
             metrics["version"] = int(self._checkpoint_version)
@@ -121,18 +161,20 @@ class DrawStudentAgent:
             return
         version = int(self._traj)
         train = float(self._last_loss) if self._last_loss is not None else None
-        # Until a real holdout exists, ink_miss is the val / quality signal.
         val = float(self._last_ink_miss) if self._last_ink_miss is not None else None
+        probe = float(self._last_probe) if self._last_probe is not None else None
         gap = None if train is None or val is None else float(val - train)
         body = {
             "version": version,
             "step_id": version,
             "train_loss": train,
             "val_loss": val,
+            "probe_loss": probe,
             "metrics": {
                 "version": version,
                 "train_loss": train,
                 "val_loss": val,
+                "probe_loss": probe,
                 "train_val_gap": gap,
                 "ink_miss": self._last_ink_miss,
                 "command_id": self.command_id,
@@ -157,25 +199,80 @@ class DrawStudentAgent:
         ink = self._last_ink_miss
         is_best = False
         if ink is not None and (
-            self._best_ink_miss is None or ink < self._best_ink_miss
+            self._best_ink_miss is None or ink < self._best_ink_miss - 1e-6
         ):
-            self._best_ink_miss = float(ink)
+            # best tracked in _train_one; still mark local best when improved
             is_best = True
+        blob_key = f"ckpts/{self.hb.cfg.instance_id}/v{version}.pkl"
+        try:
+            payload = build_checkpoint_blob(
+                self.app,
+                version=version,
+                cfg=self.cfg,
+                lr=float(self.lr),
+                val_loss=float(ink) if ink is not None else None,
+            )
+            uploaded = self.hb.put_blob(blob_key, payload, timeout_s=30.0)
+        except Exception as exc:  # noqa: BLE001
+            _emit(f"checkpoint-blob-failed:{exc}", traj=self._traj)
+            uploaded = False
+            blob_key = None  # type: ignore[assignment]
         body = {
             "version": version,
             "val_loss": float(ink) if ink is not None else None,
             "ink_miss": ink,
+            "probe_loss": self._last_probe,
             "is_local_best": is_best,
-            # Weights stay in-process until restore/blob path lands.
-            "weights_in_process": True,
+            "weights_in_process": not uploaded,
+            "knobs": {
+                "learning_rate": float(self.lr),
+                "train_patience": int(self._train_patience),
+                "sigma": self._sigma,
+                "max_steps": self._max_steps,
+            },
+            "config_snapshot": True,
         }
         ok = self.hb.append_ledger_doc(
             doc_type="checkpoint",
             body=body,
             branch_id=self._branch_id,
+            blob_key=blob_key if uploaded else None,
         )
         if ok:
             self._checkpoint_version = version
+
+    def _restore_from_command(self, cmd) -> None:
+        payload = dict(cmd.payload or {})
+        blob_key = payload.get("blob_key")
+        version = payload.get("version")
+        if not blob_key:
+            self.hb.queue_ack(cmd.id, ok=False, detail="missing blob_key")
+            return
+        data = self.hb.fetch_blob(str(blob_key))
+        if data is None:
+            self.hb.queue_ack(cmd.id, ok=False, detail=f"blob not found: {blob_key}")
+            return
+        try:
+            body = load_checkpoint_blob(data)
+            knobs = apply_checkpoint_blob(self.app, body)
+        except Exception as exc:  # noqa: BLE001
+            self.hb.queue_ack(cmd.id, ok=False, detail=f"restore failed: {exc}")
+            return
+        if "learning_rate" in knobs and knobs["learning_rate"] is not None:
+            self.lr = float(knobs["learning_rate"])
+            self.cfg.setdefault("optimization", {})["learning_rate"] = self.lr
+        if knobs.get("sigma") is not None:
+            self._sigma = float(knobs["sigma"])
+        if knobs.get("train_patience") is not None:
+            self._train_patience = max(1, int(knobs["train_patience"]))
+        if version is not None:
+            self._checkpoint_version = int(version)
+        self._stale = 0
+        self._es_tripped = False
+        self.hb.set_active_checkpoint(
+            {"version": int(version) if version is not None else None, "blob_key": str(blob_key)}
+        )
+        self.hb.queue_ack(cmd.id, ok=True, detail=f"restored v{version}")
 
     def _drain_commands(self) -> None:
         hb = self.hb
@@ -214,11 +311,7 @@ class DrawStudentAgent:
                     hb.queue_ack(cmd.id, ok=True)
                 elif action == "restore":
                     hb.mark_command_seen(cmd.id)
-                    hb.queue_ack(
-                        cmd.id,
-                        ok=False,
-                        detail="draw student restore-from-blob not implemented yet",
-                    )
+                    self._restore_from_command(cmd)
                 else:
                     hb.mark_command_seen(cmd.id)
                     hb.queue_ack(cmd.id, ok=False, detail=f"unknown action {action}")
@@ -246,6 +339,61 @@ class DrawStudentAgent:
         desired = (self.hb.desired_state or "").strip().lower()
         return desired == "running"
 
+    def _maybe_es_shadow(self) -> None:
+        if not self._es_shadow or self._es_tripped:
+            return
+        if self._traj < self._es_min_traj:
+            return
+        if self._stale < self._train_patience:
+            return
+        self._es_tripped = True
+        _emit("es-trip", loss=self._last_loss, traj=self._traj)
+        path = (
+            f"/api/instances/{self.hb.cfg.instance_id}/tm-brain/act"
+            if self._es_apply
+            else f"/api/instances/{self.hb.cfg.instance_id}/tm-brain/shadow"
+        )
+        body = {
+            "patience": float(self._train_patience),
+            "lr": float(self.lr),
+            "window": 32,
+        }
+        if self._es_apply:
+            body["dry_run"] = True  # still no silent apply
+            body["apply"] = True
+        out = self.hb.post_json(path, body, timeout_s=10.0)
+        if out and isinstance(out.get("decision"), dict):
+            ep = out["decision"].get("episode_id")
+            if ep:
+                self._pending_outcome_episode = str(ep)
+                self._outcome_due_traj = self._traj + self._outcome_horizon
+        elif out and out.get("ok") and isinstance(out.get("decision"), dict):
+            pass
+        _emit(
+            f"es-shadow:{out.get('decision', {}).get('action') if out else 'fail'}",
+            traj=self._traj,
+        )
+
+    def _maybe_label_outcome(self) -> None:
+        if not self._pending_outcome_episode or self._outcome_due_traj is None:
+            return
+        if self._traj < self._outcome_due_traj:
+            return
+        # Positive outcome if probe improved vs best-at-trip baseline.
+        baseline = self._best_probe
+        now = self._last_probe
+        if baseline is None or now is None:
+            outcome = 0.0
+        else:
+            outcome = float(baseline - now)  # improvement => positive
+        self.hb.post_json(
+            f"/api/tm-brain/episodes/{self._pending_outcome_episode}/outcome",
+            {"outcome": outcome},
+            timeout_s=5.0,
+        )
+        self._pending_outcome_episode = None
+        self._outcome_due_traj = None
+
     def _train_one(self) -> float:
         result = self.app.trainer.rollout_train(
             command_ids=self.command_ids,
@@ -264,8 +412,28 @@ class DrawStudentAgent:
                 )
             except Exception:  # noqa: BLE001
                 self._last_ink_miss = None
+            try:
+                self._last_probe = float(
+                    self.app.loss_fn.ink_miss(canvas, self._probe_target)
+                )
+            except Exception:  # noqa: BLE001
+                self._last_probe = None
+        # Patience / ES on train metric (ink_miss); probe is for outcomes.
+        ink = self._last_ink_miss
+        if ink is not None:
+            if self._best_ink_miss is None or ink < self._best_ink_miss - 1e-6:
+                self._best_ink_miss = float(ink)
+                self._stale = 0
+                self._es_tripped = False
+            else:
+                self._stale += 1
+        if self._last_probe is not None:
+            if self._best_probe is None or self._last_probe < self._best_probe:
+                self._best_probe = float(self._last_probe)
         self._append_step()
         self._maybe_checkpoint()
+        self._maybe_es_shadow()
+        self._maybe_label_outcome()
         return self._last_loss
 
     def run(self) -> None:
@@ -290,7 +458,6 @@ class DrawStudentAgent:
         self._publish("stopped")
 
 
-# Back-compat alias (old name was confusing — this is the student).
 DrawingExpertAgent = DrawStudentAgent
 
 

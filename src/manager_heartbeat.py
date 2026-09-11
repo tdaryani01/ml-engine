@@ -162,6 +162,58 @@ class ManagerHeartbeat:
             _log.warning("GET blob %s failed: %s", blob_key, exc)
             return None
 
+    def put_blob(self, blob_key: str, data: bytes, *, timeout_s: float | None = None) -> bool:
+        """Blocking blob PUT — upload checkpoint bytes before ledger doc append."""
+        if not self._cfg.enabled or not self._cfg.uri:
+            return False
+        base = self._cfg.uri.rstrip("/")
+        key = urllib.parse.quote(blob_key, safe="/")
+        url = f"{base}/api/ledger/blobs/{key}"
+        req = urllib.request.Request(
+            url,
+            data=bytes(data),
+            method="PUT",
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Accept": "application/json",
+            },
+        )
+        wait = float(timeout_s if timeout_s is not None else max(5.0, float(self._cfg.timeout_s)))
+        try:
+            with urllib.request.urlopen(req, timeout=wait) as resp:
+                resp.read()
+                return 200 <= int(resp.status) < 300
+        except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
+            _log.warning("PUT blob %s failed: %s", blob_key, exc)
+            return False
+
+    def post_json(
+        self, path: str, body: Mapping[str, Any], *, timeout_s: float | None = None
+    ) -> dict[str, Any] | None:
+        """Blocking JSON POST to TM API (shadow/decide/outcome)."""
+        if not self._cfg.enabled or not self._cfg.uri:
+            return None
+        base = self._cfg.uri.rstrip("/")
+        url = f"{base}{path}" if path.startswith("/") else f"{base}/{path}"
+        wait = float(timeout_s if timeout_s is not None else max(2.0, float(self._cfg.timeout_s)))
+        data = json.dumps(dict(body)).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=wait) as resp:
+                raw = resp.read()
+                if not raw:
+                    return {}
+                parsed = json.loads(raw.decode("utf-8"))
+                return parsed if isinstance(parsed, dict) else {}
+        except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, json.JSONDecodeError) as exc:
+            _log.warning("POST %s failed: %s", path, exc)
+            return None
+
     def append_ledger_doc(
         self,
         *,
@@ -310,6 +362,31 @@ def decode_checkpoint_blob(data: bytes) -> dict[str, Any]:
     if not isinstance(obj, dict):
         raise TypeError(f"checkpoint blob is {type(obj)!r}, expected dict")
     return _from_wire(obj)
+
+
+def encode_checkpoint_blob(body: Mapping[str, Any]) -> bytes:
+    """Pickle a checkpoint body with ndarray wire encoding for MinIO."""
+    return pickle.dumps(_to_wire(dict(body)), protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _to_wire(value: Any) -> Any:
+    import numpy as np
+
+    if isinstance(value, np.ndarray):
+        arr = np.ascontiguousarray(value)
+        return {
+            "__ndarray__": True,
+            "dtype": str(arr.dtype),
+            "shape": list(arr.shape),
+            "data": arr.tobytes(),
+        }
+    if isinstance(value, dict):
+        return {str(k): _to_wire(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_to_wire(v) for v in value]
+    if isinstance(value, tuple):
+        return [_to_wire(v) for v in value]
+    return value
 
 
 def _from_wire(value: Any) -> Any:

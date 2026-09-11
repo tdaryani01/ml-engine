@@ -24,6 +24,9 @@ closed_loop:
   loss_edt_weight: 1.0
   loss_edt_sym_weight: 1.0
   loss_edt_soft_tau: 2.0
+  # ES-style trip for TM brain shadow (not silent apply).
+  train_patience: 40
+  es_min_traj: 20
   target:
     kind: stock
 
@@ -45,11 +48,17 @@ optimization:
   learning_rate: 0.0005
   seed: 0
 
-# Append step.complete + periodic checkpoint metadata to TM shared ledger.
+# Append step.complete + periodic checkpoint (weights blob + config) to TM ledger.
 ledger:
   enabled: true
   branch_id: main
   checkpoint_every: 25
+
+# On ES: call TM shadow (decide+log). apply_on_es=false = no silent restore.
+tm_brain:
+  shadow_on_es: true
+  apply_on_es: false
+  outcome_horizon: 10
 
 training_manager:
   enabled: true
@@ -64,6 +73,7 @@ training_manager:
     - start
     - pause
     - resume
+    - restore
     - shutdown
     - cancel
   interval_s: 5
