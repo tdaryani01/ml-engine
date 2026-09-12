@@ -117,7 +117,13 @@ cd ~/Projects/training-manager
 cd ~/Projects/ml-engine
 PYTHONPATH=. .venv/bin/python examples/closed_loop_draw/expert_gym.py --tm-uri http://127.0.0.1:8000 --episodes 8 --train-after
 
-# === TM_EXPERT_CURRICULUM === background rounds until decent val (default val>=0.70, n_train>=40)
+# === TM_EXPERT_GYM_WORKER === Slice B: poll drawing-expert Start/Pause; run rounds; train; stop on val
+# Dashboard: select drawing-expert → Start (arms tm_gym_*). Worker honors Pause between rounds.
+cd ~/Projects/ml-engine
+PYTHONPATH=. .venv/bin/python examples/closed_loop_draw/expert_gym_worker.py \
+  --tm-uri http://127.0.0.1:8000 --poll-s 2
+
+# === TM_EXPERT_CURRICULUM === (debug) shell rounds until decent val — prefer gym worker above
 cd ~/Projects/ml-engine
 mkdir -p diagnostics_output/closed_loop_draw
 VAL_TARGET=0.70 MIN_N_TRAIN=40 BATCH=16 MAX_ROUNDS=20 \
