@@ -4,15 +4,16 @@ Draw student: closed-loop draw worker under Training Manager dial-out.
 
 Registers, trains while desired=running, appends step/checkpoint docs with
 weight blobs + config snapshots, honors pause/resume/shutdown/restore.
-On train_patience (ES) trip: POST tm-brain/shadow (log decision; no silent apply).
-
-Usage (from ml-engine repo root; TM API must be up):
-  .venv/bin/python -m examples.closed_loop_draw.agent
+On ES / first physiology onset: POST tm-brain/act — rules decide (model shadows),
+actuators run (pause→restore→resume+config, retune, or park_stop). Episodes
++ outcomes are logged for brain training. Start/resume ``config`` is applied
+and confirmed in the command ack.
 """
 from __future__ import annotations
 
 import argparse
 import copy
+import json
 import os
 import sys
 import time
@@ -41,7 +42,23 @@ def _parse_args() -> argparse.Namespace:
         default=str(Path(__file__).resolve().parent / "config_draw_agent.yaml"),
         help="YAML config path",
     )
+    p.add_argument(
+        "--log-file",
+        default=None,
+        help="Append status lines here (default: <output_dir>/draw-student.log)",
+    )
     return p.parse_args()
+
+
+_LOG_FP = None
+
+
+def _open_log_file(path: Path) -> None:
+    global _LOG_FP
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _LOG_FP = open(path, "a", encoding="utf-8")  # noqa: SIM115 — process lifetime
+    print(f"[draw-student] logging to {path}", flush=True)
 
 
 def _emit(state: str, *, loss: float | None = None, traj: int = 0) -> None:
@@ -50,7 +67,11 @@ def _emit(state: str, *, loss: float | None = None, traj: int = 0) -> None:
         bits.append(f"traj={traj}")
     if loss is not None:
         bits.append(f"loss={loss:.4f}")
-    print(" ".join(bits), flush=True)
+    line = " ".join(bits)
+    print(line, flush=True)
+    if _LOG_FP is not None:
+        _LOG_FP.write(line + "\n")
+        _LOG_FP.flush()
 
 
 class DrawStudentAgent:
@@ -86,11 +107,12 @@ class DrawStudentAgent:
         self._checkpoint_every = max(1, int(led.get("checkpoint_every", 25)))
         self._branch_id = str(led.get("branch_id", "main"))
 
-        self._train_patience = max(1, int(cl.get("train_patience", 40)))
+        self._train_patience = max(1, int(cl.get("train_patience", 32)))
         self._es_min_traj = max(1, int(cl.get("es_min_traj", 20)))
         brain = cfg.get("tm_brain") or {}
         self._es_shadow = bool(brain.get("shadow_on_es", True))
-        self._es_apply = bool(brain.get("apply_on_es", False))  # never silent; default off
+        # Apply rule decisions (model still shadows inside decide). Default on.
+        self._es_apply = bool(brain.get("apply_on_es", True))
 
         tm = cfg.get("training_manager") or {}
         caps = list(tm.get("capabilities") or [])
@@ -108,6 +130,7 @@ class DrawStudentAgent:
 
         self._run_authorized = False
         self._paused = False
+        self._user_pause_hold = False
         self._stop = False
         self._shutdown_accepted = False
         self._traj = 0
@@ -118,6 +141,8 @@ class DrawStudentAgent:
         self._best_probe: float | None = None
         self._stale = 0
         self._es_tripped = False
+        self._es_park_hold = False
+        self._handled_onset_version: int | None = None
         self._pending_outcome_episode: str | None = None
         self._outcome_horizon = max(1, int(brain.get("outcome_horizon", 10)))
         self._outcome_due_traj: int | None = None
@@ -250,7 +275,52 @@ class DrawStudentAgent:
         if ok:
             self._checkpoint_version = version
 
+    def _live_config(self) -> dict:
+        return {
+            "learning_rate": float(self.lr),
+            "train_patience": int(self._train_patience),
+            "sigma": float(self._sigma),
+            "max_steps": int(self._max_steps),
+            "continuity_weight": float(self._continuity_weight),
+        }
+
+    def _apply_config_payload(self, config: dict | None) -> dict:
+        """Apply TM start/resume ``config``; return confirmed live values."""
+        if not isinstance(config, dict) or not config:
+            return {}
+        confirmed: dict = {}
+        if config.get("learning_rate") is not None:
+            self.lr = float(config["learning_rate"])
+            self.cfg.setdefault("optimization", {})["learning_rate"] = self.lr
+            confirmed["learning_rate"] = float(self.lr)
+        if config.get("train_patience") is not None:
+            self._train_patience = max(1, int(config["train_patience"]))
+            self.cfg.setdefault("closed_loop", {})["train_patience"] = self._train_patience
+            confirmed["train_patience"] = int(self._train_patience)
+        if config.get("sigma") is not None:
+            self._sigma = float(config["sigma"])
+            self.cfg.setdefault("closed_loop", {})["sigma"] = self._sigma
+            confirmed["sigma"] = float(self._sigma)
+        if config.get("max_steps") is not None:
+            self._max_steps = int(config["max_steps"])
+            self.cfg.setdefault("closed_loop", {})["max_steps"] = self._max_steps
+            confirmed["max_steps"] = int(self._max_steps)
+        if config.get("continuity_weight") is not None:
+            self._continuity_weight = float(config["continuity_weight"])
+            self.cfg.setdefault("closed_loop", {})[
+                "continuity_weight"
+            ] = self._continuity_weight
+            confirmed["continuity_weight"] = float(self._continuity_weight)
+        return confirmed
+
+    def _print_config(self, tag: str, knobs: dict) -> None:
+        if not knobs:
+            return
+        bits = " ".join(f"{k}={v}" for k, v in sorted(knobs.items()))
+        _emit(f"config:{tag} {bits}", traj=self._traj)
+
     def _restore_from_command(self, cmd) -> None:
+        """Restore weights only. Config changes arrive on the following start/resume."""
         payload = dict(cmd.payload or {})
         blob_key = payload.get("blob_key")
         version = payload.get("version")
@@ -263,26 +333,72 @@ class DrawStudentAgent:
             return
         try:
             body = load_checkpoint_blob(data)
-            knobs = apply_checkpoint_blob(self.app, body)
+            apply_checkpoint_blob(self.app, body)  # weights; knobs ignored here
         except Exception as exc:  # noqa: BLE001
             self.hb.queue_ack(cmd.id, ok=False, detail=f"restore failed: {exc}")
             return
-        if "learning_rate" in knobs and knobs["learning_rate"] is not None:
-            self.lr = float(knobs["learning_rate"])
-            self.cfg.setdefault("optimization", {})["learning_rate"] = self.lr
-        if knobs.get("sigma") is not None:
-            self._sigma = float(knobs["sigma"])
-        if knobs.get("train_patience") is not None:
-            self._train_patience = max(1, int(knobs["train_patience"]))
         if version is not None:
             self._checkpoint_version = int(version)
         self._stale = 0
         self._es_tripped = False
         self.hb.set_active_checkpoint(
-            {"version": int(version) if version is not None else None, "blob_key": str(blob_key)}
+            {
+                "version": int(version) if version is not None else None,
+                "blob_key": str(blob_key),
+            }
         )
-        self.hb.queue_ack(cmd.id, ok=True, detail=f"restored v{version}")
-        _emit(f"restored:v{version}", loss=self._last_loss, traj=self._traj)
+        detail = f"restored_weights:v{version}"
+        self.hb.queue_ack(cmd.id, ok=True, detail=detail)
+        _emit(detail, loss=self._last_loss, traj=self._traj)
+
+    def _handle_start_resume(self, cmd) -> None:
+        payload = dict(cmd.payload or {})
+        src = str(payload.get("source") or "").strip().lower()
+        # Human Pause must stick: ignore brain resume/start until user clears hold.
+        if self._user_pause_hold and src == "tm_brain":
+            self._paused = True
+            self.hb.set_desired_state("paused")
+            self.hb.mark_command_seen(cmd.id)
+            self.hb.queue_ack(
+                cmd.id,
+                ok=False,
+                detail="blocked:user_paused",
+            )
+            _emit(
+                "blocked:user_paused",
+                loss=self._last_loss,
+                traj=self._traj,
+            )
+            return
+        if src != "tm_brain":
+            self._user_pause_hold = False
+        confirmed = self._apply_config_payload(
+            payload.get("config") if isinstance(payload.get("config"), dict) else None
+        )
+        self._run_authorized = True
+        self._paused = False
+        self._es_park_hold = False
+        self.hb.set_desired_state("running")
+        self.hb.mark_command_seen(cmd.id)
+        live = self._live_config()
+        if confirmed:
+            self._print_config("confirmed", confirmed)
+        else:
+            self._print_config("live", live)
+        ack = {
+            "ok": True,
+            "action": cmd.action,
+            "phase": payload.get("phase"),
+            "episode_id": payload.get("episode_id"),
+            "config_requested": payload.get("config") or {},
+            "config_confirmed": confirmed or live,
+        }
+        self.hb.queue_ack(cmd.id, ok=True, detail=json.dumps(ack, sort_keys=True))
+        _emit(
+            f"{cmd.action.strip().lower()}:config_ok",
+            loss=self._last_loss,
+            traj=self._traj,
+        )
 
     def _drain_commands(self) -> None:
         hb = self.hb
@@ -290,22 +406,36 @@ class DrawStudentAgent:
             action = cmd.action.strip().lower()
             try:
                 if action in ("start", "resume"):
-                    self._run_authorized = True
-                    self._paused = False
-                    hb.set_desired_state("running")
-                    hb.mark_command_seen(cmd.id)
-                    hb.queue_ack(cmd.id, ok=True)
+                    self._handle_start_resume(cmd)
                 elif action == "pause":
+                    payload = dict(cmd.payload or {})
+                    src = str(payload.get("source") or "").strip().lower()
+                    # Non-brain pause (UI / shadow park) arms the hold.
+                    if src != "tm_brain":
+                        self._user_pause_hold = True
                     self._paused = True
                     hb.set_desired_state("paused")
                     hb.mark_command_seen(cmd.id)
-                    hb.queue_ack(cmd.id, ok=True)
+                    phase = payload.get("phase")
+                    hb.queue_ack(
+                        cmd.id,
+                        ok=True,
+                        detail=f"paused:{phase}" if phase else "paused",
+                    )
+                    _emit(
+                        f"paused:{phase}" if phase else "paused",
+                        loss=self._last_loss,
+                        traj=self._traj,
+                    )
                 elif action == "cancel":
+                    self._user_pause_hold = False
                     self._run_authorized = False
                     self._paused = False
+                    self._es_park_hold = False
                     hb.set_desired_state("idle")
                     hb.mark_command_seen(cmd.id)
-                    hb.queue_ack(cmd.id, ok=True)
+                    hb.queue_ack(cmd.id, ok=True, detail="cancelled")
+                    _emit("cancelled", loss=self._last_loss, traj=self._traj)
                 elif action == "shutdown":
                     created = float(cmd.created_at or 0.0)
                     if created > 0.0 and created < (self._process_started_at - 2.0):
@@ -338,51 +468,138 @@ class DrawStudentAgent:
         if desired == "paused":
             self._paused = True
         elif desired == "running":
+            # ES park / human Pause must stick until an explicit start/resume command.
+            # Heartbeat otherwise re-applies TM sticky desired=running from
+            # the earlier Autopilot Start and unpauses without a decision.
+            if self._es_park_hold or self._user_pause_hold:
+                self._paused = True
+                self.hb.set_desired_state("paused")
+                return
             if self._run_authorized:
                 self._paused = False
         elif desired in ("idle", ""):
-            self._paused = False
+            if not self._es_park_hold and not self._user_pause_hold:
+                self._paused = False
 
     def _allows_train(self) -> bool:
-        if not self._run_authorized or self._paused or self._stop:
+        if not self._run_authorized or self._paused or self._stop or self._es_park_hold:
             return False
         desired = (self.hb.desired_state or "").strip().lower()
         return desired == "running"
 
+    def _onset_within_patience(self) -> tuple[bool, int | None]:
+        """True when a *new* unhealthy onset is still inside train_patience.
+
+        Uses the latest unhandled onset from session-health ``onsets[]`` —
+        not a sticky first-on-tape mark.
+        """
+        path = f"/api/instances/{self.hb.cfg.instance_id}/session-health"
+        health = self.hb.get_json(path, timeout_s=3.0)
+        if not health:
+            return False, None
+        raw_onsets = health.get("onsets")
+        onsets: list[dict] = (
+            [o for o in raw_onsets if isinstance(o, dict)]
+            if isinstance(raw_onsets, list)
+            else []
+        )
+        if not onsets and health.get("onset_version") is not None:
+            onsets = [{"version": health.get("onset_version")}]
+        handled = self._handled_onset_version
+        patience = int(self._train_patience)
+        for o in onsets:
+            try:
+                onset_i = int(o["version"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if handled is not None and onset_i <= handled:
+                continue
+            age = max(0, int(self._traj) - onset_i)
+            if age <= patience:
+                return True, onset_i
+        return False, None
+
     def _maybe_es_shadow(self) -> None:
-        if not self._es_shadow or self._es_tripped:
+        if not self._es_shadow:
             return
         if self._traj < self._es_min_traj:
             return
-        if self._stale < self._train_patience:
+        patience_hit = self._stale >= self._train_patience
+        onset_hit, onset_ver = self._onset_within_patience()
+        new_onset = (
+            onset_hit
+            and onset_ver is not None
+            and (
+                self._handled_onset_version is None
+                or int(onset_ver) > int(self._handled_onset_version)
+            )
+        )
+        # While tripped, only a brand-new onset re-arms (ink improve clears trip).
+        if self._es_tripped and not new_onset:
+            return
+        if not patience_hit and not onset_hit:
             return
         self._es_tripped = True
-        _emit("es-trip", loss=self._last_loss, traj=self._traj)
-        path = (
-            f"/api/instances/{self.hb.cfg.instance_id}/tm-brain/act"
-            if self._es_apply
-            else f"/api/instances/{self.hb.cfg.instance_id}/tm-brain/shadow"
-        )
+        if onset_ver is not None:
+            self._handled_onset_version = int(onset_ver)
+        trip = "es-onset" if onset_hit and not patience_hit else "es-trip"
+        self._set_status(trip, loss=self._last_loss)
+
+        # Rules decide + apply; model shadows inside decide. Episodes logged on TM.
+        path = f"/api/instances/{self.hb.cfg.instance_id}/tm-brain/act"
         body = {
             "patience": float(self._train_patience),
             "lr": float(self.lr),
             "window": 32,
+            "apply": True,
+            "dry_run": False if self._es_apply else True,
         }
-        if self._es_apply:
-            body["dry_run"] = True  # still no silent apply
-            body["apply"] = True
-        out = self.hb.post_json(path, body, timeout_s=10.0)
-        if out and isinstance(out.get("decision"), dict):
-            ep = out["decision"].get("episode_id")
+        out = self.hb.post_json(path, body, timeout_s=15.0)
+        decision = out.get("decision") if isinstance(out, dict) else None
+        actuation = out.get("actuation") if isinstance(out, dict) else None
+        if isinstance(decision, dict):
+            ep = decision.get("episode_id")
             if ep:
                 self._pending_outcome_episode = str(ep)
                 self._outcome_due_traj = self._traj + self._outcome_horizon
-        elif out and out.get("ok") and isinstance(out.get("decision"), dict):
-            pass
-        _emit(
-            f"es-shadow:{out.get('decision', {}).get('action') if out else 'fail'}",
-            traj=self._traj,
-        )
+            action = decision.get("action")
+            reason = decision.get("reason")
+            model_a = decision.get("model_action")
+            _emit(
+                f"brain:{action} auth={decision.get('authority')} "
+                f"model={model_a} ep={ep}",
+                traj=self._traj,
+            )
+            if reason:
+                _emit(f"brain-reason:{reason}", traj=self._traj)
+            self._set_status(f"es-act:{action}", loss=self._last_loss)
+        else:
+            action = None
+            self._set_status("es-act:fail", loss=self._last_loss)
+
+        if isinstance(actuation, dict):
+            seq = actuation.get("sequence") or actuation.get("would_steps")
+            cfg = actuation.get("config")
+            _emit(
+                f"actuation:applied={actuation.get('applied')} "
+                f"seq={seq} config={cfg}",
+                traj=self._traj,
+            )
+            # Only hard-hold on park_stop; restore/retune resume via commands.
+            if action == "park_stop" and actuation.get("applied"):
+                self._es_park_hold = True
+                self._paused = True
+                self.hb.set_desired_state("paused")
+        elif not self._es_apply:
+            # Dry-run / shadow-only: park so a human can inspect.
+            self._paused = True
+            self._es_park_hold = True
+            self.hb.set_desired_state("paused")
+            self.hb.post_json(
+                f"/api/instances/{self.hb.cfg.instance_id}/control/pause",
+                {"payload": {"source": "es_shadow_only"}},
+                timeout_s=5.0,
+            )
 
     def _maybe_label_outcome(self) -> None:
         if not self._pending_outcome_episode or self._outcome_due_traj is None:
@@ -460,6 +677,11 @@ class DrawStudentAgent:
                 time.sleep(max(0.1, idle_s))
                 continue
             loss = self._train_one()
+            # ES parks inside _train_one; do not stamp "training" over that.
+            if not self._allows_train():
+                state = "paused" if self._paused else "idle"
+                self._set_status(state, loss=loss)
+                continue
             prev = self._last_status
             self._set_status("training", loss=loss)
             # Progress pings while status stays training.
@@ -474,11 +696,25 @@ DrawingExpertAgent = DrawStudentAgent
 def main() -> int:
     args = _parse_args()
     cfg = load_config(args.config)
+    out_dir = Path(
+        (cfg.get("meta") or {}).get("output_dir")
+        or "diagnostics_output/closed_loop_draw_agent"
+    )
+    if not out_dir.is_absolute():
+        out_dir = Path(_REPO) / out_dir
+    log_path = (
+        Path(args.log_file).expanduser()
+        if args.log_file
+        else out_dir / "draw-student.log"
+    )
+    _open_log_file(log_path)
     agent = DrawStudentAgent(cfg)
     try:
         agent.run()
     finally:
         agent.close()
+        if _LOG_FP is not None:
+            _LOG_FP.close()
     return 0
 
 

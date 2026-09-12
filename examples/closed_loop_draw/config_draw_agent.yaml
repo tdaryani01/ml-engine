@@ -5,6 +5,7 @@
 meta:
   pipeline_name: closed_loop_draw_agent
   output_dir: diagnostics_output/closed_loop_draw_agent
+  # Agent also appends status lines to <output_dir>/draw-student.log (override: --log-file)
 
 closed_loop:
   max_steps: 10
@@ -24,8 +25,8 @@ closed_loop:
   loss_edt_weight: 1.0
   loss_edt_sym_weight: 1.0
   loss_edt_soft_tau: 2.0
-  # ES-style trip for TM brain shadow (not silent apply).
-  train_patience: 40
+  # ES trip for TM shadow. Match session_health.WINDOW (32) so first onset is caught.
+  train_patience: 32
   es_min_traj: 20
   target:
     kind: stock
@@ -54,10 +55,11 @@ ledger:
   branch_id: main
   checkpoint_every: 25
 
-# On ES: call TM shadow (decide+log). apply_on_es=false = no silent restore.
+# On ES: tm-brain/act — rules decide+apply (model shadows). apply_on_es=true.
+# Restore path: pause → restore weights → resume with config in payload (agent confirms).
 tm_brain:
   shadow_on_es: true
-  apply_on_es: false
+  apply_on_es: true
   outcome_horizon: 10
 
 training_manager:

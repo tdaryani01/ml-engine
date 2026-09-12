@@ -214,6 +214,29 @@ class ManagerHeartbeat:
             _log.warning("POST %s failed: %s", path, exc)
             return None
 
+    def get_json(self, path: str, *, timeout_s: float | None = None) -> dict[str, Any] | None:
+        """Blocking JSON GET (session-health / onset)."""
+        if not self._cfg.enabled or not self._cfg.uri:
+            return None
+        base = self._cfg.uri.rstrip("/")
+        url = f"{base}{path}" if path.startswith("/") else f"{base}/{path}"
+        wait = float(timeout_s if timeout_s is not None else max(2.0, float(self._cfg.timeout_s)))
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={"Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=wait) as resp:
+                raw = resp.read()
+                if not raw:
+                    return {}
+                parsed = json.loads(raw.decode("utf-8"))
+                return parsed if isinstance(parsed, dict) else {}
+        except (urllib.error.URLError, TimeoutError, socket.timeout, OSError, json.JSONDecodeError) as exc:
+            _log.warning("GET %s failed: %s", path, exc)
+            return None
+
     def append_ledger_doc(
         self,
         *,
