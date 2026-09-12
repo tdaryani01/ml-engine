@@ -116,3 +116,11 @@ cd ~/Projects/training-manager
 # Episodes/outcomes persist automatically (Postgres + var/expert_corpus JSONL); boot rehydrates.
 cd ~/Projects/ml-engine
 PYTHONPATH=. .venv/bin/python examples/closed_loop_draw/expert_gym.py --tm-uri http://127.0.0.1:8000 --episodes 8 --train-after
+
+# === TM_EXPERT_CURRICULUM === background rounds until decent val (default val>=0.70, n_train>=40)
+cd ~/Projects/ml-engine
+mkdir -p diagnostics_output/closed_loop_draw
+VAL_TARGET=0.70 MIN_N_TRAIN=40 BATCH=16 MAX_ROUNDS=20 \
+  nohup ./examples/closed_loop_draw/run_expert_curriculum.sh \
+  > diagnostics_output/closed_loop_draw/expert_curriculum.nohup.out 2>&1 &
+tail -f diagnostics_output/closed_loop_draw/expert_curriculum.log
