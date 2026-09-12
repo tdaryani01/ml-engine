@@ -22,6 +22,14 @@ def test_decide_wait_when_paused():
     )
 
 
+def test_decide_run_when_armed_even_if_idle():
+    """suggest/outcome used to pulse idle mid-round — armed must still run."""
+    assert (
+        decide_gym_action({"state": "idle", "tm_gym_armed": True, "tm_gym_batch": 2})
+        == "run"
+    )
+
+
 def test_decide_run_when_armed_training():
     assert (
         decide_gym_action({"state": "training", "tm_gym_armed": True, "tm_gym_batch": 2})

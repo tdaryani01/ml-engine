@@ -110,11 +110,13 @@ def decide_gym_action(metrics: dict[str, Any] | None) -> str:
     """Pure policy: run | wait | stop_done.
 
     stop_done = armed but stop criteria already met (caller should disarm).
+    Armed + not user-paused → run even if metrics.state was clobbered to idle
+    by suggest/outcome heartbeats mid-round.
     """
     g = read_gym_from_metrics(metrics)
     if not g["armed"]:
         return "wait"
-    if g["user_paused"] or g["state"] == "paused":
+    if g["user_paused"]:
         return "wait"
     if g["state"] in ("down",):
         return "wait"
@@ -131,10 +133,7 @@ def decide_gym_action(metrics: dict[str, Any] | None) -> str:
             return "stop_done"
     except (TypeError, ValueError):
         pass
-    if g["state"] in ("training", "running"):
-        return "run"
-    # Armed but idle (e.g. after restore): wait for Start.
-    return "wait"
+    return "run"
 
 
 def fetch_expert_metrics(tm_uri: str, instance_id: str = DRAWING_EXPERT_ID) -> dict[str, Any]:
@@ -279,12 +278,8 @@ def worker_loop(
         # Re-check pause before train (Pause between episodes/rounds).
         metrics2 = fetch_fn(tm_uri)
         if decide_gym_action(metrics2) == "wait":
-            pulse_fn(
-                tm_uri,
-                gym_round=rounds,
-                gym_last_val=gym.get("gym_last_val"),
-                state="paused",
-            )
+            # Do not pulse metrics.state=paused — that fakes a human Pause and
+            # deadlocks the dashboard while desired stays running.
             sleep_fn(poll_s)
             continue
         try:
