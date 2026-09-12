@@ -622,6 +622,11 @@ class DrawStudentAgent:
         self._outcome_due_traj = None
 
     def _train_one(self) -> float:
+        # Honor Pause that arrived while the previous traj was in flight.
+        self._drain_commands()
+        self._apply_desired()
+        if not self._allows_train():
+            return float(self._last_loss or 0.0)
         result = self.app.trainer.rollout_train(
             command_ids=self.command_ids,
             target=self.target,
