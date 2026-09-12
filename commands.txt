@@ -112,18 +112,17 @@ cd ~/Projects/training-manager
 ./scripts/clean-ledger-tape.sh -y --with-blobs             # also drop MinIO checkpoint objects
 ./scripts/clean-ledger-tape.sh -y --include-expert-checkpoints  # also wipe drawing-expert ckpts (rare)
 
-# === TM_EXPERT_GYM === headless gym → suggest → apply → outcome (needs TM up + native build)
-# Episodes/outcomes persist automatically (Postgres + var/expert_corpus JSONL); boot rehydrates.
-cd ~/Projects/ml-engine
-PYTHONPATH=. .venv/bin/python examples/closed_loop_draw/expert_gym.py --tm-uri http://127.0.0.1:8000 --episodes 8 --train-after
-
-# === TM_EXPERT_GYM_WORKER === Slice B: poll drawing-expert Start/Pause; run rounds; train; stop on val
-# Dashboard: select drawing-expert → Start (arms tm_gym_*). Worker honors Pause between rounds.
+# === TM_EXPERT_GYM_WORKER === preferred path (BL-002)
+# Dashboard: select drawing-expert → Autopilot (or Start). Worker honors Pause; domain=drawing_expert.
 cd ~/Projects/ml-engine
 PYTHONPATH=. .venv/bin/python examples/closed_loop_draw/expert_gym_worker.py \
   --tm-uri http://127.0.0.1:8000 --poll-s 2
 
-# === TM_EXPERT_CURRICULUM === (debug) shell rounds until decent val — prefer gym worker above
+# === TM_EXPERT_GYM === one-shot batch (debug / smoke) → suggest → apply → outcome
+cd ~/Projects/ml-engine
+PYTHONPATH=. .venv/bin/python examples/closed_loop_draw/expert_gym.py --tm-uri http://127.0.0.1:8000 --episodes 8 --train-after
+
+# === TM_EXPERT_CURRICULUM === DEBUG ONLY shell loop — demoted; use gym worker above
 cd ~/Projects/ml-engine
 mkdir -p diagnostics_output/closed_loop_draw
 VAL_TARGET=0.70 MIN_N_TRAIN=40 BATCH=16 MAX_ROUNDS=20 \

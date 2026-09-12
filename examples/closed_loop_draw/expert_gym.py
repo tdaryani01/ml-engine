@@ -11,8 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from examples.closed_loop_draw.apply_deltas import apply_drawing_deltas
-from examples.closed_loop_draw.assemble import assemble, load_config, make_target
+from examples.closed_loop_draw.assemble import load_config
 from examples.closed_loop_draw.commands import COMMANDS, STOCK_COMMAND_IDS
 
 # Shape difficulty (stock only). Harder shapes need more strokes / closure.
@@ -120,85 +119,27 @@ def run_one(
     command_id: int | None,
     complexity: str | None,
 ) -> dict[str, Any]:
-    rng = np.random.default_rng(seed)
-    tier = _pick_complexity(rng, complexity)
-    pool = COMPLEXITY_POOLS[tier]
-    cid = int(command_id) if command_id is not None else int(rng.choice(pool))
-    if cid not in STOCK_COMMAND_IDS:
-        cid = int(rng.choice(list(STOCK_COMMAND_IDS)))
+    from examples.closed_loop_draw.gym_domain import GymTask, get_gym_domain
 
-    cfg = _jitter_config(cfg, rng, complexity=tier)
-    cfg.setdefault("closed_loop", {})["command_id"] = cid
-    cfg["closed_loop"]["target"] = {"kind": "stock"}
-
-    app = assemble(cfg, seed=seed)
-    try:
-        B = app.batch_size
-        target = make_target(cfg, batch_size=B)
-        ids = np.full(B, cid, dtype=np.int64)
-        lr = float(cfg.get("optimization", {}).get("learning_rate", app.lr))
-
-        loss_pre, ink_pre = _train_block(
-            app, target=target, command_ids=ids, n_traj=pre_traj, lr=lr
+    domain = get_gym_domain("drawing_expert")
+    task = domain.sample(seed=seed, complexity=complexity)
+    if command_id is not None:
+        cid = int(command_id)
+        task = GymTask(
+            domain=task.domain,
+            seed=task.seed,
+            complexity=task.complexity,
+            command_id=cid,
+            meta={"command": COMMANDS.get(cid, str(cid))},
         )
-        plateau = bool(loss_pre < 0.02 and ink_pre > 0.15)
-
-        suggest_body = {
-            "instance_id": instance_id,
-            "ink_miss": ink_pre,
-            "loss": loss_pre,
-            "trajs": pre_traj,
-            "sigma": float(app.env.sigma),
-            "max_steps": int(app.max_steps),
-            "lr": float(lr),
-            "continuity_weight": float(app.env.continuity_weight),
-            "plateau": plateau,
-            "closed": ink_pre < 0.2,
-            "meta": {
-                "command_id": cid,
-                "command": COMMANDS.get(cid, str(cid)),
-                "complexity": tier,
-                "seed": seed,
-                "phase": "pre",
-                "cfg_sigma": cfg["closed_loop"].get("sigma"),
-                "cfg_continuity": cfg["closed_loop"].get("continuity_weight"),
-                "cfg_max_steps": cfg["closed_loop"].get("max_steps"),
-                "cfg_lr": lr,
-            },
-        }
-        suggest = _post_json(
-            f"{tm_uri.rstrip('/')}/api/experts/drawing/suggest",
-            suggest_body,
-        )
-        episode_id = str(suggest.get("episode_id") or "")
-        deltas = list(suggest.get("deltas") or [])
-        applied, lr = apply_drawing_deltas(app, deltas, train_lr=lr)
-
-        loss_post, ink_post = _train_block(
-            app, target=target, command_ids=ids, n_traj=post_traj, lr=float(lr or app.lr)
-        )
-        outcome = float(ink_pre - ink_post)
-        if episode_id:
-            _post_json(
-                f"{tm_uri.rstrip('/')}/api/experts/drawing/episodes/{episode_id}/outcome",
-                {"outcome": outcome},
-            )
-        return {
-            "command_id": cid,
-            "command": COMMANDS.get(cid, str(cid)),
-            "complexity": tier,
-            "episode_id": episode_id,
-            "authority": suggest.get("authority"),
-            "applied": applied,
-            "ink_pre": ink_pre,
-            "ink_post": ink_post,
-            "loss_pre": loss_pre,
-            "loss_post": loss_post,
-            "outcome": outcome,
-            "summary": suggest.get("summary"),
-        }
-    finally:
-        app.close()
+    return domain.run(
+        task,
+        cfg=cfg,
+        tm_uri=tm_uri,
+        instance_id=instance_id,
+        pre_traj=pre_traj,
+        post_traj=post_traj,
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

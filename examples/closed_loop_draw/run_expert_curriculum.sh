@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# DEBUG ONLY — prefer dashboard Autopilot + expert_gym_worker.py (BL-002).
 # Background drawing-expert curriculum: gym batches → train → stop on val target.
 # Usage:
 #   ./examples/closed_loop_draw/run_expert_curriculum.sh
@@ -6,6 +7,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
+echo "[curriculum] DEBUG shell — prefer: dashboard Autopilot on drawing-expert + expert_gym_worker.py" >&2
 TM_URI="${TM_URI:-http://127.0.0.1:8000}"
 BATCH="${BATCH:-16}"
 PRE="${PRE:-10}"

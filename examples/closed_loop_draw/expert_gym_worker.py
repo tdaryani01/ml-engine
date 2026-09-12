@@ -17,9 +17,47 @@ from pathlib import Path
 from typing import Any, Callable
 
 from examples.closed_loop_draw.assemble import load_config
-from examples.closed_loop_draw.expert_gym import run_one
+from examples.closed_loop_draw.gym_domain import get_gym_domain
 
 DRAWING_EXPERT_ID = "drawing-expert"
+
+
+def _episode_via_domain(
+    *,
+    cfg: dict[str, Any],
+    tm_uri: str,
+    instance_id: str,
+    pre_traj: int,
+    post_traj: int,
+    seed: int,
+    command_id: int | None,
+    complexity: str | None,
+    domain_name: str = "drawing_expert",
+) -> dict[str, Any]:
+    """Default episode path: resolve domain adapter (sample → run)."""
+    from examples.closed_loop_draw.gym_domain import GymTask, get_gym_domain
+
+    domain = get_gym_domain(domain_name)
+    task = domain.sample(seed=seed, complexity=complexity)
+    if command_id is not None:
+        from examples.closed_loop_draw.commands import COMMANDS
+
+        cid = int(command_id)
+        task = GymTask(
+            domain=task.domain,
+            seed=task.seed,
+            complexity=task.complexity,
+            command_id=cid,
+            meta={"command": COMMANDS.get(cid, str(cid))},
+        )
+    return domain.run(
+        task,
+        cfg=cfg,
+        tm_uri=tm_uri,
+        instance_id=instance_id,
+        pre_traj=pre_traj,
+        post_traj=post_traj,
+    )
 
 
 def _get_json(url: str, timeout_s: float = 10.0) -> Any:
@@ -60,6 +98,7 @@ def read_gym_from_metrics(metrics: dict[str, Any] | None) -> dict[str, Any]:
         "val_target": float(m.get("tm_gym_val_target") or 0.70),
         "min_n_train": max(1, int(m.get("tm_gym_min_n_train") or 40)),
         "complexity": str(m.get("tm_gym_complexity") or "mixed"),
+        "domain": str(m.get("tm_gym_domain") or "drawing_expert"),
         "gym_round": int(m.get("gym_round") or 0),
         "gym_last_val": m.get("gym_last_val"),
         "val_accuracy": m.get("val_accuracy"),
@@ -156,7 +195,7 @@ def run_worker_round(
     tm_uri: str,
     gym: dict[str, Any],
     seed0: int,
-    episode_fn: Callable[..., dict[str, Any]] = run_one,
+    episode_fn: Callable[..., dict[str, Any]] | None = None,
     instance_tag: str = "expert-gym-worker",
 ) -> list[dict[str, Any]]:
     """Run one gym batch (batch episodes). Pause is checked by caller between rounds."""
@@ -164,8 +203,14 @@ def run_worker_round(
     complexity = gym["complexity"]
     if complexity == "mixed":
         complexity = None
+    domain_name = str(gym.get("domain") or "drawing_expert")
+    ep = episode_fn
+    if ep is None:
+        def ep(**kwargs: Any) -> dict[str, Any]:
+            return _episode_via_domain(domain_name=domain_name, **kwargs)
+
     for i in range(int(gym["batch"])):
-        row = episode_fn(
+        row = ep(
             cfg=cfg,
             tm_uri=tm_uri,
             instance_id=instance_tag,
@@ -186,9 +231,9 @@ def worker_loop(
     poll_s: float = 2.0,
     seed0: int = 100,
     max_rounds: int = 10_000,
-    episode_fn: Callable[..., dict[str, Any]] = run_one,
+    episode_fn: Callable[..., dict[str, Any]] | None = None,
     fetch_fn: Callable[[str], dict[str, Any]] = fetch_expert_metrics,
-    train_fn: Callable[[str], dict[str, Any]] = train_expert,
+    train_fn: Callable[[str], dict[str, Any]] | None = None,
     pulse_fn: Callable[..., None] = pulse_gym_progress,
     disarm_fn: Callable[[str], None] = disarm_gym,
     sleep_fn: Callable[[float], None] = time.sleep,
@@ -218,8 +263,9 @@ def worker_loop(
         # run
         rounds += 1
         seed = seed0 + rounds * int(gym["batch"])
+        domain_name = str(gym.get("domain") or "drawing_expert")
         print(
-            f"[gym-worker] round={rounds} batch={gym['batch']} "
+            f"[gym-worker] round={rounds} domain={domain_name} batch={gym['batch']} "
             f"val_target={gym['val_target']} min_n={gym['min_n_train']}",
             flush=True,
         )
@@ -242,7 +288,10 @@ def worker_loop(
             sleep_fn(poll_s)
             continue
         try:
-            last_train = train_fn(tm_uri)
+            if train_fn is not None:
+                last_train = train_fn(tm_uri)
+            else:
+                last_train = get_gym_domain(domain_name).train(tm_uri)
         except Exception as exc:  # noqa: BLE001
             print(f"[gym-worker] train failed: {exc}", flush=True)
             sleep_fn(poll_s)
