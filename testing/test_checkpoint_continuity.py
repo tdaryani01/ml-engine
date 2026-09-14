@@ -136,6 +136,64 @@ def test_regression_restore_applies_checkpoint_config(monkeypatch):
     assert agent._stale == 0
 
 
+def test_regression_es_restore_keeps_ckpt_knobs_plate_is_resume_overlay():
+    """Contract: checkpoint captures full config; ES resume adds feed without retune.
+
+    Live proof (tm-brain v1800): blob config == ledger config; post-restore steps
+    keep lr/sigma/max_steps; after_restore resume carries those knobs + new plate.
+    ``command_id`` may change only when remix_data_on_es remaps terrain after restore.
+    """
+    cfg = {
+        "closed_loop": {
+            "sigma": 0.06,
+            "train_patience": 32,
+            "max_steps": 10,
+            "batch_size": 4,
+            "command_id": 1,
+            "loss_kind": "balanced",
+            "remix_data_on_es": True,
+        },
+        "optimization": {"learning_rate": 0.0005, "seed": 0},
+        "mhsa": {"d_model": 64},
+        "cnn_encoder": {"feature_dim": 32},
+        "source": "user",
+        "feed": {"on_es": "new_plate"},
+    }
+    pub = public_run_config(cfg, lr=0.0005)
+    knobs = knobs_from_cfg(cfg, lr=0.0005)
+
+    # Capture: full run config in blob/ledger body (overlays stripped).
+    assert "source" not in pub and "feed" not in pub
+    assert pub["closed_loop"]["command_id"] == 1
+    assert pub["optimization"]["learning_rate"] == 0.0005
+    assert knobs["learning_rate"] == 0.0005
+    assert knobs["sigma"] == 0.06
+    assert knobs["train_patience"] == 32
+    assert knobs["command_id"] == 1
+
+    # ES after_restore resume dialect from actuate.py: board knobs + feed delivery.
+    resume_config = {
+        "learning_rate": knobs["learning_rate"],
+        "train_patience": knobs["train_patience"],
+        "sigma": knobs["sigma"],
+        "max_steps": knobs["max_steps"],
+        "feed": {
+            "plate_id": "plate-6a0c6090145d",
+            "recipe_id": "brain_synth_default",
+            "source_id": "src-path",
+        },
+    }
+    assert resume_config["learning_rate"] == pub["optimization"]["learning_rate"]
+    assert resume_config["sigma"] == pub["closed_loop"]["sigma"]
+    assert resume_config["train_patience"] == pub["closed_loop"]["train_patience"]
+    assert resume_config["max_steps"] == pub["closed_loop"]["max_steps"]
+    assert resume_config["feed"]["plate_id"].startswith("plate-")
+    # Feed is resume overlay only — not a retune of checkpoint hot knobs.
+    assert job_overlay_only({"feed": resume_config["feed"], "closed_loop": {"sigma": 9}}) == {
+        "feed": resume_config["feed"]
+    }
+
+
 def test_regression_claim_resume_checkpoint_restores_before_overlay(monkeypatch):
     """Any-worker claim with resume_checkpoint pin restores ckpt; overlay only."""
     agent = object.__new__(DrawStudentAgent)
@@ -147,6 +205,8 @@ def test_regression_claim_resume_checkpoint_restores_before_overlay(monkeypatch)
     agent._user_pause_hold = True
     agent._last_loss = None
     agent.app = object()
+    agent._configured = False
+    agent.hb = SimpleNamespace(cfg=SimpleNamespace(instance_id="pool-test"))
 
     restored = []
 

@@ -126,6 +126,59 @@ def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
     assert any("/tm-brain/act" in p[0] for p in posts)
 
 
+def test_regression_es_act_uses_bound_model_not_pool_session(monkeypatch):
+    """Pool session id must not be the tm-brain/act path (was HTTP 404)."""
+    monkeypatch.setattr(
+        "examples.closed_loop_draw.agent.make_target", _fake_make_target
+    )
+    agent = _bare_agent()
+    agent._es_shadow = True
+    agent._es_apply = True
+    agent._es_min_traj = 1
+    agent._train_patience = 1
+    agent._es_tripped = False
+    agent._handled_onset_version = None
+    agent._outcome_horizon = 10
+    agent._pending_outcome_episode = None
+    agent._outcome_due_traj = None
+
+    monkeypatch.setattr(
+        DrawStudentAgent,
+        "_onset_within_patience",
+        lambda self: (False, None),
+    )
+    monkeypatch.setattr(DrawStudentAgent, "_set_status", lambda self, *a, **k: None)
+
+    posts: list[str] = []
+
+    class HB:
+        cfg = SimpleNamespace(instance_id="22409324")  # pool session
+
+        @property
+        def bound_model_id(self) -> str:
+            return "tm-brain"
+
+        def post_json(self, path, body, timeout_s=15.0):
+            posts.append(path)
+            return {
+                "decision": {
+                    "action": "noop",
+                    "authority": "rules",
+                    "reason": "stable / continue",
+                    "episode_id": "ep-pool",
+                    "model_action": None,
+                },
+                "actuation": {"applied": False, "reason": "no actuator for action"},
+            }
+
+    agent.hb = HB()
+    DrawStudentAgent._maybe_es_shadow(agent)
+
+    assert posts, "expected tm-brain/act POST"
+    assert posts[0] == "/api/instances/tm-brain/tm-brain/act"
+    assert all("22409324" not in p for p in posts)
+
+
 def test_regression_restore_ack_remixes_terrain_once(monkeypatch):
     monkeypatch.setattr(
         "examples.closed_loop_draw.agent.make_target", _fake_make_target

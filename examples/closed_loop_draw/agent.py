@@ -171,6 +171,20 @@ class DrawStudentAgent:
     def close(self) -> None:
         self.app.close()
 
+    def _tm_agent_id(self) -> str:
+        """TM agent id for control-plane routes and ckpt keys.
+
+        Pool workers keep ``hb.cfg.instance_id`` as the anonymous session id.
+        Job-bound routes must use ``bound_model_id`` (e.g. tm-brain) or ES act
+        404s against the session.
+        """
+        mid = getattr(self.hb, "bound_model_id", None)
+        if callable(mid):
+            mid = mid()
+        if isinstance(mid, str) and mid.strip():
+            return mid.strip()
+        return str(getattr(self.hb.cfg, "instance_id", "") or "").strip()
+
     @staticmethod
     def _deep_merge(base: dict, overlay: dict) -> dict:
         out = copy.deepcopy(base) if isinstance(base, dict) else {}
@@ -426,7 +440,7 @@ class DrawStudentAgent:
         ):
             # best tracked in _train_one; still mark local best when improved
             is_best = True
-        blob_key = f"ckpts/{self.hb.cfg.instance_id}/v{version}.pkl"
+        blob_key = f"ckpts/{self._tm_agent_id()}/v{version}.pkl"
         try:
             payload = build_checkpoint_blob(
                 self.app,
@@ -681,7 +695,7 @@ class DrawStudentAgent:
         Uses the latest unhandled onset from session-health ``onsets[]`` —
         not a sticky first-on-tape mark.
         """
-        path = f"/api/instances/{self.hb.cfg.instance_id}/session-health"
+        path = f"/api/instances/{self._tm_agent_id()}/session-health"
         health = self.hb.get_json(path, timeout_s=3.0)
         if not health:
             return False, None
@@ -788,7 +802,7 @@ class DrawStudentAgent:
         self._set_status(trip, loss=self._last_loss)
 
         # Rules decide + apply first (restore on onset). Remix runs after restore lands.
-        path = f"/api/instances/{self.hb.cfg.instance_id}/tm-brain/act"
+        path = f"/api/instances/{self._tm_agent_id()}/tm-brain/act"
         body = {
             "patience": float(self._train_patience),
             "lr": float(self.lr),
@@ -855,7 +869,7 @@ class DrawStudentAgent:
             self._es_park_hold = True
             self.hb.set_desired_state("paused")
             self.hb.post_json(
-                f"/api/instances/{self.hb.cfg.instance_id}/control/pause",
+                f"/api/instances/{self._tm_agent_id()}/control/pause",
                 {"payload": {"source": "es_shadow_only"}},
                 timeout_s=5.0,
             )
