@@ -153,6 +153,9 @@ class ModelController:
         training_manager: Any | None = None,
         output_dir: str = "diagnostics_output",
         max_epochs: int | None = None,
+        manager_heartbeat: Any | None = None,
+        adopt_job: dict[str, Any] | None = None,
+        job_scoped: bool = False,
     ) -> Tuple[List[float], List[float]]:
         """Executes the training loop via TrainingSession (Phase C boundary)."""
         if self.model is None:
@@ -165,7 +168,9 @@ class ModelController:
         from src.manager_heartbeat import maybe_from_settings
         from src.training_engine import create_training_engine
 
-        hb = maybe_from_settings(training_manager, ledger_enabled=ledger_on)
+        hb = manager_heartbeat
+        if hb is None:
+            hb = maybe_from_settings(training_manager, ledger_enabled=ledger_on)
         if ledger_on or hb is not None:
             import os
 
@@ -174,13 +179,13 @@ class ModelController:
             ls = ledger_settings or LedgerSettings()
             ledger_dir = os.path.join(output_dir, ls.path if ledger_on else "training_ledger_noop")
             arch_id = model_type.name if hasattr(model_type, "name") else str(model_type)
-            # Fleet identity: TM instance_id must match ledger model_instance_id for tape filter.
-            tm_instance_id = None
-            if training_manager is not None:
-                tm_instance_id = getattr(training_manager, "instance_id", None)
-                if tm_instance_id is None and isinstance(training_manager, dict):
-                    tm_instance_id = training_manager.get("instance_id")
-            model_instance_id = str(tm_instance_id or ls.branch_id)
+            # Ledger model id is the TM agent id. Until a job is claimed/adopted it is
+            # unbound; claim/adopt stamps job.model_id (never the pool worker id).
+            model_instance_id = "unbound"
+            if adopt_job is not None:
+                mid = str(adopt_job.get("model_id") or "").strip()
+                if mid:
+                    model_instance_id = mid
 
             if ledger_on:
                 eng_cfg = LedgerConfig(
@@ -208,6 +213,9 @@ class ModelController:
                         if not isinstance(training_manager, dict)
                         else training_manager.get("timeout_s", 0.5)
                     )
+                if not uri and hb is not None:
+                    cfg = getattr(hb, "_cfg", None) or getattr(hb, "cfg", None)
+                    uri = str(getattr(cfg, "uri", "") or "") if cfg is not None else ""
                 if not uri:
                     raise ValueError(
                         "ledger.store_backend=http_tm requires training_manager.uri"
@@ -252,7 +260,9 @@ class ModelController:
                     compute_r2_score=self.compute_r2_score,
                     max_epochs=max_epochs,
                 )
-                results = engine.run()
+                if adopt_job is not None:
+                    engine.adopt_claimed_job(dict(adopt_job))
+                results = engine.run(job_scoped=bool(job_scoped or adopt_job is not None))
                 hist = results.get(session.session_id)
                 if hist is None:
                     hist = (list(session.train_history), list(session.val_history))

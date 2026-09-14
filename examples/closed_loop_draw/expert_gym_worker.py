@@ -188,6 +188,123 @@ def train_expert(tm_uri: str, *, min_outcome: float = 0.0) -> dict[str, Any]:
     )
 
 
+def fetch_plate(tm_uri: str, plate_id: str) -> dict[str, Any] | None:
+    base = tm_uri.rstrip("/")
+    try:
+        body = _get_json(f"{base}/api/feeds/plates/{plate_id}")
+    except urllib.error.HTTPError as exc:
+        if getattr(exc, "code", None) == 404:
+            return None
+        raise
+    if isinstance(body, dict) and isinstance(body.get("plate"), dict):
+        return body["plate"]
+    return None
+
+
+def claim_feed_plate(
+    tm_uri: str,
+    *,
+    run_id: str,
+    recipe_id: str = "gym_batch_default",
+    train_brain: bool = False,
+) -> dict[str, Any] | None:
+    body = _post_json(
+        f"{tm_uri.rstrip('/')}/api/feeds/claim",
+        {
+            "run_id": run_id,
+            "recipe_id": recipe_id,
+            "prepare_if_empty": True,
+            "train_brain": bool(train_brain),
+        },
+    )
+    if isinstance(body, dict) and isinstance(body.get("plate"), dict):
+        return body
+    return None
+
+
+def consume_feed_plate(tm_uri: str, plate_id: str) -> None:
+    try:
+        _post_json(
+            f"{tm_uri.rstrip('/')}/api/feeds/plates/{plate_id}/consume",
+            {},
+        )
+    except urllib.error.HTTPError:
+        pass
+
+
+def _patch_json(url: str, body: dict[str, Any], timeout_s: float = 30.0) -> dict[str, Any]:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="PATCH",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def patch_feed_active(
+    tm_uri: str,
+    *,
+    instance_id: str,
+    plate_id: str,
+    recipe_id: str = "",
+    kind: str = "",
+) -> None:
+    """Sticky active plate via settings (heartbeat cannot set tm_* keys)."""
+    _patch_json(
+        f"{tm_uri.rstrip('/')}/api/instances/{instance_id}/settings",
+        {
+            "feed_active_plate_id": str(plate_id),
+            "feed_active_recipe_id": str(recipe_id),
+            "feed_active_kind": str(kind),
+        },
+    )
+
+
+def resolve_round_plate(
+    tm_uri: str,
+    metrics: dict[str, Any],
+    *,
+    instance_id: str = DRAWING_EXPERT_ID,
+) -> dict[str, Any] | None:
+    """Honor Autopilot feed policy: new_plate claims; else use sticky active plate."""
+    on_es = str(metrics.get("tm_feed_on_es") or metrics.get("feed_on_es") or "noop").lower()
+    recipe_id = str(
+        metrics.get("tm_feed_recipe_id")
+        or metrics.get("tm_feed_active_recipe_id")
+        or "gym_batch_default"
+    )
+    active = str(metrics.get("tm_feed_active_plate_id") or "").strip()
+
+    if on_es in ("new_plate", "new-plate", "plate"):
+        claimed = claim_feed_plate(
+            tm_uri,
+            run_id=instance_id,
+            recipe_id=recipe_id,
+            train_brain=recipe_id.startswith("brain_synth"),
+        )
+        if claimed and isinstance(claimed.get("plate"), dict):
+            plate = claimed["plate"]
+            try:
+                patch_feed_active(
+                    tm_uri,
+                    instance_id=instance_id,
+                    plate_id=str(plate.get("plate_id") or ""),
+                    recipe_id=str(plate.get("recipe_id") or recipe_id),
+                    kind=str(plate.get("kind") or ""),
+                )
+            except Exception:
+                pass
+            return plate
+        return None
+
+    if active:
+        return fetch_plate(tm_uri, active)
+    return None
+
+
 def run_worker_round(
     *,
     cfg: dict[str, Any],
@@ -196,8 +313,12 @@ def run_worker_round(
     seed0: int,
     episode_fn: Callable[..., dict[str, Any]] | None = None,
     instance_tag: str = "expert-gym-worker",
+    plate: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Run one gym batch (batch episodes). Pause is checked by caller between rounds."""
+    """Run one gym batch (batch episodes). Pause is checked by caller between rounds.
+
+    When ``plate`` is a gym_batch delivery, episode seeds come from plate items.
+    """
     rows: list[dict[str, Any]] = []
     complexity = gym["complexity"]
     if complexity == "mixed":
@@ -208,16 +329,38 @@ def run_worker_round(
         def ep(**kwargs: Any) -> dict[str, Any]:
             return _episode_via_domain(domain_name=domain_name, **kwargs)
 
-    for i in range(int(gym["batch"])):
+    items: list[dict[str, Any]] = []
+    if isinstance(plate, dict) and plate.get("kind") == "gym_batch":
+        payload = plate.get("payload") if isinstance(plate.get("payload"), dict) else {}
+        raw_items = payload.get("items") or []
+        if isinstance(raw_items, list):
+            items = [x for x in raw_items if isinstance(x, dict)]
+
+    batch_n = int(gym["batch"])
+    if items:
+        batch_n = min(batch_n, len(items))
+
+    for i in range(batch_n):
+        if items:
+            seed = int(items[i].get("seed", seed0 + i))
+            item_complexity = items[i].get("complexity")
+            use_complexity = (
+                None
+                if item_complexity in (None, "mixed")
+                else str(item_complexity)
+            )
+        else:
+            seed = int(seed0) + i
+            use_complexity = complexity
         row = ep(
             cfg=cfg,
             tm_uri=tm_uri,
             instance_id=instance_tag,
             pre_traj=int(gym["pre_traj"]),
             post_traj=int(gym["post_traj"]),
-            seed=int(seed0) + i,
+            seed=seed,
             command_id=None,
-            complexity=complexity,
+            complexity=use_complexity,
         )
         rows.append(row)
     return rows
@@ -263,9 +406,16 @@ def worker_loop(
         rounds += 1
         seed = seed0 + rounds * int(gym["batch"])
         domain_name = str(gym.get("domain") or "drawing_expert")
+        plate = None
+        try:
+            plate = resolve_round_plate(tm_uri, metrics, instance_id=DRAWING_EXPERT_ID)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[gym-worker] feed resolve failed: {exc}", flush=True)
+        plate_id = None if not plate else plate.get("plate_id")
         print(
             f"[gym-worker] round={rounds} domain={domain_name} batch={gym['batch']} "
-            f"val_target={gym['val_target']} min_n={gym['min_n_train']}",
+            f"val_target={gym['val_target']} min_n={gym['min_n_train']} "
+            f"plate={plate_id or '-'}",
             flush=True,
         )
         run_worker_round(
@@ -274,7 +424,18 @@ def worker_loop(
             gym=gym,
             seed0=seed,
             episode_fn=episode_fn,
+            plate=plate,
         )
+        if plate_id:
+            try:
+                consume_feed_plate(tm_uri, str(plate_id))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[gym-worker] feed consume failed: {exc}", flush=True)
+            if plate and plate.get("kind") == "brain_synth":
+                try:
+                    train_tm_brain(tm_uri)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[gym-worker] tm-brain train failed: {exc}", flush=True)
         # Re-check pause before train (Pause between episodes/rounds).
         metrics2 = fetch_fn(tm_uri)
         if decide_gym_action(metrics2) == "wait":

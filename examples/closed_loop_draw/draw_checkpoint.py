@@ -110,6 +110,30 @@ def knobs_from_cfg(cfg: dict[str, Any], *, lr: float) -> dict[str, Any]:
     }
 
 
+def public_run_config(cfg: dict[str, Any], *, lr: float | None = None) -> dict[str, Any]:
+    """Full YAML-shaped run config for ledger (strip worker-local TM connect)."""
+    out = copy.deepcopy(cfg) if isinstance(cfg, dict) else {}
+    out.pop("training_manager", None)
+    # Drop Start/job overlays if present on cfg.
+    for k in (
+        "source",
+        "autopilot",
+        "feed",
+        "gym",
+        "config_version",
+        "config_source",
+        "config_preset_id",
+        "preset_id",
+        "resume_checkpoint",
+    ):
+        out.pop(k, None)
+    if lr is not None:
+        opt = dict(out.get("optimization") or {})
+        opt["learning_rate"] = float(lr)
+        out["optimization"] = opt
+    return out
+
+
 def build_checkpoint_blob(
     app: DrawApp,
     *,
@@ -123,7 +147,7 @@ def build_checkpoint_blob(
         "version": int(version),
         "val_loss": val_loss,
         "weights": snapshot_trainable(app),
-        "config": copy.deepcopy(cfg),
+        "config": public_run_config(cfg, lr=lr),
         "knobs": knobs_from_cfg(cfg, lr=lr),
     }
     return encode_checkpoint_blob(body)
@@ -137,10 +161,22 @@ def load_checkpoint_blob(data: bytes) -> dict[str, Any]:
 
 
 def apply_checkpoint_blob(app: DrawApp, body: dict[str, Any]) -> dict[str, Any]:
-    """Restore weights; return knobs for the agent to re-apply."""
+    """Restore weights; return ``{config, knobs}`` for the agent to re-apply."""
     weights = body.get("weights")
     if not isinstance(weights, dict):
         raise ValueError("checkpoint missing weights")
     restore_trainable(app, weights)
     knobs = body.get("knobs") if isinstance(body.get("knobs"), dict) else {}
-    return dict(knobs)
+    cfg = body.get("config") if isinstance(body.get("config"), dict) else {}
+    return {"knobs": dict(knobs), "config": dict(cfg)}
+
+
+def job_overlay_only(job_config: dict[str, Any] | None) -> dict[str, Any]:
+    """Start/job overlay keys only — never replace checkpoint hot knobs."""
+    if not isinstance(job_config, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k in ("source", "autopilot", "feed", "gym"):
+        if k in job_config:
+            out[k] = copy.deepcopy(job_config[k])
+    return out

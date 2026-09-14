@@ -124,10 +124,14 @@ class LedgerSettings:
 
 @dataclass(frozen=True)
 class TrainingManagerSettings:
-    """Optional fire-and-forget heartbeats to sibling training-manager control plane."""
+    """Optional heartbeats to sibling training-manager control plane.
+
+    ``instance_id`` is the **pool worker** id only. Leave empty to get a random
+    numeric id at process start. Durable agent / ledger id is ``job.model_id``.
+    """
     enabled: bool = False
     uri: str = "http://127.0.0.1:8000"
-    instance_id: str = "engine-local-1"
+    instance_id: str = ""
     kind: str = "engine"
     label: str | None = None
     advertise_url: str = "http://127.0.0.1:0"

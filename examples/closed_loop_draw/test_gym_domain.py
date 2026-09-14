@@ -81,6 +81,43 @@ def test_integration_worker_round_uses_domain_episode_fn():
     assert all(r["domain"] == "drawing_expert" for r in rows)
 
 
+def test_worker_round_uses_gym_batch_plate_seeds():
+    calls: list[int] = []
+
+    def ep(**kwargs):
+        calls.append(int(kwargs["seed"]))
+        return {"domain": "drawing_expert", "outcome": 0.0}
+
+    gym = read_gym_from_metrics(
+        {
+            "tm_gym_armed": True,
+            "tm_gym_batch": 8,
+            "tm_gym_pre_traj": 1,
+            "tm_gym_post_traj": 1,
+            "state": "training",
+        }
+    )
+    plate = {
+        "kind": "gym_batch",
+        "payload": {
+            "items": [
+                {"seed": 7, "complexity": "easy"},
+                {"seed": 11, "complexity": "easy"},
+            ]
+        },
+    }
+    rows = run_worker_round(
+        cfg={},
+        tm_uri="http://test",
+        gym=gym,
+        seed0=100,
+        episode_fn=ep,
+        plate=plate,
+    )
+    assert len(rows) == 2
+    assert calls == [7, 11]
+
+
 if __name__ == "__main__":
     test_registry_has_drawing_expert()
     test_sample_returns_stock_task()

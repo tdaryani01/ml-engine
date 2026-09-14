@@ -28,6 +28,8 @@ closed_loop:
   # ES trip for TM shadow. Match session_health.WINDOW (32) so first onset is caught.
   train_patience: 32
   es_min_traj: 20
+  # On early stopping: switch to a different stock target mix (listen + remix).
+  remix_data_on_es: true
   target:
     kind: stock
 

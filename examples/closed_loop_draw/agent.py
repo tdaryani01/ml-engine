@@ -1,13 +1,13 @@
 # examples/closed_loop_draw/agent.py
 """
-Draw student: closed-loop draw worker under Training Manager dial-out.
+Closed-loop draw config for the training engine (like CNN/MLP — not a second loop).
 
-Registers, trains while desired=running, appends step/checkpoint docs with
-weight blobs + config snapshots, honors pause/resume/shutdown/restore.
-On ES / first physiology onset: POST tm-brain/act — rules decide (model shadows),
-actuators run (pause→restore→resume+config, retune, or park_stop). Episodes
-+ outcomes are logged for brain training. Start/resume ``config`` is applied
-and confirmed in the command ack.
+TrainingEngine owns claim / HB / command drain. This module supplies:
+  - train_tick (external_step)
+  - control hooks (start/resume config, pause holds, draw-blob restore)
+  - ES / tm-brain act + remix (draw-specific physiology)
+
+Episodes + outcomes stay on the live write path for brain training.
 """
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -26,12 +27,15 @@ if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
 from examples.closed_loop_draw.assemble import assemble, load_config, make_target
+from examples.closed_loop_draw.commands import STOCK_COMMAND_IDS
 from examples.closed_loop_draw.draw_checkpoint import (
     apply_checkpoint_blob,
     build_checkpoint_blob,
+    job_overlay_only,
     load_checkpoint_blob,
+    public_run_config,
 )
-from src.manager_heartbeat import maybe_from_settings
+from src.manager_heartbeat import _diag, maybe_from_settings
 from utils.conv_dispatch import bootstrap_im2col_gemm_runtime
 
 
@@ -77,10 +81,13 @@ def _emit(state: str, *, loss: float | None = None, traj: int = 0) -> None:
 class DrawStudentAgent:
     """Headless closed-loop draw *student* controlled by TM dial-out commands."""
 
-    def __init__(self, cfg: dict) -> None:
+    def __init__(self, cfg: dict, *, heartbeat: Any | None = None) -> None:
         bootstrap_im2col_gemm_runtime()
         seed = int(cfg.get("optimization", {}).get("seed", 0))
         self.cfg = cfg
+        self._boot_cfg = copy.deepcopy(cfg)
+        self._configured = False
+        self._config_version: int | None = None
         self.app = assemble(cfg, seed=seed)
         cl = cfg["closed_loop"]
         self.B = self.app.batch_size
@@ -109,6 +116,11 @@ class DrawStudentAgent:
 
         self._train_patience = max(1, int(cl.get("train_patience", 32)))
         self._es_min_traj = max(1, int(cl.get("es_min_traj", 20)))
+        # On early-stop: sample a different stock target mix (default on).
+        self._remix_data_on_es = bool(cl.get("remix_data_on_es", True))
+        self._remix_count = 0
+        # Armed by restore_best / successful restore; consumed once (restore or after_restore).
+        self._remix_after_restore = False
         brain = cfg.get("tm_brain") or {}
         self._es_shadow = bool(brain.get("shadow_on_es", True))
         # Apply rule decisions (model still shadows inside decide). Default on.
@@ -121,12 +133,15 @@ class DrawStudentAgent:
             tm = dict(tm)
             tm["capabilities"] = caps
             cfg["training_manager"] = tm
-        self.hb = maybe_from_settings(tm, ledger_enabled=self._ledger_on)
-        if self.hb is None:
-            raise RuntimeError(
-                "training_manager.enabled + uri required "
-                "(see config_draw_agent.yaml)"
-            )
+        if heartbeat is not None:
+            self.hb = heartbeat
+        else:
+            self.hb = maybe_from_settings(tm, ledger_enabled=self._ledger_on)
+            if self.hb is None:
+                raise RuntimeError(
+                    "training_manager.enabled + uri required "
+                    "(see config_draw_agent.yaml)"
+                )
 
         self._run_authorized = False
         self._paused = False
@@ -155,6 +170,171 @@ class DrawStudentAgent:
 
     def close(self) -> None:
         self.app.close()
+
+    @staticmethod
+    def _deep_merge(base: dict, overlay: dict) -> dict:
+        out = copy.deepcopy(base) if isinstance(base, dict) else {}
+        for key, value in (overlay or {}).items():
+            if isinstance(value, dict) and isinstance(out.get(key), dict):
+                out[key] = DrawStudentAgent._deep_merge(out[key], value)
+            else:
+                out[key] = copy.deepcopy(value)
+        return out
+
+    def _reload_live_knobs(self) -> None:
+        """Refresh live fields from self.cfg after assemble / merge."""
+        cl = self.cfg.get("closed_loop") or {}
+        opt = self.cfg.get("optimization") or {}
+        brain = self.cfg.get("tm_brain") or {}
+        led = self.cfg.get("ledger") or {}
+        self.B = self.app.batch_size
+        self.lr = float(opt.get("learning_rate", self.app.lr))
+        self.command_id = int(cl.get("command_id", 0))
+        self.command_ids = np.full(self.B, self.command_id, dtype=np.int64)
+        self.target = make_target(self.cfg, batch_size=self.B)
+        probe_cfg = copy.deepcopy(self.cfg)
+        probe_cfg.setdefault("closed_loop", {})
+        self._probe_target = make_target(probe_cfg, batch_size=self.B)
+        self._ledger_on = bool(led.get("enabled", True))
+        self._checkpoint_every = max(1, int(led.get("checkpoint_every", 25)))
+        self._branch_id = str(led.get("branch_id", "main"))
+        self._train_patience = max(1, int(cl.get("train_patience", 32)))
+        self._es_min_traj = max(1, int(cl.get("es_min_traj", 20)))
+        self._remix_data_on_es = bool(cl.get("remix_data_on_es", True))
+        self._es_shadow = bool(brain.get("shadow_on_es", True))
+        self._es_apply = bool(brain.get("apply_on_es", True))
+        self._outcome_horizon = max(1, int(brain.get("outcome_horizon", 10)))
+        self._sigma = float(cl.get("sigma", 0.06))
+        self._max_steps = int(cl.get("max_steps", 10))
+        self._continuity_weight = float(cl.get("continuity_weight", 0.0))
+        self._stale = 0
+        self._es_tripped = False
+        self._best_ink_miss = None
+        self._best_probe = None
+
+    def apply_run_config(self, config: dict | None, *, rebuild: bool = False) -> dict:
+        """Apply YAML-shaped or flat knobs (claim + brain resume share this path)."""
+        if not isinstance(config, dict) or not config:
+            return {}
+        overlay_keys = {"source", "autopilot", "gym"}
+        body = {k: v for k, v in config.items() if k not in overlay_keys}
+        has_structure = any(
+            k in body for k in ("closed_loop", "mhsa", "cnn_encoder", "optimization", "ledger", "tm_brain")
+        )
+        if rebuild or has_structure:
+            tm = copy.deepcopy(self._boot_cfg.get("training_manager") or {})
+            merged = self._deep_merge(self.cfg, body)
+            merged["training_manager"] = tm
+            seed = int(merged.get("optimization", {}).get("seed", 0))
+            try:
+                self.app.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.cfg = merged
+            self.app = assemble(merged, seed=seed)
+            self._reload_live_knobs()
+            self._configured = True
+            _emit("config:applied:rebuild", traj=self._traj)
+            return self._live_config()
+        # Flat knob overlay (brain retune dialect).
+        confirmed = self._apply_config_payload(body)
+        self._configured = True
+        return confirmed
+
+    def on_claim_config(self, job: dict) -> bool:
+        """Configure from job; if resume_checkpoint pinned, restore that ckpt first."""
+        try:
+            cfg = dict(job.get("config") or {})
+            data = dict(job.get("data") or {})
+            _diag(
+                "agent_claim_config_enter",
+                job_id=job.get("job_id"),
+                model_id=job.get("model_id"),
+                pool=self.hb.cfg.instance_id,
+                config_keys=sorted(cfg.keys()),
+                has_resume=bool(
+                    isinstance(data.get("resume_checkpoint"), dict)
+                    or isinstance(cfg.get("resume_checkpoint"), dict)
+                ),
+                boot_assembled=True,
+                configured=self._configured,
+            )
+            resume = data.get("resume_checkpoint")
+            if not isinstance(resume, dict):
+                resume = cfg.get("resume_checkpoint")
+            if isinstance(resume, dict) and resume.get("blob_key"):
+                ok = self._restore_checkpoint(
+                    version=resume.get("version"),
+                    blob_key=str(resume["blob_key"]),
+                    command_id=None,
+                )
+                if not ok:
+                    _diag("agent_claim_config_resume_fail", job_id=job.get("job_id"))
+                    return False
+                # Overlay feed/autopilot only — hot knobs come from the checkpoint.
+                for k, v in job_overlay_only(cfg).items():
+                    self.cfg[k] = copy.deepcopy(v)
+                self._es_park_hold = False
+                self._user_pause_hold = False
+                _emit(
+                    f"claim-config:resume-ckpt="
+                    f"v{resume.get('version')} job={job.get('job_id')}",
+                    traj=self._traj,
+                )
+                _diag(
+                    "agent_claim_config_resume_ok",
+                    job_id=job.get("job_id"),
+                    version=resume.get("version"),
+                )
+                return True
+
+            raw_ver = cfg.get("config_version")
+            try:
+                self._config_version = (
+                    int(raw_ver) if raw_ver is not None else None
+                )
+            except (TypeError, ValueError):
+                self._config_version = None
+            self.apply_run_config(cfg, rebuild=True)
+            self._es_park_hold = False
+            self._user_pause_hold = False
+            _emit(
+                f"claim-config:job={job.get('job_id')} "
+                f"model={job.get('model_id')} "
+                f"config_v={self._config_version}",
+                traj=self._traj,
+            )
+            _diag(
+                "agent_claim_config_rebuild_ok",
+                job_id=job.get("job_id"),
+                model_id=job.get("model_id"),
+                config_v=self._config_version,
+                sigma=self._sigma,
+                lr=float(self.lr),
+                max_steps=self._max_steps,
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001
+            _emit(f"claim-config:fail:{exc}", traj=self._traj)
+            _diag("agent_claim_config_fail", error=str(exc), job_id=job.get("job_id"))
+            return False
+
+    def on_release_config(self) -> None:
+        """Reset to bootstrap YAML when lease returns to the pool."""
+        seed = int(self._boot_cfg.get("optimization", {}).get("seed", 0))
+        try:
+            self.app.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self.cfg = copy.deepcopy(self._boot_cfg)
+        self.app = assemble(self.cfg, seed=seed)
+        self._reload_live_knobs()
+        self._configured = False
+        self._config_version = None
+        self._es_park_hold = False
+        self._user_pause_hold = False
+        self._remix_after_restore = False
+        _emit("config:reset:pool", traj=self._traj)
 
     def _set_status(self, state: str, *, loss: float | None = None) -> None:
         """Publish metrics always; print only when the run status changes."""
@@ -223,6 +403,15 @@ class DrawStudentAgent:
             body=body,
             branch_id=self._branch_id,
         )
+        _diag(
+            "agent_step_append",
+            traj=version,
+            pool=self.hb.cfg.instance_id,
+            bound=getattr(self.hb, "_bound_model_id", None),
+            job=getattr(self.hb, "_job_id", None),
+            train=train,
+            val=val,
+        )
 
     def _maybe_checkpoint(self) -> None:
         if not self._ledger_on:
@@ -264,6 +453,8 @@ class DrawStudentAgent:
                 "sigma": self._sigma,
                 "max_steps": self._max_steps,
             },
+            # BL-008a: full live run config; identity = checkpoint version.
+            "config": public_run_config(self.cfg, lr=float(self.lr)),
             "config_snapshot": True,
         }
         ok = self.hb.append_ledger_doc(
@@ -319,26 +510,48 @@ class DrawStudentAgent:
         bits = " ".join(f"{k}={v}" for k, v in sorted(knobs.items()))
         _emit(f"config:{tag} {bits}", traj=self._traj)
 
-    def _restore_from_command(self, cmd) -> None:
-        """Restore weights only. Config changes arrive on the following start/resume."""
-        payload = dict(cmd.payload or {})
-        blob_key = payload.get("blob_key")
-        version = payload.get("version")
-        if not blob_key:
-            self.hb.queue_ack(cmd.id, ok=False, detail="missing blob_key")
-            return
+    def _restore_checkpoint(
+        self,
+        *,
+        version: Any,
+        blob_key: str,
+        command_id: str | None,
+    ) -> bool:
+        """Load checkpoint blob: config then weights (stateless continuity)."""
         data = self.hb.fetch_blob(str(blob_key))
         if data is None:
-            self.hb.queue_ack(cmd.id, ok=False, detail=f"blob not found: {blob_key}")
-            return
+            if command_id is not None:
+                self.hb.queue_ack(
+                    command_id, ok=False, detail=f"blob not found: {blob_key}"
+                )
+            return False
         try:
             body = load_checkpoint_blob(data)
-            apply_checkpoint_blob(self.app, body)  # weights; knobs ignored here
+            cfg = body.get("config") if isinstance(body.get("config"), dict) else {}
+            knobs = body.get("knobs") if isinstance(body.get("knobs"), dict) else {}
+            # Config first (may rebuild app), then weights onto that app.
+            if cfg:
+                self.apply_run_config(cfg, rebuild=True)
+            elif knobs:
+                self._apply_config_payload(knobs)
+            apply_checkpoint_blob(self.app, body)
         except Exception as exc:  # noqa: BLE001
-            self.hb.queue_ack(cmd.id, ok=False, detail=f"restore failed: {exc}")
-            return
+            if command_id is not None:
+                self.hb.queue_ack(
+                    command_id, ok=False, detail=f"restore failed: {exc}"
+                )
+            _emit(f"restore-fail:{exc}", traj=self._traj)
+            return False
         if version is not None:
-            self._checkpoint_version = int(version)
+            try:
+                ver_i = int(version)
+            except (TypeError, ValueError):
+                ver_i = None
+            if ver_i is not None:
+                self._checkpoint_version = ver_i
+                self._config_version = ver_i
+                # Continue traj numbering from the restored point.
+                self._traj = ver_i
         self._stale = 0
         self._es_tripped = False
         self.hb.set_active_checkpoint(
@@ -347,145 +560,120 @@ class DrawStudentAgent:
                 "blob_key": str(blob_key),
             }
         )
-        detail = f"restored_weights:v{version}"
-        self.hb.queue_ack(cmd.id, ok=True, detail=detail)
+        detail = f"restored:v{version}"
+        if command_id is not None:
+            self.hb.queue_ack(command_id, ok=True, detail=detail)
         _emit(detail, loss=self._last_loss, traj=self._traj)
+        return True
 
-    def _handle_start_resume(self, cmd) -> None:
+    def _restore_from_command(self, cmd) -> None:
+        """Restore weights + checkpoint config (explicit / cancel / brain)."""
+        payload = dict(cmd.payload or {})
+        blob_key = payload.get("blob_key")
+        version = payload.get("version")
+        if not blob_key:
+            self.hb.queue_ack(cmd.id, ok=False, detail="missing blob_key")
+            return
+        ok = self._restore_checkpoint(
+            version=version, blob_key=str(blob_key), command_id=cmd.id
+        )
+        if not ok:
+            return
+        # Onset/ES → restore first; then remix terrain for the next stretch.
+        if self._remix_data_on_es:
+            self._remix_after_restore = True
+            self._consume_terrain_remix(reason="post-restore")
+
+    def on_engine_start_resume(self, cmd) -> bool:
+        """Config hook for TrainingEngine — apply payload; False blocks authorize."""
         payload = dict(cmd.payload or {})
         src = str(payload.get("source") or "").strip().lower()
-        # Human Pause must stick: ignore brain resume/start until user clears hold.
+        phase = str(payload.get("phase") or "").strip().lower()
         if self._user_pause_hold and src == "tm_brain":
-            self._paused = True
             self.hb.set_desired_state("paused")
-            self.hb.mark_command_seen(cmd.id)
-            self.hb.queue_ack(
-                cmd.id,
-                ok=False,
-                detail="blocked:user_paused",
-            )
-            _emit(
-                "blocked:user_paused",
-                loss=self._last_loss,
-                traj=self._traj,
-            )
-            return
+            _emit("blocked:user_paused", loss=self._last_loss, traj=self._traj)
+            return False
         if src != "tm_brain":
             self._user_pause_hold = False
-        confirmed = self._apply_config_payload(
-            payload.get("config") if isinstance(payload.get("config"), dict) else None
+        confirmed = self.apply_run_config(
+            payload.get("config") if isinstance(payload.get("config"), dict) else None,
+            rebuild=False,
         )
-        self._run_authorized = True
-        self._paused = False
         self._es_park_hold = False
-        self.hb.set_desired_state("running")
-        self.hb.mark_command_seen(cmd.id)
+        if src == "tm_brain" and phase == "after_restore":
+            self._consume_terrain_remix(reason="after_restore")
         live = self._live_config()
         if confirmed:
             self._print_config("confirmed", confirmed)
         else:
             self._print_config("live", live)
-        ack = {
-            "ok": True,
-            "action": cmd.action,
-            "phase": payload.get("phase"),
-            "episode_id": payload.get("episode_id"),
-            "config_requested": payload.get("config") or {},
-            "config_confirmed": confirmed or live,
-        }
-        self.hb.queue_ack(cmd.id, ok=True, detail=json.dumps(ack, sort_keys=True))
         _emit(
             f"{cmd.action.strip().lower()}:config_ok",
             loss=self._last_loss,
             traj=self._traj,
         )
+        return True
 
-    def _drain_commands(self) -> None:
-        hb = self.hb
-        for cmd in hb.poll_commands():
-            action = cmd.action.strip().lower()
-            try:
-                if action in ("start", "resume"):
-                    self._handle_start_resume(cmd)
-                elif action == "pause":
-                    payload = dict(cmd.payload or {})
-                    src = str(payload.get("source") or "").strip().lower()
-                    # Non-brain pause (UI / shadow park) arms the hold.
-                    if src != "tm_brain":
-                        self._user_pause_hold = True
-                    self._paused = True
-                    hb.set_desired_state("paused")
-                    hb.mark_command_seen(cmd.id)
-                    phase = payload.get("phase")
-                    hb.queue_ack(
-                        cmd.id,
-                        ok=True,
-                        detail=f"paused:{phase}" if phase else "paused",
-                    )
-                    _emit(
-                        f"paused:{phase}" if phase else "paused",
-                        loss=self._last_loss,
-                        traj=self._traj,
-                    )
-                elif action == "cancel":
-                    self._user_pause_hold = False
-                    self._run_authorized = False
-                    self._paused = False
-                    self._es_park_hold = False
-                    hb.set_desired_state("idle")
-                    hb.mark_command_seen(cmd.id)
-                    hb.queue_ack(cmd.id, ok=True, detail="cancelled")
-                    _emit("cancelled", loss=self._last_loss, traj=self._traj)
-                elif action == "shutdown":
-                    created = float(cmd.created_at or 0.0)
-                    if created > 0.0 and created < (self._process_started_at - 2.0):
-                        hb.mark_command_seen(cmd.id)
-                        hb.queue_ack(
-                            cmd.id, ok=True, detail="ignored_stale_pre_boot_shutdown"
-                        )
-                        continue
-                    self._shutdown_accepted = True
-                    self._stop = True
-                    hb.set_desired_state("stopped")
-                    hb.mark_command_seen(cmd.id)
-                    hb.queue_ack(cmd.id, ok=True)
-                elif action == "restore":
-                    hb.mark_command_seen(cmd.id)
-                    self._restore_from_command(cmd)
-                else:
-                    hb.mark_command_seen(cmd.id)
-                    hb.queue_ack(cmd.id, ok=False, detail=f"unknown action {action}")
-            except Exception as exc:  # noqa: BLE001
-                hb.mark_command_seen(cmd.id)
-                hb.queue_ack(cmd.id, ok=False, detail=str(exc))
+    def on_engine_pause(self, cmd) -> None:
+        payload = dict(cmd.payload or {})
+        src = str(payload.get("source") or "").strip().lower()
+        if src != "tm_brain":
+            self._user_pause_hold = True
+        phase = payload.get("phase")
+        _emit(
+            f"paused:{phase}" if phase else "paused",
+            loss=self._last_loss,
+            traj=self._traj,
+        )
 
-    def _apply_desired(self) -> None:
-        desired = (self.hb.desired_state or "").strip().lower()
-        if desired == "stopped":
-            if self._shutdown_accepted:
-                self._stop = True
-            return
-        if desired == "paused":
-            self._paused = True
-        elif desired == "running":
-            # ES park / human Pause must stick until an explicit start/resume command.
-            # Heartbeat otherwise re-applies TM sticky desired=running from
-            # the earlier Autopilot Start and unpauses without a decision.
-            if self._es_park_hold or self._user_pause_hold:
-                self._paused = True
-                self.hb.set_desired_state("paused")
-                return
-            if self._run_authorized:
-                self._paused = False
-        elif desired in ("idle", ""):
-            if not self._es_park_hold and not self._user_pause_hold:
-                self._paused = False
+    def on_engine_cancel(self, cmd) -> None:
+        del cmd
+        self._user_pause_hold = False
+        self._es_park_hold = False
+        _emit("cancelled", loss=self._last_loss, traj=self._traj)
 
-    def _allows_train(self) -> bool:
-        if not self._run_authorized or self._paused or self._stop or self._es_park_hold:
+    def on_engine_restore(self, cmd) -> bool:
+        """Draw-blob restore — fully handled (skip ledger restore)."""
+        self.hb.mark_command_seen(cmd.id)
+        self._restore_from_command(cmd)
+        return True
+
+    def pause_gate(self) -> bool:
+        return bool(self._es_park_hold or self._user_pause_hold)
+
+    def train_tick(self) -> bool:
+        """One closed-loop traj for TrainingEngine.external_step."""
+        if self._es_park_hold or self._user_pause_hold:
             return False
-        desired = (self.hb.desired_state or "").strip().lower()
-        return desired == "running"
+        loss = self._train_one()
+        if self._es_park_hold:
+            return False
+        prev = self._last_status
+        self._set_status("training", loss=loss)
+        if prev == "training" and self._traj % 10 == 0:
+            _emit("training", loss=loss, traj=self._traj)
+        return True
+
+    def _handle_start_resume(self, cmd) -> None:
+        """Test/compat: config hook + local authorize (engine path uses hooks)."""
+        if not self.on_engine_start_resume(cmd):
+            self.hb.mark_command_seen(cmd.id)
+            self.hb.queue_ack(cmd.id, ok=False, detail="blocked:user_paused")
+            return
+        self._run_authorized = True
+        self._paused = False
+        self.hb.set_desired_state("running")
+        self.hb.mark_command_seen(cmd.id)
+        live = self._live_config()
+        ack = {
+            "ok": True,
+            "action": cmd.action,
+            "phase": (cmd.payload or {}).get("phase")
+            if isinstance(cmd.payload, dict)
+            else None,
+            "config_confirmed": live,
+        }
+        self.hb.queue_ack(cmd.id, ok=True, detail=json.dumps(ack, sort_keys=True))
 
     def _onset_within_patience(self) -> tuple[bool, int | None]:
         """True when a *new* unhealthy onset is still inside train_patience.
@@ -519,6 +707,60 @@ class DrawStudentAgent:
                 return True, onset_i
         return False, None
 
+    def _remix_training_data(self) -> None:
+        """Generate a different stock target mix (new terrain) and reset patience."""
+        cl = self.cfg.setdefault("closed_loop", {})
+        cur = int(cl.get("command_id", self.command_id))
+        pool = [int(c) for c in STOCK_COMMAND_IDS if int(c) != cur]
+        if not pool:
+            pool = [int(c) for c in STOCK_COMMAND_IDS]
+        # Deterministic walk through stock mix, seeded by remix count + traj.
+        pick = pool[(int(self._remix_count) + int(self._traj)) % len(pool)]
+        cl["command_id"] = int(pick)
+        tgt = dict(cl.get("target") or {})
+        tgt["kind"] = "stock"
+        cl["target"] = tgt
+        self.command_id = int(pick)
+        self.command_ids = np.full(self.B, self.command_id, dtype=np.int64)
+        self.target = make_target(self.cfg, batch_size=self.B)
+
+        probe_cfg = copy.deepcopy(self.cfg)
+        probe_tgt = dict(probe_cfg["closed_loop"].get("target") or {})
+        probe_tgt["kind"] = probe_tgt.get("kind") or "stock"
+        probe_cfg["closed_loop"]["target"] = probe_tgt
+        # Different stock from train when possible.
+        probe_pool = [int(c) for c in STOCK_COMMAND_IDS if int(c) != pick]
+        if probe_pool:
+            probe_cfg["closed_loop"]["command_id"] = int(
+                probe_pool[(int(self._remix_count) + 1) % len(probe_pool)]
+            )
+        self._probe_target = make_target(probe_cfg, batch_size=self.B)
+
+        self._remix_count += 1
+        self._stale = 0
+        self._best_ink_miss = None
+        self._best_probe = None
+        self._last_ink_miss = None
+        self._last_probe = None
+        _emit(
+            f"es-remix:command_id={self.command_id} n={self._remix_count}",
+            traj=self._traj,
+        )
+
+    def _consume_terrain_remix(self, *, reason: str) -> None:
+        """Remix once per restore cycle; clear park so training continues."""
+        if not self._remix_data_on_es or not self._remix_after_restore:
+            return
+        self._remix_after_restore = False
+        try:
+            self._remix_training_data()
+        except Exception as exc:  # noqa: BLE001
+            _emit(f"es-remix:fail:{exc}", traj=self._traj)
+            return
+        # Restore cycle done — do not leave the run parked under Autopilot.
+        self._es_park_hold = False
+        _emit(f"es-remix:via={reason}", traj=self._traj)
+
     def _maybe_es_shadow(self) -> None:
         if not self._es_shadow:
             return
@@ -545,7 +787,7 @@ class DrawStudentAgent:
         trip = "es-onset" if onset_hit and not patience_hit else "es-trip"
         self._set_status(trip, loss=self._last_loss)
 
-        # Rules decide + apply; model shadows inside decide. Episodes logged on TM.
+        # Rules decide + apply first (restore on onset). Remix runs after restore lands.
         path = f"/api/instances/{self.hb.cfg.instance_id}/tm-brain/act"
         body = {
             "patience": float(self._train_patience),
@@ -553,10 +795,20 @@ class DrawStudentAgent:
             "window": 32,
             "apply": True,
             "dry_run": False if self._es_apply else True,
+            # Grow TM-brain corpus with labeled physiology tapes (families × regimes).
+            "synth_on_es": True,
+            "synth_n": 8,
         }
         out = self.hb.post_json(path, body, timeout_s=15.0)
         decision = out.get("decision") if isinstance(out, dict) else None
         actuation = out.get("actuation") if isinstance(out, dict) else None
+        synth = out.get("synth") if isinstance(out, dict) else None
+        if isinstance(synth, dict) and synth.get("n_episodes"):
+            _emit(
+                f"brain-synth:n={synth.get('n_episodes')} "
+                f"iid={synth.get('instance_id')}",
+                traj=self._traj,
+            )
         if isinstance(decision, dict):
             ep = decision.get("episode_id")
             if ep:
@@ -573,6 +825,9 @@ class DrawStudentAgent:
             if reason:
                 _emit(f"brain-reason:{reason}", traj=self._traj)
             self._set_status(f"es-act:{action}", loss=self._last_loss)
+            # Arm terrain remix for the restore dial-out / after_restore resume.
+            if action == "restore_best" and self._remix_data_on_es:
+                self._remix_after_restore = True
         else:
             action = None
             self._set_status("es-act:fail", loss=self._last_loss)
@@ -590,6 +845,10 @@ class DrawStudentAgent:
                 self._es_park_hold = True
                 self._paused = True
                 self.hb.set_desired_state("paused")
+            # Successful restore actuation must not leave a sticky park from a
+            # prior shadow trip — resume(after_restore) continues training.
+            elif action == "restore_best" and actuation.get("applied"):
+                self._es_park_hold = False
         elif not self._es_apply:
             # Dry-run / shadow-only: park so a human can inspect.
             self._paused = True
@@ -622,11 +881,8 @@ class DrawStudentAgent:
         self._outcome_due_traj = None
 
     def _train_one(self) -> float:
-        # Honor Pause that arrived while the previous traj was in flight.
-        self._drain_commands()
-        self._apply_desired()
-        if not self._allows_train():
-            return float(self._last_loss or 0.0)
+        # Pause/cancel arrive via TrainingEngine.drain_manager_commands before
+        # train_tick; holds are checked there. This method is the traj body only.
         result = self.app.trainer.rollout_train(
             command_ids=self.command_ids,
             target=self.target,
@@ -668,37 +924,13 @@ class DrawStudentAgent:
         self._maybe_label_outcome()
         return self._last_loss
 
-    def run(self) -> None:
-        idle_s = float(self.hb.cfg.idle_sleep_s)
-        self._set_status("idle")
-        while not self._stop:
-            self._drain_commands()
-            self._apply_desired()
-            if self._stop:
-                break
-            if not self._allows_train():
-                state = "paused" if self._paused else "idle"
-                self._set_status(state)
-                time.sleep(max(0.1, idle_s))
-                continue
-            loss = self._train_one()
-            # ES parks inside _train_one; do not stamp "training" over that.
-            if not self._allows_train():
-                state = "paused" if self._paused else "idle"
-                self._set_status(state, loss=loss)
-                continue
-            prev = self._last_status
-            self._set_status("training", loss=loss)
-            # Progress pings while status stays training.
-            if prev == "training" and self._traj % 10 == 0:
-                _emit("training", loss=loss, traj=self._traj)
-        self._set_status("stopped", loss=self._last_loss)
-
 
 DrawingExpertAgent = DrawStudentAgent
 
 
 def main() -> int:
+    from examples.closed_loop_draw.run_lease import build_closed_loop_engine
+
     args = _parse_args()
     cfg = load_config(args.config)
     out_dir = Path(
@@ -714,9 +946,16 @@ def main() -> int:
     )
     _open_log_file(log_path)
     agent = DrawStudentAgent(cfg)
+    engine = build_closed_loop_engine(
+        agent,
+        model_instance_id=str(agent.hb.cfg.instance_id),
+        ledger_dir=out_dir / "engine_ledger",
+        claim_inside_engine=True,
+    )
     try:
-        agent.run()
+        engine.run()
     finally:
+        engine.close()
         agent.close()
         if _LOG_FP is not None:
             _LOG_FP.close()

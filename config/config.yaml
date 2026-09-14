@@ -96,17 +96,16 @@ ledger:
 # =====================================================================
 # TRAINING MANAGER (sibling control plane — optional)
 # =====================================================================
-# Fire-and-forget HTTP register + heartbeat from the engine useful-work /
-# idle-park path (works with ledger on or off).
+# Fire-and-forget HTTP pool register + heartbeat from the engine.
 # interval_s / idle_sleep_s should stay under training-manager
 # config/registry.heartbeat_ttl_s (default 60).
-# When ledger.enabled is false, capabilities omit "ledger" and the fleet
-# label is annotated "(no ledger)".
-# instance_id must match ledger model_instance_id so importer + fleet filter align.
+# When ledger.enabled is false, capabilities omit "ledger".
+# Pool worker id is a random number at process start (not a model name).
+# Durable model_instance_id comes from the claimed job.model_id (TM agent).
 training_manager:
   enabled: true
   uri: "http://127.0.0.1:8000"
-  instance_id: "engine-local-1"
+  # omit instance_id → random pool session id
   kind: "engine"
   label: "local ml-engine"
   advertise_url: "http://127.0.0.1:0"

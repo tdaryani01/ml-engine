@@ -240,6 +240,17 @@ class TrainingEngine:
         self._stop = threading.Event()
         self._paused = threading.Event()
         self._work_poll: Callable[[], bool] | None = None
+        # Optional train step when no TrainingSession (e.g. closed-loop config).
+        self._external_step: Callable[[], bool] | None = None
+        # Optional control hooks for config-specific start/pause/restore.
+        self._on_start_resume: Callable[[Any], bool] | None = None
+        self._on_pause: Callable[[Any], None] | None = None
+        self._on_cancel: Callable[[Any], None] | None = None
+        self._on_restore: Callable[[Any], bool] | None = None
+        self._pause_gate: Callable[[], bool] | None = None
+        # BL-007d: configure from job on claim; reset when lease drops.
+        self._on_claim_config: Callable[[dict[str, Any]], bool] | None = None
+        self._on_release_config: Callable[[], None] | None = None
         self._restore_inflight: dict[str, threading.Thread] = {}
         self._restore_ready: dict[str, Any] = {}
         self._restore_lock = threading.Lock()
@@ -254,6 +265,8 @@ class TrainingEngine:
         # Sticky desired=stopped / redelivered shutdown must not kill a new process.
         self._process_started_at: float = time.time()
         self._shutdown_accepted: bool = False
+        # BL-006c: True while we hold a claimed work lease (cleared on release/ack).
+        self._work_lease_active: bool = False
         if session is not None:
             self._register_session(session, activate=True)
 
@@ -331,8 +344,43 @@ class TrainingEngine:
         hb.set_metrics(metrics)
 
     def set_work_poll(self, poll: Callable[[], bool] | None) -> None:
-        """Optional hook: return True when external work was queued (TM jobs later)."""
+        """Optional hook: return True when external work was queued (wake idle)."""
         self._work_poll = poll
+
+    def set_external_step(self, step: Callable[[], bool] | None) -> None:
+        """Optional train tick when this process has no supervised sessions.
+
+        Called from the main ``run()`` loop while authorized and not paused.
+        Return True if a step ran (keep training cadence).
+        """
+        self._external_step = step
+
+    def set_control_hooks(
+        self,
+        *,
+        on_start_resume: Callable[[Any], bool] | None = None,
+        on_pause: Callable[[Any], None] | None = None,
+        on_cancel: Callable[[Any], None] | None = None,
+        on_restore: Callable[[Any], bool] | None = None,
+        pause_gate: Callable[[], bool] | None = None,
+        on_claim_config: Callable[[dict[str, Any]], bool] | None = None,
+        on_release_config: Callable[[], None] | None = None,
+    ) -> None:
+        """Config-specific control extras (not a second claim/HB loop).
+
+        on_start_resume: return False to block authorize (e.g. user_paused).
+        on_restore: return True if fully handled (skip ledger restore).
+        pause_gate: when True, sticky desired=running must not unpause.
+        on_claim_config: apply job.config before authorize; False aborts claim.
+        on_release_config: reset in-process config when lease returns to pool.
+        """
+        self._on_start_resume = on_start_resume
+        self._on_pause = on_pause
+        self._on_cancel = on_cancel
+        self._on_restore = on_restore
+        self._pause_gate = pause_gate
+        self._on_claim_config = on_claim_config
+        self._on_release_config = on_release_config
 
     @property
     def session(self) -> TrainingSession | None:
@@ -578,11 +626,41 @@ class TrainingEngine:
         )
         return session
 
+    def _ledger_model_instance_id(self, session: TrainingSession | None = None) -> str:
+        """Durable TM agent id (job.model_id). Never the pool worker / session UUID."""
+        mid = str(getattr(self.ledger, "model_instance_id", "") or "").strip()
+        if mid and mid != "unbound":
+            return mid
+        if session is not None:
+            return str(session.session_id)
+        return mid or "unbound"
+
+    def adopt_claimed_job(self, job: dict[str, Any]) -> None:
+        """Authorize a lease already claimed by the outer pool-worker loop."""
+        mid = str(job.get("model_id") or "").strip()
+        if mid and getattr(self, "ledger", None) is not None:
+            self.ledger.model_instance_id = mid
+        self._work_lease_active = True
+        self._run_authorized = True
+        hb = self._manager_heartbeat
+        if hb is not None:
+            hb.set_desired_state("running")
+        self.request_resume()
+        logging.info(
+            "[TrainingEngine] adopted job=%s model=%s pool=%s",
+            job.get("job_id"),
+            mid or job.get("model_id"),
+            getattr(hb, "pool_session_id", None) if hb is not None else None,
+        )
+        self._publish_manager_metrics("training")
+        self._emit_engine_status("training", force=True, note="work_adopted")
+
     def run(
         self,
         *,
         activate_pending: bool = False,
         park_when_idle: bool | None = None,
+        job_scoped: bool = False,
     ) -> dict[str, tuple[list[float], list[float]]]:
         """
         Drive ACTIVE sessions to completion (round-robin one epoch each).
@@ -593,9 +671,16 @@ class TrainingEngine:
         **parks idle** until the manager queues ``start`` / ``resume``
         in this process (not merely sticky desired_state from a prior run).
         Pause / restore / shutdown are honored in idle.
+
+        ``job_scoped=True``: lease was claimed outside (pool worker). Do not
+        re-claim; stay in the lease until released/stopped (park within the
+        job — one False ``external_step`` must not ack the whole train job).
         """
         hb = self._manager_heartbeat
-        if hb is not None:
+        if job_scoped:
+            # Hold the lease: idle/pause sleep inside the job, do not exit.
+            park = True
+        elif hb is not None:
             # TM-managed: always park; never auto-train on boot.
             park = True
         elif park_when_idle is None:
@@ -610,7 +695,9 @@ class TrainingEngine:
 
         results: dict[str, tuple[list[float], list[float]]] = {}
         self._stop.clear()
-        boot_state = "idle" if hb is not None else "training"
+        boot_state = "idle" if hb is not None and not job_scoped else "training"
+        if job_scoped and self._run_authorized:
+            boot_state = "training"
         self._maybe_manager_heartbeat(state=boot_state)
         self._emit_engine_status(boot_state, force=True)
 
@@ -618,33 +705,44 @@ class TrainingEngine:
             self.drain_manager_commands(allow_restore=True)
             self._maybe_truncate_imported_journal()
             self._apply_manager_desired_state()
+            self._sync_work_lease()
+            if job_scoped and not self._work_lease_active:
+                break
 
             if self._stop.is_set():
                 break
 
             if not self._manager_allows_training():
+                if job_scoped and not self._work_lease_active:
+                    break
+                if not job_scoped and self._maybe_claim_tm_work():
+                    continue
                 state = "paused" if self._paused.is_set() else "idle"
                 self._maybe_manager_heartbeat(state=state)
                 self._emit_engine_status(state)
-                sleep_s = (
-                    float(getattr(hb._cfg, "idle_sleep_s", 10.0)) if hb else 10.0
-                )
+                sleep_s = self._idle_sleep_s()
                 if self._stop.wait(timeout=max(0.1, sleep_s)):
                     break
                 continue
 
             if self._paused.is_set():
+                if job_scoped and not self._work_lease_active:
+                    break
                 self._maybe_manager_heartbeat(state="paused")
                 self._emit_engine_status("paused")
-                sleep_s = (
-                    float(getattr(hb._cfg, "idle_sleep_s", 10.0)) if hb else 10.0
-                )
+                sleep_s = self._idle_sleep_s()
                 if self._stop.wait(timeout=max(0.1, sleep_s)):
                     break
                 continue
 
             self._arm_pending_fits()
             progressed = self._drive_active_epochs(results)
+            if not progressed and self._external_step is not None:
+                try:
+                    progressed = bool(self._external_step())
+                except Exception:
+                    logging.exception("[TrainingEngine] external_step failed")
+                    progressed = False
             if progressed:
                 self.drain_manager_commands(allow_restore=False)
                 self._maybe_manager_heartbeat(state="training")
@@ -654,21 +752,34 @@ class TrainingEngine:
             if not park:
                 break
 
-            # Idle: sleep, wake, check work, idle heartbeat, repeat.
-            sleep_s = float(getattr(hb._cfg, "idle_sleep_s", 10.0)) if hb else 10.0
+            # Idle within lease (or long-lived park): sleep, wake, check work.
+            sleep_s = self._idle_sleep_s()
             if self._stop.wait(timeout=max(0.1, sleep_s)):
                 break
             self.drain_manager_commands(allow_restore=True)
             self._apply_manager_desired_state()
+            self._sync_work_lease()
+            if job_scoped and not self._work_lease_active:
+                break
             if self._paused.is_set() or not self._manager_allows_training():
                 continue
-            if self._check_for_work():
+            if not job_scoped and self._check_for_work():
                 self._maybe_manager_heartbeat(state="training")
                 self._emit_engine_status("training")
                 continue
             self._idle_heartbeat()
             self._emit_engine_status("idle")
         return results
+
+    def _idle_sleep_s(self) -> float:
+        hb = self._manager_heartbeat
+        if hb is None:
+            return 10.0
+        direct = getattr(hb, "idle_sleep_s", None)
+        if direct is not None:
+            return float(direct)
+        cfg = getattr(hb, "_cfg", None) or getattr(hb, "cfg", None)
+        return float(getattr(cfg, "idle_sleep_s", 10.0) if cfg is not None else 10.0)
 
     def _manager_allows_training(self) -> bool:
         """Without TM, always allow. With TM, only after Start/Resume in this process
@@ -706,6 +817,12 @@ class TrainingEngine:
             if not self._paused.is_set():
                 self.request_pause()
         elif desired == "running":
+            if self._pause_gate is not None and self._pause_gate():
+                # Config hold (ES park / human Pause) sticks until explicit command.
+                if not self._paused.is_set():
+                    self.request_pause()
+                hb.set_desired_state("paused")
+                return
             if self._paused.is_set():
                 self.request_resume()
         elif desired in ("idle", ""):
@@ -728,20 +845,52 @@ class TrainingEngine:
             action = cmd.action.strip().lower()
             try:
                 if action in ("start", "resume"):
+                    if self._on_start_resume is not None:
+                        try:
+                            ok = self._on_start_resume(cmd)
+                        except Exception as exc:  # noqa: BLE001
+                            hb.mark_command_seen(cmd.id)
+                            hb.queue_ack(cmd.id, ok=False, detail=str(exc))
+                            continue
+                        if ok is False:
+                            hb.mark_command_seen(cmd.id)
+                            hb.queue_ack(
+                                cmd.id, ok=False, detail="blocked:start_resume_hook"
+                            )
+                            continue
                     self._run_authorized = True
                     hb.set_desired_state("running")
                     self.request_resume()
                     hb.mark_command_seen(cmd.id)
                     hb.queue_ack(cmd.id, ok=True)
                 elif action == "pause":
+                    if self._on_pause is not None:
+                        try:
+                            self._on_pause(cmd)
+                        except Exception:
+                            logging.exception("[TrainingEngine] on_pause hook failed")
                     hb.set_desired_state("paused")
                     self.request_pause()
                     hb.mark_command_seen(cmd.id)
                     hb.queue_ack(cmd.id, ok=True)
                 elif action == "cancel":
+                    if self._on_cancel is not None:
+                        try:
+                            self._on_cancel(cmd)
+                        except Exception:
+                            logging.exception("[TrainingEngine] on_cancel hook failed")
                     self._run_authorized = False
+                    was_leased = self._work_lease_active
+                    self._work_lease_active = False
                     hb.set_desired_state("idle")
                     self._paused.clear()
+                    if was_leased and self._on_release_config is not None:
+                        try:
+                            self._on_release_config()
+                        except Exception:
+                            logging.exception(
+                                "[TrainingEngine] on_release_config on cancel failed"
+                            )
                     self._publish_manager_metrics("idle")
                     self._emit_engine_status("idle", force=True, note="start_cancelled")
                     hb.mark_command_seen(cmd.id)
@@ -773,6 +922,15 @@ class TrainingEngine:
                     hb.mark_command_seen(cmd.id)
                     hb.queue_ack(cmd.id, ok=True)
                 elif action == "restore":
+                    if self._on_restore is not None:
+                        try:
+                            handled = bool(self._on_restore(cmd))
+                        except Exception as exc:  # noqa: BLE001
+                            hb.mark_command_seen(cmd.id)
+                            hb.queue_ack(cmd.id, ok=False, detail=str(exc))
+                            continue
+                        if handled:
+                            continue
                     # Do not flip sticky desired to paused — restore is weight sync.
                     if not self._paused.is_set() and not allow_restore:
                         self._paused.set()
@@ -790,9 +948,12 @@ class TrainingEngine:
 
         Never fights an explicit restore or a settled local tip — that caused
         1150↔1250 restore loops when ``active_checkpoint`` was stale across HBs.
+        Skip when a config ``on_restore`` hook owns restore (e.g. closed-loop draw).
         """
         hb = self._manager_heartbeat
         if hb is None or not allow_restore:
+            return
+        if self._on_restore is not None:
             return
         if int(self.ledger.version) > 0:
             return
@@ -1005,8 +1166,104 @@ class TrainingEngine:
                 self.drop_session(s.session_id)
         return progressed
 
+    def _sync_work_lease(self) -> None:
+        """If TM parked/cancelled our job (release_job), drop local authorization."""
+        hb = self._manager_heartbeat
+        if hb is None or not self._work_lease_active:
+            return
+        if bool(getattr(hb, "job_bound", False)):
+            return
+        self._work_lease_active = False
+        self._run_authorized = False
+        hb.set_desired_state("idle")
+        if self._paused.is_set():
+            self._paused.clear()
+        if self._on_release_config is not None:
+            try:
+                self._on_release_config()
+            except Exception:
+                logging.exception("[TrainingEngine] on_release_config failed")
+        self._publish_manager_metrics("idle")
+        self._emit_engine_status("idle", force=True, note="work_lease_released")
+        logging.info("[TrainingEngine] work lease released — parking idle")
+
+    def _maybe_claim_tm_work(self) -> bool:
+        """Idle → claim any queued train job (worker = capacity; BL-006c)."""
+        hb = self._manager_heartbeat
+        claim_fn = getattr(hb, "try_claim_work", None) if hb is not None else None
+        if hb is None or claim_fn is None:
+            return False
+        if bool(getattr(hb, "job_bound", False)):
+            return False
+        if self._paused.is_set() or self._stop.is_set():
+            return False
+        if self._run_authorized:
+            return False
+        if self._pause_gate is not None and self._pause_gate():
+            return False
+        try:
+            job = claim_fn()
+        except Exception:
+            logging.exception("[TrainingEngine] try_claim_work failed")
+            return False
+        if not job:
+            return False
+        if self._on_claim_config is not None:
+            try:
+                ok = bool(self._on_claim_config(dict(job)))
+            except Exception:
+                logging.exception("[TrainingEngine] on_claim_config failed")
+                ok = False
+            if not ok:
+                fail = getattr(hb, "fail_work", None)
+                if callable(fail):
+                    try:
+                        fail(error="claim_config_rejected")
+                    except Exception:
+                        logging.exception("[TrainingEngine] fail_work after config reject")
+                else:
+                    unbind = getattr(hb, "unbind_job", None)
+                    if callable(unbind):
+                        unbind()
+                return False
+        mid = str(job.get("model_id") or "").strip()
+        if mid and getattr(self, "ledger", None) is not None:
+            self.ledger.model_instance_id = mid
+        self._work_lease_active = True
+        self._run_authorized = True
+        hb.set_desired_state("running")
+        self.request_resume()
+        logging.info(
+            "[TrainingEngine] claimed job=%s model=%s kind=%s pool=%s",
+            job.get("job_id"),
+            mid or job.get("model_id"),
+            job.get("kind"),
+            getattr(hb, "pool_session_id", None),
+        )
+        try:
+            from src.manager_heartbeat import _diag
+
+            _diag(
+                "engine_claim_authorized",
+                job_id=job.get("job_id"),
+                model_id=mid,
+                kind=job.get("kind"),
+                pool=getattr(hb, "pool_session_id", None),
+                ledger_model=getattr(self.ledger, "model_instance_id", None),
+                has_on_claim_config=self._on_claim_config is not None,
+                has_external_step=self._external_step is not None,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self._publish_manager_metrics("training")
+        self._emit_engine_status("training", force=True, note="work_claimed")
+        return True
+
     def _check_for_work(self) -> bool:
         """True if there is (or was just accepted) training work to drive."""
+        self._sync_work_lease()
+        if self._maybe_claim_tm_work():
+            return True
         if self._work_poll is not None:
             try:
                 if self._work_poll():
@@ -1525,7 +1782,7 @@ class TrainingEngine:
             train_loss=result.loss,
             val_loss=step.val_loss,
             verdict=verdict,
-            model_instance_id=session.session_id,
+            model_instance_id=self._ledger_model_instance_id(session),
         )
 
         if verdict == VERDICT_HEALTHY:
@@ -1539,7 +1796,7 @@ class TrainingEngine:
                 version=new_version,
                 val_loss=step.val_loss,
                 is_local_best=is_local_best,
-                model_instance_id=session.session_id,
+                model_instance_id=self._ledger_model_instance_id(session),
             )
             session._steps_since_checkpoint = 0
 
@@ -1585,7 +1842,9 @@ class TrainingEngine:
             cp = self.ledger.store.get_checkpoint(self.ledger.branch_id, target)
             if cp is None:
                 self.ledger.push_checkpoint(
-                    sess.model, version=target, model_instance_id=sess.session_id
+                    sess.model,
+                    version=target,
+                    model_instance_id=self._ledger_model_instance_id(sess),
                 )
         child_ledger = self.ledger.fork_branch(new_branch_id, target, reason, settings_delta)
         return TrainingEngine(ledger=child_ledger, config=self.config, session=sess)
@@ -1604,7 +1863,9 @@ class TrainingEngine:
         if self.ledger.version == 0:
             with self._ledger_lock:
                 self.ledger.push_checkpoint(
-                    sess.model, version=0, model_instance_id=sess.session_id
+                    sess.model,
+                    version=0,
+                    model_instance_id=self._ledger_model_instance_id(sess),
                 )
         if self.config.contract_list_enabled and hasattr(sess.model, "enable_contract_list"):
             sess.model.enable_contract_list(
@@ -1666,7 +1927,7 @@ class TrainingEngine:
                 version=version,
                 val_loss=val_loss,
                 is_local_best=True,
-                model_instance_id=sess.session_id,
+                model_instance_id=self._ledger_model_instance_id(sess),
             )
         return version
 
