@@ -84,3 +84,9 @@ training_manager:
   timeout_s: 0.5
   idle_sleep_s: 2
   park_when_idle: true
+  # BL-014g — Authentik M2M JWT (or set TM_M2M_* / TM_WORKER_M2M_* env).
+  # m2m:
+  #   token_url: "http://127.0.0.1:9090/application/o/token/"
+  #   client_id: "<OIDC_CLIENT_ID>"
+  #   username: "tm-worker"
+  #   password: "<from setup-fleet-m2m.sh>"

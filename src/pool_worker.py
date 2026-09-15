@@ -137,8 +137,25 @@ def run_pool_worker_loop(
             if bool(getattr(hb, "job_bound", False)):
                 ack = getattr(hb, "ack_work", None)
                 if callable(ack):
-                    ack(result={"ok": True, "model_id": mid, "job_id": jid})
-            logging.info("[PoolWorker] job=%s complete — back to idle", jid)
+                    out = ack(result={"ok": True, "model_id": mid, "job_id": jid})
+                    if out is not None:
+                        logging.info(
+                            "[PoolWorker] job=%s complete — claim released, back to idle",
+                            jid,
+                        )
+                    else:
+                        logging.warning(
+                            "[PoolWorker] job=%s finished locally but ack did not "
+                            "release claim on TM",
+                            jid,
+                        )
+                else:
+                    logging.info("[PoolWorker] job=%s complete — back to idle", jid)
+            else:
+                logging.info(
+                    "[PoolWorker] job=%s complete — already unbound, back to idle",
+                    jid,
+                )
         except Exception as exc:  # noqa: BLE001
             logging.exception("[PoolWorker] job=%s failed: %s", jid, exc)
             if bool(getattr(hb, "job_bound", False)):

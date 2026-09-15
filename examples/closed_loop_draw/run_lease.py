@@ -60,6 +60,10 @@ def build_closed_loop_engine(
         manager_heartbeat=agent.hb,
     )
     engine.set_external_step(agent.train_tick)
+    # Manual ES ends the lease via request_stop → pool_worker ack → idle.
+    bind = getattr(agent, "bind_engine_stop", None)
+    if callable(bind):
+        bind(engine.request_stop)
     hooks: dict[str, Any] = {
         "on_start_resume": agent.on_engine_start_resume,
         "on_pause": agent.on_engine_pause,
@@ -125,3 +129,26 @@ def run_closed_loop_claimed_job(
     finally:
         engine.close()
         agent.close()
+    # Normal finish (e.g. manual ES already acked inside the agent): if the
+    # lease is still bound, release it here so TM does not stay claimed.
+    if bool(getattr(hb, "job_bound", False)):
+        ack = getattr(hb, "ack_work", None)
+        if callable(ack):
+            out = ack(
+                result={
+                    "ok": True,
+                    "reason": "lease_complete",
+                    "model_id": mid,
+                    "job_id": job.get("job_id"),
+                }
+            )
+            if out is not None:
+                logging.info(
+                    "[ClosedLoopLease] job=%s acked after run — claim released",
+                    job.get("job_id"),
+                )
+            else:
+                logging.warning(
+                    "[ClosedLoopLease] job=%s still bound — ack did not release claim",
+                    job.get("job_id"),
+                )

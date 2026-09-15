@@ -19,7 +19,7 @@ def test_regression_engine_heartbeat_pool_only_on_boot():
     )
     calls: list[tuple[str, dict]] = []
 
-    def fake_post(url, body, *, expect_commands):
+    def fake_post(url, body, *, expect_commands, timeout_s=None):
         calls.append((url, dict(body)))
         if "/api/workers/" in url and url.rstrip("/").endswith("/heartbeat"):
             return {"session_id": "55443322", "should_exit": False}
@@ -72,7 +72,7 @@ def test_regression_bind_job_heartbeats_agent_model_id():
     )
     calls: list[tuple[str, dict]] = []
 
-    def fake_post(url, body, *, expect_commands):
+    def fake_post(url, body, *, expect_commands, timeout_s=None):
         calls.append((url, dict(body)))
         if "/api/workers/" in url and url.rstrip("/").endswith("/heartbeat"):
             return {"session_id": "55443322", "should_exit": False}
@@ -121,7 +121,7 @@ def test_regression_pool_heartbeat_miss_clears_registration():
     )
     hb._pool_registered = True
 
-    def fake_post(url, body, *, expect_commands):
+    def fake_post(url, body, *, expect_commands, timeout_s=None):
         del body, expect_commands
         if "/api/workers/" in url and url.endswith("/heartbeat"):
             return None
@@ -137,6 +137,46 @@ def test_regression_pool_heartbeat_miss_clears_registration():
     assert hb._pool_registered is False
 
 
+def test_regression_claim_registers_pool_before_claim():
+    """Claim must sync-register — async HB register races → 404 session not found."""
+    hb = ManagerHeartbeat(
+        ManagerHeartbeatConfig(
+            enabled=True,
+            uri="http://tm.test",
+            instance_id="55443322",
+        )
+    )
+    calls: list[str] = []
+
+    def fake_post(url, body, *, expect_commands, timeout_s=None):
+        del body, expect_commands, timeout_s
+        calls.append(url)
+        if url.endswith("/api/workers/register"):
+            return True
+        if url.endswith("/api/work/claim"):
+            return {
+                "job": {
+                    "job_id": "job-42",
+                    "model_id": "agent-x",
+                    "kind": "train",
+                    "claim_token": "tok-1",
+                    "config": {},
+                }
+            }
+        return {}
+
+    hb._post_json = fake_post  # type: ignore[method-assign]
+    assert hb._pool_registered is False
+    job = hb.try_claim_work()
+    assert job is not None
+    assert hb._pool_registered is True
+    assert any(u.endswith("/api/workers/register") for u in calls)
+    assert any(u.endswith("/api/work/claim") for u in calls)
+    reg_i = next(i for i, u in enumerate(calls) if u.endswith("/api/workers/register"))
+    claim_i = next(i for i, u in enumerate(calls) if u.endswith("/api/work/claim"))
+    assert reg_i < claim_i
+
+
 def test_regression_claim_work_binds_job_then_ack_unbinds():
     """BL-006c/011: claim → bind model_id; ack → unbind (agent HB only while leased)."""
     hb = ManagerHeartbeat(
@@ -148,7 +188,7 @@ def test_regression_claim_work_binds_job_then_ack_unbinds():
     )
     calls: list[tuple[str, dict]] = []
 
-    def fake_post(url, body, *, expect_commands):
+    def fake_post(url, body, *, expect_commands, timeout_s=None):
         calls.append((url, dict(body)))
         if url.endswith("/api/work/claim"):
             return {
@@ -249,7 +289,7 @@ def test_regression_claim_without_model_id_refuses_bind():
         )
     )
 
-    def fake_post(url, body, *, expect_commands):
+    def fake_post(url, body, *, expect_commands, timeout_s=None):
         del body, expect_commands
         if url.endswith("/api/work/claim"):
             return {"job": {"job_id": "j1", "claim_token": "t", "kind": "train"}}
@@ -260,8 +300,63 @@ def test_regression_claim_without_model_id_refuses_bind():
     assert hb.job_bound is False
 
 
+def test_regression_ack_work_keeps_claim_when_http_fails():
+    """Failed /ack must not unbind locally — TM would keep claimed forever."""
+    from src.manager_heartbeat import ManagerHeartbeat, ManagerHeartbeatConfig
+
+    hb = ManagerHeartbeat(
+        ManagerHeartbeatConfig(
+            enabled=True,
+            uri="http://tm.test",
+            instance_id="55443322",
+        )
+    )
+
+    def fake_post(url, body, *, expect_commands, timeout_s=None):
+        del body, expect_commands, timeout_s
+        if url.endswith("/api/work/claim"):
+            return {
+                "job": {
+                    "job_id": "job-keep",
+                    "model_id": "agent-x",
+                    "kind": "train",
+                    "claim_token": "tok-keep",
+                    "config": {},
+                }
+            }
+        if "/ack" in url:
+            return None  # HTTP failed
+        return {}
+
+    hb._post_json = fake_post  # type: ignore[method-assign]
+    assert hb.try_claim_work() is not None
+    assert hb.job_bound is True
+    assert hb.ack_work(result={"ok": True}) is None
+    assert hb.job_bound is True
+    assert hb.job_id == "job-keep"
+
+
+def test_regression_ack_work_skips_without_claim_token():
+    """No claim_token → no ack, stay bound (do not pretend released)."""
+    from src.manager_heartbeat import ManagerHeartbeat, ManagerHeartbeatConfig
+
+    hb = ManagerHeartbeat(
+        ManagerHeartbeatConfig(
+            enabled=True,
+            uri="http://tm.test",
+            instance_id="55443322",
+        )
+    )
+    hb.bind_job("job-notoken", model_id="agent-x")
+    # bind_job does not set claim_token
+    assert hb.ack_work(result={"ok": True}) is None
+    assert hb.job_bound is True
+
+
 def test_regression_pool_hb_release_job_unbinds():
     """BL-006d: pool HB release_job drops agent bind after TM pause/cancel."""
+    from src.manager_heartbeat import ManagerHeartbeat, ManagerHeartbeatConfig
+
     hb = ManagerHeartbeat(
         ManagerHeartbeatConfig(
             enabled=True,
@@ -272,7 +367,8 @@ def test_regression_pool_hb_release_job_unbinds():
     hb.bind_job("job-99", model_id="agent-y")
     hb._pool_registered = True
 
-    def fake_post(url, body, *, expect_commands):
+    def fake_post(url, body, *, expect_commands, timeout_s=None):
+        del timeout_s
         if "/api/workers/" in url and url.endswith("/heartbeat"):
             assert body.get("meta", {}).get("job_id") == "job-99"
             return {"session_id": "55443322", "release_job": True}

@@ -363,6 +363,9 @@ def test_regression_run_closed_loop_lease_stamps_job_model_id(monkeypatch, tmp_p
         def on_release_config(self) -> None:
             return None
 
+        def bind_engine_stop(self, stop) -> None:
+            del stop
+
         def close(self) -> None:
             return None
 
@@ -378,6 +381,12 @@ def test_regression_run_closed_loop_lease_stamps_job_model_id(monkeypatch, tmp_p
             claim_inside_engine=claim_inside_engine,
         )
         assert eng.ledger.model_instance_id == "tm-brain"
+
+        def _run_once(**_kwargs):
+            # Don't park forever in job_scoped idle — this test only stamps ids.
+            return {}
+
+        eng.run = _run_once  # type: ignore[method-assign]
         return eng
 
     monkeypatch.setattr(run_lease, "DrawStudentAgent", _FakeAgent)

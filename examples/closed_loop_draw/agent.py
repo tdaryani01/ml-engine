@@ -18,7 +18,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -123,8 +123,12 @@ class DrawStudentAgent:
         self._remix_after_restore = False
         brain = cfg.get("tm_brain") or {}
         self._es_shadow = bool(brain.get("shadow_on_es", True))
-        # Apply rule decisions (model still shadows inside decide). Default on.
+        # Apply rule decisions only under Autopilot (see _maybe_es_shadow).
         self._es_apply = bool(brain.get("apply_on_es", True))
+        # Job overlay: Start Autopilot checkbox. Default off = manual run-once.
+        self._autopilot = bool(cfg.get("autopilot", False)) or (
+            str(cfg.get("source") or "").strip().lower() == "autopilot"
+        )
 
         tm = cfg.get("training_manager") or {}
         caps = list(tm.get("capabilities") or [])
@@ -157,6 +161,7 @@ class DrawStudentAgent:
         self._stale = 0
         self._es_tripped = False
         self._es_park_hold = False
+        self._es_run_done = False
         self._handled_onset_version: int | None = None
         self._pending_outcome_episode: str | None = None
         self._outcome_horizon = max(1, int(brain.get("outcome_horizon", 10)))
@@ -167,6 +172,12 @@ class DrawStudentAgent:
         self._max_steps = int(cl.get("max_steps", 10))
         self._continuity_weight = float(cl.get("continuity_weight", 0.0))
         self._last_status: str | None = None
+        # Bound by run_lease → TrainingEngine.request_stop (manual ES ends job).
+        self._engine_stop: Callable[[], None] | None = None
+
+    def bind_engine_stop(self, stop: Callable[[], None] | None) -> None:
+        """Wire TrainingEngine.request_stop so manual ES can finish the lease."""
+        self._engine_stop = stop
 
     def close(self) -> None:
         self.app.close()
@@ -288,7 +299,11 @@ class DrawStudentAgent:
                 # Overlay feed/autopilot only — hot knobs come from the checkpoint.
                 for k, v in job_overlay_only(cfg).items():
                     self.cfg[k] = copy.deepcopy(v)
+                self._autopilot = bool(cfg.get("autopilot", False)) or (
+                    str(cfg.get("source") or "").strip().lower() == "autopilot"
+                )
                 self._es_park_hold = False
+                self._es_run_done = False
                 self._user_pause_hold = False
                 _emit(
                     f"claim-config:resume-ckpt="
@@ -310,7 +325,11 @@ class DrawStudentAgent:
             except (TypeError, ValueError):
                 self._config_version = None
             self.apply_run_config(cfg, rebuild=True)
+            self._autopilot = bool(cfg.get("autopilot", False)) or (
+                str(cfg.get("source") or "").strip().lower() == "autopilot"
+            )
             self._es_park_hold = False
+            self._es_run_done = False
             self._user_pause_hold = False
             _emit(
                 f"claim-config:job={job.get('job_id')} "
@@ -346,6 +365,7 @@ class DrawStudentAgent:
         self._configured = False
         self._config_version = None
         self._es_park_hold = False
+        self._es_run_done = False
         self._user_pause_hold = False
         self._remix_after_restore = False
         _emit("config:reset:pool", traj=self._traj)
@@ -614,6 +634,7 @@ class DrawStudentAgent:
             rebuild=False,
         )
         self._es_park_hold = False
+        self._es_run_done = False
         if src == "tm_brain" and phase == "after_restore":
             self._consume_terrain_remix(reason="after_restore")
         live = self._live_config()
@@ -644,6 +665,7 @@ class DrawStudentAgent:
         del cmd
         self._user_pause_hold = False
         self._es_park_hold = False
+        self._es_run_done = False
         _emit("cancelled", loss=self._last_loss, traj=self._traj)
 
     def on_engine_restore(self, cmd) -> bool:
@@ -657,10 +679,10 @@ class DrawStudentAgent:
 
     def train_tick(self) -> bool:
         """One closed-loop traj for TrainingEngine.external_step."""
-        if self._es_park_hold or self._user_pause_hold:
+        if self._es_run_done or self._es_park_hold or self._user_pause_hold:
             return False
         loss = self._train_one()
-        if self._es_park_hold:
+        if self._es_run_done or self._es_park_hold:
             return False
         prev = self._last_status
         self._set_status("training", loss=loss)
@@ -801,14 +823,22 @@ class DrawStudentAgent:
         trip = "es-onset" if onset_hit and not patience_hit else "es-trip"
         self._set_status(trip, loss=self._last_loss)
 
-        # Rules decide + apply first (restore on onset). Remix runs after restore lands.
+        # Manual Start (no Autopilot): ES ends the run. Brain is informational
+        # only — never restore/retune/park claimed (Resume → "cannot resume
+        # job in state claimed" was the bug).
+        if not self._autopilot:
+            self._manual_es_inform_and_finish()
+            return
+
+        # Autopilot: rules decide + apply (restore on onset). Remix after restore.
+        apply = bool(self._es_apply)
         path = f"/api/instances/{self._tm_agent_id()}/tm-brain/act"
         body = {
             "patience": float(self._train_patience),
             "lr": float(self.lr),
             "window": 32,
-            "apply": True,
-            "dry_run": False if self._es_apply else True,
+            "apply": apply,
+            "dry_run": not apply,
             # Grow TM-brain corpus with labeled physiology tapes (families × regimes).
             "synth_on_es": True,
             "synth_n": 8,
@@ -839,14 +869,14 @@ class DrawStudentAgent:
             if reason:
                 _emit(f"brain-reason:{reason}", traj=self._traj)
             self._set_status(f"es-act:{action}", loss=self._last_loss)
-            # Arm terrain remix for the restore dial-out / after_restore resume.
-            if action == "restore_best" and self._remix_data_on_es:
+            # Arm terrain remix only when Autopilot will actually restore.
+            if apply and action == "restore_best" and self._remix_data_on_es:
                 self._remix_after_restore = True
         else:
             action = None
             self._set_status("es-act:fail", loss=self._last_loss)
 
-        if isinstance(actuation, dict):
+        if apply and isinstance(actuation, dict):
             seq = actuation.get("sequence") or actuation.get("would_steps")
             cfg = actuation.get("config")
             _emit(
@@ -863,16 +893,63 @@ class DrawStudentAgent:
             # prior shadow trip — resume(after_restore) continues training.
             elif action == "restore_best" and actuation.get("applied"):
                 self._es_park_hold = False
-        elif not self._es_apply:
-            # Dry-run / shadow-only: park so a human can inspect.
+        else:
+            # Autopilot with apply_on_es off: park within lease (shadow).
             self._paused = True
             self._es_park_hold = True
+            self._remix_after_restore = False
             self.hb.set_desired_state("paused")
             self.hb.post_json(
                 f"/api/instances/{self._tm_agent_id()}/control/pause",
                 {"payload": {"source": "es_shadow_only"}},
                 timeout_s=5.0,
             )
+            _emit("es-stop:shadow", traj=self._traj)
+
+    def _manual_es_inform_and_finish(self) -> None:
+        """Manual Start + ES: end the job. No tm-brain/act (that logs durable
+        episodes the UI reads as live steering). Worker emits would-line only
+        if we ever add a read-only shadow later — for now stay quiet.
+        """
+        self._remix_after_restore = False
+        self._es_park_hold = False
+        self._es_run_done = True
+        self._paused = False
+        self._set_status("es-stop:manual", loss=self._last_loss)
+        self.hb.set_desired_state("idle")
+        stop = self._engine_stop
+        if callable(stop):
+            try:
+                stop()
+            except Exception:  # noqa: BLE001
+                _emit("es-stop:engine_stop_fail", traj=self._traj)
+        else:
+            _emit("es-stop:no_engine_stop", traj=self._traj)
+        # Training finished → release the claim (ack).
+        ack = getattr(self.hb, "ack_work", None)
+        if callable(ack) and bool(getattr(self.hb, "job_bound", False)):
+            try:
+                out = ack(
+                    result={
+                        "ok": True,
+                        "reason": "es_manual_stop",
+                        "model_id": self._tm_agent_id(),
+                    }
+                )
+                if out is not None:
+                    jid = out.get("job_id") or getattr(self.hb, "job_id", None)
+                    _emit(
+                        f"claim-released:job={jid} reason=es_manual_stop",
+                        traj=self._traj,
+                    )
+                else:
+                    _emit("es-stop:ack_rejected", traj=self._traj)
+            except Exception as exc:  # noqa: BLE001
+                _emit(f"es-stop:ack_fail:{exc}", traj=self._traj)
+        elif not bool(getattr(self.hb, "job_bound", False)):
+            _emit("es-stop:already_unbound", traj=self._traj)
+        else:
+            _emit("es-stop:no_ack_work", traj=self._traj)
 
     def _maybe_label_outcome(self) -> None:
         if not self._pending_outcome_episode or self._outcome_due_traj is None:

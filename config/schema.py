@@ -154,6 +154,8 @@ class TrainingManagerSettings:
     idle_sleep_s: float = 10.0
     # After training drains, keep the process alive in the idle park loop.
     park_when_idle: bool = True
+    # BL-014g Authentik M2M (token_url / client_id / username / password). Env TM_M2M_* also works.
+    m2m: Optional[Dict[str, str]] = None
 
 @dataclass(frozen=True)
 class DiagnosticsConfig:

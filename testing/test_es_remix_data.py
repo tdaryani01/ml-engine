@@ -74,6 +74,7 @@ def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
     agent = _bare_agent()
     agent._es_shadow = True
     agent._es_apply = True
+    agent._autopilot = True
     agent._es_min_traj = 1
     agent._train_patience = 1
     agent._es_tripped = False
@@ -115,6 +116,9 @@ def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
                 "actuation": {"applied": True, "sequence": ["pause", "restore", "resume"]},
             }
 
+        def set_desired_state(self, *_a, **_k):
+            return None
+
     agent.hb = HB()
     before_cid = int(agent.command_id)
     DrawStudentAgent._maybe_es_shadow(agent)
@@ -124,6 +128,7 @@ def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
     assert int(agent.command_id) == before_cid
     assert agent._es_park_hold is False  # restore_best clears sticky park
     assert any("/tm-brain/act" in p[0] for p in posts)
+    assert posts[0][1].get("apply") is True
 
 
 def test_regression_es_act_uses_bound_model_not_pool_session(monkeypatch):
@@ -134,6 +139,7 @@ def test_regression_es_act_uses_bound_model_not_pool_session(monkeypatch):
     agent = _bare_agent()
     agent._es_shadow = True
     agent._es_apply = True
+    agent._autopilot = True
     agent._es_min_traj = 1
     agent._train_patience = 1
     agent._es_tripped = False
@@ -170,6 +176,9 @@ def test_regression_es_act_uses_bound_model_not_pool_session(monkeypatch):
                 },
                 "actuation": {"applied": False, "reason": "no actuator for action"},
             }
+
+        def set_desired_state(self, *_a, **_k):
+            return None
 
     agent.hb = HB()
     DrawStudentAgent._maybe_es_shadow(agent)
@@ -270,3 +279,94 @@ def test_regression_after_restore_remixes_if_restore_deferred(monkeypatch):
     assert agent._remix_after_restore is False
     assert agent._es_park_hold is False
     assert agent._remix_count == 1
+
+
+def test_regression_manual_es_does_not_apply_restore(monkeypatch):
+    """Start without Autopilot: ES ends the job — never restore / park claimed."""
+    monkeypatch.setattr(
+        "examples.closed_loop_draw.agent.make_target", _fake_make_target
+    )
+    agent = _bare_agent()
+    agent._es_shadow = True
+    agent._es_apply = True  # setup default — must still not apply without Autopilot
+    agent._autopilot = False
+    agent._es_min_traj = 1
+    agent._train_patience = 1
+    agent._es_tripped = False
+    agent._handled_onset_version = None
+    agent._outcome_horizon = 10
+    agent._pending_outcome_episode = None
+    agent._outcome_due_traj = None
+    agent._paused = False
+    agent._last_status = None
+    agent._traj = 2
+
+    statuses: list[str] = []
+    stops: list[str] = []
+    acks: list[dict] = []
+
+    monkeypatch.setattr(
+        DrawStudentAgent,
+        "_onset_within_patience",
+        lambda self: (True, 30),
+    )
+
+    def _capture_status(self, state, *, loss=None):
+        statuses.append(state)
+        self._last_status = state
+
+    monkeypatch.setattr(DrawStudentAgent, "_set_status", _capture_status)
+
+    posts = []
+
+    class HB:
+        cfg = SimpleNamespace(instance_id="draw-test")
+        job_bound = True
+        job_id = "job-manual-es"
+
+        def post_json(self, path, body, timeout_s=15.0):
+            posts.append((path, body))
+            return {
+                "decision": {
+                    "action": "restore_best",
+                    "authority": "rules",
+                    "reason": "within patience of unhealthy onset",
+                    "episode_id": "ep-manual",
+                    "model_action": None,
+                },
+                "actuation": {"applied": False},
+            }
+
+        def set_desired_state(self, state):
+            posts.append(("desired", state))
+
+        def ack_work(self, *, result=None):
+            acks.append(dict(result or {}))
+            self.job_bound = False
+            return {"job_id": "job-manual-es", "state": "done"}
+
+    agent.hb = HB()
+    agent.bind_engine_stop(lambda: stops.append("stop"))
+    DrawStudentAgent._maybe_es_shadow(agent)
+
+    # Manual: no tm-brain/act (durable episodes look like live steering in UI).
+    assert not any(
+        isinstance(p, str) and "/tm-brain/act" in p for p, _ in posts
+    )
+    assert agent._es_park_hold is False
+    assert agent._es_run_done is True
+    assert agent._paused is False
+    assert agent._remix_after_restore is False
+    assert agent._pending_outcome_episode is None
+    assert ("desired", "idle") in posts
+    assert ("desired", "paused") not in posts
+    assert not any(
+        isinstance(p, str) and p.endswith("/control/pause") for p, _ in posts
+    )
+    assert "es-stop:manual" in statuses
+    assert not any(s.startswith("es-act:") for s in statuses)
+    assert stops == ["stop"]
+    assert len(acks) == 1
+    assert acks[0].get("reason") == "es_manual_stop"
+    assert acks[0].get("ok") is True
+    assert agent.hb.job_bound is False

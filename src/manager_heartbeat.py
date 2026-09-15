@@ -74,6 +74,8 @@ class ManagerHeartbeatConfig:
     timeout_s: float = 0.5
     idle_sleep_s: float = 10.0
     park_when_idle: bool = True
+    # BL-014g — Authentik M2M JWT for gated TM routes (session-health, ledger, act).
+    m2m: dict | None = None
 
 
 class ManagerHeartbeat:
@@ -100,8 +102,18 @@ class ManagerHeartbeat:
                 timeout_s=cfg.timeout_s,
                 idle_sleep_s=cfg.idle_sleep_s,
                 park_when_idle=cfg.park_when_idle,
+                m2m=cfg.m2m,
             )
         self._cfg = cfg
+        from src.m2m_jwt import ClientCredentialsTokenSource
+
+        self._token_source = ClientCredentialsTokenSource.from_mapping(cfg.m2m)
+        if cfg.enabled and self._token_source is None:
+            _log.warning(
+                "TM enabled but M2M JWT not configured — gated routes "
+                "(session-health, ledger, tm-brain/act) will 401. "
+                "Set training_manager.m2m or TM_M2M_* env (BL-014g)."
+            )
         self._lock = threading.Lock()
         self._in_flight = False
         self._registered = False
@@ -117,6 +129,15 @@ class ManagerHeartbeat:
         self._desired_state: str | None = None
         self._seen_command_ids: set[str] = set()
         self._active_checkpoint: dict[str, Any] | None = None
+
+    def _auth_headers(self, base: dict[str, str] | None = None) -> dict[str, str]:
+        headers = dict(base or {})
+        if self._token_source is not None:
+            try:
+                headers.update(self._token_source.auth_header())
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("M2M JWT fetch failed: %s", exc)
+        return headers
 
     @property
     def pool_session_id(self) -> str:
@@ -161,6 +182,43 @@ class ManagerHeartbeat:
             self._desired_state = None
             self._claim_token = None
 
+    def ensure_pool_registered(self) -> bool:
+        """Sync pool register before claim. HB register is async and races claim."""
+        if not self._cfg.enabled or not self._cfg.uri:
+            return False
+        with self._lock:
+            if self._pool_registered:
+                return True
+            sid = self._cfg.instance_id
+            kind = self._cfg.kind
+            label = self._cfg.label
+            caps_src = list(self._cfg.capabilities)
+        base = self._cfg.uri.rstrip("/")
+        caps = ["pool", str(kind or "engine")]
+        for c in caps_src:
+            if c not in caps:
+                caps.append(str(c))
+        ok = self._post_json(
+            f"{base}/api/workers/register",
+            {
+                "session_id": sid,
+                "caps": caps,
+                "meta": {"kind": kind, "label": label or f"pool-{sid}"},
+            },
+            expect_commands=False,
+            timeout_s=max(5.0, float(self._cfg.timeout_s)),
+        )
+        if ok is None:
+            _log.warning(
+                "pool register failed session=%s — cannot claim until TM accepts register",
+                sid,
+            )
+            return False
+        with self._lock:
+            self._pool_registered = True
+        _log.info("[ManagerHeartbeat] pool registered session=%s", sid)
+        return True
+
     def try_claim_work(self, *, lease_s: float | None = None) -> dict[str, Any] | None:
         """Claim one queued job: bind **this worker** to the job (BL-006c/011).
 
@@ -173,6 +231,10 @@ class ManagerHeartbeat:
             if self._job_bound:
                 return None
             sid = self._cfg.instance_id
+        # Register must complete before claim — async maybe_ping races otherwise
+        # (TM 404 session not found).
+        if not self.ensure_pool_registered():
+            return None
         base = self._cfg.uri.rstrip("/")
         body: dict[str, Any] = {"session_id": sid}
         if lease_s is not None:
@@ -181,8 +243,12 @@ class ManagerHeartbeat:
             f"{base}/api/work/claim",
             body,
             expect_commands=True,
+            timeout_s=max(5.0, float(self._cfg.timeout_s)),
         )
         if not isinstance(resp, dict):
+            # Session TTL / TM restart: force re-register next attempt.
+            with self._lock:
+                self._pool_registered = False
             _diag("claim_http_empty", pool=sid, kind=self._cfg.kind, label=self._cfg.label)
             return None
         job = resp.get("job")
@@ -228,40 +294,75 @@ class ManagerHeartbeat:
     def ack_work(
         self, *, result: Mapping[str, Any] | None = None
     ) -> dict[str, Any] | None:
-        """Ack the bound job and unbind agent HB."""
+        """Ack the bound job on TM and unbind. None = claim not released."""
         with self._lock:
             jid = self._job_id
             token = self._claim_token
         if not jid or not token:
+            _log.warning(
+                "ack_work skipped — missing job_id=%r claim_token=%s (claim not released)",
+                jid,
+                "set" if token else "missing",
+            )
             return None
         base = self._cfg.uri.rstrip("/")
         resp = self._post_json(
             f"{base}/api/work/{urllib.parse.quote(jid, safe='')}/ack",
             {"claim_token": token, "result": dict(result or {})},
             expect_commands=True,
+            timeout_s=max(5.0, float(self._cfg.timeout_s)),
         )
+        if not isinstance(resp, dict):
+            _log.warning(
+                "ack_work HTTP failed job=%s — claim still held on TM (not released)",
+                jid,
+            )
+            return None
         self.unbind_job()
         self.set_metrics({"run_state": "idle", "state": "idle"})
-        return resp if isinstance(resp, dict) else None
+        # WARNING so it shows next to HTTP warnings (INFO is often filtered).
+        _log.warning(
+            "[ManagerHeartbeat] released claim job=%s state=%s — ack ok",
+            jid,
+            resp.get("state"),
+        )
+        return resp
 
     def fail_work(
         self, *, error: str, requeue: bool = True
     ) -> dict[str, Any] | None:
-        """Fail the bound job and unbind agent HB."""
+        """Fail the bound job on TM and unbind. None = claim not released."""
         with self._lock:
             jid = self._job_id
             token = self._claim_token
         if not jid or not token:
+            _log.warning(
+                "fail_work skipped — missing job_id=%r claim_token=%s (claim not released)",
+                jid,
+                "set" if token else "missing",
+            )
             return None
         base = self._cfg.uri.rstrip("/")
         resp = self._post_json(
             f"{base}/api/work/{urllib.parse.quote(jid, safe='')}/fail",
             {"claim_token": token, "error": str(error), "requeue": bool(requeue)},
             expect_commands=True,
+            timeout_s=max(5.0, float(self._cfg.timeout_s)),
         )
+        if not isinstance(resp, dict):
+            _log.warning(
+                "fail_work HTTP failed job=%s — claim still held on TM (not released)",
+                jid,
+            )
+            return None
         self.unbind_job()
         self.set_metrics({"run_state": "idle", "state": "failure"})
-        return resp if isinstance(resp, dict) else None
+        _log.warning(
+            "[ManagerHeartbeat] released claim job=%s state=%s — fail ok",
+            jid,
+            resp.get("state"),
+        )
+        return resp
 
     @property
     def desired_state(self) -> str | None:
@@ -347,7 +448,7 @@ class ManagerHeartbeat:
         base = self._cfg.uri.rstrip("/")
         key = urllib.parse.quote(blob_key, safe="/")
         url = f"{base}/api/ledger/blobs/{key}"
-        req = urllib.request.Request(url, method="GET", headers={"Accept": "*/*"})
+        req = urllib.request.Request(url, method="GET", headers=self._auth_headers({"Accept": "*/*"}))
         try:
             with urllib.request.urlopen(req, timeout=max(5.0, float(self._cfg.timeout_s))) as resp:
                 return resp.read()
@@ -366,10 +467,12 @@ class ManagerHeartbeat:
             url,
             data=bytes(data),
             method="PUT",
-            headers={
-                "Content-Type": "application/octet-stream",
-                "Accept": "application/json",
-            },
+            headers=self._auth_headers(
+                {
+                    "Content-Type": "application/octet-stream",
+                    "Accept": "application/json",
+                }
+            ),
         )
         wait = float(timeout_s if timeout_s is not None else max(5.0, float(self._cfg.timeout_s)))
         try:
@@ -394,7 +497,9 @@ class ManagerHeartbeat:
             url,
             data=data,
             method="POST",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=self._auth_headers(
+                {"Content-Type": "application/json", "Accept": "application/json"}
+            ),
         )
         try:
             with urllib.request.urlopen(req, timeout=wait) as resp:
@@ -417,7 +522,7 @@ class ManagerHeartbeat:
         req = urllib.request.Request(
             url,
             method="GET",
-            headers={"Accept": "application/json"},
+            headers=self._auth_headers({"Accept": "application/json"}),
         )
         try:
             with urllib.request.urlopen(req, timeout=wait) as resp:
@@ -462,7 +567,9 @@ class ManagerHeartbeat:
             f"{base}/api/ledger/docs",
             data=data,
             method="POST",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=self._auth_headers(
+                {"Content-Type": "application/json", "Accept": "application/json"}
+            ),
         )
         wait = float(timeout_s if timeout_s is not None else max(2.0, float(self._cfg.timeout_s)))
         try:
@@ -644,17 +751,27 @@ class ManagerHeartbeat:
             )
 
     def _post_json(
-        self, url: str, body: dict[str, Any], *, expect_commands: bool
+        self,
+        url: str,
+        body: dict[str, Any],
+        *,
+        expect_commands: bool,
+        timeout_s: float | None = None,
     ) -> dict[str, Any] | bool | None:
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
             url,
             data=data,
             method="POST",
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=self._auth_headers(
+                {"Content-Type": "application/json", "Accept": "application/json"}
+            ),
+        )
+        wait = float(
+            timeout_s if timeout_s is not None else self._cfg.timeout_s
         )
         try:
-            with urllib.request.urlopen(req, timeout=float(self._cfg.timeout_s)) as resp:
+            with urllib.request.urlopen(req, timeout=wait) as resp:
                 raw = resp.read()
                 if not expect_commands:
                     return True
@@ -665,8 +782,16 @@ class ManagerHeartbeat:
                 except json.JSONDecodeError:
                     return {}
                 return parsed if isinstance(parsed, dict) else {}
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:300]
+            except Exception:  # noqa: BLE001
+                detail = str(exc.reason)
+            _log.warning("POST %s HTTP %s: %s", url, exc.code, detail)
+            return None
         except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
-            _log.debug("POST %s failed: %s", url, exc)
+            _log.warning("POST %s failed: %s", url, exc)
             return None
 
 
@@ -753,6 +878,8 @@ def maybe_from_settings(
         timeout_s = float(getattr(settings, "timeout_s", 0.5))
         idle_sleep_s = float(getattr(settings, "idle_sleep_s", 10.0))
         park_when_idle = bool(getattr(settings, "park_when_idle", True))
+        m2m_raw = getattr(settings, "m2m", None)
+        m2m = dict(m2m_raw) if isinstance(m2m_raw, Mapping) else None
     elif isinstance(settings, Mapping):
         enabled = bool(settings.get("enabled", False))
         uri = str(settings.get("uri", "") or "")
@@ -777,6 +904,8 @@ def maybe_from_settings(
         timeout_s = float(settings.get("timeout_s", 0.5))
         idle_sleep_s = float(settings.get("idle_sleep_s", 10.0))
         park_when_idle = bool(settings.get("park_when_idle", True))
+        m2m_raw = settings.get("m2m")
+        m2m = dict(m2m_raw) if isinstance(m2m_raw, Mapping) else None
     else:
         return None
     if not enabled or not uri:
@@ -832,6 +961,7 @@ def maybe_from_settings(
             timeout_s=timeout_s,
             idle_sleep_s=idle_sleep_s,
             park_when_idle=park_when_idle,
+            m2m=m2m,
         )
     )
     hb.set_metrics(seed_metrics)
