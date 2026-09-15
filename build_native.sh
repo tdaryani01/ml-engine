@@ -68,6 +68,7 @@ SOURCES=(
   src/native/blas_dynamic.cpp
   src/native/conv_im2col_gemm.cpp
   src/native/contract_runner.cpp
+  src/native/mhsa_kernels.cpp
 )
 
 

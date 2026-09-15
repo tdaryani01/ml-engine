@@ -24,6 +24,11 @@ class ContractOp(IntEnum):
     # Fused block (ConvBlock path) — one native entry per fused spatial block
     CONV_BLOCK_FWD = 20
     CONV_BLOCK_BWD = 21
+    # Causal MHSA block (native mhsa_kernels — stubs until implemented)
+    MHSA_BLOCK_FWD = 30
+    MHSA_BLOCK_BWD = 31
+    MHSA_ACTION_FWD = 32
+    MHSA_ACTION_BWD = 33
 
 
 @dataclass
@@ -190,3 +195,31 @@ def cnn_contract_factory(model: Any) -> ContractList:
         layer_param_idx=model._layer_param_idx,
         dense_w_indices=dense_w_indices,
     )
+
+
+def compile_mhsa_training_step(*, graph_id: str = "mhsa_v1") -> ContractList:
+    """
+    Compiled MHSA train step: block fwd → action fwd → action bwd → block bwd → Adam.
+    """
+    contract = ContractList(graph_id=graph_id, num_params=5)
+    contract.ops.extend(
+        [
+            ContractOpDesc(opcode=ContractOp.MHSA_BLOCK_FWD, layer_idx=0, param_idx=0),
+            ContractOpDesc(opcode=ContractOp.MHSA_ACTION_FWD, layer_idx=0, param_idx=4),
+            ContractOpDesc(opcode=ContractOp.MHSA_ACTION_BWD, layer_idx=0, param_idx=4),
+            ContractOpDesc(opcode=ContractOp.MHSA_BLOCK_BWD, layer_idx=0, param_idx=0),
+            ContractOpDesc(opcode=ContractOp.ADAM_APPLY, layer_idx=-1),
+        ]
+    )
+    return contract
+
+
+def mhsa_contract_factory(model: Any) -> ContractList:
+    """Default ContractFactory for MHSANetwork."""
+    from config.constants import EngineBackend
+
+    if getattr(model, "backend", None) != EngineBackend.NATIVE:
+        raise ValueError("MHSA contract list requires NATIVE backend")
+    if int(getattr(model, "d_model", 0)) % int(getattr(model, "num_heads", 1)) != 0:
+        raise ValueError("d_model must be divisible by num_heads")
+    return compile_mhsa_training_step()

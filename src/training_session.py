@@ -242,8 +242,21 @@ class TrainingSession:
             from utils.runtime import current_thread_omp_threads
 
             with current_thread_omp_threads(1):
-                return self.predict_fn(X)
-        return self.predict_fn(X)
+                return self._predict_batched(X)
+        return self._predict_batched(X)
+
+    def _predict_batched(self, X: np.ndarray) -> np.ndarray:
+        """Forward in train-sized chunks (MHSA attention scales with B)."""
+        n = int(X.shape[0])
+        if n == 0:
+            return self.predict_fn(X)
+        bs = int(getattr(self.data_provider, "batch_size", 0) or 0)
+        if bs <= 0 or n <= bs:
+            return self.predict_fn(X)
+        outs = []
+        for i in range(0, n, bs):
+            outs.append(self.predict_fn(X[i : i + bs]))
+        return np.concatenate(outs, axis=0)
 
     def try_reap_contract_step(
         self,

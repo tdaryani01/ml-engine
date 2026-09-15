@@ -1,0 +1,92 @@
+# config/config_mhsa_sanity.yaml — MHSA cue-recall stress geometry (T=128, D=256)
+# Generate data: .venv/bin/python data/generators/mhsa/generate_cue_recall.py --preset sanity
+
+meta:
+  pipeline_name: "mhsa_cue_recall_sanity"
+  stage: "development"
+  suppress_logging: false
+  logging_level: "info"
+  output_dir: "diagnostics_output"
+
+ingestion:
+  source_mode: "csv"
+  data_file_path: "data/samples/mhsa/cue_recall_sanity.npz"
+  feature_names: "auto"
+  splits:
+    train: 0.70
+    val: 0.15
+  drain_on_empty: false
+  amqp_url: "amqp://guest:guest@localhost:5672/%2f"
+  queue_name: "supply_chain.incoming_batches"
+  val_queue_name: "supply_chain.validation_batches"
+
+architecture:
+  model_type: "mhsa"
+  backend: "native"
+  num_classes: 4
+  hidden_layers: []
+  p_dropout: 0.0
+  use_batch_norm: false
+  bn_momentum: 0.9
+
+  mhsa:
+    d_model: 256
+    num_heads: 8
+    max_seq_len: 128
+    action_dim: 4
+    ffn_mult: 4
+    num_layers: 4
+    use_pos_encoding: true
+    use_input_proj: true
+
+optimization:
+  num_threads: 4
+  optimizer: "adam"
+  epochs_full_dataset: 5
+  steps_streaming: 31
+  batch_size: 16
+  learning_rate: 0.001
+
+  lr_scheduler: "exponential"
+  scheduler_decay_rate: 0.98
+  scheduler_epochs_per_drop: 10
+  scheduler_drop_ratio: 0.5
+
+  early_stopping_enabled: false
+  patience: 10
+  min_delta: 1.0e-04
+
+  gradient_clipping_max_norm: 5.0
+
+ledger:
+  enabled: true
+  path: "training_ledger"
+  store_backend: noop
+  branch_id: "main"
+  checkpoint_every_steps: 50
+  checkpoint_on_local_best: true
+  contract_list_enabled: true
+  native_async_submit: false
+
+regularization:
+  lam_l1: 1.0e-05
+  lam_l2: 1.0e-04
+  sparsity_tolerance: 1.0e-05
+
+transformations:
+  fourier_expansion:
+    enabled: false
+    num_frequencies: 4
+
+persistence:
+  load_saved_model: false
+  model_asset_path: "deployed_mhsa_sanity_model.npz"
+
+diagnostics:
+  enabled: true
+  metric_to_plot: "all"
+  save_raw_logs: true
+  figure_width: 10
+  figure_height: 6
+  plot_style: "seaborn-v0_8-darkgrid"
+  output_format: "png"

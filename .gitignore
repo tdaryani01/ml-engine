@@ -16,7 +16,7 @@ venv/
 *.npy
 *.npz
 *.datasets/
-data/
+/data/samples/
 
 # Native build artifacts
 bin/

@@ -288,3 +288,4 @@ Scratch buffers, activations, dataset blobs, DLL handles, global backend singlet
 | 2026-09-09 | **Multi-tenant native:** stages + async mailboxes keyed by per-`ContractRuntime` tenant id; one `TrainingSession` per model instance (parallel different models OK) |
 | 2026-09-09 | **Multi-session engine:** `TrainingEngine.sessions` list; `start_session` registers (PENDING/ACTIVE); `run()` round-robins epochs; shared ledger tags docs with `session_id` via `model_instance_id`; MLP+CNN share `TrainableModel` + pluggable `contract_factory` |
 | 2026-09-09 | **Session lifecycle:** `end_session` / `finish_session` drain+drop; `resume_session` restores session-tagged checkpoint (shared ledger head unchanged); concurrent sync `run_step` allocates ledger version under lock |
+| 2026-09-09 | **MHSA scaffold:** thin `MHSANetwork` + contract opcodes 30–33 + `mhsa_kernels.cpp` stubs; compute TBD — same session/engine/ContractRuntime path as CNN |

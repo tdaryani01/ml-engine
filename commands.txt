@@ -61,3 +61,71 @@ docker images
 docker ps -a
 
 docker system df
+
+
+cd ~/Projects/ml-engine
+taskset -c 0-3 .venv/bin/python - <<'PY'
+import yappi
+from benchmarks.benchmark_cnn import _benchmark_common_from_config, run_pytorch_benchmark
+
+c = _benchmark_common_from_config(None)
+yappi.set_clock_type("wall")
+yappi.clear_stats()
+yappi.start(builtins=False)
+try:
+    run_pytorch_benchmark(
+        X_train=c["X_train"],
+        y_train_classes=c["y_train_classes"],
+        X_val=c["X_val"],
+        y_val_classes=c["y_val_classes"],
+        num_classes=c["num_classes"],
+        batch_size=c["batch_size"],
+        epochs=c["epochs"],
+        lr_init=c["lr_init"],
+        lam_l2=c["lam_l2"],
+        early_stopping_enabled=c["early_stopping_enabled"],
+        patience=c["patience"],
+        min_delta=c["min_delta"],
+        cnn_dict=c["cnn_dict"],
+        num_threads=c["num_threads"],
+    )
+finally:
+    yappi.stop()
+
+out = "yappi_pytorch_pad2.pstat"
+yappi.get_func_stats().save(out, type="pstat")
+print(f"saved {out}")
+PY
+
+
+# if NPZ missing:
+.venv/bin/python data/generators/mhsa/generate_cue_recall.py --preset quick
+
+.venv/bin/python benchmarks/benchmark_mhsa.py --config config/config.yaml --target both
+
+# === TM_TAPE_CLEAN === training-manager ledger tape wipe (excludes drawing-expert by default)
+# Training corpora (drawing_expert episodes/models + JSONL dual-write) are NOT deleted here.
+cd ~/Projects/training-manager
+./scripts/clean-ledger-tape.sh --dry-run
+./scripts/clean-ledger-tape.sh -y                          # all instances except drawing-expert
+./scripts/clean-ledger-tape.sh -i engine-local-1 -y
+./scripts/clean-ledger-tape.sh -y --with-blobs             # also drop MinIO checkpoint objects
+./scripts/clean-ledger-tape.sh -y --include-expert-checkpoints  # also wipe drawing-expert ckpts (rare)
+
+# === TM_EXPERT_GYM_WORKER === preferred path (BL-002)
+# Dashboard: select drawing-expert → Autopilot (or Start). Worker honors Pause; domain=drawing_expert.
+cd ~/Projects/ml-engine
+PYTHONPATH=. .venv/bin/python examples/closed_loop_draw/expert_gym_worker.py \
+  --tm-uri http://127.0.0.1:8000 --poll-s 2
+
+# === TM_EXPERT_GYM === one-shot batch (debug / smoke) → suggest → apply → outcome
+cd ~/Projects/ml-engine
+PYTHONPATH=. .venv/bin/python examples/closed_loop_draw/expert_gym.py --tm-uri http://127.0.0.1:8000 --episodes 8 --train-after
+
+# === TM_EXPERT_CURRICULUM === DEBUG ONLY shell loop — demoted; use gym worker above
+cd ~/Projects/ml-engine
+mkdir -p diagnostics_output/closed_loop_draw
+VAL_TARGET=0.70 MIN_N_TRAIN=40 BATCH=16 MAX_ROUNDS=20 \
+  nohup ./examples/closed_loop_draw/run_expert_curriculum.sh \
+  > diagnostics_output/closed_loop_draw/expert_curriculum.nohup.out 2>&1 &
+tail -f diagnostics_output/closed_loop_draw/expert_curriculum.log

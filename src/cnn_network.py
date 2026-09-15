@@ -390,12 +390,23 @@ class CNNNetwork(TrainableModel):
                 l1_sum += float(np.sum(np.abs(w)))
         return raw_cost + (self.lam_l2 / (2.0 * m)) * l2_sum + (self.lam_l1 / m) * l1_sum
 
-    def _compute_grads_from_cache(self, cache: ForwardCache, y: np.ndarray):
+    def _compute_grads_from_cache(
+        self, cache: ForwardCache, y: np.ndarray | None, *, delta: np.ndarray | None = None
+    ):
         """Compute gradients from a prior forward cache; does not update weights."""
         m = cache.batch_size
         inv_m = 1.0 / float(m)
         output = cache.output
-        delta = self.compute_output_delta(output, y)
+        if delta is not None:
+            delta = np.ascontiguousarray(delta, dtype=output.dtype)
+            if delta.shape != output.shape:
+                raise ValueError(
+                    f"delta shape {delta.shape} != output shape {output.shape}"
+                )
+        else:
+            if y is None:
+                raise ValueError("y is required when delta is not provided")
+            delta = self.compute_output_delta(output, y)
         arena = self.scratch_arena
 
         num_params = len(self.weights)
@@ -497,8 +508,55 @@ class CNNNetwork(TrainableModel):
                 if grad_biases[i] is not None:
                     grad_biases[i] *= scaling_factor
 
-        loss = self.compute_total_loss(output, y)
+        if y is not None:
+            loss = self.compute_total_loss(output, y)
+        else:
+            loss = 0.0
         return loss, grad_weights, grad_biases, m, None, None
+
+    def accumulate_grads_from_delta(
+        self, cache: ForwardCache, delta: np.ndarray
+    ) -> tuple[list, list, int]:
+        """
+        External-δ backward for closed-loop: seed output delta instead of output−y.
+
+        Accumulates into ``_pending_gw/_pending_gb`` (created on first call).
+        Does not apply Adam.
+        """
+        _, gw, gb, m, _, _ = self._compute_grads_from_cache(cache, y=None, delta=delta)
+        if not hasattr(self, "_pending_gw") or self._pending_gw is None:
+            self._pending_gw = [
+                (np.zeros_like(g) if g is not None else None) for g in gw
+            ]
+            self._pending_gb = [
+                (np.zeros_like(g) if g is not None else None) for g in gb
+            ]
+            self._pending_m = int(m)
+        for i, g in enumerate(gw):
+            if g is not None and self._pending_gw[i] is not None:
+                self._pending_gw[i] += np.array(g, dtype=self._pending_gw[i].dtype, copy=True)
+        for i, g in enumerate(gb):
+            if g is not None and self._pending_gb[i] is not None:
+                self._pending_gb[i] += np.array(g, dtype=self._pending_gb[i].dtype, copy=True)
+        return self._pending_gw, self._pending_gb, self._pending_m
+
+    def zero_pending_grads(self) -> None:
+        if getattr(self, "_pending_gw", None) is None:
+            return
+        for g in self._pending_gw:
+            if g is not None:
+                g.fill(0.0)
+        for g in self._pending_gb:
+            if g is not None:
+                g.fill(0.0)
+
+    def apply_pending_grads(self, active_lr: float) -> None:
+        if getattr(self, "_pending_gw", None) is None:
+            return
+        self._apply_grads(
+            self._pending_gw, self._pending_gb, self._pending_m, active_lr
+        )
+        self.zero_pending_grads()
 
     
     def _apply_grads(

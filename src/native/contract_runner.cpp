@@ -2,6 +2,7 @@
 #include "export.h"
 #include "native_tenant.h"
 #include "omp_config.h"
+#include "mhsa_kernels.h"
 #include <immintrin.h>
 #include <cstdint>
 #include <cstring>
@@ -72,6 +73,10 @@ enum ContractOpcode : int32_t {
     OP_ADAM_APPLY = 11,
     OP_CONV_BLOCK_FWD = 20,
     OP_CONV_BLOCK_BWD = 21,
+    OP_MHSA_BLOCK_FWD = 30,
+    OP_MHSA_BLOCK_BWD = 31,
+    OP_MHSA_ACTION_FWD = 32,
+    OP_MHSA_ACTION_BWD = 33,
 };
 
 struct ContractOpRow {
@@ -181,6 +186,9 @@ struct ContractExecCtx {
     DenseBinding dense[8];
     AdamBinding adam;
     float* loss_out;
+    // MHSA (composed; unused when has_mhsa==0)
+    int32_t has_mhsa;
+    MhsaBinding mhsa;
 };
 
 static void softmax_cross_entropy_loss(
@@ -424,6 +432,96 @@ static void adam_update_tensor(
     }
 }
 
+static void adam_apply_mhsa(ContractExecCtx* ctx, float decay_factor) {
+    if (!ctx->has_mhsa) return;
+    MhsaBinding* m = &ctx->mhsa;
+    AdamBinding* a = &ctx->adam;
+    const int64_t D = m->D;
+    const int64_t Hff = m->ffn_hidden;
+    const int64_t A = m->action_dim;
+    if (D < 1 || Hff < 1 || A < 1 || m->num_layers < 1) return;
+
+    for (int64_t li = 0; li < m->num_layers; ++li) {
+        MhsaLayerBind* L = &m->layers[li];
+        if (!L->ms_W_qkv || !L->vs_W_qkv) continue;
+        adam_update_tensor(
+            L->W_qkv, L->dW_qkv, L->ms_W_qkv, L->vs_W_qkv,
+            L->W_qkv_next, L->ms_W_qkv_next, L->vs_W_qkv_next,
+            D * 3 * D, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            L->b_qkv, L->db_qkv, L->ms_b_qkv, L->vs_b_qkv,
+            L->b_qkv_next, L->ms_b_qkv_next, L->vs_b_qkv_next,
+            3 * D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->W_o, L->dW_o, L->ms_W_o, L->vs_W_o,
+            L->W_o_next, L->ms_W_o_next, L->vs_W_o_next,
+            D * D, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            L->b_o, L->db_o, L->ms_b_o, L->vs_b_o,
+            L->b_o_next, L->ms_b_o_next, L->vs_b_o_next,
+            D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->W_ff1, L->dW_ff1, L->ms_W_ff1, L->vs_W_ff1,
+            L->W_ff1_next, L->ms_W_ff1_next, L->vs_W_ff1_next,
+            D * Hff, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            L->b_ff1, L->db_ff1, L->ms_b_ff1, L->vs_b_ff1,
+            L->b_ff1_next, L->ms_b_ff1_next, L->vs_b_ff1_next,
+            Hff, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->W_ff2, L->dW_ff2, L->ms_W_ff2, L->vs_W_ff2,
+            L->W_ff2_next, L->ms_W_ff2_next, L->vs_W_ff2_next,
+            Hff * D, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            L->b_ff2, L->db_ff2, L->ms_b_ff2, L->vs_b_ff2,
+            L->b_ff2_next, L->ms_b_ff2_next, L->vs_b_ff2_next,
+            D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->ln1_gamma, L->d_ln1_gamma, L->ms_ln1_g, L->vs_ln1_g,
+            L->ln1_gamma_next, L->ms_ln1_g_next, L->vs_ln1_g_next,
+            D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->ln1_beta, L->d_ln1_beta, L->ms_ln1_b, L->vs_ln1_b,
+            L->ln1_beta_next, L->ms_ln1_b_next, L->vs_ln1_b_next,
+            D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->ln2_gamma, L->d_ln2_gamma, L->ms_ln2_g, L->vs_ln2_g,
+            L->ln2_gamma_next, L->ms_ln2_g_next, L->vs_ln2_g_next,
+            D, a, ctx->lr, 0.0f);
+        adam_update_tensor(
+            L->ln2_beta, L->d_ln2_beta, L->ms_ln2_b, L->vs_ln2_b,
+            L->ln2_beta_next, L->ms_ln2_b_next, L->vs_ln2_b_next,
+            D, a, ctx->lr, 0.0f);
+    }
+
+    if (m->ms_W_act && m->vs_W_act) {
+        adam_update_tensor(
+            m->W_act, m->dW_act, m->ms_W_act, m->vs_W_act,
+            m->W_act_next, m->ms_W_act_next, m->vs_W_act_next,
+            D * A, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            m->b_act, m->db_act, m->ms_b_act, m->vs_b_act,
+            m->b_act_next, m->ms_b_act_next, m->vs_b_act_next,
+            A, a, ctx->lr, 0.0f);
+    }
+    if (m->pos && m->d_pos && m->ms_pos && m->vs_pos && m->max_seq_len > 0) {
+        adam_update_tensor(
+            m->pos, m->d_pos, m->ms_pos, m->vs_pos,
+            m->pos_next, m->ms_pos_next, m->vs_pos_next,
+            m->max_seq_len * D, a, ctx->lr, decay_factor);
+    }
+    if (m->W_in && m->dW_in && m->ms_W_in && m->vs_W_in) {
+        adam_update_tensor(
+            m->W_in, m->dW_in, m->ms_W_in, m->vs_W_in,
+            m->W_in_next, m->ms_W_in_next, m->vs_W_in_next,
+            D * D, a, ctx->lr, decay_factor);
+        adam_update_tensor(
+            m->b_in, m->db_in, m->ms_b_in, m->vs_b_in,
+            m->b_in_next, m->ms_b_in_next, m->vs_b_in_next,
+            D, a, ctx->lr, 0.0f);
+    }
+}
+
 static void adam_apply_all(ContractExecCtx* ctx) {
     AdamBinding* a = &ctx->adam;
     a->t += 1;
@@ -456,6 +554,8 @@ static void adam_apply_all(ContractExecCtx* ctx) {
             d->b_next, d->ms_b_next, d->vs_b_next,
             d->fan_out, a, ctx->lr, 0.0f);
     }
+
+    adam_apply_mhsa(ctx, decay_factor);
 }
 
 #if defined(ML_ENGINE_PROFILE_CONTRACT_THREADS) && defined(__linux__) && defined(_OPENMP)
@@ -510,6 +610,10 @@ const char* contract_opcode_name(int32_t opcode) {
         case OP_ADAM_APPLY: return "ADAM_APPLY";
         case OP_CONV_BLOCK_FWD: return "CONV_BLOCK_FWD";
         case OP_CONV_BLOCK_BWD: return "CONV_BLOCK_BWD";
+        case OP_MHSA_BLOCK_FWD: return "MHSA_BLOCK_FWD";
+        case OP_MHSA_BLOCK_BWD: return "MHSA_BLOCK_BWD";
+        case OP_MHSA_ACTION_FWD: return "MHSA_ACTION_FWD";
+        case OP_MHSA_ACTION_BWD: return "MHSA_ACTION_BWD";
         default: return "UNKNOWN";
     }
 }
@@ -529,6 +633,8 @@ bool is_training_contract(const ContractOpRow* ops, int32_t op_count) {
     for (int32_t i = 0; i < op_count; ++i) {
         if (ops[i].opcode == OP_CONV_BLOCK_BWD ||
             ops[i].opcode == OP_DENSE_BWD ||
+            ops[i].opcode == OP_MHSA_BLOCK_BWD ||
+            ops[i].opcode == OP_MHSA_ACTION_BWD ||
             ops[i].opcode == OP_ADAM_APPLY) {
             return true;
         }
@@ -772,6 +878,33 @@ static int32_t run_contract_training_step_impl(
                     adam_apply_all(ctx);
                 }
                 break;
+            case OP_MHSA_BLOCK_FWD: {
+                if (!ctx->has_mhsa) return -20;
+                int32_t st = mhsa_block_forward(ctx->X, &ctx->mhsa);
+                if (st != 0) return st;
+                ctx->act = ctx->mhsa.O;
+                break;
+            }
+            case OP_MHSA_BLOCK_BWD: {
+                if (!ctx->has_mhsa) return -21;
+                int32_t st = mhsa_block_backward(ctx->X, &ctx->mhsa);
+                if (st != 0) return st;
+                if (ctx->mhsa.dX) ctx->act = ctx->mhsa.dX;
+                break;
+            }
+            case OP_MHSA_ACTION_FWD: {
+                if (!ctx->has_mhsa) return -22;
+                int32_t st = mhsa_action_forward(&ctx->mhsa);
+                if (st != 0) return st;
+                ctx->act = ctx->mhsa.actions;
+                break;
+            }
+            case OP_MHSA_ACTION_BWD: {
+                if (!ctx->has_mhsa) return -23;
+                int32_t st = mhsa_action_backward(&ctx->mhsa);
+                if (st != 0) return st;
+                break;
+            }
             default:
                 std::fprintf(stderr, "[CONTRACT] unsupported opcode %d\n", op->opcode);
                 return -10;

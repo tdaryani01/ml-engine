@@ -1,0 +1,92 @@
+# examples/closed_loop_draw/config_draw_agent.yaml
+# Draw *student* — closed-loop draw under Training Manager dial-out.
+# Knobs aligned with config_draw_interactive_known_good.yaml (L0 baseline).
+# Teacher/expert lives in training-manager, not in this process.
+meta:
+  pipeline_name: closed_loop_draw_agent
+  output_dir: diagnostics_output/closed_loop_draw_agent
+  # Agent also appends status lines to <output_dir>/draw-student.log (override: --log-file)
+
+closed_loop:
+  max_steps: 10
+  batch_size: 4
+  canvas: [1, 28, 28]
+  num_commands: 6
+  command_id: 0
+  sigma: 0.06
+  action_scale: 0.85
+  action_head_scale: 0.1
+  terminal_loss: true
+  loss_kind: balanced
+  fg_alpha: 15.0
+  fg_thresh: 0.05
+  loss_blur_sigmas: [3.0, 1.0, 0.0]
+  loss_blur_weights: [1.0, 1.0, 1.0]
+  loss_edt_weight: 1.0
+  loss_edt_sym_weight: 1.0
+  loss_edt_soft_tau: 2.0
+  # ES trip for TM shadow. Match session_health.WINDOW (32) so first onset is caught.
+  train_patience: 32
+  es_min_traj: 20
+  # On early stopping: switch to a different stock target mix (listen + remix).
+  remix_data_on_es: true
+  target:
+    kind: stock
+
+mhsa:
+  d_model: 64
+  num_heads: 4
+  action_dim: 4
+  ffn_mult: 2
+  num_layers: 2
+  use_pos_encoding: false
+  use_input_proj: false
+
+cnn_encoder:
+  input_shape: [1, 28, 28]
+  feature_dim: 32
+  dense_head: []
+
+optimization:
+  learning_rate: 0.0005
+  seed: 0
+
+# Append step.complete + periodic checkpoint (weights blob + config) to TM ledger.
+ledger:
+  enabled: true
+  branch_id: main
+  checkpoint_every: 25
+
+# On ES: tm-brain/act — rules decide+apply (model shadows). apply_on_es=true.
+# Restore path: pause → restore weights → resume with config in payload (agent confirms).
+tm_brain:
+  shadow_on_es: true
+  apply_on_es: true
+  outcome_horizon: 10
+
+training_manager:
+  enabled: true
+  uri: "http://127.0.0.1:8000"
+  instance_id: "draw-local-1"
+  kind: "closed_loop"
+  label: "Draw student"
+  advertise_url: "http://127.0.0.1:0"
+  capabilities:
+    - train_step
+    - ledger
+    - start
+    - pause
+    - resume
+    - restore
+    - shutdown
+    - cancel
+  interval_s: 5
+  timeout_s: 0.5
+  idle_sleep_s: 2
+  park_when_idle: true
+  # BL-014g — Authentik M2M JWT (or set TM_M2M_* / TM_WORKER_M2M_* env).
+  # m2m:
+  #   token_url: "http://127.0.0.1:9090/application/o/token/"
+  #   client_id: "<OIDC_CLIENT_ID>"
+  #   username: "tm-worker"
+  #   password: "<from setup-fleet-m2m.sh>"

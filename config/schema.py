@@ -38,6 +38,19 @@ class CNNConfig:
     dense_head: List[int] = field(default_factory=list)  # Intermediate dense layer dimensions
 
 @dataclass(frozen=True)
+class MHSAConfig:
+    """Causal MHSA geometry (active when model_type is MHSA)."""
+    d_model: int
+    num_heads: int
+    max_seq_len: int
+    action_dim: int
+    ffn_mult: int = 4
+    num_layers: int = 1
+    use_pos_encoding: bool = True
+    use_input_proj: bool = False
+
+
+@dataclass(frozen=True)
 class ArchitectureConfig:
     """Defines structural topology settings for the neural network model."""
     model_type: ModelType                      # Enforced Enum Type!
@@ -48,6 +61,7 @@ class ArchitectureConfig:
     use_batch_norm: bool = True
     bn_momentum: float = 0.9
     cnn: Optional[CNNConfig] = None            # Populated when model_type is CNN
+    mhsa: Optional[MHSAConfig] = None          # Populated when model_type is MHSA
 
 @dataclass(frozen=True)
 class OptimizationConfig:
@@ -109,6 +123,41 @@ class LedgerSettings:
     store_backend: str = "file_streaming"
 
 @dataclass(frozen=True)
+class TrainingManagerSettings:
+    """Optional heartbeats to sibling training-manager control plane.
+
+    ``instance_id`` is the **pool worker** id only. Leave empty to get a random
+    numeric id at process start. Durable agent / ledger id is ``job.model_id``.
+    """
+    enabled: bool = False
+    uri: str = "http://127.0.0.1:8000"
+    instance_id: str = ""
+    kind: str = "engine"
+    label: str | None = None
+    advertise_url: str = "http://127.0.0.1:0"
+    capabilities: List[str] = field(
+        default_factory=lambda: [
+            "train_step",
+            "ledger",
+            "start",
+            "pause",
+            "resume",
+            "restore",
+            "shutdown",
+            "cancel",
+        ]
+    )
+    interval_s: float = 10.0
+    timeout_s: float = 0.5
+    # Idle park: sleep this long between wake/check/idle-heartbeat cycles.
+    # Manager marks the instance down after ~60s without a heartbeat.
+    idle_sleep_s: float = 10.0
+    # After training drains, keep the process alive in the idle park loop.
+    park_when_idle: bool = True
+    # BL-014g Authentik M2M (token_url / client_id / username / password). Env TM_M2M_* also works.
+    m2m: Optional[Dict[str, str]] = None
+
+@dataclass(frozen=True)
 class DiagnosticsConfig:
     """Defines plotting and output properties for pipeline diagnostics."""
     enabled: bool
@@ -131,3 +180,6 @@ class PipelineConfig:
     persistence: PersistenceConfig
     diagnostics: DiagnosticsConfig
     ledger: LedgerSettings = field(default_factory=LedgerSettings)
+    training_manager: TrainingManagerSettings = field(
+        default_factory=TrainingManagerSettings
+    )
