@@ -629,14 +629,16 @@ class DrawStudentAgent:
             return False
         if src != "tm_brain":
             self._user_pause_hold = False
-        confirmed = self.apply_run_config(
-            payload.get("config") if isinstance(payload.get("config"), dict) else None,
-            rebuild=False,
+        cfg = (
+            payload.get("config") if isinstance(payload.get("config"), dict) else None
         )
+        confirmed = self.apply_run_config(cfg, rebuild=False)
         self._es_park_hold = False
         self._es_run_done = False
         if src == "tm_brain" and phase == "after_restore":
-            self._consume_terrain_remix(reason="after_restore")
+            # BL-005i: TM stock plate wins over local remix when stamped.
+            if not self._apply_stock_from_feed(cfg):
+                self._consume_terrain_remix(reason="after_restore")
         live = self._live_config()
         if confirmed:
             self._print_config("confirmed", confirmed)
@@ -743,20 +745,15 @@ class DrawStudentAgent:
                 return True, onset_i
         return False, None
 
-    def _remix_training_data(self) -> None:
-        """Generate a different stock target mix (new terrain) and reset patience."""
+    def _apply_stock_command(self, command_id: int) -> None:
+        """Swap train (+ probe) stock target to ``command_id``; reset patience."""
+        pick = int(command_id)
         cl = self.cfg.setdefault("closed_loop", {})
-        cur = int(cl.get("command_id", self.command_id))
-        pool = [int(c) for c in STOCK_COMMAND_IDS if int(c) != cur]
-        if not pool:
-            pool = [int(c) for c in STOCK_COMMAND_IDS]
-        # Deterministic walk through stock mix, seeded by remix count + traj.
-        pick = pool[(int(self._remix_count) + int(self._traj)) % len(pool)]
-        cl["command_id"] = int(pick)
+        cl["command_id"] = pick
         tgt = dict(cl.get("target") or {})
         tgt["kind"] = "stock"
         cl["target"] = tgt
-        self.command_id = int(pick)
+        self.command_id = pick
         self.command_ids = np.full(self.B, self.command_id, dtype=np.int64)
         self.target = make_target(self.cfg, batch_size=self.B)
 
@@ -764,7 +761,6 @@ class DrawStudentAgent:
         probe_tgt = dict(probe_cfg["closed_loop"].get("target") or {})
         probe_tgt["kind"] = probe_tgt.get("kind") or "stock"
         probe_cfg["closed_loop"]["target"] = probe_tgt
-        # Different stock from train when possible.
         probe_pool = [int(c) for c in STOCK_COMMAND_IDS if int(c) != pick]
         if probe_pool:
             probe_cfg["closed_loop"]["command_id"] = int(
@@ -778,10 +774,44 @@ class DrawStudentAgent:
         self._best_probe = None
         self._last_ink_miss = None
         self._last_probe = None
+
+    def _remix_training_data(self) -> None:
+        """Generate a different stock target mix (new terrain) and reset patience."""
+        cl = self.cfg.setdefault("closed_loop", {})
+        cur = int(cl.get("command_id", self.command_id))
+        pool = [int(c) for c in STOCK_COMMAND_IDS if int(c) != cur]
+        if not pool:
+            pool = [int(c) for c in STOCK_COMMAND_IDS]
+        # Deterministic walk through stock mix, seeded by remix count + traj.
+        pick = pool[(int(self._remix_count) + int(self._traj)) % len(pool)]
+        self._apply_stock_command(pick)
         _emit(
             f"es-remix:command_id={self.command_id} n={self._remix_count}",
             traj=self._traj,
         )
+
+    def _apply_stock_from_feed(self, config: dict | None) -> bool:
+        """Prefer TM stock plate ``command_id`` over local remix. True if applied."""
+        if not isinstance(config, dict):
+            return False
+        feed = config.get("feed") if isinstance(config.get("feed"), dict) else {}
+        raw = feed.get("command_id")
+        if raw is None:
+            return False
+        try:
+            cid = int(raw)
+        except (TypeError, ValueError):
+            return False
+        if cid not in set(STOCK_COMMAND_IDS):
+            return False
+        self._apply_stock_command(cid)
+        self._remix_after_restore = False
+        self._es_park_hold = False
+        _emit(
+            f"es-feed-stock:command_id={self.command_id} n={self._remix_count}",
+            traj=self._traj,
+        )
+        return True
 
     def _consume_terrain_remix(self, *, reason: str) -> None:
         """Remix once per restore cycle; clear park so training continues."""

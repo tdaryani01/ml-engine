@@ -370,3 +370,54 @@ def test_regression_manual_es_does_not_apply_restore(monkeypatch):
     assert acks[0].get("reason") == "es_manual_stop"
     assert acks[0].get("ok") is True
     assert agent.hb.job_bound is False
+
+
+def test_regression_after_restore_prefers_feed_stock_over_local_remix(monkeypatch):
+    """BL-005i: resume after_restore with feed.command_id skips local remix."""
+    monkeypatch.setattr(
+        "examples.closed_loop_draw.agent.make_target", _fake_make_target
+    )
+    agent = _bare_agent(command_id=0)
+    agent._remix_after_restore = True
+    agent._es_park_hold = True
+    agent._user_pause_hold = False
+    agent._es_run_done = False
+    agent.hb = SimpleNamespace(
+        set_desired_state=lambda *_a, **_k: None,
+        mark_command_seen=lambda *_a, **_k: None,
+        queue_ack=lambda *_a, **_k: None,
+    )
+    agent._apply_config_payload = lambda _c: {}
+    agent._live_config = lambda: {}
+    agent._print_config = lambda *_a, **_k: None
+    remixed = []
+
+    def boom(*_a, **_k):
+        remixed.append(True)
+        raise AssertionError("local remix must not run when feed stamps command_id")
+
+    monkeypatch.setattr(DrawStudentAgent, "_remix_training_data", boom)
+
+    resume = SimpleNamespace(
+        id="c-feed",
+        action="resume",
+        payload={
+            "source": "tm_brain",
+            "phase": "after_restore",
+            "config": {
+                "feed": {
+                    "plate_id": "plate-x",
+                    "recipe_id": "stock_targets_default",
+                    "command_id": 3,
+                    "plate_kind": "stock_targets",
+                }
+            },
+        },
+    )
+    ok = DrawStudentAgent.on_engine_start_resume(agent, resume)
+    assert ok is True
+    assert remixed == []
+    assert int(agent.command_id) == 3
+    assert agent._remix_after_restore is False
+    assert agent._es_park_hold is False
+    assert agent._remix_count == 1
