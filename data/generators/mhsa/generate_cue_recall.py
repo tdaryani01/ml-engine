@@ -131,8 +131,14 @@ def materialize(
     *,
     preset: str = "quick",
     seed: int | None = None,
+    n_samples: int | None = None,
+    **_kwargs,
 ) -> str:
-    """Write cue-recall NPZ for TM/engine diet materialize."""
+    """Write cue-recall NPZ for TM/engine diet materialize.
+
+    ``n_samples`` is accepted for the kitchen contract; presets own train/val sizes.
+    """
+    del n_samples  # preset owns counts
     if preset not in PRESETS:
         raise ValueError(f"unknown preset {preset!r}")
     cfg = dict(PRESETS[preset])

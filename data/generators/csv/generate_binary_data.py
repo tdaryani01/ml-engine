@@ -2,11 +2,16 @@
 """Two-blob Gaussian binary classification CSV (stdlib + numpy)."""
 from __future__ import annotations
 
-import argparse
 import csv
+import sys
 from pathlib import Path
 
 import numpy as np
+
+_GEN_ROOT = Path(__file__).resolve().parents[1]
+if str(_GEN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_GEN_ROOT))
+from _cli import run_materialize_cli  # noqa: E402
 
 
 class BinaryDataGenerator:
@@ -66,14 +71,5 @@ def materialize(
     return str(path.resolve())
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--out", required=True)
-    p.add_argument("--n", type=int, default=1000)
-    p.add_argument("--seed", type=int, default=42)
-    args = p.parse_args()
-    print(f"Wrote {materialize(args.out, n_samples=args.n, seed=args.seed)}")
-
-
 if __name__ == "__main__":
-    main()
+    run_materialize_cli(__doc__ or "binary gaussians", materialize, default_n=1000)
