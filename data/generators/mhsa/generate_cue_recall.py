@@ -126,6 +126,42 @@ def write_preset(preset: str, output_path: str | None = None) -> str:
     return out
 
 
+def materialize(
+    out_path: str,
+    *,
+    preset: str = "quick",
+    seed: int | None = None,
+) -> str:
+    """Write cue-recall NPZ for TM/engine diet materialize."""
+    if preset not in PRESETS:
+        raise ValueError(f"unknown preset {preset!r}")
+    cfg = dict(PRESETS[preset])
+    if seed is not None:
+        cfg["seed"] = int(seed)
+    T, D, A = int(cfg["T"]), int(cfg["D"]), int(cfg["A"])
+    n_train, n_val = int(cfg["n_train"]), int(cfg["n_val"])
+    use_seed = int(cfg["seed"])
+    out = out_path
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    rng = np.random.default_rng(use_seed)
+    X_train, y_train = generate_cue_recall(n_train, T, D, A, rng)
+    X_val, y_val = generate_cue_recall(n_val, T, D, A, rng)
+    np.savez_compressed(
+        out,
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_val,
+        y_val=y_val,
+        T=np.int32(T),
+        D=np.int32(D),
+        A=np.int32(A),
+        task=np.array("cue_recall"),
+        preset=np.array(preset),
+        seed=np.int32(use_seed),
+    )
+    return os.path.abspath(out)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate causal cue-recall NPZs for MHSA (quick + sanity sizes)."

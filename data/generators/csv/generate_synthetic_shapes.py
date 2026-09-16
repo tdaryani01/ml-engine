@@ -155,6 +155,31 @@ def generate_shapes_dataset(
         logging.info("[Shape Generator] Wrote CSV %s", csv_path)
 
 
+def materialize(
+    out_path: str,
+    *,
+    n_samples: int = 1600,
+    height: int = 28,
+    width: int = 28,
+    channels: int = 3,
+    noise: float = 0.05,
+    seed: int = 42,
+) -> str:
+    """Write NPZ for TM/engine diet materialize (per-class = n/4)."""
+    per = max(1, int(n_samples) // len(CLASS_NAMES))
+    generate_shapes_dataset(
+        out_path,
+        num_samples_per_class=per,
+        channels=channels,
+        height=height,
+        width=width,
+        noise_level=noise,
+        seed=seed,
+        also_csv=False,
+    )
+    return os.path.abspath(out_path)
+
+
 def _default_output(height: int, width: int) -> str:
     """Size-tagged path so 28² and 128² can coexist without clobbering."""
     return os.path.join("data", "samples", "csv", f"synthetic_shapes_{height}.npz")

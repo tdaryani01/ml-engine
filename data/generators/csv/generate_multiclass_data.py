@@ -1,46 +1,62 @@
-# generate_multiclass_data.py
-import os
+# data/generators/csv/generate_multiclass_data.py
+"""3-arm spiral multiclass CSV."""
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
 import numpy as np
 
-def generate_spiral_dataset(file_path="data/generator/robotic_multiclass_data.csv", samples_per_class=2000, noise=0.2):
-    """
-    Manufactures an interwoven 3-armed spiral coordinate matrix 
-    and exports it to a standard CSV.
-    """
-    print(f"Manufacturing 3-class spiral dataset ({samples_per_class * 3} total samples)...")
-    
+
+def generate_spiral_dataset(
+    file_path: str,
+    samples_per_class: int = 500,
+    noise: float = 0.2,
+    seed: int = 42,
+) -> str:
     num_classes = 3
     X = np.zeros((samples_per_class * num_classes, 2))
     y = np.zeros((samples_per_class * num_classes, 1), dtype=int)
-    
-    np.random.seed(42)  # Fixed seed for reproducible test patterns
-    
+    rng = np.random.default_rng(seed)
     for class_idx in range(num_classes):
-        # Calculate array slice indices
         ix = range(samples_per_class * class_idx, samples_per_class * (class_idx + 1))
-        
-        # Radii profiles
         r = np.linspace(0.0, 10.0, samples_per_class)
-        
-        # Angular space offset by 2*pi/3 for each arm, tracking with stochastic noise
-        theta = (np.linspace(class_idx * 2.5, (class_idx + 2.5) * 2.5, samples_per_class) 
-                 + np.random.randn(samples_per_class) * noise)
-        
-        # Assign spatial coordinates (Velocity, Movement)
+        theta = (
+            np.linspace(class_idx * 2.5, (class_idx + 2.5) * 2.5, samples_per_class)
+            + rng.normal(0, noise, samples_per_class)
+        )
         X[ix] = np.c_[r * np.sin(theta), r * np.cos(theta)]
         y[ix] = class_idx
-        
-    # Stack features and categorical integer markers horizontally
     dataset_matrix = np.hstack([X, y])
-    
-    # Ensure directory framework exists
-    os.makedirs(os.path.dirname(os.path.abspath(file_path)) if os.path.dirname(file_path) else '.', exist_ok=True)
-    
-    # Save target coordinates directly to disk
+    path = Path(file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     header = "Velocity,Movement,Target_Class"
-    np.savetxt(file_path, dataset_matrix, delimiter=',', header=header, comments='')
-    print(f"Successfully generated and committed multi-class layout to: {file_path}")
+    np.savetxt(path, dataset_matrix, delimiter=",", header=header, comments="")
+    return str(path.resolve())
+
+
+def materialize(
+    out_path: str,
+    *,
+    n_samples: int = 1500,
+    noise: float = 0.2,
+    seed: int = 42,
+) -> str:
+    per = max(1, int(n_samples) // 3)
+    return generate_spiral_dataset(
+        out_path, samples_per_class=per, noise=noise, seed=seed
+    )
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--out", required=True)
+    p.add_argument("--n", type=int, default=1500)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--noise", type=float, default=0.2)
+    args = p.parse_args()
+    print(f"Wrote {materialize(args.out, n_samples=args.n, seed=args.seed, noise=args.noise)}")
+
 
 if __name__ == "__main__":
-    # Fire the generation sequence once on demand
-    generate_spiral_dataset()
+    main()
