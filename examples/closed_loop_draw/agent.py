@@ -305,6 +305,9 @@ class DrawStudentAgent:
                 self._es_park_hold = False
                 self._es_run_done = False
                 self._user_pause_hold = False
+                clear_si = getattr(self.hb, "clear_site_interrupt", None)
+                if callable(clear_si):
+                    clear_si()
                 _emit(
                     f"claim-config:resume-ckpt="
                     f"v{resume.get('version')} job={job.get('job_id')}",
@@ -331,6 +334,9 @@ class DrawStudentAgent:
             self._es_park_hold = False
             self._es_run_done = False
             self._user_pause_hold = False
+            clear_si = getattr(self.hb, "clear_site_interrupt", None)
+            if callable(clear_si):
+                clear_si()
             _emit(
                 f"claim-config:job={job.get('job_id')} "
                 f"model={job.get('model_id')} "
@@ -629,6 +635,9 @@ class DrawStudentAgent:
             return False
         if src != "tm_brain":
             self._user_pause_hold = False
+            clear_si = getattr(self.hb, "clear_site_interrupt", None)
+            if callable(clear_si):
+                clear_si()
         cfg = (
             payload.get("config") if isinstance(payload.get("config"), dict) else None
         )
@@ -650,6 +659,13 @@ class DrawStudentAgent:
             traj=self._traj,
         )
         return True
+
+    def on_site_interrupt(self) -> None:
+        """BL-023: TM unreachable long enough — park like a user Pause."""
+        self._user_pause_hold = True
+        self._paused = True
+        self.hb.set_desired_state("paused")
+        _emit("paused:site_interrupt", loss=self._last_loss, traj=self._traj)
 
     def on_engine_pause(self, cmd) -> None:
         payload = dict(cmd.payload or {})
@@ -677,7 +693,11 @@ class DrawStudentAgent:
         return True
 
     def pause_gate(self) -> bool:
-        return bool(self._es_park_hold or self._user_pause_hold)
+        return bool(
+            self._es_park_hold
+            or self._user_pause_hold
+            or bool(getattr(self.hb, "site_interrupt_hold", False))
+        )
 
     def train_tick(self) -> bool:
         """One closed-loop traj for TrainingEngine.external_step."""
@@ -860,81 +880,15 @@ class DrawStudentAgent:
             self._manual_es_inform_and_finish()
             return
 
-        # Autopilot: rules decide + apply (restore on onset). Remix after restore.
-        apply = bool(self._es_apply)
-        path = f"/api/instances/{self._tm_agent_id()}/tm-brain/act"
-        body = {
-            "patience": float(self._train_patience),
-            "lr": float(self.lr),
-            "window": 32,
-            "apply": apply,
-            "dry_run": not apply,
-            # Grow TM-brain corpus with labeled physiology tapes (families × regimes).
-            "synth_on_es": True,
-            "synth_n": 8,
-        }
-        out = self.hb.post_json(path, body, timeout_s=15.0)
-        decision = out.get("decision") if isinstance(out, dict) else None
-        actuation = out.get("actuation") if isinstance(out, dict) else None
-        synth = out.get("synth") if isinstance(out, dict) else None
-        if isinstance(synth, dict) and synth.get("n_episodes"):
-            _emit(
-                f"brain-synth:n={synth.get('n_episodes')} "
-                f"iid={synth.get('instance_id')}",
-                traj=self._traj,
-            )
-        if isinstance(decision, dict):
-            ep = decision.get("episode_id")
-            if ep:
-                self._pending_outcome_episode = str(ep)
-                self._outcome_due_traj = self._traj + self._outcome_horizon
-            action = decision.get("action")
-            reason = decision.get("reason")
-            model_a = decision.get("model_action")
-            _emit(
-                f"brain:{action} auth={decision.get('authority')} "
-                f"model={model_a} ep={ep}",
-                traj=self._traj,
-            )
-            if reason:
-                _emit(f"brain-reason:{reason}", traj=self._traj)
-            self._set_status(f"es-act:{action}", loss=self._last_loss)
-            # Arm terrain remix only when Autopilot will actually restore.
-            if apply and action == "restore_best" and self._remix_data_on_es:
-                self._remix_after_restore = True
-        else:
-            action = None
-            self._set_status("es-act:fail", loss=self._last_loss)
-
-        if apply and isinstance(actuation, dict):
-            seq = actuation.get("sequence") or actuation.get("would_steps")
-            cfg = actuation.get("config")
-            _emit(
-                f"actuation:applied={actuation.get('applied')} "
-                f"seq={seq} config={cfg}",
-                traj=self._traj,
-            )
-            # Only hard-hold on park_stop; restore/retune resume via commands.
-            if action == "park_stop" and actuation.get("applied"):
-                self._es_park_hold = True
-                self._paused = True
-                self.hb.set_desired_state("paused")
-            # Successful restore actuation must not leave a sticky park from a
-            # prior shadow trip — resume(after_restore) continues training.
-            elif action == "restore_best" and actuation.get("applied"):
-                self._es_park_hold = False
-        else:
-            # Autopilot with apply_on_es off: park within lease (shadow).
-            self._paused = True
-            self._es_park_hold = True
-            self._remix_after_restore = False
-            self.hb.set_desired_state("paused")
-            self.hb.post_json(
-                f"/api/instances/{self._tm_agent_id()}/control/pause",
-                {"payload": {"source": "es_shadow_only"}},
-                timeout_s=5.0,
-            )
-            _emit("es-stop:shadow", traj=self._traj)
+        # BL-024: Autopilot continuous — publish trip + soft hold only.
+        # TM ES driver sees metrics.state (es-onset/es-trip), runs restore+plate,
+        # and resumes via control commands. No /tm-brain/act (train blew 15s).
+        self._es_park_hold = True
+        self._paused = True
+        if self._es_apply and self._remix_data_on_es:
+            # Arm remix; cleared/consumed on after_restore if feed stock applied.
+            self._remix_after_restore = True
+        _emit("es-stop:await_tm", traj=self._traj)
 
     def _manual_es_inform_and_finish(self) -> None:
         """Manual Start + ES: end the job. No tm-brain/act (that logs durable

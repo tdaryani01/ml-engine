@@ -66,8 +66,70 @@ def test_regression_remix_helper_changes_stock_target(monkeypatch):
     assert agent._remix_count == 1
 
 
+def test_regression_es_autopilot_trip_awaits_tm_no_act(monkeypatch):
+    """BL-024: Autopilot ES publishes trip + soft hold; no /act or /work/pause."""
+    monkeypatch.setattr(
+        "examples.closed_loop_draw.agent.make_target", _fake_make_target
+    )
+    agent = _bare_agent()
+    agent._es_shadow = True
+    agent._es_apply = True
+    agent._autopilot = True
+    agent._es_min_traj = 1
+    agent._train_patience = 1
+    agent._es_tripped = False
+    agent._handled_onset_version = None
+    agent._user_pause_hold = False
+    agent._paused = False
+    agent._traj = 2
+    agent._remix_data_on_es = True
+    agent._remix_after_restore = False
+
+    monkeypatch.setattr(
+        DrawStudentAgent,
+        "_onset_within_patience",
+        lambda self: (True, 30),
+    )
+    statuses: list[str] = []
+
+    def _capture_status(self, state, **_k):
+        statuses.append(str(state))
+
+    monkeypatch.setattr(DrawStudentAgent, "_set_status", _capture_status)
+
+    posts: list[tuple[str, dict]] = []
+
+    class HB:
+        cfg = SimpleNamespace(instance_id="draw-test", timeout_s=0.5)
+
+        @property
+        def bound_model_id(self) -> str:
+            return "tm-brain"
+
+        def post_json(self, path, body, timeout_s=15.0):
+            posts.append((path, dict(body)))
+            return {}
+
+        def set_desired_state(self, *_a, **_k):
+            return None
+
+        def set_metrics(self, *_a, **_k):
+            return None
+
+    agent.hb = HB()
+    DrawStudentAgent._maybe_es_shadow(agent)
+
+    assert agent._paused is True
+    assert agent._es_park_hold is True
+    assert agent._user_pause_hold is False
+    assert agent._remix_after_restore is True
+    assert "es-onset" in statuses or any(s.startswith("es-") for s in statuses)
+    assert not any("/tm-brain/act" in p[0] for p in posts)
+    assert not any(p[0] == "/api/work/pause" for p in posts)
+
+
 def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
-    """Onset/ES posts tm-brain/act and arms remix — does not remix yet."""
+    """Onset/ES soft-holds for TM; does not remix yet."""
     monkeypatch.setattr(
         "examples.closed_loop_draw.agent.make_target", _fake_make_target
     )
@@ -126,13 +188,12 @@ def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
     assert remixed == []
     assert agent._remix_after_restore is True
     assert int(agent.command_id) == before_cid
-    assert agent._es_park_hold is False  # restore_best clears sticky park
-    assert any("/tm-brain/act" in p[0] for p in posts)
-    assert posts[0][1].get("apply") is True
+    assert agent._es_park_hold is True  # soft-hold awaiting TM restore/resume
+    assert not any("/tm-brain/act" in p[0] for p in posts)
 
 
-def test_regression_es_act_uses_bound_model_not_pool_session(monkeypatch):
-    """Pool session id must not be the tm-brain/act path (was HTTP 404)."""
+def test_regression_es_autopilot_uses_bound_model_not_pool_session(monkeypatch):
+    """BL-024: trip uses bound agent id for metrics; no /act to pool session."""
     monkeypatch.setattr(
         "examples.closed_loop_draw.agent.make_target", _fake_make_target
     )
@@ -144,18 +205,26 @@ def test_regression_es_act_uses_bound_model_not_pool_session(monkeypatch):
     agent._train_patience = 1
     agent._es_tripped = False
     agent._handled_onset_version = None
-    agent._outcome_horizon = 10
-    agent._pending_outcome_episode = None
-    agent._outcome_due_traj = None
+    agent._traj = 2
+    agent._stale = 99
+    agent._last_status = None
+    agent._last_loss = 0.0
+    agent._sigma = 0.0
+    agent._max_steps = 64
+    agent._continuity_weight = 0.0
+    agent._ledger_on = False
+    agent._paused = False
+    agent._user_pause_hold = False
+    agent._es_run_done = False
+    agent._remix_data_on_es = False
+    agent._es_apply = True
 
     monkeypatch.setattr(
         DrawStudentAgent,
         "_onset_within_patience",
         lambda self: (False, None),
     )
-    monkeypatch.setattr(DrawStudentAgent, "_set_status", lambda self, *a, **k: None)
-
-    posts: list[str] = []
+    published: list[dict] = []
 
     class HB:
         cfg = SimpleNamespace(instance_id="22409324")  # pool session
@@ -165,27 +234,23 @@ def test_regression_es_act_uses_bound_model_not_pool_session(monkeypatch):
             return "tm-brain"
 
         def post_json(self, path, body, timeout_s=15.0):
-            posts.append(path)
-            return {
-                "decision": {
-                    "action": "noop",
-                    "authority": "rules",
-                    "reason": "stable / continue",
-                    "episode_id": "ep-pool",
-                    "model_action": None,
-                },
-                "actuation": {"applied": False, "reason": "no actuator for action"},
-            }
+            raise AssertionError(f"no HTTP on Autopilot ES trip: {path}")
 
         def set_desired_state(self, *_a, **_k):
             return None
 
+        def set_metrics(self, metrics):
+            published.append(dict(metrics))
+
+        def maybe_ping(self, force=False):
+            return None
+
     agent.hb = HB()
     DrawStudentAgent._maybe_es_shadow(agent)
-
-    assert posts, "expected tm-brain/act POST"
-    assert posts[0] == "/api/instances/tm-brain/tm-brain/act"
-    assert all("22409324" not in p for p in posts)
+    assert agent._tm_agent_id() == "tm-brain"
+    assert agent._es_park_hold is True
+    assert published
+    assert str(published[-1].get("state") or "").startswith("es-")
 
 
 def test_regression_restore_ack_remixes_terrain_once(monkeypatch):

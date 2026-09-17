@@ -1175,6 +1175,29 @@ class TrainingEngine:
             return
         self._work_lease_active = False
         self._run_authorized = False
+        site_hold = bool(getattr(hb, "site_interrupt_hold", False))
+        gate = False
+        if self._pause_gate is not None:
+            try:
+                gate = bool(self._pause_gate())
+            except Exception:
+                gate = False
+        if site_hold or gate:
+            # BL-023 / user pause: look paused, not idle-cleared.
+            hb.set_desired_state("paused")
+            if not self._paused.is_set():
+                self._paused.set()
+            self._publish_manager_metrics("paused")
+            self._emit_engine_status("paused", force=True, note="work_lease_released_paused")
+            if self._on_release_config is not None:
+                try:
+                    self._on_release_config()
+                except Exception:
+                    logging.exception("[TrainingEngine] on_release_config failed")
+            logging.info(
+                "[TrainingEngine] work lease released — staying paused (site/user hold)"
+            )
+            return
         hb.set_desired_state("idle")
         if self._paused.is_set():
             self._paused.clear()

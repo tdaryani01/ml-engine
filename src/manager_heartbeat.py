@@ -20,7 +20,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
+import os
 
 _log = logging.getLogger(__name__)
 
@@ -76,6 +77,8 @@ class ManagerHeartbeatConfig:
     park_when_idle: bool = True
     # BL-014g — Authentik M2M JWT for gated TM routes (session-health, ledger, act).
     m2m: dict | None = None
+    # BL-023: consecutive pool HB soft-fails before local site-interrupt pause.
+    site_interrupt_fail_threshold: int = 6
 
 
 class ManagerHeartbeat:
@@ -90,6 +93,12 @@ class ManagerHeartbeat:
     def __init__(self, cfg: ManagerHeartbeatConfig) -> None:
         pool_id = str(cfg.instance_id or "").strip() or new_pool_session_id()
         if pool_id != cfg.instance_id:
+            thr = int(
+                os.environ.get(
+                    "TM_SITE_INTERRUPT_FAILS",
+                    str(cfg.site_interrupt_fail_threshold),
+                )
+            )
             cfg = ManagerHeartbeatConfig(
                 enabled=cfg.enabled,
                 uri=cfg.uri,
@@ -103,7 +112,31 @@ class ManagerHeartbeat:
                 idle_sleep_s=cfg.idle_sleep_s,
                 park_when_idle=cfg.park_when_idle,
                 m2m=cfg.m2m,
+                site_interrupt_fail_threshold=max(1, thr),
             )
+        else:
+            thr = int(
+                os.environ.get(
+                    "TM_SITE_INTERRUPT_FAILS",
+                    str(cfg.site_interrupt_fail_threshold),
+                )
+            )
+            if thr != cfg.site_interrupt_fail_threshold:
+                cfg = ManagerHeartbeatConfig(
+                    enabled=cfg.enabled,
+                    uri=cfg.uri,
+                    instance_id=cfg.instance_id,
+                    kind=cfg.kind,
+                    label=cfg.label,
+                    advertise_url=cfg.advertise_url,
+                    capabilities=cfg.capabilities,
+                    interval_s=cfg.interval_s,
+                    timeout_s=cfg.timeout_s,
+                    idle_sleep_s=cfg.idle_sleep_s,
+                    park_when_idle=cfg.park_when_idle,
+                    m2m=cfg.m2m,
+                    site_interrupt_fail_threshold=max(1, thr),
+                )
         self._cfg = cfg
         from src.m2m_jwt import ClientCredentialsTokenSource
 
@@ -129,6 +162,11 @@ class ManagerHeartbeat:
         self._desired_state: str | None = None
         self._seen_command_ids: set[str] = set()
         self._active_checkpoint: dict[str, Any] | None = None
+        # BL-023 site interrupt
+        self._hb_fail_streak = 0
+        self._site_interrupt_local = False
+        self._site_interrupt_work_pause_sent = False
+        self._on_site_interrupt: Callable[[], None] | None = None
 
     def _auth_headers(self, base: dict[str, str] | None = None) -> dict[str, str]:
         headers = dict(base or {})
@@ -158,6 +196,82 @@ class ManagerHeartbeat:
         with self._lock:
             return self._job_id
 
+    def set_on_site_interrupt(self, cb: Callable[[], None] | None) -> None:
+        """Called once when HB fail streak trips local user-like pause (BL-023)."""
+        self._on_site_interrupt = cb
+
+    @property
+    def site_interrupt_hold(self) -> bool:
+        with self._lock:
+            return bool(self._site_interrupt_local)
+
+    def clear_site_interrupt(self) -> None:
+        with self._lock:
+            self._site_interrupt_local = False
+            self._site_interrupt_work_pause_sent = False
+            self._hb_fail_streak = 0
+
+    def _trip_site_interrupt(self) -> None:
+        """Local pause after prolonged TM unreachable while holding a job."""
+        cb: Callable[[], None] | None
+        with self._lock:
+            if self._site_interrupt_local or not self._job_bound:
+                return
+            self._site_interrupt_local = True
+            cb = self._on_site_interrupt
+        self.set_desired_state("paused")
+        self.set_metrics({"run_state": "paused", "state": "paused"})
+        _log.warning(
+            "BL-023 site interrupt: TM unreachable streak=%s — local pause",
+            self._cfg.site_interrupt_fail_threshold,
+        )
+        if cb is not None:
+            try:
+                cb()
+            except Exception:  # noqa: BLE001
+                _log.exception("on_site_interrupt callback failed")
+
+    def _note_pool_hb_failure(self) -> None:
+        trip = False
+        with self._lock:
+            self._hb_fail_streak += 1
+            thr = int(self._cfg.site_interrupt_fail_threshold)
+            if (
+                self._job_bound
+                and not self._site_interrupt_local
+                and self._hb_fail_streak >= thr
+            ):
+                trip = True
+        if trip:
+            self._trip_site_interrupt()
+
+    def _note_pool_hb_success(self) -> None:
+        with self._lock:
+            self._hb_fail_streak = 0
+            need_pause = (
+                self._site_interrupt_local
+                and self._job_bound
+                and not self._site_interrupt_work_pause_sent
+            )
+            mid = self._bound_model_id
+        if not need_pause or not mid:
+            return
+        # User-like park so Resume works when the site returns.
+        out = self.post_json(
+            "/api/work/pause",
+            {"model_id": mid},
+            timeout_s=max(5.0, float(self._cfg.timeout_s)),
+        )
+        if out is not None:
+            with self._lock:
+                self._site_interrupt_work_pause_sent = True
+            _log.info("BL-023 site interrupt: posted /api/work/pause model=%s", mid)
+        else:
+            _log.warning(
+                "BL-023 site interrupt: /api/work/pause failed model=%s — will retry",
+                mid,
+            )
+
     def bind_job(
         self, job_id: str | None = None, *, model_id: str | None = None
     ) -> None:
@@ -171,6 +285,10 @@ class ManagerHeartbeat:
             self._job_id = None if job_id is None else str(job_id)
             self._bound_model_id = mid or None
             self._registered = False
+            # Fresh claim clears any prior outage hold.
+            self._site_interrupt_local = False
+            self._site_interrupt_work_pause_sent = False
+            self._hb_fail_streak = 0
 
     def unbind_job(self) -> None:
         """Release worker↔job lease after ack/fail — pool session remains."""
@@ -713,18 +831,26 @@ class ManagerHeartbeat:
             # Session lost (TTL / restart) — re-register next ping.
             with self._lock:
                 self._pool_registered = False
+            self._note_pool_hb_failure()
             return
+        self._note_pool_hb_success()
         if isinstance(body, dict) and body.get("should_exit"):
             _log.info(
                 "training-manager pool drain requested for session=%s", sid
             )
         if isinstance(body, dict) and body.get("release_job") and self.job_bound:
             # BL-006d: TM parked/cancelled — drop agent bind; pool stays.
+            # BL-023: keep paused metrics when site-interrupt / user pause parked us.
+            site_hold = self.site_interrupt_hold
             _log.info(
                 "training-manager release_job for session=%s job=%s", sid, jid
             )
             self.unbind_job()
-            self.set_metrics({"run_state": "idle", "state": "paused"})
+            if site_hold:
+                self.set_metrics({"run_state": "paused", "state": "paused"})
+                self.set_desired_state("paused")
+            else:
+                self.set_metrics({"run_state": "idle", "state": "paused"})
 
     def _flush_acks(self, base: str) -> None:
         with self._lock:
