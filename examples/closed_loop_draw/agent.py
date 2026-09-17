@@ -600,6 +600,9 @@ class DrawStudentAgent:
                 self._traj = ver_i
         self._stale = 0
         self._es_tripped = False
+        # BL-028f: abandon future-timeline onsets left on session-health tape
+        # after restore rewind so we do not immediately re-trip ES.
+        self._advance_handled_past_future_onsets()
         self.hb.set_active_checkpoint(
             {
                 "version": int(version) if version is not None else None,
@@ -745,6 +748,45 @@ class DrawStudentAgent:
         }
         self.hb.queue_ack(cmd.id, ok=True, detail=json.dumps(ack, sort_keys=True))
 
+    def _advance_handled_past_future_onsets(self) -> None:
+        """Mark future-timeline onsets handled after restore rewind (BL-028f).
+
+        Session-health may still list onset_version > traj; those belong to the
+        abandoned timeline and must not re-arm ES at the restored point.
+        """
+        get_json = getattr(self.hb, "get_json", None)
+        if not callable(get_json):
+            return
+        try:
+            path = f"/api/instances/{self._tm_agent_id()}/session-health"
+            health = get_json(path, timeout_s=3.0)
+        except Exception:  # noqa: BLE001 — restore must not fail on health probe
+            return
+        if not health:
+            return
+        raw_onsets = health.get("onsets")
+        onsets: list[dict] = (
+            [o for o in raw_onsets if isinstance(o, dict)]
+            if isinstance(raw_onsets, list)
+            else []
+        )
+        if not onsets and health.get("onset_version") is not None:
+            onsets = [{"version": health.get("onset_version")}]
+        traj = int(self._traj)
+        future_max: int | None = None
+        for o in onsets:
+            try:
+                onset_i = int(o["version"])
+            except (TypeError, ValueError, KeyError):
+                continue
+            if onset_i > traj:
+                future_max = onset_i if future_max is None else max(future_max, onset_i)
+        if future_max is None:
+            return
+        cur = self._handled_onset_version
+        base = int(cur) if cur is not None else -1
+        self._handled_onset_version = max(base, future_max)
+
     def _onset_within_patience(self) -> tuple[bool, int | None]:
         """True when a *new* unhealthy onset is still inside train_patience.
 
@@ -772,7 +814,11 @@ class DrawStudentAgent:
                 continue
             if handled is not None and onset_i <= handled:
                 continue
-            age = max(0, int(self._traj) - onset_i)
+            # Future-timeline onset is invalid after restore rewind
+            # (onset_version > traj → old age=max(0,…) treated it as age 0).
+            if int(self._traj) < onset_i:
+                continue
+            age = int(self._traj) - onset_i
             if age <= patience:
                 return True, onset_i
         return False, None
@@ -877,12 +923,14 @@ class DrawStudentAgent:
         # While tripped, only a brand-new onset re-arms (ink improve clears trip).
         if self._es_tripped and not new_onset:
             return
-        if not patience_hit and not onset_hit:
+        # Already-handled onset must not re-trip after restore clears _es_tripped
+        # (Continuous ES was death-spiraling: restore→1 step→same onset→restore).
+        if not patience_hit and not new_onset:
             return
         self._es_tripped = True
         if onset_ver is not None:
             self._handled_onset_version = int(onset_ver)
-        trip = "es-onset" if onset_hit and not patience_hit else "es-trip"
+        trip = "es-onset" if new_onset and not patience_hit else "es-trip"
         self._set_status(trip, loss=self._last_loss)
 
         # Manual Start (no Autopilot): ES ends the run. Brain is informational
