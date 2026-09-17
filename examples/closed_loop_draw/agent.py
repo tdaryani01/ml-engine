@@ -693,11 +693,24 @@ class DrawStudentAgent:
         return True
 
     def pause_gate(self) -> bool:
-        return bool(
-            self._es_park_hold
-            or self._user_pause_hold
-            or bool(getattr(self.hb, "site_interrupt_hold", False))
-        )
+        """Durable pause only (human / site-interrupt) — blocks claim/unpause.
+
+        Autopilot ES soft-hold is train_tick-only (not here). If we included it,
+        desired flipped to paused, the lease released, and UI Resume left the
+        worker unable to reclaim (board looked idle/queued forever).
+
+        After UI Resume, TM sets desired=idle and clears sticky tm_user_paused.
+        Drop local ``_user_pause_hold`` so the worker can claim the requeued job.
+        """
+        if bool(getattr(self.hb, "site_interrupt_hold", False)):
+            return True
+        if not self._user_pause_hold:
+            return False
+        desired = str(getattr(self.hb, "desired_state", None) or "").strip().lower()
+        if desired in ("idle", "running"):
+            self._user_pause_hold = False
+            return False
+        return True
 
     def train_tick(self) -> bool:
         """One closed-loop traj for TrainingEngine.external_step."""
@@ -883,8 +896,9 @@ class DrawStudentAgent:
         # BL-024: Autopilot continuous — publish trip + soft hold only.
         # TM ES driver sees metrics.state (es-onset/es-trip), runs restore+plate,
         # and resumes via control commands. No /tm-brain/act (train blew 15s).
+        # Soft hold must not set agent._paused / desired=paused (that released
+        # the lease). train_tick no-ops while _es_park_hold; desired stays running.
         self._es_park_hold = True
-        self._paused = True
         if self._es_apply and self._remix_data_on_es:
             # Arm remix; cleared/consumed on after_restore if feed stock applied.
             self._remix_after_restore = True

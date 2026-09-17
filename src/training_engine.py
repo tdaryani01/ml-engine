@@ -818,7 +818,9 @@ class TrainingEngine:
                 self.request_pause()
         elif desired == "running":
             if self._pause_gate is not None and self._pause_gate():
-                # Config hold (ES park / human Pause) sticks until explicit command.
+                # Durable hold (human Pause / site-interrupt) sticks until
+                # explicit Resume. Soft ES await-TM is NOT pause_gate — do not
+                # flip desired→paused (that parks the job and strands Autopilot).
                 if not self._paused.is_set():
                     self.request_pause()
                 hb.set_desired_state("paused")

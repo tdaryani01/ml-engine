@@ -81,9 +81,11 @@ def test_regression_es_autopilot_trip_awaits_tm_no_act(monkeypatch):
     agent._handled_onset_version = None
     agent._user_pause_hold = False
     agent._paused = False
+    agent._es_run_done = False
     agent._traj = 2
     agent._remix_data_on_es = True
     agent._remix_after_restore = False
+    agent._last_loss = 0.0
 
     monkeypatch.setattr(
         DrawStudentAgent,
@@ -119,13 +121,34 @@ def test_regression_es_autopilot_trip_awaits_tm_no_act(monkeypatch):
     agent.hb = HB()
     DrawStudentAgent._maybe_es_shadow(agent)
 
-    assert agent._paused is True
+    assert agent._paused is False  # soft hold must not durable-pause
     assert agent._es_park_hold is True
+    assert agent.pause_gate() is False  # not user/site — keep desired=running
     assert agent._user_pause_hold is False
     assert agent._remix_after_restore is True
     assert "es-onset" in statuses or any(s.startswith("es-") for s in statuses)
     assert not any("/tm-brain/act" in p[0] for p in posts)
     assert not any(p[0] == "/api/work/pause" for p in posts)
+    assert DrawStudentAgent.train_tick(agent) is False
+
+
+def test_regression_pause_gate_clears_on_resume_desired_idle(monkeypatch):
+    """UI Resume sets desired=idle; local user hold must not block reclaim."""
+    monkeypatch.setattr(
+        "examples.closed_loop_draw.agent.make_target", _fake_make_target
+    )
+    agent = _bare_agent()
+    agent._user_pause_hold = True
+    agent._es_park_hold = False
+
+    class HB:
+        cfg = SimpleNamespace(instance_id="pool-1")
+        desired_state = "idle"
+        site_interrupt_hold = False
+
+    agent.hb = HB()
+    assert agent.pause_gate() is False
+    assert agent._user_pause_hold is False
 
 
 def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
