@@ -174,10 +174,16 @@ class DrawStudentAgent:
         self._last_status: str | None = None
         # Bound by run_lease → TrainingEngine.request_stop (manual ES ends job).
         self._engine_stop: Callable[[], None] | None = None
+        # Bound by run_lease → TrainingEngine.request_pause (Autopilot ES park).
+        self._engine_pause: Callable[[], None] | None = None
 
     def bind_engine_stop(self, stop: Callable[[], None] | None) -> None:
         """Wire TrainingEngine.request_stop so manual ES can finish the lease."""
         self._engine_stop = stop
+
+    def bind_engine_pause(self, pause: Callable[[], None] | None) -> None:
+        """Wire TrainingEngine.request_pause for Autopilot ES local park."""
+        self._engine_pause = pause
 
     def close(self) -> None:
         self.app.close()
@@ -630,7 +636,6 @@ class DrawStudentAgent:
         src = str(payload.get("source") or "").strip().lower()
         phase = str(payload.get("phase") or "").strip().lower()
         if self._user_pause_hold and src == "tm_brain":
-            self.hb.set_desired_state("paused")
             _emit("blocked:user_paused", loss=self._last_loss, traj=self._traj)
             return False
         if src != "tm_brain":
@@ -664,7 +669,6 @@ class DrawStudentAgent:
         """BL-023: TM unreachable long enough — park like a user Pause."""
         self._user_pause_hold = True
         self._paused = True
-        self.hb.set_desired_state("paused")
         _emit("paused:site_interrupt", loss=self._last_loss, traj=self._traj)
 
     def on_engine_pause(self, cmd) -> None:
@@ -695,19 +699,15 @@ class DrawStudentAgent:
     def pause_gate(self) -> bool:
         """Durable pause only (human / site-interrupt) — blocks claim/unpause.
 
-        Autopilot ES soft-hold is train_tick-only (not here). If we included it,
-        desired flipped to paused, the lease released, and UI Resume left the
-        worker unable to reclaim (board looked idle/queued forever).
-
-        After UI Resume, TM sets desired=idle and clears sticky tm_user_paused.
-        Drop local ``_user_pause_hold`` so the worker can claim the requeued job.
+        Autopilot ES soft-hold is train_tick + local engine pause (not here).
+        After UI Resume unbound the lease, clear ``_user_pause_hold`` so the
+        worker can reclaim the requeued job.
         """
         if bool(getattr(self.hb, "site_interrupt_hold", False)):
             return True
         if not self._user_pause_hold:
             return False
-        desired = str(getattr(self.hb, "desired_state", None) or "").strip().lower()
-        if desired in ("idle", "running"):
+        if not bool(getattr(self.hb, "job_bound", False)):
             self._user_pause_hold = False
             return False
         return True
@@ -733,7 +733,6 @@ class DrawStudentAgent:
             return
         self._run_authorized = True
         self._paused = False
-        self.hb.set_desired_state("running")
         self.hb.mark_command_seen(cmd.id)
         live = self._live_config()
         ack = {
@@ -893,12 +892,18 @@ class DrawStudentAgent:
             self._manual_es_inform_and_finish()
             return
 
-        # BL-024: Autopilot continuous — publish trip + soft hold only.
-        # TM ES driver sees metrics.state (es-onset/es-trip), runs restore+plate,
-        # and resumes via control commands. No /tm-brain/act (train blew 15s).
-        # Soft hold must not set agent._paused / desired=paused (that released
-        # the lease). train_tick no-ops while _es_park_hold; desired stays running.
+        # BL-024 / BL-027: Autopilot continuous — publish trip + soft hold +
+        # local engine pause. TM ES driver sees metrics.state (es-onset/es-trip),
+        # runs restore+plate, and resumes via control commands. No /work/pause
+        # and no /tm-brain/act (train blew 15s). Soft hold must not release the
+        # lease; train_tick no-ops while _es_park_hold.
         self._es_park_hold = True
+        pause = getattr(self, "_engine_pause", None)
+        if callable(pause) and bool(getattr(self.hb, "job_bound", False)):
+            try:
+                pause()
+            except Exception:  # noqa: BLE001
+                _emit("es-stop:engine_pause_fail", traj=self._traj)
         if self._es_apply and self._remix_data_on_es:
             # Arm remix; cleared/consumed on after_restore if feed stock applied.
             self._remix_after_restore = True
@@ -914,7 +919,6 @@ class DrawStudentAgent:
         self._es_run_done = True
         self._paused = False
         self._set_status("es-stop:manual", loss=self._last_loss)
-        self.hb.set_desired_state("idle")
         stop = self._engine_stop
         if callable(stop):
             try:
