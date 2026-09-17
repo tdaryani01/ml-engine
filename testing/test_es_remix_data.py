@@ -66,6 +66,61 @@ def test_regression_remix_helper_changes_stock_target(monkeypatch):
     assert agent._remix_count == 1
 
 
+def test_regression_es_act_timeout_posts_work_pause(monkeypatch):
+    """Act timeout must /work/pause (not control/pause claimed) so Resume works."""
+    monkeypatch.setattr(
+        "examples.closed_loop_draw.agent.make_target", _fake_make_target
+    )
+    agent = _bare_agent()
+    agent._es_shadow = True
+    agent._es_apply = True
+    agent._autopilot = True
+    agent._es_min_traj = 1
+    agent._train_patience = 1
+    agent._es_tripped = False
+    agent._handled_onset_version = None
+    agent._user_pause_hold = False
+    agent._paused = False
+    agent._traj = 2
+
+    monkeypatch.setattr(
+        DrawStudentAgent,
+        "_onset_within_patience",
+        lambda self: (True, 30),
+    )
+    monkeypatch.setattr(DrawStudentAgent, "_set_status", lambda self, *a, **k: None)
+
+    posts: list[tuple[str, dict]] = []
+
+    class HB:
+        cfg = SimpleNamespace(instance_id="draw-test", timeout_s=0.5)
+
+        @property
+        def bound_model_id(self) -> str:
+            return "tm-brain"
+
+        def post_json(self, path, body, timeout_s=15.0):
+            posts.append((path, dict(body)))
+            if "/tm-brain/act" in path:
+                return None  # timeout / soft-fail
+            if path == "/api/work/pause":
+                return {"state": "paused", "job_id": "j1"}
+            return {}
+
+        def set_desired_state(self, *_a, **_k):
+            return None
+
+    agent.hb = HB()
+    DrawStudentAgent._maybe_es_shadow(agent)
+
+    assert agent._paused is True
+    assert agent._es_park_hold is True
+    assert agent._user_pause_hold is True
+    assert any(p[0] == "/api/work/pause" for p in posts)
+    assert not any("control/pause" in p[0] for p in posts)
+    assert any(p[0] == "/api/work/pause" and p[1].get("model_id") == "tm-brain" for p in posts)
+
+
 def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
     """Onset/ES posts tm-brain/act and arms remix — does not remix yet."""
     monkeypatch.setattr(

@@ -944,17 +944,25 @@ class DrawStudentAgent:
             elif action == "restore_best" and actuation.get("applied"):
                 self._es_park_hold = False
         else:
-            # Autopilot with apply_on_es off: park within lease (shadow).
+            # Act timed out / failed, or apply_on_es off: user-like /work/pause
+            # so Resume works (claimed+control/pause left Resume broken — BL-023).
             self._paused = True
             self._es_park_hold = True
+            self._user_pause_hold = True
             self._remix_after_restore = False
             self.hb.set_desired_state("paused")
-            self.hb.post_json(
-                f"/api/instances/{self._tm_agent_id()}/control/pause",
-                {"payload": {"source": "es_shadow_only"}},
-                timeout_s=5.0,
+            mid = self._tm_agent_id()
+            paused = self.hb.post_json(
+                "/api/work/pause",
+                {"model_id": mid},
+                timeout_s=max(5.0, float(getattr(self.hb.cfg, "timeout_s", 5.0) or 5.0)),
             )
-            _emit("es-stop:shadow", traj=self._traj)
+            if paused is None:
+                # TM still unreachable: local hold stays; site-interrupt HB streak
+                # will retry /work/pause when the site returns.
+                _emit("es-stop:work_pause_pending", traj=self._traj)
+            else:
+                _emit("es-stop:work_pause", traj=self._traj)
 
     def _manual_es_inform_and_finish(self) -> None:
         """Manual Start + ES: end the job. No tm-brain/act (that logs durable
