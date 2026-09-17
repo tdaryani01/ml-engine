@@ -305,6 +305,9 @@ class DrawStudentAgent:
                 self._es_park_hold = False
                 self._es_run_done = False
                 self._user_pause_hold = False
+                clear_si = getattr(self.hb, "clear_site_interrupt", None)
+                if callable(clear_si):
+                    clear_si()
                 _emit(
                     f"claim-config:resume-ckpt="
                     f"v{resume.get('version')} job={job.get('job_id')}",
@@ -331,6 +334,9 @@ class DrawStudentAgent:
             self._es_park_hold = False
             self._es_run_done = False
             self._user_pause_hold = False
+            clear_si = getattr(self.hb, "clear_site_interrupt", None)
+            if callable(clear_si):
+                clear_si()
             _emit(
                 f"claim-config:job={job.get('job_id')} "
                 f"model={job.get('model_id')} "
@@ -629,6 +635,9 @@ class DrawStudentAgent:
             return False
         if src != "tm_brain":
             self._user_pause_hold = False
+            clear_si = getattr(self.hb, "clear_site_interrupt", None)
+            if callable(clear_si):
+                clear_si()
         cfg = (
             payload.get("config") if isinstance(payload.get("config"), dict) else None
         )
@@ -650,6 +659,13 @@ class DrawStudentAgent:
             traj=self._traj,
         )
         return True
+
+    def on_site_interrupt(self) -> None:
+        """BL-023: TM unreachable long enough — park like a user Pause."""
+        self._user_pause_hold = True
+        self._paused = True
+        self.hb.set_desired_state("paused")
+        _emit("paused:site_interrupt", loss=self._last_loss, traj=self._traj)
 
     def on_engine_pause(self, cmd) -> None:
         payload = dict(cmd.payload or {})
@@ -677,7 +693,11 @@ class DrawStudentAgent:
         return True
 
     def pause_gate(self) -> bool:
-        return bool(self._es_park_hold or self._user_pause_hold)
+        return bool(
+            self._es_park_hold
+            or self._user_pause_hold
+            or bool(getattr(self.hb, "site_interrupt_hold", False))
+        )
 
     def train_tick(self) -> bool:
         """One closed-loop traj for TrainingEngine.external_step."""
