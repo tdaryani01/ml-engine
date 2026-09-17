@@ -30,7 +30,6 @@ class _StubHB:
     """In-process stand-in for ManagerHeartbeat (no HTTP)."""
 
     idle_sleep_s: float = 0.02
-    _desired_state: str | None = None
     _active_checkpoint: dict[str, Any] | None = None
     _commands: list[ManagerCommand] = field(default_factory=list)
     acks: list[tuple[str, bool, str | None]] = field(default_factory=list)
@@ -39,13 +38,6 @@ class _StubHB:
 
     def __post_init__(self) -> None:
         self._cfg = type("Cfg", (), {"idle_sleep_s": self.idle_sleep_s})()
-
-    @property
-    def desired_state(self) -> str | None:
-        return self._desired_state
-
-    def set_desired_state(self, desired: str | None) -> None:
-        self._desired_state = None if desired is None else str(desired)
 
     @property
     def active_checkpoint(self) -> dict[str, Any] | None:
@@ -144,9 +136,8 @@ def _run_brief(engine: TrainingEngine, seconds: float = 0.15) -> None:
 
 
 def test_boot_stays_idle_despite_sticky_desired_running():
-    """Sticky desired=running from a prior process must not train without Start."""
+    """Boot without Start must not train (no auto-authorize)."""
     hb = _StubHB()
-    hb.set_desired_state("running")
     model, prov = _bundle()
     with tempfile.TemporaryDirectory() as tmp:
         ledger = TrainingLedger(
@@ -179,7 +170,7 @@ def test_boot_stays_idle_despite_sticky_desired_running():
         assert engine.sessions[0].status == SessionStatus.ACTIVE
         assert not engine.sessions[0]._fit_ready
         engine.close()
-    print("[PASSED] boot stays idle despite sticky desired=running")
+    print("[PASSED] boot stays idle without start authorize")
 
 
 def test_start_command_authorizes_training():
@@ -244,7 +235,6 @@ def test_restore_applies_weights_and_version_while_idle():
 
     blob_key = "ckpts/test/v0.bin"
     hb.blobs[blob_key] = pickle.dumps(beginning)
-    hb.set_desired_state("idle")
 
     with tempfile.TemporaryDirectory() as tmp:
         ledger = TrainingLedger(
@@ -297,7 +287,6 @@ def test_restore_applies_weights_and_version_while_idle():
         assert ledger.version == 0
         assert np.allclose(model.weights[0], w0[0])
         assert engine._run_authorized is False
-        assert hb.desired_state == "idle"
         ok_acks = [a for a in hb.acks if a[1] and "restored" in (a[2] or "")]
         assert ok_acks, f"expected restore ACK, got {hb.acks}"
         engine.close()
@@ -361,7 +350,6 @@ def test_restore_after_training_recovers_checkpoint_weights():
         if engine.sessions:
             engine.drop_session(engine.sessions[0].session_id)
         engine._run_authorized = False
-        hb.set_desired_state("idle")
 
         t2 = threading.Thread(target=_go, daemon=True)
         t2.start()
@@ -429,7 +417,6 @@ def test_cancel_revokes_run_authorization():
         engine.request_stop()
         t.join(timeout=3.0)
         assert engine._run_authorized is False
-        assert hb.desired_state == "idle"
         engine.close()
     print("[PASSED] cancel revokes run authorization")
 
@@ -437,7 +424,6 @@ def test_cancel_revokes_run_authorization():
 def test_stale_shutdown_command_stops_engine():
     """If TM redelivers shutdown on boot, engine exits — register must prevent this."""
     hb = _StubHB()
-    hb.set_desired_state("idle")
     model, prov = _bundle(seed=23)
     with tempfile.TemporaryDirectory() as tmp:
         ledger = TrainingLedger(
@@ -473,13 +459,13 @@ def test_stale_shutdown_command_stops_engine():
         hb.push_command("shutdown")
         t.join(timeout=3.0)
         assert not t.is_alive(), "engine should exit after shutdown"
-        assert hb.desired_state == "stopped"
+        assert engine._shutdown_accepted is True
         engine.close()
     print("[PASSED] shutdown command stops engine (stale redelivery hazard)")
 
 
 def test_boot_idle_then_start_trains_without_auto_stop():
-    """Happy path: idle → start → training; must NOT flip to stopped on its own."""
+    """Happy path: paused → start → training; must NOT flip to stopped on its own."""
     hb = _StubHB()
     model, prov = _bundle(seed=29)
     with tempfile.TemporaryDirectory() as tmp:
@@ -514,18 +500,18 @@ def test_boot_idle_then_start_trains_without_auto_stop():
         t.start()
         time.sleep(0.08)
         assert t.is_alive()
-        assert hb.desired_state in (None, "idle")
+        assert engine._run_authorized is False
         hb.push_command("start")
         deadline = time.time() + 3.0
         while time.time() < deadline and ledger.version == 0:
             time.sleep(0.05)
         assert ledger.version > 0
         assert t.is_alive(), "engine died during training without shutdown"
-        assert hb.desired_state == "running"
-        # Still alive after training work (park idle with desired=running is ok)
+        assert engine._run_authorized is True
+        # Still alive after training work
         time.sleep(0.15)
         assert t.is_alive()
-        assert hb.desired_state != "stopped"
+        assert not engine._stop.is_set()
         engine.request_stop()
         t.join(timeout=3.0)
         engine.close()

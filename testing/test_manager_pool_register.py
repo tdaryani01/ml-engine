@@ -24,7 +24,7 @@ def test_regression_engine_heartbeat_pool_only_on_boot():
         if "/api/workers/" in url and url.rstrip("/").endswith("/heartbeat"):
             return {"session_id": "55443322", "should_exit": False}
         if expect_commands:
-            return {"desired_state": "idle", "commands": []}
+            return {"commands": []}
         return True
 
     hb._post_json = fake_post  # type: ignore[method-assign]
@@ -77,7 +77,7 @@ def test_regression_bind_job_heartbeats_agent_model_id():
         if "/api/workers/" in url and url.rstrip("/").endswith("/heartbeat"):
             return {"session_id": "55443322", "should_exit": False}
         if expect_commands:
-            return {"desired_state": "running", "commands": []}
+            return {"commands": []}
         return True
 
     hb._post_json = fake_post  # type: ignore[method-assign]
@@ -203,7 +203,7 @@ def test_regression_claim_work_binds_job_then_ack_unbinds():
         if "/ack" in url:
             return {"job_id": "job-42", "state": "done"}
         if expect_commands:
-            return {"desired_state": "running", "commands": []}
+            return {"commands": []}
         return True
 
     hb._post_json = fake_post  # type: ignore[method-assign]

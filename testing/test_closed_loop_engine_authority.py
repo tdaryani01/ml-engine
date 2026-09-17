@@ -17,7 +17,6 @@ from src.training_engine import TrainingEngine
 @dataclass
 class _StubHB:
     idle_sleep_s: float = 0.02
-    _desired_state: str | None = None
     _active_checkpoint: dict[str, Any] | None = None
     _commands: list[ManagerCommand] = field(default_factory=list)
     acks: list[tuple[str, bool, str | None]] = field(default_factory=list)
@@ -26,13 +25,6 @@ class _StubHB:
     job_id: str | None = None
     claim_calls: int = 0
     claim_jobs: list[dict[str, Any]] = field(default_factory=list)
-
-    @property
-    def desired_state(self) -> str | None:
-        return self._desired_state
-
-    def set_desired_state(self, state: str | None) -> None:
-        self._desired_state = state
 
     @property
     def active_checkpoint(self) -> dict[str, Any] | None:
@@ -235,4 +227,77 @@ def test_regression_pause_gate_blocks_claim():
         engine.set_control_hooks(pause_gate=lambda: True)
         assert engine._maybe_claim_tm_work() is False
         assert hb.claim_calls == 0
+        engine.close()
+
+
+def test_regression_bl026_engine_does_not_overwrite_metrics_while_leased():
+    """BL-026: while job_bound, engine idle must not clobber worker ES output."""
+    hb = _StubHB()
+    hb.job_bound = True
+    hb.metrics = {"state": "es-onset", "traj": 352}
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = TrainingLedger(
+            store=FileLedgerStore(tmp),
+            branch_id="main",
+            architecture_id="closed_loop_draw",
+        )
+        engine = TrainingEngine(
+            ledger=ledger,
+            config=LedgerConfig(
+                checkpoint_every_steps=10**9,
+                checkpoint_on_local_best=False,
+            ),
+            manager_heartbeat=hb,  # type: ignore[arg-type]
+        )
+        engine._work_lease_active = True
+        engine._run_authorized = True
+        engine._publish_manager_metrics("idle")
+        engine._idle_heartbeat()
+        assert hb.metrics.get("state") == "es-onset"
+        assert hb.metrics.get("traj") == 352
+        engine.close()
+
+
+def test_regression_bl027_no_desired_gate_trains_when_authorized():
+    """BL-027: authorized + job_bound, no desired field — external_step runs."""
+    hb = _StubHB()
+    hb.job_bound = True
+    ticks = {"n": 0}
+
+    def step() -> bool:
+        ticks["n"] += 1
+        return ticks["n"] < 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger = TrainingLedger(
+            store=FileLedgerStore(tmp),
+            branch_id="main",
+            architecture_id="closed_loop_draw",
+        )
+        engine = TrainingEngine(
+            ledger=ledger,
+            config=LedgerConfig(
+                checkpoint_every_steps=10**9,
+                checkpoint_on_local_best=False,
+            ),
+            manager_heartbeat=hb,  # type: ignore[arg-type]
+        )
+        engine.set_external_step(step)
+        engine._work_lease_active = True
+        engine._run_authorized = True
+        engine.request_resume()
+
+        def _go() -> None:
+            engine.run(job_scoped=True)
+
+        t = threading.Thread(target=_go, daemon=True)
+        t.start()
+        deadline = time.time() + 3.0
+        while time.time() < deadline and ticks["n"] < 2:
+            time.sleep(0.02)
+        engine.request_stop()
+        t.join(timeout=3.0)
+        assert ticks["n"] >= 2
+        assert engine._run_authorized is True
+        assert not hasattr(hb, "desired_state") or getattr(hb, "desired_state", None) is None
         engine.close()

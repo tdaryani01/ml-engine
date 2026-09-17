@@ -257,12 +257,12 @@ class TrainingEngine:
         self._last_status_line: str | None = None
         self._restored_checkpoint_version: int | None = None
         # After fit completes sessions are dropped; keep the model so TM restore
-        # can still apply weights while parked idle.
+        # can still apply weights while parked paused.
         self._held_model_for_restore: Any | None = None
-        # Sticky desired=running from a prior process must not auto-train.
-        # Only an explicit start/resume command in *this* process authorizes run.
+        # Only an explicit start/resume (or claim/adopt) in *this* process
+        # authorizes run — boot never auto-trains.
         self._run_authorized: bool = False
-        # Sticky desired=stopped / redelivered shutdown must not kill a new process.
+        # Redelivered pre-boot shutdown must not kill a new process.
         self._process_started_at: float = time.time()
         self._shutdown_accepted: bool = False
         # BL-006c: True while we hold a claimed work lease (cleared on release/ack).
@@ -296,9 +296,12 @@ class TrainingEngine:
         force: bool = False,
         note: str | None = None,
     ) -> None:
-        """Print a compact run-state line (status changes only). Details stay in logs."""
-        hb = self._manager_heartbeat
-        desired = None if hb is None else hb.desired_state
+        """Print a compact run-state line (status changes only). Details stay in logs.
+
+        Worker model is binary: running/training vs paused (idle ≡ paused, no claim).
+        """
+        if state == "idle":
+            state = "paused"
         ckpt = int(self.ledger.version)
         loss = None
         sess = self._current_session
@@ -307,8 +310,6 @@ class TrainingEngine:
         parts = [f"status={state}", f"checkpoint=v{ckpt}"]
         if self._restored_checkpoint_version is not None:
             parts.append(f"restored_from=v{self._restored_checkpoint_version}")
-        if desired is not None:
-            parts.append(f"desired={desired}")
         if loss is not None:
             parts.append(f"loss={loss:.4f}")
         if note:
@@ -323,6 +324,11 @@ class TrainingEngine:
     def _publish_manager_metrics(self, state: str, session: TrainingSession | None = None) -> None:
         hb = self._manager_heartbeat
         if hb is None:
+            return
+        # BL-026: while a train job is leased, metrics.state is a worker *output*
+        # (agent trip/progress). Engine idle/pause loops must not overwrite
+        # es-onset with idle (board idle + pool busy; TM never steers).
+        if bool(getattr(hb, "job_bound", False)):
             return
         # Once training advances past a restore point, stop advertising it as tip.
         if (
@@ -370,7 +376,7 @@ class TrainingEngine:
 
         on_start_resume: return False to block authorize (e.g. user_paused).
         on_restore: return True if fully handled (skip ledger restore).
-        pause_gate: when True, sticky desired=running must not unpause.
+        pause_gate: when True, block train/claim (human Pause / site-interrupt).
         on_claim_config: apply job.config before authorize; False aborts claim.
         on_release_config: reset in-process config when lease returns to pool.
         """
@@ -643,8 +649,6 @@ class TrainingEngine:
         self._work_lease_active = True
         self._run_authorized = True
         hb = self._manager_heartbeat
-        if hb is not None:
-            hb.set_desired_state("running")
         self.request_resume()
         logging.info(
             "[TrainingEngine] adopted job=%s model=%s pool=%s",
@@ -668,9 +672,9 @@ class TrainingEngine:
         Finished sessions are dropped; results keyed by session_id.
 
         When a Training Manager heartbeat client is attached, the engine
-        **parks idle** until the manager queues ``start`` / ``resume``
-        in this process (not merely sticky desired_state from a prior run).
-        Pause / restore / shutdown are honored in idle.
+        **parks paused** until ``start`` / ``resume`` (or claim/adopt)
+        authorizes run in this process. Pause / restore / shutdown are
+        honored while parked.
 
         ``job_scoped=True``: lease was claimed outside (pool worker). Do not
         re-claim; stay in the lease until released/stopped (park within the
@@ -695,7 +699,7 @@ class TrainingEngine:
 
         results: dict[str, tuple[list[float], list[float]]] = {}
         self._stop.clear()
-        boot_state = "idle" if hb is not None and not job_scoped else "training"
+        boot_state = "paused" if hb is not None and not job_scoped else "training"
         if job_scoped and self._run_authorized:
             boot_state = "training"
         self._maybe_manager_heartbeat(state=boot_state)
@@ -704,7 +708,6 @@ class TrainingEngine:
         while not self._stop.is_set():
             self.drain_manager_commands(allow_restore=True)
             self._maybe_truncate_imported_journal()
-            self._apply_manager_desired_state()
             self._sync_work_lease()
             if job_scoped and not self._work_lease_active:
                 break
@@ -717,7 +720,7 @@ class TrainingEngine:
                     break
                 if not job_scoped and self._maybe_claim_tm_work():
                     continue
-                state = "paused" if self._paused.is_set() else "idle"
+                state = "paused"
                 self._maybe_manager_heartbeat(state=state)
                 self._emit_engine_status(state)
                 sleep_s = self._idle_sleep_s()
@@ -752,12 +755,11 @@ class TrainingEngine:
             if not park:
                 break
 
-            # Idle within lease (or long-lived park): sleep, wake, check work.
+            # Park within lease (or long-lived park): sleep, wake, check work.
             sleep_s = self._idle_sleep_s()
             if self._stop.wait(timeout=max(0.1, sleep_s)):
                 break
             self.drain_manager_commands(allow_restore=True)
-            self._apply_manager_desired_state()
             self._sync_work_lease()
             if job_scoped and not self._work_lease_active:
                 break
@@ -768,7 +770,7 @@ class TrainingEngine:
                 self._emit_engine_status("training")
                 continue
             self._idle_heartbeat()
-            self._emit_engine_status("idle")
+            self._emit_engine_status("paused")
         return results
 
     def _idle_sleep_s(self) -> float:
@@ -782,56 +784,20 @@ class TrainingEngine:
         return float(getattr(cfg, "idle_sleep_s", 10.0) if cfg is not None else 10.0)
 
     def _manager_allows_training(self) -> bool:
-        """Without TM, always allow. With TM, only after Start/Resume in this process
-        and manager desired_state=running."""
+        """Without TM, always allow. With TM: authorized and not pause_gate."""
         hb = self._manager_heartbeat
         if hb is None:
             return True
         if not self._run_authorized:
             return False
-        desired = hb.desired_state
-        if desired is None:
-            return False  # boot: wait for Start
-        return str(desired).strip().lower() == "running"
-
-    def _apply_manager_desired_state(self) -> None:
-        hb = self._manager_heartbeat
-        if hb is None:
-            return
-        desired = (hb.desired_state or "").strip().lower()
-        if desired == "stopped":
-            # Only stop if *this* process accepted a shutdown command.
-            # Sticky desired=stopped from a prior run must not kill boot.
-            if not self._shutdown_accepted:
-                logging.warning(
-                    "[TrainingEngine] ignoring sticky desired=stopped "
-                    "(no shutdown command in this process)"
-                )
-                return
-            if not self._paused.is_set():
-                self._paused.set()
-                self._publish_manager_metrics("paused")
-                self._emit_engine_status("paused", note="shutdown_pause")
-            self.request_stop()
-        elif desired == "paused":
-            if not self._paused.is_set():
-                self.request_pause()
-        elif desired == "running":
-            if self._pause_gate is not None and self._pause_gate():
-                # Config hold (ES park / human Pause) sticks until explicit command.
-                if not self._paused.is_set():
-                    self.request_pause()
-                hb.set_desired_state("paused")
-                return
-            if self._paused.is_set():
-                self.request_resume()
-        elif desired in ("idle", ""):
-            # Idle is not paused — clear local pause if manager wants idle.
-            if self._paused.is_set():
-                self._paused.clear()
-                self._publish_manager_metrics("idle")
-                self._emit_engine_status("idle")
-        # None: leave local pause alone; training gated by _manager_allows_training
+        if self._pause_gate is not None:
+            try:
+                if bool(self._pause_gate()):
+                    return False
+            except Exception:
+                logging.exception("[TrainingEngine] pause_gate failed")
+                return False
+        return True
 
     def drain_manager_commands(self, *, allow_restore: bool) -> None:
         """Apply TM commands at a safe point. Never blocks on network I/O."""
@@ -840,7 +806,6 @@ class TrainingEngine:
             return
         self._finish_ready_restores()
         self._maybe_auto_restore_from_manager(allow_restore=allow_restore)
-        self._apply_manager_desired_state()
         for cmd in hb.poll_commands():
             action = cmd.action.strip().lower()
             try:
@@ -859,7 +824,6 @@ class TrainingEngine:
                             )
                             continue
                     self._run_authorized = True
-                    hb.set_desired_state("running")
                     self.request_resume()
                     hb.mark_command_seen(cmd.id)
                     hb.queue_ack(cmd.id, ok=True)
@@ -869,7 +833,6 @@ class TrainingEngine:
                             self._on_pause(cmd)
                         except Exception:
                             logging.exception("[TrainingEngine] on_pause hook failed")
-                    hb.set_desired_state("paused")
                     self.request_pause()
                     hb.mark_command_seen(cmd.id)
                     hb.queue_ack(cmd.id, ok=True)
@@ -882,7 +845,6 @@ class TrainingEngine:
                     self._run_authorized = False
                     was_leased = self._work_lease_active
                     self._work_lease_active = False
-                    hb.set_desired_state("idle")
                     self._paused.clear()
                     if was_leased and self._on_release_config is not None:
                         try:
@@ -891,8 +853,8 @@ class TrainingEngine:
                             logging.exception(
                                 "[TrainingEngine] on_release_config on cancel failed"
                             )
-                    self._publish_manager_metrics("idle")
-                    self._emit_engine_status("idle", force=True, note="start_cancelled")
+                    self._publish_manager_metrics("paused")
+                    self._emit_engine_status("paused", force=True, note="start_cancelled")
                     hb.mark_command_seen(cmd.id)
                     hb.queue_ack(cmd.id, ok=True)
                 elif action == "shutdown":
@@ -912,7 +874,6 @@ class TrainingEngine:
                         )
                         continue
                     self._shutdown_accepted = True
-                    hb.set_desired_state("stopped")
                     # Pause before exiting.
                     if not self._paused.is_set():
                         self._paused.set()
@@ -931,7 +892,7 @@ class TrainingEngine:
                             continue
                         if handled:
                             continue
-                    # Do not flip sticky desired to paused — restore is weight sync.
+                    # Restore is weight sync — hold locally if mid-train drain.
                     if not self._paused.is_set() and not allow_restore:
                         self._paused.set()
                     self._start_restore_async(cmd)
@@ -1029,27 +990,26 @@ class TrainingEngine:
             t.start()
 
     def _recover_after_restore_hold(self) -> None:
-        """Clear silent restore hold and re-align with sticky desired_state."""
-        hb = self._manager_heartbeat
-        desired = (
-            ""
-            if hb is None
-            else (hb.desired_state or "").strip().lower()
-        )
-        if desired == "running":
-            self._paused.clear()
-            # Park loop will publish training/idle from actual work; don't lie "paused".
-            state = "training" if self._manager_allows_training() else "idle"
-            self._publish_manager_metrics(state)
-            self._emit_engine_status(state, force=True, note="after_restore_hold")
-        elif desired == "paused":
+        """Clear silent restore hold; re-align pause from authorize + pause_gate."""
+        gate = False
+        if self._pause_gate is not None:
+            try:
+                gate = bool(self._pause_gate())
+            except Exception:
+                gate = False
+        if gate:
             self._paused.set()
             self._publish_manager_metrics("paused")
             self._emit_engine_status("paused", force=True, note="after_restore_hold")
-        else:
+        elif self._run_authorized:
             self._paused.clear()
-            self._publish_manager_metrics("idle")
-            self._emit_engine_status("idle", force=True, note="after_restore_hold")
+            state = "training" if self._manager_allows_training() else "paused"
+            self._publish_manager_metrics(state)
+            self._emit_engine_status(state, force=True, note="after_restore_hold")
+        else:
+            self._paused.set()
+            self._publish_manager_metrics("paused")
+            self._emit_engine_status("paused", force=True, note="after_restore_hold")
 
     def _finish_ready_restores(self) -> None:
         hb = self._manager_heartbeat
@@ -1183,8 +1143,7 @@ class TrainingEngine:
             except Exception:
                 gate = False
         if site_hold or gate:
-            # BL-023 / user pause: look paused, not idle-cleared.
-            hb.set_desired_state("paused")
+            # BL-023 / user pause: look paused, not cleared-for-claim.
             if not self._paused.is_set():
                 self._paused.set()
             self._publish_manager_metrics("paused")
@@ -1198,7 +1157,6 @@ class TrainingEngine:
                 "[TrainingEngine] work lease released — staying paused (site/user hold)"
             )
             return
-        hb.set_desired_state("idle")
         if self._paused.is_set():
             self._paused.clear()
         if self._on_release_config is not None:
@@ -1206,9 +1164,9 @@ class TrainingEngine:
                 self._on_release_config()
             except Exception:
                 logging.exception("[TrainingEngine] on_release_config failed")
-        self._publish_manager_metrics("idle")
-        self._emit_engine_status("idle", force=True, note="work_lease_released")
-        logging.info("[TrainingEngine] work lease released — parking idle")
+        self._publish_manager_metrics("paused")
+        self._emit_engine_status("paused", force=True, note="work_lease_released")
+        logging.info("[TrainingEngine] work lease released — parking paused")
 
     def _maybe_claim_tm_work(self) -> bool:
         """Idle → claim any queued train job (worker = capacity; BL-006c)."""
@@ -1254,7 +1212,6 @@ class TrainingEngine:
             self.ledger.model_instance_id = mid
         self._work_lease_active = True
         self._run_authorized = True
-        hb.set_desired_state("running")
         self.request_resume()
         logging.info(
             "[TrainingEngine] claimed job=%s model=%s kind=%s pool=%s",
@@ -1307,7 +1264,7 @@ class TrainingEngine:
         hb = self._manager_heartbeat
         if hb is None:
             return
-        self._publish_manager_metrics("idle")
+        self._publish_manager_metrics("paused")
         hb.maybe_ping(force=True)
 
     def _begin_registered_fit(self, session: TrainingSession) -> None:

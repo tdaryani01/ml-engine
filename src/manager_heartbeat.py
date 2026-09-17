@@ -159,7 +159,6 @@ class ManagerHeartbeat:
         self._metrics: dict[str, Any] = {}
         self._commands: queue.Queue[ManagerCommand] = queue.Queue()
         self._pending_acks: queue.Queue[tuple[str, bool, str | None]] = queue.Queue()
-        self._desired_state: str | None = None
         self._seen_command_ids: set[str] = set()
         self._active_checkpoint: dict[str, Any] | None = None
         # BL-023 site interrupt
@@ -219,7 +218,6 @@ class ManagerHeartbeat:
                 return
             self._site_interrupt_local = True
             cb = self._on_site_interrupt
-        self.set_desired_state("paused")
         self.set_metrics({"run_state": "paused", "state": "paused"})
         _log.warning(
             "BL-023 site interrupt: TM unreachable streak=%s — local pause",
@@ -297,7 +295,6 @@ class ManagerHeartbeat:
             self._job_id = None
             self._bound_model_id = None
             self._registered = False
-            self._desired_state = None
             self._claim_token = None
 
     def ensure_pool_registered(self) -> bool:
@@ -481,15 +478,6 @@ class ManagerHeartbeat:
             resp.get("state"),
         )
         return resp
-
-    @property
-    def desired_state(self) -> str | None:
-        with self._lock:
-            return self._desired_state
-
-    def set_desired_state(self, desired: str | None) -> None:
-        with self._lock:
-            self._desired_state = None if desired is None else str(desired)
 
     @property
     def active_checkpoint(self) -> dict[str, Any] | None:
@@ -752,10 +740,6 @@ class ManagerHeartbeat:
                 expect_commands=True,
             )
             if isinstance(body, dict):
-                desired = body.get("desired_state")
-                if desired is not None:
-                    with self._lock:
-                        self._desired_state = str(desired) if desired else None
                 active = body.get("active_checkpoint")
                 if isinstance(active, dict):
                     with self._lock:
@@ -848,7 +832,6 @@ class ManagerHeartbeat:
             self.unbind_job()
             if site_hold:
                 self.set_metrics({"run_state": "paused", "state": "paused"})
-                self.set_desired_state("paused")
             else:
                 self.set_metrics({"run_state": "idle", "state": "paused"})
 

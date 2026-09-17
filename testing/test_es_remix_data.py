@@ -81,9 +81,11 @@ def test_regression_es_autopilot_trip_awaits_tm_no_act(monkeypatch):
     agent._handled_onset_version = None
     agent._user_pause_hold = False
     agent._paused = False
+    agent._es_run_done = False
     agent._traj = 2
     agent._remix_data_on_es = True
     agent._remix_after_restore = False
+    agent._last_loss = 0.0
 
     monkeypatch.setattr(
         DrawStudentAgent,
@@ -101,6 +103,7 @@ def test_regression_es_autopilot_trip_awaits_tm_no_act(monkeypatch):
 
     class HB:
         cfg = SimpleNamespace(instance_id="draw-test", timeout_s=0.5)
+        job_bound = True
 
         @property
         def bound_model_id(self) -> str:
@@ -110,22 +113,43 @@ def test_regression_es_autopilot_trip_awaits_tm_no_act(monkeypatch):
             posts.append((path, dict(body)))
             return {}
 
-        def set_desired_state(self, *_a, **_k):
-            return None
-
         def set_metrics(self, *_a, **_k):
             return None
 
     agent.hb = HB()
+    pauses: list[str] = []
+    agent.bind_engine_pause(lambda: pauses.append("pause"))
     DrawStudentAgent._maybe_es_shadow(agent)
 
-    assert agent._paused is True
+    assert agent._paused is False  # soft hold must not durable-pause agent flag
     assert agent._es_park_hold is True
+    assert agent.pause_gate() is False  # not user/site
     assert agent._user_pause_hold is False
+    assert pauses == ["pause"]
     assert agent._remix_after_restore is True
     assert "es-onset" in statuses or any(s.startswith("es-") for s in statuses)
     assert not any("/tm-brain/act" in p[0] for p in posts)
     assert not any(p[0] == "/api/work/pause" for p in posts)
+    assert DrawStudentAgent.train_tick(agent) is False
+
+
+def test_regression_pause_gate_clears_when_unbound(monkeypatch):
+    """UI Resume unbinds the lease; local user hold must not block reclaim."""
+    monkeypatch.setattr(
+        "examples.closed_loop_draw.agent.make_target", _fake_make_target
+    )
+    agent = _bare_agent()
+    agent._user_pause_hold = True
+    agent._es_park_hold = False
+
+    class HB:
+        cfg = SimpleNamespace(instance_id="pool-1")
+        job_bound = False
+        site_interrupt_hold = False
+
+    agent.hb = HB()
+    assert agent.pause_gate() is False
+    assert agent._user_pause_hold is False
 
 
 def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
@@ -177,9 +201,6 @@ def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
                 },
                 "actuation": {"applied": True, "sequence": ["pause", "restore", "resume"]},
             }
-
-        def set_desired_state(self, *_a, **_k):
-            return None
 
     agent.hb = HB()
     before_cid = int(agent.command_id)
@@ -236,9 +257,6 @@ def test_regression_es_autopilot_uses_bound_model_not_pool_session(monkeypatch):
         def post_json(self, path, body, timeout_s=15.0):
             raise AssertionError(f"no HTTP on Autopilot ES trip: {path}")
 
-        def set_desired_state(self, *_a, **_k):
-            return None
-
         def set_metrics(self, metrics):
             published.append(dict(metrics))
 
@@ -246,9 +264,13 @@ def test_regression_es_autopilot_uses_bound_model_not_pool_session(monkeypatch):
             return None
 
     agent.hb = HB()
+    agent.hb.job_bound = True
+    pauses: list[str] = []
+    agent.bind_engine_pause(lambda: pauses.append("pause"))
     DrawStudentAgent._maybe_es_shadow(agent)
     assert agent._tm_agent_id() == "tm-brain"
     assert agent._es_park_hold is True
+    assert pauses == ["pause"]
     assert published
     assert str(published[-1].get("state") or "").startswith("es-")
 
@@ -306,7 +328,6 @@ def test_regression_restore_ack_remixes_terrain_once(monkeypatch):
     agent._user_pause_hold = False
     agent._run_authorized = False
     agent._paused = True
-    agent.hb.set_desired_state = lambda *_a, **_k: None
     agent.hb.mark_command_seen = lambda *_a, **_k: None
     agent._apply_config_payload = lambda _c: {}
     agent._live_config = lambda: {}
@@ -325,7 +346,6 @@ def test_regression_after_restore_remixes_if_restore_deferred(monkeypatch):
     agent._remix_after_restore = True
     agent._user_pause_hold = False
     agent.hb = SimpleNamespace(
-        set_desired_state=lambda *_a, **_k: None,
         mark_command_seen=lambda *_a, **_k: None,
         queue_ack=lambda *_a, **_k: None,
     )
@@ -402,9 +422,6 @@ def test_regression_manual_es_does_not_apply_restore(monkeypatch):
                 "actuation": {"applied": False},
             }
 
-        def set_desired_state(self, state):
-            posts.append(("desired", state))
-
         def ack_work(self, *, result=None):
             acks.append(dict(result or {}))
             self.job_bound = False
@@ -423,8 +440,7 @@ def test_regression_manual_es_does_not_apply_restore(monkeypatch):
     assert agent._paused is False
     assert agent._remix_after_restore is False
     assert agent._pending_outcome_episode is None
-    assert ("desired", "idle") in posts
-    assert ("desired", "paused") not in posts
+    assert not any(p[0] == "desired" for p in posts if isinstance(p, tuple))
     assert not any(
         isinstance(p, str) and p.endswith("/control/pause") for p, _ in posts
     )
@@ -448,7 +464,6 @@ def test_regression_after_restore_prefers_feed_stock_over_local_remix(monkeypatc
     agent._user_pause_hold = False
     agent._es_run_done = False
     agent.hb = SimpleNamespace(
-        set_desired_state=lambda *_a, **_k: None,
         mark_command_seen=lambda *_a, **_k: None,
         queue_ack=lambda *_a, **_k: None,
     )

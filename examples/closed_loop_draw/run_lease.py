@@ -64,6 +64,9 @@ def build_closed_loop_engine(
     bind = getattr(agent, "bind_engine_stop", None)
     if callable(bind):
         bind(engine.request_stop)
+    bind_pause = getattr(agent, "bind_engine_pause", None)
+    if callable(bind_pause):
+        bind_pause(engine.request_pause)
     set_si = getattr(agent.hb, "set_on_site_interrupt", None)
     if callable(set_si):
         set_si(agent.on_site_interrupt)

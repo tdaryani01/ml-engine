@@ -38,7 +38,7 @@ def test_regression_site_interrupt_hb_streak_pauses_and_work_pause():
 
     assert hb.site_interrupt_hold is True
     assert trips == ["trip"]
-    assert hb.desired_state == "paused"
+    assert hb._metrics.get("state") == "paused"
 
     # TM returns — next successful pool HB should POST /api/work/pause.
     pause_bodies: list[dict] = []

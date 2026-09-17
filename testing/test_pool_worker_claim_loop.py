@@ -18,7 +18,6 @@ from src.training_engine import TrainingEngine
 @dataclass
 class _StubHB:
     idle_sleep_s: float = 0.02
-    _desired_state: str | None = None
     _active_checkpoint: dict[str, Any] | None = None
     job_bound: bool = False
     job_id: str | None = None
@@ -49,13 +48,6 @@ class _StubHB:
                     "park_when_idle": True,
                 },
             )()
-
-    @property
-    def desired_state(self) -> str | None:
-        return self._desired_state
-
-    def set_desired_state(self, state: str | None) -> None:
-        self._desired_state = state
 
     @property
     def active_checkpoint(self) -> dict[str, Any] | None:
@@ -365,6 +357,9 @@ def test_regression_run_closed_loop_lease_stamps_job_model_id(monkeypatch, tmp_p
 
         def bind_engine_stop(self, stop) -> None:
             del stop
+
+        def bind_engine_pause(self, pause) -> None:
+            del pause
 
         def close(self) -> None:
             return None
