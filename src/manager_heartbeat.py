@@ -25,8 +25,26 @@ import os
 
 _log = logging.getLogger(__name__)
 
+# BL-023b: session re-entry bounds (anti-stampede).
+_REENTRY_COOLDOWN_S = 3.0
+_REENTRY_BACKOFF_S = 0.5
+
 # DIAGNOSTIC-ONLY: NDJSON claim/ledger trace. Path survives diagnostics_output deletes.
 _DIAG_PATH = Path("/tmp/ml_engine_run_diag.ndjson")
+
+
+@dataclass(frozen=True)
+class HttpResult:
+    """Structured POST outcome — distinguishes transport fail vs HTTP status (BL-023b)."""
+
+    ok: bool
+    status: int | None = None  # None ⇒ transport / no HTTP response
+    payload: Any = None
+    detail: str = ""
+
+    @property
+    def transport_fail(self) -> bool:
+        return (not self.ok) and self.status is None
 
 
 def _diag(event: str, **fields: Any) -> None:
@@ -166,6 +184,9 @@ class ManagerHeartbeat:
         self._site_interrupt_local = False
         self._site_interrupt_work_pause_sent = False
         self._on_site_interrupt: Callable[[], None] | None = None
+        # BL-023b session re-entry
+        self._claim_suspect = False
+        self._reentry_cooldown_until = 0.0
 
     def _auth_headers(self, base: dict[str, str] | None = None) -> dict[str, str]:
         headers = dict(base or {})
@@ -203,6 +224,56 @@ class ManagerHeartbeat:
     def site_interrupt_hold(self) -> bool:
         with self._lock:
             return bool(self._site_interrupt_local)
+
+    @property
+    def claim_suspect(self) -> bool:
+        """True after session-404 while job-bound until validating HB or abandon."""
+        with self._lock:
+            return bool(self._claim_suspect)
+
+    def _reentry_cooling(self) -> bool:
+        with self._lock:
+            return time.monotonic() < float(self._reentry_cooldown_until)
+
+    def _arm_reentry_cooldown(self) -> None:
+        with self._lock:
+            self._reentry_cooldown_until = time.monotonic() + _REENTRY_COOLDOWN_S
+
+    @staticmethod
+    def _is_pool_session_route(url: str) -> bool:
+        path = urllib.parse.urlparse(url).path.lower().rstrip("/")
+        if path.endswith("/api/work/claim"):
+            return True
+        if "/api/workers/" in path and path.endswith("/heartbeat"):
+            return True
+        return False
+
+    @staticmethod
+    def _detail_session_not_found(detail: str) -> bool:
+        return "session not found" in (detail or "").lower()
+
+    def _is_session_identity_404(self, result: HttpResult, url: str) -> bool:
+        """Rule 2: only HB/claim + session-not-found detail (not generic 404)."""
+        if result.status != 404:
+            return False
+        if not self._is_pool_session_route(url):
+            return False
+        return self._detail_session_not_found(result.detail)
+
+    def _park_after_failed_reentry(self) -> None:
+        """Rule 3: abandon local claim; pause so gradients are not authorized."""
+        with self._lock:
+            abandon = self._job_bound or self._claim_suspect
+            self._claim_suspect = False
+        if abandon:
+            self.unbind_job()
+        with self._lock:
+            self._site_interrupt_local = True
+            self._pool_registered = False
+        self.set_metrics({"run_state": "paused", "state": "paused"})
+        _log.warning(
+            "BL-023b: abandoned suspect claim after failed session re-entry — paused"
+        )
 
     def clear_site_interrupt(self) -> None:
         with self._lock:
@@ -287,6 +358,7 @@ class ManagerHeartbeat:
             self._site_interrupt_local = False
             self._site_interrupt_work_pause_sent = False
             self._hb_fail_streak = 0
+            self._claim_suspect = False
 
     def unbind_job(self) -> None:
         """Release worker↔job lease after ack/fail — pool session remains."""
@@ -304,17 +376,30 @@ class ManagerHeartbeat:
         with self._lock:
             if self._pool_registered:
                 return True
+            if time.monotonic() < float(self._reentry_cooldown_until):
+                return False
             sid = self._cfg.instance_id
             kind = self._cfg.kind
             label = self._cfg.label
             caps_src = list(self._cfg.capabilities)
         base = self._cfg.uri.rstrip("/")
+        return self._register_pool_session(base, sid, kind, label, caps_src)
+
+    def _register_pool_session(
+        self,
+        base: str,
+        sid: str,
+        kind: str,
+        label: str | None,
+        caps_src: list[str],
+    ) -> bool:
         caps = ["pool", str(kind or "engine")]
         for c in caps_src:
             if c not in caps:
                 caps.append(str(c))
-        ok = self._post_json(
-            f"{base}/api/workers/register",
+        url = f"{base}/api/workers/register"
+        result = self._post_result(
+            url,
             {
                 "session_id": sid,
                 "caps": caps,
@@ -323,7 +408,7 @@ class ManagerHeartbeat:
             expect_commands=False,
             timeout_s=max(5.0, float(self._cfg.timeout_s)),
         )
-        if ok is None:
+        if not result.ok:
             _log.warning(
                 "pool register failed session=%s — cannot claim until TM accepts register",
                 sid,
@@ -346,26 +431,60 @@ class ManagerHeartbeat:
             if self._job_bound:
                 return None
             sid = self._cfg.instance_id
-        # Register must complete before claim — async maybe_ping races otherwise
-        # (TM 404 session not found).
+            kind = self._cfg.kind
+            label = self._cfg.label
+            caps_src = list(self._cfg.capabilities)
         if not self.ensure_pool_registered():
             return None
         base = self._cfg.uri.rstrip("/")
         body: dict[str, Any] = {"session_id": sid}
         if lease_s is not None:
             body["lease_s"] = float(lease_s)
-        resp = self._post_json(
-            f"{base}/api/work/claim",
+        claim_url = f"{base}/api/work/claim"
+        result = self._post_result(
+            claim_url,
             body,
             expect_commands=True,
             timeout_s=max(5.0, float(self._cfg.timeout_s)),
         )
-        if not isinstance(resp, dict):
-            # Session TTL / TM restart: force re-register next attempt.
+        if self._is_session_identity_404(result, claim_url):
             with self._lock:
                 self._pool_registered = False
-            _diag("claim_http_empty", pool=sid, kind=self._cfg.kind, label=self._cfg.label)
+            if self._reentry_cooling():
+                _diag("claim_session_404_cooling", pool=sid)
+                return None
+            _log.warning(
+                "BL-023b session re-entry: claim 404 session=%s → register once",
+                sid,
+            )
+            time.sleep(_REENTRY_BACKOFF_S)
+            if not self._register_pool_session(base, sid, kind, label, caps_src):
+                self._arm_reentry_cooldown()
+                return None
+            result = self._post_result(
+                claim_url,
+                body,
+                expect_commands=True,
+                timeout_s=max(5.0, float(self._cfg.timeout_s)),
+            )
+            if not result.ok or not isinstance(result.payload, dict):
+                with self._lock:
+                    self._pool_registered = False
+                self._arm_reentry_cooldown()
+                _diag("claim_reentry_retry_fail", pool=sid, status=result.status)
+                return None
+        elif not result.ok or not isinstance(result.payload, dict):
+            with self._lock:
+                self._pool_registered = False
+            _diag(
+                "claim_http_empty",
+                pool=sid,
+                kind=self._cfg.kind,
+                label=self._cfg.label,
+                status=result.status,
+            )
             return None
+        resp = result.payload
         job = resp.get("job")
         if not isinstance(job, dict) or not job.get("job_id"):
             _diag("claim_no_job", pool=sid, kind=self._cfg.kind, resp_keys=list(resp.keys()))
@@ -377,7 +496,6 @@ class ManagerHeartbeat:
             return None
         token = str(job.get("claim_token") or "")
         jid = str(job["job_id"])
-        # Job public should already expose worker_id == this pool session.
         worker_id = str(job.get("worker_id") or job.get("session_id") or sid)
         with self._lock:
             self._claim_token = token or None
@@ -783,57 +901,104 @@ class ManagerHeartbeat:
         """Register + heartbeat this process as a TM pool worker (capacity only)."""
         cfg = self._cfg
         sid = cfg.instance_id
-        caps = ["pool", str(cfg.kind or "engine")]
-        for c in cfg.capabilities:
-            if c not in caps:
-                caps.append(str(c))
+        caps_src = list(cfg.capabilities)
         if need_pool:
-            ok = self._post_json(
-                f"{base}/api/workers/register",
-                {
-                    "session_id": sid,
-                    "caps": caps,
-                    "meta": {"kind": cfg.kind, "label": cfg.label or f"pool-{sid}"},
-                },
-                expect_commands=False,
-            )
-            if ok is not None:
-                with self._lock:
-                    self._pool_registered = True
+            self._register_pool_session(base, sid, cfg.kind, cfg.label, caps_src)
         status = self._pool_status_from_metrics(metrics)
         meta: dict[str, Any] = {"kind": cfg.kind}
         with self._lock:
             jid = self._job_id
         if jid:
             meta["job_id"] = jid
-        body = self._post_json(
-            f"{base}/api/workers/{urllib.parse.quote(sid, safe='')}/heartbeat",
-            {"status": status, "meta": meta},
-            expect_commands=True,
-        )
-        if body is None:
-            # Session lost (TTL / restart) — re-register next ping.
+        hb_url = f"{base}/api/workers/{urllib.parse.quote(sid, safe='')}/heartbeat"
+        hb_body = {"status": status, "meta": meta}
+        result = self._post_result(hb_url, hb_body, expect_commands=True)
+
+        if result.ok and isinstance(result.payload, dict):
+            self._finish_pool_hb_ok(result.payload, sid, jid)
+            return
+
+        if result.transport_fail or (
+            not result.ok and not self._is_session_identity_404(result, hb_url)
+        ):
             with self._lock:
                 self._pool_registered = False
             self._note_pool_hb_failure()
             return
+
+        # Rule 2 session-identity 404 → bounded re-entry (Rules 1 + 3).
+        with self._lock:
+            if self._job_bound:
+                self._claim_suspect = True
+            self._pool_registered = False
+            streak_before = int(self._hb_fail_streak)
+        if self._reentry_cooling():
+            _log.warning(
+                "BL-023b session re-entry: HB 404 session=%s but cooling — skip register",
+                sid,
+            )
+            if self.claim_suspect:
+                self._park_after_failed_reentry()
+            return
+
+        _log.warning(
+            "BL-023b session re-entry: HB 404 session=%s → register once (no site-interrupt streak)",
+            sid,
+        )
+        time.sleep(_REENTRY_BACKOFF_S)
+        if not self._register_pool_session(base, sid, cfg.kind, cfg.label, caps_src):
+            self._arm_reentry_cooldown()
+            if self.claim_suspect:
+                self._park_after_failed_reentry()
+            with self._lock:
+                # Rule: 404 must not increment site-interrupt streak.
+                self._hb_fail_streak = streak_before
+            return
+
+        retry = self._post_result(hb_url, hb_body, expect_commands=True)
+        if retry.ok and isinstance(retry.payload, dict):
+            with self._lock:
+                self._hb_fail_streak = streak_before
+            self._finish_pool_hb_ok(retry.payload, sid, jid)
+            return
+
+        with self._lock:
+            self._pool_registered = False
+            self._hb_fail_streak = streak_before
+        self._arm_reentry_cooldown()
+        if self.claim_suspect:
+            self._park_after_failed_reentry()
+        elif retry.transport_fail:
+            self._note_pool_hb_failure()
+
+    def _finish_pool_hb_ok(
+        self, body: dict[str, Any], sid: str, jid: str | None
+    ) -> None:
         self._note_pool_hb_success()
-        if isinstance(body, dict) and body.get("should_exit"):
+        if body.get("should_exit"):
             _log.info(
                 "training-manager pool drain requested for session=%s", sid
             )
-        if isinstance(body, dict) and body.get("release_job") and self.job_bound:
-            # BL-006d: TM parked/cancelled — drop agent bind; pool stays.
-            # BL-023: keep paused metrics when site-interrupt / user pause parked us.
+        if body.get("release_job") and self.job_bound:
             site_hold = self.site_interrupt_hold
             _log.info(
                 "training-manager release_job for session=%s job=%s", sid, jid
             )
             self.unbind_job()
+            with self._lock:
+                self._claim_suspect = False
             if site_hold:
                 self.set_metrics({"run_state": "paused", "state": "paused"})
             else:
                 self.set_metrics({"run_state": "idle", "state": "paused"})
+        elif self.claim_suspect and self.job_bound:
+            with self._lock:
+                self._claim_suspect = False
+            _log.info(
+                "BL-023b: claim validated after session re-entry session=%s job=%s",
+                sid,
+                jid,
+            )
 
     def _flush_acks(self, base: str) -> None:
         with self._lock:
@@ -867,6 +1032,25 @@ class ManagerHeartbeat:
         expect_commands: bool,
         timeout_s: float | None = None,
     ) -> dict[str, Any] | bool | None:
+        """Backward-compatible wrapper over `_post_result`."""
+        result = self._post_result(
+            url, body, expect_commands=expect_commands, timeout_s=timeout_s
+        )
+        if not result.ok:
+            return None
+        if expect_commands:
+            return result.payload if isinstance(result.payload, dict) else {}
+        return True
+
+    def _post_result(
+        self,
+        url: str,
+        body: dict[str, Any],
+        *,
+        expect_commands: bool,
+        timeout_s: float | None = None,
+    ) -> HttpResult:
+        """POST JSON; never raise on HTTP/parse errors (BL-023b Rule 4)."""
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(
             url,
@@ -881,27 +1065,45 @@ class ManagerHeartbeat:
         )
         try:
             with urllib.request.urlopen(req, timeout=wait) as resp:
+                status = int(getattr(resp, "status", 200) or 200)
                 raw = resp.read()
                 if not expect_commands:
-                    return True
+                    return HttpResult(ok=True, status=status, payload=True)
                 if not raw:
-                    return {}
+                    return HttpResult(ok=True, status=status, payload={})
                 try:
                     parsed = json.loads(raw.decode("utf-8"))
-                except json.JSONDecodeError:
-                    return {}
-                return parsed if isinstance(parsed, dict) else {}
+                except Exception:  # noqa: BLE001 — Rule 4
+                    return HttpResult(ok=True, status=status, payload={})
+                if isinstance(parsed, dict):
+                    return HttpResult(ok=True, status=status, payload=parsed)
+                return HttpResult(ok=True, status=status, payload={})
         except urllib.error.HTTPError as exc:
             detail = ""
             try:
-                detail = exc.read().decode("utf-8", errors="replace")[:300]
+                raw_err = exc.read()
+                if isinstance(raw_err, (bytes, bytearray)):
+                    text = raw_err.decode("utf-8", errors="replace")[:500]
+                else:
+                    text = str(raw_err)[:500]
+                detail = text
+                try:
+                    obj = json.loads(text)
+                    if isinstance(obj, dict) and obj.get("detail") is not None:
+                        detail = str(obj.get("detail"))
+                except Exception:  # noqa: BLE001 — Rule 4: non-JSON HTML/proxy OK
+                    pass
             except Exception:  # noqa: BLE001
-                detail = str(exc.reason)
-            _log.warning("POST %s HTTP %s: %s", url, exc.code, detail)
-            return None
+                try:
+                    detail = str(exc.reason)
+                except Exception:  # noqa: BLE001
+                    detail = ""
+            code = int(getattr(exc, "code", 0) or 0)
+            _log.warning("POST %s HTTP %s: %s", url, code, detail[:300])
+            return HttpResult(ok=False, status=code, payload=None, detail=detail)
         except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
             _log.warning("POST %s failed: %s", url, exc)
-            return None
+            return HttpResult(ok=False, status=None, payload=None, detail=str(exc))
 
 
 def decode_checkpoint_blob(data: bytes) -> dict[str, Any]:
