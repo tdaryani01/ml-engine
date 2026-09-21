@@ -145,10 +145,13 @@ def ensure_stock_images(*, height: int = 28, width: int = 28, force: bool = Fals
 def load_png_grayscale(path: Path, *, height: int, width: int) -> np.ndarray:
     """Load PNG → float32 (H,W) in [0,1], resized nearest-neighbor if needed."""
     path = Path(path)
-    # Prefer matplotlib (already a project dep via diagnostics) over Pillow.
-    import matplotlib.image as mpimg
-
-    raw = mpimg.imread(str(path))
+    try:
+        import matplotlib.image as mpimg
+        raw = mpimg.imread(str(path))
+    except ImportError:
+        from PIL import Image
+        img = Image.open(path)
+        raw = np.asarray(img)
     if raw.ndim == 3:
         # RGB(A) → luma
         rgb = raw[..., :3].astype(np.float64)
