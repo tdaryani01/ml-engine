@@ -26,6 +26,7 @@ _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
+from examples.closed_loop_draw.goal import DrawGoal
 from examples.closed_loop_draw.assemble import assemble, load_config, make_target
 from examples.closed_loop_draw.commands import STOCK_COMMAND_IDS
 from examples.closed_loop_draw.draw_checkpoint import (
@@ -1025,9 +1026,7 @@ class DrawStudentAgent:
         # Pause/cancel arrive via TrainingEngine.drain_manager_commands before
         # train_tick; holds are checked there. This method is the traj body only.
         result = self.app.trainer.rollout_train(
-            command_ids=self.command_ids,
-            target=self.target,
-            max_steps=self.app.max_steps,
+            goal=DrawGoal(command_ids=self.command_ids, target=self.target),
             lr=self.lr,
             apply_updates=True,
         )

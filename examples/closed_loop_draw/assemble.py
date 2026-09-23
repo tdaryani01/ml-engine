@@ -10,6 +10,7 @@ import numpy as np
 import yaml
 
 from config.constants import EngineBackend
+from examples.closed_loop_draw.actor import DrawActor
 from examples.closed_loop_draw.cnn_encoder import CnnUpstreamEncoder
 from examples.closed_loop_draw.env import CanvasReconstructionLoss, SoftCanvasEnv
 from examples.closed_loop_draw.targets import target_circle
@@ -33,6 +34,7 @@ class DrawApp:
     conditioning: ConditioningBank
     env: SoftCanvasEnv
     loss_fn: CanvasReconstructionLoss
+    actor: DrawActor
     cfg: dict[str, Any]
 
     @property
@@ -211,16 +213,22 @@ def assemble(cfg: dict[str, Any], *, seed: int = 0) -> DrawApp:
         edt_sym_weight=float(cl.get("loss_edt_sym_weight", 0.0)),
         edt_soft_tau=float(cl.get("loss_edt_soft_tau", 2.0)),
     )
-    trainer = ClosedLoopTrainer(
+    # Domain adapter implementing the generic Actor protocol. From Phase 2 the
+    # trainer talks ONLY to actor / env / loss_fn.
+    actor = DrawActor(
         mhsa=mhsa,
         encoder=encoder,
         adapter=adapter,
         action_embed=action_embed,
         conditioning=conditioning,
+    )
+    trainer = ClosedLoopTrainer(
+        actor=actor,
         env=env,
         loss_fn=loss_fn,
+        max_steps=int(cl["max_steps"]),
     )
-    return DrawApp(
+    app = DrawApp(
         trainer=trainer,
         cnn=cnn,
         mhsa=mhsa,
@@ -230,40 +238,31 @@ def assemble(cfg: dict[str, Any], *, seed: int = 0) -> DrawApp:
         conditioning=conditioning,
         env=env,
         loss_fn=loss_fn,
+        actor=actor,
         cfg=cfg,
     )
 
+    # Deferred import avoids the assemble <-> draw_checkpoint cycle.
+    def _checkpoint_blob(version: int, val_loss: float) -> bytes:
+        from examples.closed_loop_draw.draw_checkpoint import build_checkpoint_blob
 
-def rollout_forward(app: DrawApp, *, command_ids: np.ndarray) -> np.ndarray:
-    """
-    Inference-only trajectory; returns final canvas (NCHW).
+        return build_checkpoint_blob(
+            app,
+            version=int(version),
+            cfg=cfg,
+            lr=float(cfg.get("optimization", {}).get("learning_rate", 0.0)),
+            val_loss=val_loss,
+        )
 
-    Does not update weights. Uses the same interleave layout as training.
-    """
-    frames = list(rollout_forward_frames(app, command_ids=command_ids))
-    return frames[-1] if frames else app.env.reset(int(np.asarray(command_ids).reshape(-1).shape[0]))
+    actor.checkpoint_fn = _checkpoint_blob
+    return app
 
 
-def rollout_forward_frames(app: DrawApp, *, command_ids: np.ndarray):
-    """
-    Yield canvas after each stroke (inference only).
-
-    First yield is the blank canvas after reset; then one frame per stroke.
-    """
-    B = int(np.asarray(command_ids).reshape(-1).shape[0])
-    goal = app.conditioning.embed(command_ids)
-    obs = app.env.reset(B)
-    yield np.array(obs, copy=True)
-    states_S: list[np.ndarray] = []
-    action_embs: list[np.ndarray] = []
-    for t in range(1, app.max_steps + 1):
-        V = app.encoder.encode(obs)
-        S = app.adapter.forward(V)
-        states_S.append(np.array(S, copy=True))
-        X = app.trainer.interleaver.build(goal, states_S, action_embs)
-        A = np.ascontiguousarray(app.mhsa.predict(X), dtype=np.float32)
-        obs = app.env.step(A)
-        yield np.array(obs, copy=True)
-        if t < app.max_steps:
-            action_embs.append(app.action_embed.forward(A))
-    app.encoder.zero_grad()
+__all__ = [
+    "DrawApp",
+    "assemble",
+    "load_config",
+    "make_cnn",
+    "make_mhsa",
+    "make_target",
+]
