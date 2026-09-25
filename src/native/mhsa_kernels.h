@@ -188,6 +188,14 @@ struct MhsaBinding {
     float* pos_next;
     float* ms_pos_next;
     float* vs_pos_next;
+
+    // 0 = continuous (tanh + MSE), 1 = discrete (logits + softmax CE)
+    int64_t action_mode;
+};
+
+enum {
+    MHSA_ACTION_MODE_CONTINUOUS = 0,
+    MHSA_ACTION_MODE_DISCRETE = 1,
 };
 
 // X: [B*T, D] raw tokens. Runs optional input proj + pos, then num_layers
