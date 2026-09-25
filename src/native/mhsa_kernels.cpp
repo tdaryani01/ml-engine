@@ -441,7 +441,10 @@ int32_t mhsa_action_forward(MhsaBinding* m) {
     }
     blas_gemm_forward(m->scratch, m->W_act, m->actions, B, A, D);
     add_bias_rows(m->actions, m->b_act, B, A);
-    for (int64_t i = 0; i < B * A; ++i) m->actions[i] = std::tanh(m->actions[i]);
+    // Discrete: leave raw logits. Continuous: tanh-bound actions.
+    if (m->action_mode != MHSA_ACTION_MODE_DISCRETE) {
+        for (int64_t i = 0; i < B * A; ++i) m->actions[i] = std::tanh(m->actions[i]);
+    }
     return 0;
 }
 
@@ -459,15 +462,44 @@ int32_t mhsa_action_backward(MhsaBinding* m) {
     const int64_t A = m->action_dim;
     if (B < 1 || T < 1 || D < 1 || A < 1) return -3;
 
-    const float inv = 2.0f / static_cast<float>(B * A);
-    float loss = 0.0f;
     float* dz = m->d_qkv;
-    for (int64_t i = 0; i < B * A; ++i) {
-        const float diff = m->actions[i] - m->y[i];
-        loss += diff * diff;
-        dz[i] = inv * diff * (1.0f - m->actions[i] * m->actions[i]);
+    if (m->action_mode == MHSA_ACTION_MODE_DISCRETE) {
+        // Softmax + mean CE: ∂L/∂logits = (probs - one_hot) / B.
+        const float inv_B = 1.0f / static_cast<float>(B);
+        float loss = 0.0f;
+        constexpr float kLogEps = 1e-7f;
+        for (int64_t b = 0; b < B; ++b) {
+            const float* logits = m->actions + b * A;
+            const float* tgt = m->y + b * A;
+            float* row = dz + b * A;
+            float max_logit = logits[0];
+            for (int64_t a = 1; a < A; ++a) {
+                if (logits[a] > max_logit) max_logit = logits[a];
+            }
+            float sum_exp = 0.0f;
+            for (int64_t a = 0; a < A; ++a) {
+                row[a] = std::exp(logits[a] - max_logit);
+                sum_exp += row[a];
+            }
+            const float inv_sum = 1.0f / sum_exp;
+            for (int64_t a = 0; a < A; ++a) {
+                const float p = row[a] * inv_sum;
+                loss -= tgt[a] * std::log(p + kLogEps);
+                row[a] = inv_B * (p - tgt[a]);
+            }
+        }
+        if (m->loss_out) m->loss_out[0] = loss * inv_B;
+    } else {
+        // Continuous: mean MSE on tanh actions, with ∂tanh = 1 - a^2.
+        const float inv = 2.0f / static_cast<float>(B * A);
+        float loss = 0.0f;
+        for (int64_t i = 0; i < B * A; ++i) {
+            const float diff = m->actions[i] - m->y[i];
+            loss += diff * diff;
+            dz[i] = inv * diff * (1.0f - m->actions[i] * m->actions[i]);
+        }
+        if (m->loss_out) m->loss_out[0] = loss / static_cast<float>(B * A);
     }
-    if (m->loss_out) m->loss_out[0] = loss / static_cast<float>(B * A);
 
     for (int64_t b = 0; b < B; ++b) {
         const float* src = m->O + (b * T + (T - 1)) * D;
