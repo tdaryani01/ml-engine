@@ -15,7 +15,10 @@ from utils.engine_ops import create_engine_context
 
 class MHSANetwork(TrainableModel):
     """
-    Stacked causal Pre-LN MHSA+FFN blocks + continuous action head.
+    Stacked causal Pre-LN MHSA+FFN blocks + action head.
+
+    ``action_mode='continuous'`` (default): tanh + MSE (bounded actions).
+    ``action_mode='discrete'``: raw logits + softmax cross-entropy (classification).
 
     Python owns parameter storage and compiles the MHSA contract list.
     Forward/backward live in native ``mhsa_kernels``.
@@ -33,6 +36,7 @@ class MHSANetwork(TrainableModel):
         num_layers: int = 1,
         use_pos_encoding: bool = True,
         use_input_proj: bool = False,
+        action_mode: str = "continuous",
         backend: EngineBackend = EngineBackend.NATIVE,
         engine_ctx=None,
         lam_l1: float = 0.01,
@@ -49,6 +53,11 @@ class MHSANetwork(TrainableModel):
         num_layers = int(num_layers)
         if num_layers < 1 or num_layers > 8:
             raise ValueError(f"num_layers must be in 1..8, got {num_layers}")
+        mode = str(getattr(action_mode, "value", action_mode)).lower()
+        if mode not in ("continuous", "discrete"):
+            raise ValueError(
+                f"action_mode must be 'continuous' or 'discrete', got {action_mode!r}"
+            )
         kwargs.pop("p_dropout", None)
         kwargs.pop("use_batch_norm", None)
         kwargs.pop("bn_momentum", None)
@@ -76,6 +85,7 @@ class MHSANetwork(TrainableModel):
         self.num_layers = num_layers
         self.use_pos_encoding = bool(use_pos_encoding)
         self.use_input_proj = bool(use_input_proj)
+        self.action_mode = mode
 
         self.weights: list[np.ndarray] = []
         self.biases: list[np.ndarray] = []
@@ -109,7 +119,7 @@ class MHSANetwork(TrainableModel):
 
         logging.info(
             "[MHSA] layers=%d d_model=%d heads=%d d_head=%d T_max=%d action_dim=%d "
-            "ffn=%d pos=%s in_proj=%s",
+            "ffn=%d pos=%s in_proj=%s action_mode=%s",
             self.num_layers,
             self.d_model,
             self.num_heads,
@@ -119,6 +129,7 @@ class MHSANetwork(TrainableModel):
             self.ffn_hidden,
             self.use_pos_encoding,
             self.use_input_proj,
+            self.action_mode,
         )
 
     def _xavier(self, rows: int, cols: int) -> np.ndarray:
@@ -205,7 +216,7 @@ class MHSANetwork(TrainableModel):
                 self._vs_b_in = np.zeros_like(self.b_in)
 
     def predict(self, processed_data: np.ndarray) -> np.ndarray:
-        """X (B,T,D) → continuous actions (B, action_dim) via native MHSA forward."""
+        """X (B,T,D) → actions/logits (B, action_dim) via native MHSA forward."""
         if self._contract_runtime is None:
             self.enable_contract_list()
         return self._contract_runtime.run_mhsa_forward(processed_data)
@@ -221,8 +232,9 @@ class MHSANetwork(TrainableModel):
         """
         External-action backward for closed-loop BPTT.
 
-        Re-forwards ``X``, injects ``dA`` = ∂L/∂actions (post-tanh), runs block
-        bwd. Returns ``(dW, db, dX)`` with ``dX`` shaped (B, T, D).
+        Re-forwards ``X``, injects ``dA`` = ∂L/∂actions (post-tanh when continuous;
+        ∂L/∂logits when discrete), runs block bwd. Returns ``(dW, db, dX)`` with
+        ``dX`` shaped (B, T, D).
         """
         if self._contract_runtime is None:
             self.enable_contract_list()
@@ -236,6 +248,12 @@ class MHSANetwork(TrainableModel):
         return self._contract_runtime.get_last_dX()
 
     def calculate_raw_cost(self, output: np.ndarray, y: np.ndarray) -> float:
+        if self.action_mode == "discrete":
+            # Mean CE over batch; output is logits.
+            z = output.astype(np.float64, copy=False)
+            z = z - z.max(axis=1, keepdims=True)
+            log_p = z - np.log(np.exp(z).sum(axis=1, keepdims=True))
+            return float(-np.mean(np.sum(y.astype(np.float64) * log_p, axis=1)))
         return float(np.mean((output - y) ** 2))
 
     def compute_total_loss(self, output: np.ndarray, y: np.ndarray) -> float:

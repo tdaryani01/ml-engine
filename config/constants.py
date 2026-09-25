@@ -15,6 +15,18 @@ class ModelType(Enum):
     MHSA = auto()  # Causal multi-head self-attention + action head
 
 
+class MhsaActionMode(str, Enum):
+    """MHSA action head: continuous (tanh+MSE) vs discrete (logits+softmax CE)."""
+
+    CONTINUOUS = "continuous"
+    DISCRETE = "discrete"
+
+
+# Native MhsaBinding.action_mode values (must match mhsa_kernels.h).
+MHSA_ACTION_MODE_CONTINUOUS = 0
+MHSA_ACTION_MODE_DISCRETE = 1
+
+
 class IngestionMode(Enum):
     """Defines the data ingestion source options for the pipeline."""
     CSV = auto()

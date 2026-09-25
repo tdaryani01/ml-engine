@@ -285,6 +285,8 @@ class MhsaBinding(ctypes.Structure):
         ("pos_next", ctypes.c_void_p),
         ("ms_pos_next", ctypes.c_void_p),
         ("vs_pos_next", ctypes.c_void_p),
+        # 0 = continuous (tanh + MSE), 1 = discrete (logits + softmax CE)
+        ("action_mode", ctypes.c_int64),
     ]
 
 
@@ -2378,6 +2380,11 @@ class ContractRuntime:
         mb.action_dim = int(m.action_dim)
         mb.ffn_hidden = int(m.ffn_hidden)
         mb.num_layers = L
+        mode = getattr(m, "action_mode", "continuous")
+        mode_s = getattr(mode, "value", mode)
+        mb.action_mode = (
+            1 if str(mode_s).lower() == "discrete" else 0
+        )
 
         use_pos = bool(getattr(m, "use_pos_encoding", False) and pos_embed is not None)
         use_proj = bool(getattr(m, "use_input_proj", False) and W_in is not None)
@@ -2599,7 +2606,14 @@ class ContractRuntime:
         T = rows // B
         dA = np.ascontiguousarray(dA, dtype=np.float32).reshape(B, A)
         actions = ws["actions"].reshape(B, A)
-        dz = dA * (1.0 - actions * actions)
+        mode = getattr(m, "action_mode", "continuous")
+        mode_s = str(getattr(mode, "value", mode)).lower()
+        if mode_s == "discrete":
+            # dA is ∂L/∂logits (no tanh).
+            dz = dA
+        else:
+            # dA is ∂L/∂actions (post-tanh).
+            dz = dA * (1.0 - actions * actions)
         W_act = m.weights[-1]
         if W_act.dtype != np.float32:
             W_act = W_act.astype(np.float32)

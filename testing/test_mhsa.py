@@ -40,6 +40,7 @@ def _make_mhsa(
     num_layers: int = 1,
     seed: int = 0,
     use_input_proj: bool = False,
+    action_mode: str = "continuous",
 ):
     bootstrap_im2col_gemm_runtime()
     np.random.seed(seed)
@@ -58,6 +59,7 @@ def _make_mhsa(
             # Pos adds noise to tiny probes; exercise it in a dedicated smoke.
             "use_pos_encoding": False,
             "use_input_proj": use_input_proj,
+            "action_mode": action_mode,
         },
         contract_list_enabled=True,
         lam_l2=0.0,
@@ -105,6 +107,48 @@ def test_mhsa_naive_forward_actions():
         assert np.all(actions >= -1.0 - 1e-5) and np.all(actions <= 1.0 + 1e-5)
         assert np.allclose(actions, model.predict(X), atol=1e-6)
         print("[PASSED] mhsa: naive native forward → tanh actions (deterministic)")
+    finally:
+        _close(model)
+
+
+def test_mhsa_discrete_forward_logits_and_ce():
+    """Discrete mode: raw logits (no tanh) + softmax CE grads move weights."""
+    model = _make_mhsa(
+        d_model=16, num_heads=2, action_dim=3, seed=42, action_mode="discrete"
+    )
+    try:
+        assert model.action_mode == "discrete"
+        X = np.random.randn(4, 4, 16).astype(np.float64)
+        logits = model.predict(X)
+        assert logits.shape == (4, 3)
+        assert np.all(np.isfinite(logits))
+        # Must not be tanh-bounded: at least one |logit| > 1 for random Xavier init
+        # is likely; stronger lock: re-run continuous twin and compare.
+        cont = _make_mhsa(
+            d_model=16, num_heads=2, action_dim=3, seed=42, action_mode="continuous"
+        )
+        try:
+            tanh_a = cont.predict(X)
+            assert np.all(np.abs(tanh_a) <= 1.0 + 1e-5)
+            # Same seed → same pre-activation; discrete logits ≠ continuous tanh.
+            assert not np.allclose(logits, tanh_a, atol=1e-4)
+        finally:
+            _close(cont)
+
+        y = np.zeros((4, 3), dtype=np.float64)
+        y[np.arange(4), np.random.randint(0, 3, size=4)] = 1.0
+        w0 = [w.copy() for w in model.weights]
+        loss0, gw, _, _ = model.run_contract_train_step(
+            X, y, lr=1e-2, apply_adam=True
+        )
+        assert np.isfinite(loss0) and loss0 > 0.0
+        assert all(g is not None and np.all(np.isfinite(g)) for g in gw)
+        assert any(not np.allclose(a, b) for a, b in zip(w0, model.weights))
+        # Gradients on action head must be non-trivial (no tanh saturation cliff).
+        assert float(np.max(np.abs(gw[-1]))) > 1e-6
+        loss1, _, _, _ = model.run_contract_train_step(X, y, lr=1e-2, apply_adam=True)
+        assert loss1 < loss0, f"CE should drop: {loss0} -> {loss1}"
+        print("[PASSED] mhsa: discrete logits + CE train (grads free, loss drops)")
     finally:
         _close(model)
 
@@ -561,6 +605,7 @@ def test_mhsa_finite_diff_grads_l2():
 if __name__ == "__main__":
     test_mhsa_compile_ops()
     test_mhsa_naive_forward_actions()
+    test_mhsa_discrete_forward_logits_and_ce()
     test_mhsa_train_step_smoke()
     test_mhsa_stacked_smoke()
     test_mhsa_rejects_bad_geometry()

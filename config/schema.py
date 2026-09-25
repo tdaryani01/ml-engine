@@ -48,6 +48,7 @@ class MHSAConfig:
     num_layers: int = 1
     use_pos_encoding: bool = True
     use_input_proj: bool = False
+    action_mode: str = "continuous"  # continuous | discrete
 
 
 @dataclass(frozen=True)
