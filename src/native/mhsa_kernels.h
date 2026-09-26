@@ -191,6 +191,10 @@ struct MhsaBinding {
 
     // 0 = continuous (tanh + MSE), 1 = discrete (logits + softmax CE)
     int64_t action_mode;
+    // BL-030c: discrete-head softmax temperature. 1.0 is a strict no-op
+    // (unscaled softmax, unchanged from pre-BL-030 behavior). Callers must
+    // set this explicitly — the struct is not zero-initialized to 1.0.
+    float temperature;
 };
 
 enum {

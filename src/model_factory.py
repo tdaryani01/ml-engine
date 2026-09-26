@@ -155,6 +155,7 @@ class ModelFactory:
                 use_pos_encoding = bool(getattr(mhsa_config, "use_pos_encoding", True))
                 use_input_proj = bool(getattr(mhsa_config, "use_input_proj", False))
                 action_mode = getattr(mhsa_config, "action_mode", "continuous")
+                action_temperature = getattr(mhsa_config, "action_temperature", 1.0)
             else:
                 d_model = mhsa_config["d_model"]
                 num_heads = mhsa_config["num_heads"]
@@ -165,6 +166,7 @@ class ModelFactory:
                 use_pos_encoding = bool(mhsa_config.get("use_pos_encoding", True))
                 use_input_proj = bool(mhsa_config.get("use_input_proj", False))
                 action_mode = mhsa_config.get("action_mode", "continuous")
+                action_temperature = mhsa_config.get("action_temperature", 1.0)
 
             factory_kwargs.pop("use_batch_norm", None)
             factory_kwargs.pop("bn_momentum", None)
@@ -180,6 +182,7 @@ class ModelFactory:
                 use_pos_encoding=use_pos_encoding,
                 use_input_proj=use_input_proj,
                 action_mode=action_mode,
+                action_temperature=float(action_temperature),
                 backend=backend_val,
                 engine_ctx=engine_ctx,
                 **factory_kwargs,

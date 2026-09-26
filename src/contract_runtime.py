@@ -287,6 +287,10 @@ class MhsaBinding(ctypes.Structure):
         ("vs_pos_next", ctypes.c_void_p),
         # 0 = continuous (tanh + MSE), 1 = discrete (logits + softmax CE)
         ("action_mode", ctypes.c_int64),
+        # BL-030c: discrete-head softmax temperature. 1.0 = no-op. Must be
+        # set explicitly by every binder — ctypes zero-inits to 0.0, which
+        # would divide-by-zero in the kernel if left unset.
+        ("temperature", ctypes.c_float),
     ]
 
 
@@ -2385,6 +2389,8 @@ class ContractRuntime:
         mb.action_mode = (
             1 if str(mode_s).lower() == "discrete" else 0
         )
+        # BL-030c: default 1.0 — must never be left at ctypes' 0.0 default.
+        mb.temperature = float(getattr(m, "action_temperature", 1.0) or 1.0)
 
         use_pos = bool(getattr(m, "use_pos_encoding", False) and pos_embed is not None)
         use_proj = bool(getattr(m, "use_input_proj", False) and W_in is not None)

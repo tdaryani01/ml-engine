@@ -464,7 +464,14 @@ int32_t mhsa_action_backward(MhsaBinding* m) {
 
     float* dz = m->d_qkv;
     if (m->action_mode == MHSA_ACTION_MODE_DISCRETE) {
-        // Softmax + mean CE: ∂L/∂logits = (probs - one_hot) / B.
+        // Softmax(logits/T) + mean CE (BL-030c: T scalar, 1.0 = no-op —
+        // exp((logits-max)/1.0) is bit-identical to the pre-BL-030
+        // exp(logits-max)). ∂L/∂logits = (probs - target) / (T * B): the
+        // temperature scale carries into the gradient too (d(logits/T)/d
+        // logits = 1/T), not just the forward softmax — otherwise T != 1
+        // would silently miscalibrate the gradient magnitude.
+        const float T = m->temperature > 0.0f ? m->temperature : 1.0f;
+        const float inv_T = 1.0f / T;
         const float inv_B = 1.0f / static_cast<float>(B);
         float loss = 0.0f;
         constexpr float kLogEps = 1e-7f;
@@ -478,14 +485,14 @@ int32_t mhsa_action_backward(MhsaBinding* m) {
             }
             float sum_exp = 0.0f;
             for (int64_t a = 0; a < A; ++a) {
-                row[a] = std::exp(logits[a] - max_logit);
+                row[a] = std::exp((logits[a] - max_logit) * inv_T);
                 sum_exp += row[a];
             }
             const float inv_sum = 1.0f / sum_exp;
             for (int64_t a = 0; a < A; ++a) {
                 const float p = row[a] * inv_sum;
                 loss -= tgt[a] * std::log(p + kLogEps);
-                row[a] = inv_B * (p - tgt[a]);
+                row[a] = inv_B * inv_T * (p - tgt[a]);
             }
         }
         if (m->loss_out) m->loss_out[0] = loss * inv_B;
