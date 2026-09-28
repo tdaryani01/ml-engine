@@ -3,8 +3,21 @@
 #include "blas_dynamic.h"
 
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+
+// BL-030x: ABI guards. MhsaBinding is mirrored field-for-field by the ctypes
+// struct in src/contract_runtime.py, so a layout drift on EITHER side makes the
+// kernel read pointers at the wrong offsets — no crash, just silently corrupted
+// weights. These two asserts pin the newest field's offset and the total size;
+// the ctypes mirror asserts the same two numbers when it is imported, so the
+// pair covers both directions. If one fires, change BOTH sides together.
+static_assert(
+    offsetof(MhsaBinding, sample_weights) == 6656,
+    "ABI mismatch: sample_weights offset changed");
+static_assert(
+    sizeof(MhsaBinding) == 6664, "ABI mismatch: MhsaBinding size changed");
 
 namespace {
 

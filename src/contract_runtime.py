@@ -298,6 +298,24 @@ class MhsaBinding(ctypes.Structure):
     ]
 
 
+# BL-030x: ABI guard mirroring the static_asserts in src/native/mhsa_kernels.cpp.
+# The C++ struct and this ctypes mirror must agree field-for-field — if EITHER
+# side drifts, the kernel dereferences pointers at the wrong offsets with no
+# error at all, just silently corrupted weights. The C++ asserts catch a
+# C++-side change at build time; this catches a ctypes-side change at import.
+# Fail loudly instead of training on garbage. (Pinned for 64-bit targets; a
+# 32-bit build has different pointer sizes and the prebuilt .so is x86-64 only.)
+if (
+    MhsaBinding.sample_weights.offset != 6656
+    or ctypes.sizeof(MhsaBinding) != 6664
+):
+    raise RuntimeError(
+        "MhsaBinding ABI mismatch vs src/native/mhsa_kernels.cpp: "
+        f"sample_weights offset={MhsaBinding.sample_weights.offset} (want 6656), "
+        f"sizeof={ctypes.sizeof(MhsaBinding)} (want 6664)"
+    )
+
+
 class ContractExecCtx(ctypes.Structure):
     _fields_ = [
         ("N", ctypes.c_int64),
