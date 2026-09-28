@@ -473,9 +473,18 @@ int32_t mhsa_action_backward(MhsaBinding* m) {
         const float T = m->temperature > 0.0f ? m->temperature : 1.0f;
         const float inv_T = 1.0f / T;
         const float inv_B = 1.0f / static_cast<float>(B);
+        // BL-030x: per-row loss weights (golden anchors > 1.0). NULL ⇒ 1.0.
+        // ``weight`` scales BOTH the accumulated CE and the logit-gradient
+        // contribution of row b; weight == 1.0f multiplies through exactly,
+        // so an unweighted call stays bit-identical to pre-BL-030.
+        const float* row_weights = m->sample_weights;
         float loss = 0.0f;
         constexpr float kLogEps = 1e-7f;
         for (int64_t b = 0; b < B; ++b) {
+            float weight = row_weights ? row_weights[b] : 1.0f;
+            // Defensive: a negative/NaN weight would flip the loss sign or
+            // poison the gradient. Treat it as "drop this row".
+            if (!(weight > 0.0f)) weight = 0.0f;
             const float* logits = m->actions + b * A;
             const float* tgt = m->y + b * A;
             float* row = dz + b * A;
@@ -491,8 +500,8 @@ int32_t mhsa_action_backward(MhsaBinding* m) {
             const float inv_sum = 1.0f / sum_exp;
             for (int64_t a = 0; a < A; ++a) {
                 const float p = row[a] * inv_sum;
-                loss -= tgt[a] * std::log(p + kLogEps);
-                row[a] = inv_B * inv_T * (p - tgt[a]);
+                loss -= weight * tgt[a] * std::log(p + kLogEps);
+                row[a] = inv_B * inv_T * weight * (p - tgt[a]);
             }
         }
         if (m->loss_out) m->loss_out[0] = loss * inv_B;

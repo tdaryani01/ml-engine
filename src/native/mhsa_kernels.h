@@ -195,6 +195,13 @@ struct MhsaBinding {
     // (unscaled softmax, unchanged from pre-BL-030 behavior). Callers must
     // set this explicitly — the struct is not zero-initialized to 1.0.
     float temperature;
+
+    // BL-030x: optional per-row loss weights, length B (batch rows), NULL ⇒
+    // uniform 1.0. Golden-anchor rows get > 1.0 so the discrete action head's
+    // softmax-CE loss and its logit gradient are scaled up for them. Must be
+    // set explicitly by the binder; ctypes zero-inits to NULL (= uniform),
+    // which is the pre-BL-030 behavior.
+    float* sample_weights;
 };
 
 enum {

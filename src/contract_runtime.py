@@ -291,6 +291,10 @@ class MhsaBinding(ctypes.Structure):
         # set explicitly by every binder — ctypes zero-inits to 0.0, which
         # would divide-by-zero in the kernel if left unset.
         ("temperature", ctypes.c_float),
+        # BL-030x: optional per-row loss weights, length B, NULL ⇒ uniform.
+        # Mirrors mhsa_kernels.h. Appended last so every existing field keeps
+        # its offset (the C++ and ctypes layouts must stay byte-identical).
+        ("sample_weights", ctypes.c_void_p),
     ]
 
 
@@ -2264,8 +2268,15 @@ class ContractRuntime:
         slot_idx: int = 0,
         input_bank_idx: int | None = None,
         output_bank_idx: int | None = None,
+        sample_weights: np.ndarray | None = None,
     ) -> ContractExecCtx:
-        """Bind MHSA geometry + float32 banks into ContractExecCtx.mhsa."""
+        """Bind MHSA geometry + float32 banks into ContractExecCtx.mhsa.
+
+        ``sample_weights`` (BL-030x) is an optional ``(B,)`` float32 array of
+        per-row loss weights (golden anchors > 1.0). ``None`` leaves the
+        kernel's weight pointer NULL, i.e. uniform — bit-identical to the
+        pre-BL-030 backward pass.
+        """
         if X.ndim != 3:
             raise ValueError(f"MHSA input must be (B,T,D); got shape {X.shape}")
         B, T, D_in = (int(X.shape[0]), int(X.shape[1]), int(X.shape[2]))
@@ -2351,6 +2362,17 @@ class ContractRuntime:
                     f"MHSA target shape {yf.shape} != ({B}, {m.action_dim})"
                 )
             ws["y"] = yf
+        # BL-030x: keep the weight buffer alive in the workspace (same reason
+        # ws["y"] is cached — the kernel holds a raw pointer for the duration
+        # of the native call).
+        wf = None
+        if sample_weights is not None:
+            wf = np.ascontiguousarray(sample_weights, dtype=np.float32).reshape(-1)
+            if wf.shape != (B,):
+                raise ValueError(
+                    f"MHSA sample_weights shape {wf.shape} != ({B},)"
+                )
+            ws["sample_weights"] = wf
 
         opt = m.optimizer
         if apply_adam and hasattr(m, "ensure_adam_moments"):
@@ -2391,6 +2413,8 @@ class ContractRuntime:
         )
         # BL-030c: default 1.0 — must never be left at ctypes' 0.0 default.
         mb.temperature = float(getattr(m, "action_temperature", 1.0) or 1.0)
+        # BL-030x: NULL when unweighted (= uniform 1.0 in the kernel).
+        mb.sample_weights = _ptr(wf) if wf is not None else None
 
         use_pos = bool(getattr(m, "use_pos_encoding", False) and pos_embed is not None)
         use_proj = bool(getattr(m, "use_input_proj", False) and W_in is not None)
@@ -2706,13 +2730,21 @@ class ContractRuntime:
         apply_adam: bool = False,
         step_token: int | None = None,
         tick_fn: Callable[[], None] | None = None,
+        sample_weights: np.ndarray | None = None,
     ) -> tuple[float, list[np.ndarray], list[np.ndarray], int]:
-        """Sync one-shot for unit tests (blocking native invoke)."""
+        """Sync one-shot for unit tests (blocking native invoke).
+
+        ``sample_weights`` (BL-030x): optional ``(B,)`` per-row loss weights
+        applied by the MHSA action head. Ignored on the dense/conv path (which
+        has no weighting support) — ``None`` = uniform everywhere.
+        """
         del tick_fn, step_token
         if self._mhsa_mode:
             X = np.ascontiguousarray(X)
             y = np.ascontiguousarray(y)
-            ctx = self._bind_mhsa(X, y, apply_adam=apply_adam)
+            ctx = self._bind_mhsa(
+                X, y, apply_adam=apply_adam, sample_weights=sample_weights
+            )
             self._zero_mhsa_grads()
             ctx.lr = float(lr)
             ctx.skip_adam = 0 if apply_adam else 1
