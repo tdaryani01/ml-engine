@@ -17,7 +17,10 @@ static_assert(
     offsetof(MhsaBinding, sample_weights) == 6656,
     "ABI mismatch: sample_weights offset changed");
 static_assert(
-    sizeof(MhsaBinding) == 6664, "ABI mismatch: MhsaBinding size changed");
+    offsetof(MhsaBinding, D_in) == 6664,
+    "ABI mismatch: D_in offset changed");
+static_assert(
+    sizeof(MhsaBinding) == 6672, "ABI mismatch: MhsaBinding size changed");
 
 namespace {
 
@@ -387,6 +390,10 @@ int32_t layer_backward(
 
 extern "C" {
 
+ML_ENGINE_EXPORT int64_t mhsa_binding_sizeof(void) {
+    return static_cast<int64_t>(sizeof(MhsaBinding));
+}
+
 int32_t mhsa_block_forward(const float* X, MhsaBinding* m) {
     if (!X || !bind_ok_fwd(m)) return -2;
     const int32_t br = require_blas_ready();
@@ -398,17 +405,22 @@ int32_t mhsa_block_forward(const float* X, MhsaBinding* m) {
     const int64_t H = m->H;
     const int64_t Dh = m->d_head;
     const int64_t Hff = m->ffn_hidden;
-    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1) return -3;
+    // Raw token width. 0/absent → legacy square projection (D_in == D).
+    const int64_t D_in = (m->D_in > 0) ? m->D_in : D;
+    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1 || D_in < 1) return -3;
 
     const int64_t rows = B * T;
     const size_t bytes_D = static_cast<size_t>(rows * D) * sizeof(float);
     const bool use_proj = (m->W_in != nullptr && m->b_in != nullptr);
     const bool use_pos = (m->pos != nullptr && m->max_seq_len >= T);
     if ((use_proj || use_pos) && !m->X_emb) return -2;
+    // A dimension-changing projection is required when raw width != model width.
+    if (D_in != D && !use_proj) return -3;
 
     const float* layer0_X = X;
     if (use_proj) {
-        blas_gemm_forward(X, m->W_in, m->X_emb, rows, D, D);
+        // X [rows, D_in] @ W_in [D_in, D] -> X_emb [rows, D]
+        blas_gemm_forward(X, m->W_in, m->X_emb, rows, D, D_in);
         add_bias_rows(m->X_emb, m->b_in, rows, D);
         layer0_X = m->X_emb;
     } else if (use_pos) {
@@ -562,12 +574,16 @@ int32_t mhsa_block_backward(const float* X, MhsaBinding* m) {
     const int64_t Dh = m->d_head;
     const int64_t Hff = m->ffn_hidden;
     const int64_t rows = B * T;
-    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1) return -3;
+    const int64_t D_in = (m->D_in > 0) ? m->D_in : D;
+    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1 || D_in < 1) return -3;
 
     const bool use_proj = (m->W_in != nullptr && m->b_in != nullptr);
     const bool use_pos = (m->pos != nullptr && m->max_seq_len >= T);
     if ((use_proj || use_pos) && !m->X_emb) return -2;
     if (use_proj && (!m->dW_in || !m->db_in)) return -2;
+    // Mirror of the forward guard: without a projection, dX is [rows, D_in]
+    // and the passthrough memcpy below copies rows*D — they must match.
+    if (D_in != D && !use_proj) return -3;
 
     // Layer 0 saw X_emb when proj and/or pos ran; otherwise raw X.
     const float* X_l0 = (use_proj || use_pos) ? m->X_emb : X;
@@ -600,11 +616,11 @@ int32_t mhsa_block_backward(const float* X, MhsaBinding* m) {
     }
 
     if (use_proj) {
-        // dW_in / db_in from X_raw and d_emb; dX = d_emb @ W_in^T.
-        blas_gemm_weight_grad_rm(X, d_cur, m->dW_in, rows, D, D, 1.0f);
+        // dW_in [D_in, D] / db_in from X_raw and d_emb; dX = d_emb @ W_in^T.
+        blas_gemm_weight_grad_rm(X, d_cur, m->dW_in, rows, D, D_in, 1.0f);
         accumulate_bias_grad(d_cur, m->db_in, rows, D);
         if (m->dX) {
-            blas_gemm_input_grad_rm(d_cur, m->W_in, m->dX, rows, D, D);
+            blas_gemm_input_grad_rm(d_cur, m->W_in, m->dX, rows, D, D_in);
         }
     } else if (m->dX) {
         std::memcpy(m->dX, d_cur, static_cast<size_t>(rows * D) * sizeof(float));

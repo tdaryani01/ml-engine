@@ -62,6 +62,17 @@ def load_config(path: str | Path) -> dict[str, Any]:
     return cfg
 
 
+def _schema_template(cfg: dict[str, Any]) -> dict[str, Any]:
+    """TM-authoritative dynamic dims (top-level or under ``architecture``)."""
+    template = cfg.get("schema_template")
+    if isinstance(template, dict):
+        return template
+    arch = cfg.get("architecture")
+    if isinstance(arch, dict) and isinstance(arch.get("schema_template"), dict):
+        return arch["schema_template"]
+    return {}
+
+
 def _default_spatial_pipeline(in_channels: int) -> list[dict[str, Any]]:
     return [
         {
@@ -89,11 +100,25 @@ def _default_spatial_pipeline(in_channels: int) -> list[dict[str, Any]]:
 
 
 def make_cnn(cfg: dict[str, Any], *, seed: int = 0):
+    # schema_template (TM authority) wins; legacy cnn_encoder keys are fallback.
+    st = _schema_template(cfg)
     ce = cfg.get("cnn_encoder", {})
-    shape = list(ce.get("input_shape", cfg["closed_loop"]["canvas"]))
+    shape = list(
+        st["input_shape"]
+        if st.get("input_shape") is not None
+        else ce.get("input_shape", cfg["closed_loop"]["canvas"])
+    )
     feature_dim = int(ce.get("feature_dim", 16))
-    pipeline = ce.get("spatial_pipeline") or _default_spatial_pipeline(int(shape[0]))
-    dense_head = list(ce.get("dense_head", []))
+    pipeline = (
+        st.get("spatial_pipeline")
+        or ce.get("spatial_pipeline")
+        or _default_spatial_pipeline(int(shape[0]))
+    )
+    dense_head = list(
+        st["dense_head"]
+        if st.get("dense_head") is not None
+        else ce.get("dense_head", [])
+    )
     np.random.seed(seed)
     return ModelFactory.create_model(
         "cnn",
@@ -115,23 +140,42 @@ def make_cnn(cfg: dict[str, Any], *, seed: int = 0):
 
 def make_mhsa(cfg: dict[str, Any], *, seed: int = 1):
     cl = cfg["closed_loop"]
+    # schema_template (TM authority) wins; legacy `mhsa` keys are fallback.
+    st = _schema_template(cfg)
     mh = cfg.get("mhsa", {})
     max_steps = int(cl["max_steps"])
+
+    def _pick(name: str, legacy_default: Any) -> Any:
+        if st.get(name) is not None:
+            return st[name]
+        return mh.get(name, legacy_default)
+
+    action_dim = int(_pick("action_dim", 4))
+    # The interleaver fixes the emitted sequence length; max_seq_len must cover it.
+    required_T = TokenInterleaver.seq_len(max_steps)
+    provided_T = (
+        st.get("max_seq_len")
+        if st.get("max_seq_len") is not None
+        else mh.get("max_seq_len")
+    )
+    max_seq_len = (
+        max(required_T, int(provided_T)) if provided_T is not None else required_T
+    )
     np.random.seed(seed)
     return ModelFactory.create_model(
         "mhsa",
-        layer_sizes=[int(mh.get("action_dim", 4))],
+        layer_sizes=[action_dim],
         backend=EngineBackend.NATIVE,
         optimizer="adam",
         mhsa_config={
-            "d_model": int(mh.get("d_model", 32)),
-            "num_heads": int(mh.get("num_heads", 4)),
-            "max_seq_len": TokenInterleaver.seq_len(max_steps),
-            "action_dim": int(mh.get("action_dim", 4)),
-            "ffn_mult": int(mh.get("ffn_mult", 2)),
-            "num_layers": int(mh.get("num_layers", 1)),
-            "use_pos_encoding": bool(mh.get("use_pos_encoding", False)),
-            "use_input_proj": bool(mh.get("use_input_proj", False)),
+            "d_model": int(_pick("d_model", 32)),
+            "num_heads": int(_pick("num_heads", 4)),
+            "max_seq_len": max_seq_len,
+            "action_dim": action_dim,
+            "ffn_mult": int(_pick("ffn_mult", 2)),
+            "num_layers": int(_pick("num_layers", 1)),
+            "use_pos_encoding": bool(_pick("use_pos_encoding", False)),
+            "use_input_proj": bool(_pick("use_input_proj", False)),
         },
         contract_list_enabled=True,
         lam_l2=0.0,

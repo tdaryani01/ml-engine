@@ -295,6 +295,9 @@ class MhsaBinding(ctypes.Structure):
         # Mirrors mhsa_kernels.h. Appended last so every existing field keeps
         # its offset (the C++ and ctypes layouts must stay byte-identical).
         ("sample_weights", ctypes.c_void_p),
+        # Raw token width [B*T, D_in]. 0 → legacy square projection (D_in==D).
+        # Appended last so existing offsets hold; mirrors mhsa_kernels.h.
+        ("D_in", ctypes.c_int64),
     ]
 
 
@@ -307,12 +310,14 @@ class MhsaBinding(ctypes.Structure):
 # 32-bit build has different pointer sizes and the prebuilt .so is x86-64 only.)
 if (
     MhsaBinding.sample_weights.offset != 6656
-    or ctypes.sizeof(MhsaBinding) != 6664
+    or MhsaBinding.D_in.offset != 6664
+    or ctypes.sizeof(MhsaBinding) != 6672
 ):
     raise RuntimeError(
         "MhsaBinding ABI mismatch vs src/native/mhsa_kernels.cpp: "
         f"sample_weights offset={MhsaBinding.sample_weights.offset} (want 6656), "
-        f"sizeof={ctypes.sizeof(MhsaBinding)} (want 6664)"
+        f"D_in offset={MhsaBinding.D_in.offset} (want 6664), "
+        f"sizeof={ctypes.sizeof(MhsaBinding)} (want 6672)"
     )
 
 
@@ -579,6 +584,41 @@ def shutdown_contract_async() -> None:
         set_t(ctypes.c_int32(0))
 
 
+_MHSA_ABI_VERIFIED: set[int] = set()
+
+
+def _verify_native_mhsa_abi(lib: Any) -> None:
+    """Assert the loaded native library's MhsaBinding matches the ctypes mirror.
+
+    The Python-side checks above only prove the ctypes struct is what this
+    source tree expects. A stale prebuilt conv_kernels (e.g. an old Windows DLL)
+    can still carry an older, smaller MhsaBinding — it would then read D_in and
+    later fields from the wrong offsets. The library reports its own sizeof;
+    a missing export means it predates the check and is equally stale.
+    """
+    key = id(lib)
+    if key in _MHSA_ABI_VERIFIED:
+        return
+    fn = getattr(lib, "mhsa_binding_sizeof", None)
+    if fn is None:
+        raise RuntimeError(
+            "Native library has no mhsa_binding_sizeof export — it predates the "
+            "current MhsaBinding ABI (stale conv_kernels.so/.dll). Rebuild: "
+            "bash build_native.sh (Linux) or .\\build_native.ps1 (Windows)."
+        )
+    fn.restype = ctypes.c_int64
+    fn.argtypes = []
+    native = int(fn())
+    expected = ctypes.sizeof(MhsaBinding)
+    if native != expected:
+        raise RuntimeError(
+            f"MhsaBinding ABI mismatch: native library sizeof={native}, ctypes "
+            f"mirror sizeof={expected}. The native library is stale or built "
+            "from different sources — rebuild it (build_native.sh / .ps1)."
+        )
+    _MHSA_ABI_VERIFIED.add(key)
+
+
 class ContractRuntime:
     """Binds a compiled ContractList to live CNN weights + scratch arena."""
 
@@ -598,6 +638,8 @@ class ContractRuntime:
             )
             for op in self.contract.ops
         )
+        if self._mhsa_mode:
+            _verify_native_mhsa_abi(self._lib)
         if not self._mhsa_mode:
             if len(model._dense_w_indices) < 1:
                 raise ValueError("Contract path requires at least one dense head layer")
@@ -1290,7 +1332,8 @@ class ContractRuntime:
         Hff = int(m.ffn_hidden)
         A = int(m.action_dim)
         L = int(m.num_layers)
-        key = (B, T, D, H, Hff, A, L)
+        D_in = int(getattr(m, "input_dim", D) or D)
+        key = (B, T, D, D_in, H, Hff, A, L)
         if ws.get("_key") == key:
             return
         fresh = self._alloc_mhsa_workspace_buffers(B, T)
@@ -2144,9 +2187,10 @@ class ContractRuntime:
         Hff = int(m.ffn_hidden)
         A = int(m.action_dim)
         L = int(m.num_layers)
+        D_in = int(getattr(m, "input_dim", D) or D)
         Dh = D // H
         rows = B * T
-        key = (B, T, D, H, Hff, A, L)
+        key = (B, T, D, D_in, H, Hff, A, L)
         layers_ws = []
         for _ in range(L):
             layers_ws.append(
@@ -2169,14 +2213,14 @@ class ContractRuntime:
             "actions": np.zeros((B, A), dtype=np.float32),
             "d_qkv": np.zeros((rows, 3 * D), dtype=np.float32),
             "dO": np.zeros((rows, D), dtype=np.float32),
-            "dX": np.zeros((rows, D), dtype=np.float32),
+            "dX": np.zeros((rows, D_in), dtype=np.float32),
             "d_stream": np.zeros((rows, D), dtype=np.float32),
-            "X": np.zeros((rows, D), dtype=np.float32),
+            "X": np.zeros((rows, D_in), dtype=np.float32),
             "X_emb": np.zeros((rows, D), dtype=np.float32),
             "y": np.zeros((B, A), dtype=np.float32),
             "loss": np.zeros(1, dtype=np.float32),
             "d_pos": np.zeros((int(m.max_seq_len), D), dtype=np.float32),
-            "dW_in": np.zeros((D, D), dtype=np.float32),
+            "dW_in": np.zeros((D_in, D), dtype=np.float32),
             "db_in": np.zeros(D, dtype=np.float32),
             "q_pack": np.zeros((T * Dh,), dtype=np.float32),
             "k_pack": np.zeros((T * Dh,), dtype=np.float32),
@@ -2191,7 +2235,8 @@ class ContractRuntime:
         Hff = int(m.ffn_hidden)
         A = int(m.action_dim)
         L = int(m.num_layers)
-        key = (B, T, D, H, Hff, A, L)
+        D_in = int(getattr(m, "input_dim", D) or D)
+        key = (B, T, D, D_in, H, Hff, A, L)
         if self._mhsa_ws is not None and self._mhsa_ws.get("_key") == key:
             return
         self._mhsa_ws = self._alloc_mhsa_workspace_buffers(B, T)
@@ -2296,11 +2341,15 @@ class ContractRuntime:
         pre-BL-030 backward pass.
         """
         if X.ndim != 3:
-            raise ValueError(f"MHSA input must be (B,T,D); got shape {X.shape}")
+            raise ValueError(f"MHSA input must be (B,T,D_in); got shape {X.shape}")
         B, T, D_in = (int(X.shape[0]), int(X.shape[1]), int(X.shape[2]))
         m = self.model
-        if D_in != int(m.d_model):
-            raise ValueError(f"MHSA D mismatch: X has {D_in}, model d_model={m.d_model}")
+        model_d_in = int(getattr(m, "input_dim", m.d_model) or m.d_model)
+        if D_in != model_d_in:
+            raise ValueError(
+                f"MHSA input width mismatch: X has D_in={D_in}, "
+                f"model input_dim={model_d_in}"
+            )
         if T > int(m.max_seq_len):
             raise ValueError(f"MHSA T={T} exceeds max_seq_len={m.max_seq_len}")
 
@@ -2424,6 +2473,8 @@ class ContractRuntime:
         mb.action_dim = int(m.action_dim)
         mb.ffn_hidden = int(m.ffn_hidden)
         mb.num_layers = L
+        # Raw token width: drives the (D_in -> D) input projection in the kernel.
+        mb.D_in = D_in
         mode = getattr(m, "action_mode", "continuous")
         mode_s = getattr(mode, "value", mode)
         mb.action_mode = (
@@ -2435,7 +2486,11 @@ class ContractRuntime:
         mb.sample_weights = _ptr(wf) if wf is not None else None
 
         use_pos = bool(getattr(m, "use_pos_encoding", False) and pos_embed is not None)
-        use_proj = bool(getattr(m, "use_input_proj", False) and W_in is not None)
+        # W_in presence is the proj switch: allocated when use_input_proj OR
+        # when the raw token width differs from d_model.
+        use_proj = W_in is not None and b_in is not None
+        if W_in is not None and b_in is None:
+            raise ValueError("MHSA input projection has W_in but no b_in")
 
         for li in range(L):
             base = 4 * li

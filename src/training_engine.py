@@ -226,7 +226,12 @@ class TrainingEngine:
         config: LedgerConfig | None = None,
         session: TrainingSession | None = None,
         manager_heartbeat: ManagerHeartbeat | None = None,
+        *,
+        authorize_on_boot: bool = True,
     ):
+        """``authorize_on_boot``: with a heartbeat attached, start training on
+        boot (True) or park until TM sends Start/Resume (False). Set from
+        ``training_manager.authorize_on_boot`` (host config or TM payload)."""
         self.sessions: list[TrainingSession] = []
         self._current_session: TrainingSession | None = None
         self.ledger = ledger
@@ -248,8 +253,7 @@ class TrainingEngine:
         self._on_cancel: Callable[[Any], None] | None = None
         self._on_restore: Callable[[Any], bool] | None = None
         self._pause_gate: Callable[[], bool] | None = None
-        # BL-007d: configure from job on claim; reset when lease drops.
-        self._on_claim_config: Callable[[dict[str, Any]], bool] | None = None
+        # Config-specific reset hook (e.g. closed-loop agent on cancel).
         self._on_release_config: Callable[[], None] | None = None
         self._restore_inflight: dict[str, threading.Thread] = {}
         self._restore_ready: dict[str, Any] = {}
@@ -259,14 +263,14 @@ class TrainingEngine:
         # After fit completes sessions are dropped; keep the model so TM restore
         # can still apply weights while parked paused.
         self._held_model_for_restore: Any | None = None
-        # Only an explicit start/resume (or claim/adopt) in *this* process
-        # authorizes run — boot never auto-trains.
+        # Direct execution: with a heartbeat attached, training starts on boot
+        # only when authorize_on_boot; otherwise the engine parks until TM
+        # sends Start/Resume.
         self._run_authorized: bool = False
+        self._authorize_on_boot: bool = bool(authorize_on_boot)
         # Redelivered pre-boot shutdown must not kill a new process.
         self._process_started_at: float = time.time()
         self._shutdown_accepted: bool = False
-        # BL-006c: True while we hold a claimed work lease (cleared on release/ack).
-        self._work_lease_active: bool = False
         if session is not None:
             self._register_session(session, activate=True)
 
@@ -325,11 +329,6 @@ class TrainingEngine:
         hb = self._manager_heartbeat
         if hb is None:
             return
-        # BL-026: while a train job is leased, metrics.state is a worker *output*
-        # (agent trip/progress). Engine idle/pause loops must not overwrite
-        # es-onset with idle (board idle + pool busy; TM never steers).
-        if bool(getattr(hb, "job_bound", False)):
-            return
         # Once training advances past a restore point, stop advertising it as tip.
         if (
             self._restored_checkpoint_version is not None
@@ -369,23 +368,20 @@ class TrainingEngine:
         on_cancel: Callable[[Any], None] | None = None,
         on_restore: Callable[[Any], bool] | None = None,
         pause_gate: Callable[[], bool] | None = None,
-        on_claim_config: Callable[[dict[str, Any]], bool] | None = None,
         on_release_config: Callable[[], None] | None = None,
     ) -> None:
-        """Config-specific control extras (not a second claim/HB loop).
+        """Config-specific control extras (not a heartbeat loop).
 
         on_start_resume: return False to block authorize (e.g. user_paused).
         on_restore: return True if fully handled (skip ledger restore).
-        pause_gate: when True, block train/claim (human Pause / site-interrupt).
-        on_claim_config: apply job.config before authorize; False aborts claim.
-        on_release_config: reset in-process config when lease returns to pool.
+        pause_gate: when True, block training (human Pause).
+        on_release_config: reset in-process config on cancel/stop.
         """
         self._on_start_resume = on_start_resume
         self._on_pause = on_pause
         self._on_cancel = on_cancel
         self._on_restore = on_restore
         self._pause_gate = pause_gate
-        self._on_claim_config = on_claim_config
         self._on_release_config = on_release_config
 
     @property
@@ -633,7 +629,7 @@ class TrainingEngine:
         return session
 
     def _ledger_model_instance_id(self, session: TrainingSession | None = None) -> str:
-        """Durable TM agent id (job.model_id). Never the pool worker / session UUID."""
+        """Durable TM agent id (configured instance id) or the session UUID."""
         mid = str(getattr(self.ledger, "model_instance_id", "") or "").strip()
         if mid and mid != "unbound":
             return mid
@@ -641,51 +637,27 @@ class TrainingEngine:
             return str(session.session_id)
         return mid or "unbound"
 
-    def adopt_claimed_job(self, job: dict[str, Any]) -> None:
-        """Authorize a lease already claimed by the outer pool-worker loop."""
-        mid = str(job.get("model_id") or "").strip()
-        if mid and getattr(self, "ledger", None) is not None:
-            self.ledger.model_instance_id = mid
-        self._work_lease_active = True
-        self._run_authorized = True
-        hb = self._manager_heartbeat
-        self.request_resume()
-        logging.info(
-            "[TrainingEngine] adopted job=%s model=%s pool=%s",
-            job.get("job_id"),
-            mid or job.get("model_id"),
-            getattr(hb, "pool_session_id", None) if hb is not None else None,
-        )
-        self._publish_manager_metrics("training")
-        self._emit_engine_status("training", force=True, note="work_adopted")
-
     def run(
         self,
         *,
         activate_pending: bool = False,
         park_when_idle: bool | None = None,
-        job_scoped: bool = False,
     ) -> dict[str, tuple[list[float], list[float]]]:
         """
         Drive ACTIVE sessions to completion (round-robin one epoch each).
 
         Finished sessions are dropped; results keyed by session_id.
 
-        When a Training Manager heartbeat client is attached, the engine
-        **parks paused** until ``start`` / ``resume`` (or claim/adopt)
-        authorizes run in this process. Pause / restore / shutdown are
-        honored while parked.
-
-        ``job_scoped=True``: lease was claimed outside (pool worker). Do not
-        re-claim; stay in the lease until released/stopped (park within the
-        job — one False ``external_step`` must not ack the whole train job).
+        Direct execution: when a Training Manager heartbeat is attached the
+        engine authorizes on boot if ``authorize_on_boot`` is set, otherwise it
+        parks until TM sends Start/Resume. Pause / resume / restore / shutdown
+        commands are honored while parked.
         """
         hb = self._manager_heartbeat
-        if job_scoped:
-            # Hold the lease: idle/pause sleep inside the job, do not exit.
-            park = True
-        elif hb is not None:
-            # TM-managed: always park; never auto-train on boot.
+        if hb is not None:
+            # TM's start policy: train now, or park for Start/Resume.
+            if self._authorize_on_boot:
+                self._run_authorized = True
             park = True
         elif park_when_idle is None:
             park = False
@@ -699,27 +671,18 @@ class TrainingEngine:
 
         results: dict[str, tuple[list[float], list[float]]] = {}
         self._stop.clear()
-        boot_state = "paused" if hb is not None and not job_scoped else "training"
-        if job_scoped and self._run_authorized:
-            boot_state = "training"
+        boot_state = "training" if (hb is None or self._run_authorized) else "paused"
         self._maybe_manager_heartbeat(state=boot_state)
         self._emit_engine_status(boot_state, force=True)
 
         while not self._stop.is_set():
             self.drain_manager_commands(allow_restore=True)
             self._maybe_truncate_imported_journal()
-            self._sync_work_lease()
-            if job_scoped and not self._work_lease_active:
-                break
 
             if self._stop.is_set():
                 break
 
             if not self._manager_allows_training():
-                if job_scoped and not self._work_lease_active:
-                    break
-                if not job_scoped and self._maybe_claim_tm_work():
-                    continue
                 state = "paused"
                 self._maybe_manager_heartbeat(state=state)
                 self._emit_engine_status(state)
@@ -729,8 +692,6 @@ class TrainingEngine:
                 continue
 
             if self._paused.is_set():
-                if job_scoped and not self._work_lease_active:
-                    break
                 self._maybe_manager_heartbeat(state="paused")
                 self._emit_engine_status("paused")
                 sleep_s = self._idle_sleep_s()
@@ -755,17 +716,14 @@ class TrainingEngine:
             if not park:
                 break
 
-            # Park within lease (or long-lived park): sleep, wake, check work.
+            # Park (or long-lived run): sleep, wake, check work.
             sleep_s = self._idle_sleep_s()
             if self._stop.wait(timeout=max(0.1, sleep_s)):
                 break
             self.drain_manager_commands(allow_restore=True)
-            self._sync_work_lease()
-            if job_scoped and not self._work_lease_active:
-                break
             if self._paused.is_set() or not self._manager_allows_training():
                 continue
-            if not job_scoped and self._check_for_work():
+            if self._check_for_work():
                 self._maybe_manager_heartbeat(state="training")
                 self._emit_engine_status("training")
                 continue
@@ -843,10 +801,8 @@ class TrainingEngine:
                         except Exception:
                             logging.exception("[TrainingEngine] on_cancel hook failed")
                     self._run_authorized = False
-                    was_leased = self._work_lease_active
-                    self._work_lease_active = False
                     self._paused.clear()
-                    if was_leased and self._on_release_config is not None:
+                    if self._on_release_config is not None:
                         try:
                             self._on_release_config()
                         except Exception:
@@ -1126,124 +1082,8 @@ class TrainingEngine:
                 self.drop_session(s.session_id)
         return progressed
 
-    def _sync_work_lease(self) -> None:
-        """If TM parked/cancelled our job (release_job), drop local authorization."""
-        hb = self._manager_heartbeat
-        if hb is None or not self._work_lease_active:
-            return
-        if bool(getattr(hb, "job_bound", False)):
-            return
-        self._work_lease_active = False
-        self._run_authorized = False
-        site_hold = bool(getattr(hb, "site_interrupt_hold", False))
-        gate = False
-        if self._pause_gate is not None:
-            try:
-                gate = bool(self._pause_gate())
-            except Exception:
-                gate = False
-        if site_hold or gate:
-            # BL-023 / user pause: look paused, not cleared-for-claim.
-            if not self._paused.is_set():
-                self._paused.set()
-            self._publish_manager_metrics("paused")
-            self._emit_engine_status("paused", force=True, note="work_lease_released_paused")
-            if self._on_release_config is not None:
-                try:
-                    self._on_release_config()
-                except Exception:
-                    logging.exception("[TrainingEngine] on_release_config failed")
-            logging.info(
-                "[TrainingEngine] work lease released — staying paused (site/user hold)"
-            )
-            return
-        if self._paused.is_set():
-            self._paused.clear()
-        if self._on_release_config is not None:
-            try:
-                self._on_release_config()
-            except Exception:
-                logging.exception("[TrainingEngine] on_release_config failed")
-        self._publish_manager_metrics("paused")
-        self._emit_engine_status("paused", force=True, note="work_lease_released")
-        logging.info("[TrainingEngine] work lease released — parking paused")
-
-    def _maybe_claim_tm_work(self) -> bool:
-        """Idle → claim any queued train job (worker = capacity; BL-006c)."""
-        hb = self._manager_heartbeat
-        claim_fn = getattr(hb, "try_claim_work", None) if hb is not None else None
-        if hb is None or claim_fn is None:
-            return False
-        if bool(getattr(hb, "job_bound", False)):
-            return False
-        if self._paused.is_set() or self._stop.is_set():
-            return False
-        if self._run_authorized:
-            return False
-        if self._pause_gate is not None and self._pause_gate():
-            return False
-        try:
-            job = claim_fn()
-        except Exception:
-            logging.exception("[TrainingEngine] try_claim_work failed")
-            return False
-        if not job:
-            return False
-        if self._on_claim_config is not None:
-            try:
-                ok = bool(self._on_claim_config(dict(job)))
-            except Exception:
-                logging.exception("[TrainingEngine] on_claim_config failed")
-                ok = False
-            if not ok:
-                fail = getattr(hb, "fail_work", None)
-                if callable(fail):
-                    try:
-                        fail(error="claim_config_rejected")
-                    except Exception:
-                        logging.exception("[TrainingEngine] fail_work after config reject")
-                else:
-                    unbind = getattr(hb, "unbind_job", None)
-                    if callable(unbind):
-                        unbind()
-                return False
-        mid = str(job.get("model_id") or "").strip()
-        if mid and getattr(self, "ledger", None) is not None:
-            self.ledger.model_instance_id = mid
-        self._work_lease_active = True
-        self._run_authorized = True
-        self.request_resume()
-        logging.info(
-            "[TrainingEngine] claimed job=%s model=%s kind=%s pool=%s",
-            job.get("job_id"),
-            mid or job.get("model_id"),
-            job.get("kind"),
-            getattr(hb, "pool_session_id", None),
-        )
-        try:
-            from src.manager_heartbeat import _diag
-
-            _diag(
-                "engine_claim_authorized",
-                job_id=job.get("job_id"),
-                model_id=mid,
-                kind=job.get("kind"),
-                pool=getattr(hb, "pool_session_id", None),
-                ledger_model=getattr(self.ledger, "model_instance_id", None),
-                has_on_claim_config=self._on_claim_config is not None,
-                has_external_step=self._external_step is not None,
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        self._publish_manager_metrics("training")
-        self._emit_engine_status("training", force=True, note="work_claimed")
-        return True
-
     def _check_for_work(self) -> bool:
         """True if there is (or was just accepted) training work to drive."""
-        self._sync_work_lease()
-        if self._maybe_claim_tm_work():
-            return True
         if self._work_poll is not None:
             try:
                 if self._work_poll():
@@ -1951,6 +1791,7 @@ def create_training_engine(
     config: LedgerConfig | None = None,
     manager_heartbeat: ManagerHeartbeat | None = None,
     store_kwargs: dict[str, Any] | None = None,
+    authorize_on_boot: bool = True,
 ) -> TrainingEngine:
     """Open ledger store and return a TrainingEngine (session optional / attached later)."""
     from pathlib import Path
@@ -1987,4 +1828,5 @@ def create_training_engine(
         config=config,
         session=session,
         manager_heartbeat=manager_heartbeat,
+        authorize_on_boot=authorize_on_boot,
     )

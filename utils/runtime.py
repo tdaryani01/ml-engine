@@ -22,6 +22,7 @@ import yaml
 from threadpoolctl import threadpool_info, threadpool_limits
 
 from config.constants import EngineBackend
+from config.config_source import ConfigSource, detect_config_source
 
 logger = logging.getLogger(__name__)
 
@@ -222,12 +223,25 @@ def _resolve_omp_team_size(
     return int(omp_spec)
 
 
+# TM-sourced runs: the payload's thread budget / async knob, recorded the first
+# time they are resolved explicitly so later bare ``load_runtime_settings()``
+# calls in the same process (e.g. conv_dispatch's native thread sync) reuse the
+# TM values instead of a local default.
+_TM_RESOLVED: Dict[str, object] = {}
+
+
+def reset_tm_runtime_budget() -> None:
+    """Forget the recorded TM thread budget (tests / a new TM payload)."""
+    _TM_RESOLVED.clear()
+
+
 def _resolve_num_threads(
     config_path: Path,
     runtime_raw: Mapping[str, object],
     env: Mapping[str, str],
     *,
     num_threads: Optional[int] = None,
+    allow_config_read: bool = True,
 ) -> int:
     """Resolve full thread budget (OMP_THREAD_LIMIT default / machine budget).
 
@@ -238,6 +252,11 @@ def _resolve_num_threads(
 
     OMP_NUM_THREADS in runtime.yaml is not a budget source — it is the OpenMP
     team size policy (\"auto\" | N); see _resolve_omp_team_size.
+
+    ``allow_config_read=False`` (TM-sourced run) severs step 3 entirely: the
+    budget must come from the TM payload (``optimization.num_threads``, passed
+    as ``num_threads``) or from this process's earlier TM resolution. There is
+    no silent default — a TM run with no budget raises.
     """
     del env  # budget ignores OMP_NUM_THREADS; kept in signature for call sites
     if num_threads is not None:
@@ -249,6 +268,15 @@ def _resolve_num_threads(
     )
     if rt_threads is not None:
         return rt_threads
+
+    if not allow_config_read:
+        recorded = _TM_RESOLVED.get("num_threads")
+        if recorded is not None:
+            return int(recorded)  # type: ignore[arg-type]
+        raise ValueError(
+            "TM-sourced run has no thread budget: the TM payload must set "
+            "optimization.num_threads (or runtime.yaml num_threads for this host)"
+        )
 
     cfg = _load_yaml(config_path)
     return _parse_positive_int(
@@ -302,15 +330,24 @@ def load_runtime_settings(
     num_threads: Optional[int] = None,
     platform: Optional[str] = None,
     native_async_submit: Optional[bool] = None,
+    config_source: Optional["ConfigSource"] = None,
 ) -> RuntimeSettings:
+    source = config_source if config_source is not None else detect_config_source()
+    sever_config = source == ConfigSource.TRAINING_MANAGER
     cfg_path = Path(config_path) if config_path else DEFAULT_CONFIG_PATH
     rt_path = Path(runtime_path) if runtime_path else DEFAULT_RUNTIME_PATH
     raw = _load_yaml(rt_path)
     resolved_platform = platform or detect_platform()
     env = _merge_env_sections(raw, resolved_platform)
     threads = _resolve_num_threads(
-        cfg_path, raw, env, num_threads=num_threads
+        cfg_path,
+        raw,
+        env,
+        num_threads=num_threads,
+        allow_config_read=not sever_config,
     )
+    if sever_config and num_threads is not None:
+        _TM_RESOLVED["num_threads"] = threads
     omp_limit = _resolve_omp_thread_limit(raw, env)
 
     blas_section = raw.get("blas_threads") or {}
@@ -321,16 +358,23 @@ def load_runtime_settings(
     if not isinstance(docker_section, Mapping):
         raise ValueError("runtime.docker must be a mapping")
 
-    cfg = _load_yaml(cfg_path)
-    ledger = cfg.get("ledger") or {}
-    native_async = (
-        bool(ledger.get("native_async_submit", False))
-        if isinstance(ledger, Mapping)
-        else False
-    )
     if native_async_submit is not None:
+        # Explicit value (e.g. the TM payload): never touch config.yaml.
         native_async = bool(native_async_submit)
-
+        if sever_config:
+            _TM_RESOLVED["native_async_submit"] = native_async
+    elif sever_config:
+        # TM-sourced: local config.yaml is not an authority for this knob; reuse
+        # the payload's value if this process resolved it, else off.
+        native_async = bool(_TM_RESOLVED.get("native_async_submit", False))
+    else:
+        cfg = _load_yaml(cfg_path)
+        ledger = cfg.get("ledger") or {}
+        native_async = (
+            bool(ledger.get("native_async_submit", False))
+            if isinstance(ledger, Mapping)
+            else False
+        )
     # OMP_NUM_THREADS: "auto" (or unset) | normal int. Async+auto => N-1.
     omp_spec = _parse_omp_num_threads_spec(env.get("OMP_NUM_THREADS"))
     omp_threads = _resolve_omp_team_size(
@@ -650,15 +694,26 @@ def configure_runtime(
     config_path: Optional[Path] = None,
     runtime_path: Optional[Path] = None,
     num_threads: Optional[int] = None,
+    native_async_submit: Optional[bool] = None,
+    config_source: Optional["ConfigSource"] = None,
     overwrite_env: bool = False,
     if_unset_env: bool = True,
     log: bool = True,
 ) -> RuntimeSettings:
-    """Load runtime.yaml, apply process env, optionally log effective policy."""
+    """Load runtime.yaml, apply process env, optionally log effective policy.
+
+    For TM-sourced runs pass ``config_source=ConfigSource.TRAINING_MANAGER``
+    and the payload's ``num_threads`` / ``native_async_submit``: the
+    ``config.yaml`` read is severed entirely — the TM payload is the authority
+    for thread and backend budgets, and the process env from ``runtime.yaml``
+    (``OMP_MAX_ACTIVE_LEVELS`` etc.) is still applied here.
+    """
     settings = load_runtime_settings(
         config_path=config_path,
         runtime_path=runtime_path,
         num_threads=num_threads,
+        native_async_submit=native_async_submit,
+        config_source=config_source,
     )
     apply_process_env(settings, overwrite=overwrite_env, if_unset=if_unset_env)
     if backend in _CONV_BACKENDS:

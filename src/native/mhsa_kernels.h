@@ -3,6 +3,8 @@
 
 #include <cstdint>
 
+#include "export.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -160,8 +162,9 @@ struct MhsaBinding {
     // Final residual stream (alias of layers[num_layers-1].O after fwd)
     float* O;
 
-    // Optional input projection X @ W_in + b_in (null W_in → disabled)
-    float* W_in;   // [D, D]
+    // Optional input projection X @ W_in + b_in (null W_in → disabled).
+    // W_in is [D_in, D] (D_in = raw token width; == D for a square proj).
+    float* W_in;
     float* b_in;   // [D]
     float* dW_in;
     float* db_in;
@@ -202,6 +205,12 @@ struct MhsaBinding {
     // set explicitly by the binder; ctypes zero-inits to NULL (= uniform),
     // which is the pre-BL-030 behavior.
     float* sample_weights;
+
+    // Optional input width of the raw token tensor X: [B*T, D_in]. When
+    // D_in != D the optional input projection W_in is [D_in, D] (see
+    // mhsa_block_forward/backward). D_in == D preserves the legacy
+    // square-projection behavior. Appended last so existing offsets hold.
+    int64_t D_in;
 };
 
 enum {
@@ -218,6 +227,11 @@ int32_t mhsa_action_backward(MhsaBinding* m);
 
 // Backprop through layers[num_layers-1] .. layers[0], then pos / input proj.
 int32_t mhsa_block_backward(const float* X, MhsaBinding* m);
+
+// ABI self-report: sizeof(MhsaBinding) as compiled into THIS library. Python
+// compares it to its ctypes mirror at load, so a stale prebuilt .so/.dll
+// (older struct) fails loudly instead of reading fields at wrong offsets.
+ML_ENGINE_EXPORT int64_t mhsa_binding_sizeof(void);
 
 #ifdef __cplusplus
 }

@@ -2,6 +2,7 @@
 """Append-only training ledger: documents, pluggable store, replay."""
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from dataclasses import dataclass, field
@@ -11,6 +12,8 @@ from typing import Any, Iterator, Protocol
 import numpy as np
 
 from src.training_session import TrainStepResult
+
+_log = logging.getLogger(__name__)
 
 # Document type constants
 STEP_COMMAND = "step.command"
@@ -173,6 +176,26 @@ def document_from_bytes(data: bytes) -> LedgerDocument:
 
 
 
+def _restore_exact(dst: Any, src: Any, name: str, *, hint: str) -> None:
+    """Copy a checkpoint array into a model array of exactly the same shape."""
+    src_shape = tuple(np.shape(src))
+    dst_shape = tuple(np.shape(dst))
+    if src_shape != dst_shape:
+        raise ValueError(
+            f"restore_model_checkpoint: {name} shape mismatch — checkpoint "
+            f"{src_shape} vs model {dst_shape} (expected {hint}). The checkpoint "
+            "was trained with a different input_dim / d_model; rebuild the model "
+            "with the checkpoint's geometry or start fresh."
+        )
+    try:
+        dst[...] = src
+    except ValueError as exc:  # dtype / read-only / exotic broadcast failures
+        raise ValueError(
+            f"restore_model_checkpoint: could not restore {name} "
+            f"{src_shape} into model {dst_shape}: {exc}"
+        ) from exc
+
+
 def capture_model_checkpoint(model: Any, version: int, val_loss: float | None = None) -> dict[str, Any]:
     """Capture an owned checkpoint snapshot safe from later bank reuse."""
     opt = model.optimizer
@@ -226,6 +249,21 @@ def capture_model_checkpoint(model: Any, version: int, val_loss: float | None = 
     if hasattr(model, "betas"):
         values = getattr(model, "betas", None)
         body["betas"] = [np.copy(a) for a in values] if values else None
+    # Optional MHSA input projection [input_dim, d_model]. None → passthrough
+    # (older blobs remain loadable; models without a projection stay untouched).
+    w_in = getattr(model, "W_in", None)
+    if w_in is not None:
+        body["W_in"] = np.copy(w_in)
+        b_in = getattr(model, "b_in", None)
+        body["b_in"] = np.copy(b_in) if b_in is not None else None
+        body["input_dim"] = int(getattr(model, "input_dim", 0) or 0)
+        ms_w_in = getattr(model, "_ms_W_in", None)
+        vs_w_in = getattr(model, "_vs_W_in", None)
+        body["ms_W_in"] = np.copy(ms_w_in) if ms_w_in is not None else None
+        body["vs_W_in"] = np.copy(vs_w_in) if vs_w_in is not None else None
+    else:
+        body["W_in"] = None
+        body["b_in"] = None
     return body
 
 
@@ -243,6 +281,44 @@ def restore_model_checkpoint(model: Any, body: dict[str, Any]) -> None:
     if body.get("betas") and hasattr(model, "betas"):
         for i, b in enumerate(body["betas"] or []):
             model.betas[i][...] = b
+    # MHSA input projection: only when the target model has one (older blobs
+    # omit W_in → direct passthrough, model keeps its initialized projection).
+    ckpt_w_in = body.get("W_in")
+    model_w_in = getattr(model, "W_in", None)
+    if ckpt_w_in is not None and model_w_in is None:
+        # The checkpoint was trained with an input projection this model lacks
+        # (input_dim == d_model and use_input_proj off): those weights are lost.
+        _log.warning(
+            "restore_model_checkpoint: checkpoint has W_in %s (input_dim=%s) but "
+            "the target model has no input projection — W_in/b_in DROPPED. "
+            "Rebuild the model with input_dim=%s to keep them.",
+            tuple(np.shape(ckpt_w_in)),
+            body.get("input_dim"),
+            body.get("input_dim") or (np.shape(ckpt_w_in)[0] if np.ndim(ckpt_w_in) else "?"),
+        )
+    elif ckpt_w_in is not None:
+        # Explicit shape checks: NumPy would otherwise broadcast a compatible
+        # but wrong shape silently, or fail with a bare broadcast error.
+        _restore_exact(model_w_in, ckpt_w_in, "W_in", hint="[input_dim, d_model]")
+        ckpt_b_in = body.get("b_in")
+        model_b_in = getattr(model, "b_in", None)
+        if ckpt_b_in is not None and model_b_in is not None:
+            _restore_exact(model_b_in, ckpt_b_in, "b_in", hint="[1, d_model]")
+        for attr, key in (("_ms_W_in", "ms_W_in"), ("_vs_W_in", "vs_W_in")):
+            cur = getattr(model, attr, None)
+            saved = body.get(key)
+            if cur is None or saved is None:
+                continue
+            if tuple(np.shape(cur)) != tuple(np.shape(saved)):
+                _log.warning(
+                    "restore_model_checkpoint: %s shape %s != model %s — Adam "
+                    "moment reset to zero for W_in",
+                    key,
+                    tuple(np.shape(saved)),
+                    tuple(np.shape(cur)),
+                )
+                continue
+            cur[...] = saved
     if hasattr(model, "_sync_restored_weights"):
         model._sync_restored_weights()
 

@@ -152,6 +152,7 @@ def test_boot_stays_idle_despite_sticky_desired_running():
             ),
             manager_heartbeat=hb,  # type: ignore[arg-type]
         )
+        engine._authorize_on_boot = False  # command-driven park (no boot authorize)
         engine.start_session(
             model=model,
             data_provider=prov,
@@ -189,6 +190,7 @@ def test_start_command_authorizes_training():
             ),
             manager_heartbeat=hb,  # type: ignore[arg-type]
         )
+        engine._authorize_on_boot = False  # command-driven park (no boot authorize)
         engine.start_session(
             model=model,
             data_provider=prov,
@@ -251,6 +253,7 @@ def test_restore_applies_weights_and_version_while_idle():
             ),
             manager_heartbeat=hb,  # type: ignore[arg-type]
         )
+        engine._authorize_on_boot = False  # command-driven park (no boot authorize)
         engine.start_session(
             model=model,
             data_provider=prov,
@@ -310,6 +313,7 @@ def test_restore_after_training_recovers_checkpoint_weights():
             ),
             manager_heartbeat=hb,  # type: ignore[arg-type]
         )
+        engine._authorize_on_boot = False  # command-driven park (no boot authorize)
         engine.start_session(
             model=model,
             data_provider=prov,
@@ -481,6 +485,7 @@ def test_boot_idle_then_start_trains_without_auto_stop():
             ),
             manager_heartbeat=hb,  # type: ignore[arg-type]
         )
+        engine._authorize_on_boot = False  # command-driven park (no boot authorize)
         engine.start_session(
             model=model,
             data_provider=prov,

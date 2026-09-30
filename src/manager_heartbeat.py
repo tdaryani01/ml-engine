@@ -1,9 +1,12 @@
 """Non-blocking heartbeats to the sibling Training Manager control plane.
 
+Standalone direct dispatch: this client is **control / metrics / ledger only** —
+it never claims work or leases a job. It heartbeats the configured agent
+(``instance_id``) so TM can dial out ``start`` / ``pause`` / ``resume`` /
+``restore`` / ``shutdown`` / ``cancel`` commands; replies are stashed on a local
+queue for the engine to apply at safe points (never on the HTTP worker).
+
 Never blocks the training thread: interval gate + at-most-one daemon worker.
-Heartbeat JSON replies may include dial-out ``commands``; those are stashed on a
-local queue for the engine to apply at safe points (not on the HTTP worker for
-heavy restore work beyond enqueue).
 """
 from __future__ import annotations
 
@@ -25,11 +28,7 @@ import os
 
 _log = logging.getLogger(__name__)
 
-# BL-023b: session re-entry bounds (anti-stampede).
-_REENTRY_COOLDOWN_S = 3.0
-_REENTRY_BACKOFF_S = 0.5
-
-# DIAGNOSTIC-ONLY: NDJSON claim/ledger trace. Path survives diagnostics_output deletes.
+# DIAGNOSTIC-ONLY: NDJSON ledger trace. Path survives diagnostics_output deletes.
 _DIAG_PATH = Path("/tmp/ml_engine_run_diag.ndjson")
 
 
@@ -56,8 +55,8 @@ def _diag(event: str, **fields: Any) -> None:
         pass
 
 
-def new_pool_session_id() -> str:
-    """Anonymous pool worker id (numeric), not a durable agent / model id."""
+def new_instance_id() -> str:
+    """Anonymous numeric control-plane identity (never a model / agent id)."""
     return str(random.randint(10_000_000, 99_999_999))
 
 
@@ -73,7 +72,7 @@ class ManagerCommand:
 class ManagerHeartbeatConfig:
     enabled: bool = False
     uri: str = "http://127.0.0.1:8000"
-    # Pool worker id only. Empty → random numeric at construct. Never a model id.
+    # Control-plane identity for this worker/agent. Empty → random numeric.
     instance_id: str = ""
     kind: str = "engine"
     label: str | None = None
@@ -95,32 +94,22 @@ class ManagerHeartbeatConfig:
     park_when_idle: bool = True
     # BL-014g — Authentik M2M JWT for gated TM routes (session-health, ledger, act).
     m2m: dict | None = None
-    # BL-023: consecutive pool HB soft-fails before local site-interrupt pause.
-    site_interrupt_fail_threshold: int = 6
 
 
 class ManagerHeartbeat:
-    """TM client: pool capacity always; agent HB only while a job is leased.
+    """TM control client: heartbeats the configured agent; no pool, no claim.
 
-    BL-006a / BL-011: workers register as pool sessions (random numeric id).
-    A job already carries ``model_id`` (TM agent, set at enqueue). Claim binds
-    this **worker** (pool session) to that job; the worker then heartbeats the
-    agent and stamps the ledger with ``job.model_id`` — never with the pool id.
+    It publishes metrics and drains dial-out ``commands`` for the engine. It
+    never registers as a pool worker, claims a job, or leases work.
     """
 
     def __init__(self, cfg: ManagerHeartbeatConfig) -> None:
-        pool_id = str(cfg.instance_id or "").strip() or new_pool_session_id()
-        if pool_id != cfg.instance_id:
-            thr = int(
-                os.environ.get(
-                    "TM_SITE_INTERRUPT_FAILS",
-                    str(cfg.site_interrupt_fail_threshold),
-                )
-            )
+        instance_id = str(cfg.instance_id or "").strip() or new_instance_id()
+        if instance_id != cfg.instance_id:
             cfg = ManagerHeartbeatConfig(
                 enabled=cfg.enabled,
                 uri=cfg.uri,
-                instance_id=pool_id,
+                instance_id=instance_id,
                 kind=cfg.kind,
                 label=cfg.label,
                 advertise_url=cfg.advertise_url,
@@ -130,31 +119,7 @@ class ManagerHeartbeat:
                 idle_sleep_s=cfg.idle_sleep_s,
                 park_when_idle=cfg.park_when_idle,
                 m2m=cfg.m2m,
-                site_interrupt_fail_threshold=max(1, thr),
             )
-        else:
-            thr = int(
-                os.environ.get(
-                    "TM_SITE_INTERRUPT_FAILS",
-                    str(cfg.site_interrupt_fail_threshold),
-                )
-            )
-            if thr != cfg.site_interrupt_fail_threshold:
-                cfg = ManagerHeartbeatConfig(
-                    enabled=cfg.enabled,
-                    uri=cfg.uri,
-                    instance_id=cfg.instance_id,
-                    kind=cfg.kind,
-                    label=cfg.label,
-                    advertise_url=cfg.advertise_url,
-                    capabilities=cfg.capabilities,
-                    interval_s=cfg.interval_s,
-                    timeout_s=cfg.timeout_s,
-                    idle_sleep_s=cfg.idle_sleep_s,
-                    park_when_idle=cfg.park_when_idle,
-                    m2m=cfg.m2m,
-                    site_interrupt_fail_threshold=max(1, thr),
-                )
         self._cfg = cfg
         from src.m2m_jwt import ClientCredentialsTokenSource
 
@@ -167,26 +132,12 @@ class ManagerHeartbeat:
             )
         self._lock = threading.Lock()
         self._in_flight = False
-        self._registered = False
-        self._pool_registered = False
-        self._job_bound = False
-        self._job_id: str | None = None
-        self._bound_model_id: str | None = None
-        self._claim_token: str | None = None
         self._last_sent_at = 0.0
         self._metrics: dict[str, Any] = {}
         self._commands: queue.Queue[ManagerCommand] = queue.Queue()
         self._pending_acks: queue.Queue[tuple[str, bool, str | None]] = queue.Queue()
         self._seen_command_ids: set[str] = set()
         self._active_checkpoint: dict[str, Any] | None = None
-        # BL-023 site interrupt
-        self._hb_fail_streak = 0
-        self._site_interrupt_local = False
-        self._site_interrupt_work_pause_sent = False
-        self._on_site_interrupt: Callable[[], None] | None = None
-        # BL-023b session re-entry
-        self._claim_suspect = False
-        self._reentry_cooldown_until = 0.0
 
     def _auth_headers(self, base: dict[str, str] | None = None) -> dict[str, str]:
         headers = dict(base or {})
@@ -198,404 +149,14 @@ class ManagerHeartbeat:
         return headers
 
     @property
-    def pool_session_id(self) -> str:
+    def agent_id(self) -> str:
+        """Control-plane identity heartbeated to TM (standalone agent id)."""
         return self._cfg.instance_id
 
     @property
-    def bound_model_id(self) -> str | None:
-        with self._lock:
-            return self._bound_model_id
-
-    @property
-    def job_bound(self) -> bool:
-        with self._lock:
-            return self._job_bound
-
-    @property
-    def job_id(self) -> str | None:
-        with self._lock:
-            return self._job_id
-
-    def set_on_site_interrupt(self, cb: Callable[[], None] | None) -> None:
-        """Called once when HB fail streak trips local user-like pause (BL-023)."""
-        self._on_site_interrupt = cb
-
-    @property
-    def site_interrupt_hold(self) -> bool:
-        with self._lock:
-            return bool(self._site_interrupt_local)
-
-    @property
-    def claim_suspect(self) -> bool:
-        """True after session-404 while job-bound until validating HB or abandon."""
-        with self._lock:
-            return bool(self._claim_suspect)
-
-    def _reentry_cooling(self) -> bool:
-        with self._lock:
-            return time.monotonic() < float(self._reentry_cooldown_until)
-
-    def _arm_reentry_cooldown(self) -> None:
-        with self._lock:
-            self._reentry_cooldown_until = time.monotonic() + _REENTRY_COOLDOWN_S
-
-    @staticmethod
-    def _is_pool_session_route(url: str) -> bool:
-        path = urllib.parse.urlparse(url).path.lower().rstrip("/")
-        if path.endswith("/api/work/claim"):
-            return True
-        if "/api/workers/" in path and path.endswith("/heartbeat"):
-            return True
-        return False
-
-    @staticmethod
-    def _detail_session_not_found(detail: str) -> bool:
-        return "session not found" in (detail or "").lower()
-
-    def _is_session_identity_404(self, result: HttpResult, url: str) -> bool:
-        """Rule 2: only HB/claim + session-not-found detail (not generic 404)."""
-        if result.status != 404:
-            return False
-        if not self._is_pool_session_route(url):
-            return False
-        return self._detail_session_not_found(result.detail)
-
-    def _park_after_failed_reentry(self) -> None:
-        """Rule 3: abandon local claim; pause so gradients are not authorized."""
-        with self._lock:
-            abandon = self._job_bound or self._claim_suspect
-            self._claim_suspect = False
-        if abandon:
-            self.unbind_job()
-        with self._lock:
-            self._site_interrupt_local = True
-            self._pool_registered = False
-        self.set_metrics({"run_state": "paused", "state": "paused"})
-        _log.warning(
-            "BL-023b: abandoned suspect claim after failed session re-entry — paused"
-        )
-
-    def clear_site_interrupt(self) -> None:
-        with self._lock:
-            self._site_interrupt_local = False
-            self._site_interrupt_work_pause_sent = False
-            self._hb_fail_streak = 0
-
-    def _trip_site_interrupt(self) -> None:
-        """Local pause after prolonged TM unreachable while holding a job."""
-        cb: Callable[[], None] | None
-        with self._lock:
-            if self._site_interrupt_local or not self._job_bound:
-                return
-            self._site_interrupt_local = True
-            cb = self._on_site_interrupt
-        self.set_metrics({"run_state": "paused", "state": "paused"})
-        _log.warning(
-            "BL-023 site interrupt: TM unreachable streak=%s — local pause",
-            self._cfg.site_interrupt_fail_threshold,
-        )
-        if cb is not None:
-            try:
-                cb()
-            except Exception:  # noqa: BLE001
-                _log.exception("on_site_interrupt callback failed")
-
-    def _note_pool_hb_failure(self) -> None:
-        trip = False
-        with self._lock:
-            self._hb_fail_streak += 1
-            thr = int(self._cfg.site_interrupt_fail_threshold)
-            if (
-                self._job_bound
-                and not self._site_interrupt_local
-                and self._hb_fail_streak >= thr
-            ):
-                trip = True
-        if trip:
-            self._trip_site_interrupt()
-
-    def _note_pool_hb_success(self) -> None:
-        with self._lock:
-            self._hb_fail_streak = 0
-            need_pause = (
-                self._site_interrupt_local
-                and self._job_bound
-                and not self._site_interrupt_work_pause_sent
-            )
-            mid = self._bound_model_id
-        if not need_pause or not mid:
-            return
-        # User-like park so Resume works when the site returns.
-        out = self.post_json(
-            "/api/work/pause",
-            {"model_id": mid},
-            timeout_s=max(5.0, float(self._cfg.timeout_s)),
-        )
-        if out is not None:
-            with self._lock:
-                self._site_interrupt_work_pause_sent = True
-            _log.info("BL-023 site interrupt: posted /api/work/pause model=%s", mid)
-        else:
-            _log.warning(
-                "BL-023 site interrupt: /api/work/pause failed model=%s — will retry",
-                mid,
-            )
-
-    def bind_job(
-        self, job_id: str | None = None, *, model_id: str | None = None
-    ) -> None:
-        """Record lease: this pool worker holds ``job_id`` for TM agent ``model_id``.
-
-        ``model_id`` comes from the job document (enqueue); it is not the worker id.
-        """
-        mid = str(model_id or "").strip()
-        with self._lock:
-            self._job_bound = True
-            self._job_id = None if job_id is None else str(job_id)
-            self._bound_model_id = mid or None
-            self._registered = False
-            # Fresh claim clears any prior outage hold.
-            self._site_interrupt_local = False
-            self._site_interrupt_work_pause_sent = False
-            self._hb_fail_streak = 0
-            self._claim_suspect = False
-
-    def unbind_job(self) -> None:
-        """Release worker↔job lease after ack/fail — pool session remains."""
-        with self._lock:
-            self._job_bound = False
-            self._job_id = None
-            self._bound_model_id = None
-            self._registered = False
-            self._claim_token = None
-
-    def ensure_pool_registered(self) -> bool:
-        """Sync pool register before claim. HB register is async and races claim."""
-        if not self._cfg.enabled or not self._cfg.uri:
-            return False
-        with self._lock:
-            if self._pool_registered:
-                return True
-            if time.monotonic() < float(self._reentry_cooldown_until):
-                return False
-            sid = self._cfg.instance_id
-            kind = self._cfg.kind
-            label = self._cfg.label
-            caps_src = list(self._cfg.capabilities)
-        base = self._cfg.uri.rstrip("/")
-        return self._register_pool_session(base, sid, kind, label, caps_src)
-
-    def _register_pool_session(
-        self,
-        base: str,
-        sid: str,
-        kind: str,
-        label: str | None,
-        caps_src: list[str],
-    ) -> bool:
-        caps = ["pool", str(kind or "engine")]
-        for c in caps_src:
-            if c not in caps:
-                caps.append(str(c))
-        url = f"{base}/api/workers/register"
-        result = self._post_result(
-            url,
-            {
-                "session_id": sid,
-                "caps": caps,
-                "meta": {"kind": kind, "label": label or f"pool-{sid}"},
-            },
-            expect_commands=False,
-            timeout_s=max(5.0, float(self._cfg.timeout_s)),
-        )
-        if not result.ok:
-            _log.warning(
-                "pool register failed session=%s — cannot claim until TM accepts register",
-                sid,
-            )
-            return False
-        with self._lock:
-            self._pool_registered = True
-        _log.info("[ManagerHeartbeat] pool registered session=%s", sid)
-        return True
-
-    def try_claim_work(self, *, lease_s: float | None = None) -> dict[str, Any] | None:
-        """Claim one queued job: bind **this worker** to the job (BL-006c/011).
-
-        The job already has ``model_id`` (TM agent). Claim sets the job's worker
-        to this pool session. Blocking HTTP — not for the HB thread.
-        """
-        if not self._cfg.enabled or not self._cfg.uri:
-            return None
-        with self._lock:
-            if self._job_bound:
-                return None
-            sid = self._cfg.instance_id
-            kind = self._cfg.kind
-            label = self._cfg.label
-            caps_src = list(self._cfg.capabilities)
-        if not self.ensure_pool_registered():
-            return None
-        base = self._cfg.uri.rstrip("/")
-        body: dict[str, Any] = {"session_id": sid}
-        if lease_s is not None:
-            body["lease_s"] = float(lease_s)
-        claim_url = f"{base}/api/work/claim"
-        result = self._post_result(
-            claim_url,
-            body,
-            expect_commands=True,
-            timeout_s=max(5.0, float(self._cfg.timeout_s)),
-        )
-        if self._is_session_identity_404(result, claim_url):
-            with self._lock:
-                self._pool_registered = False
-            if self._reentry_cooling():
-                _diag("claim_session_404_cooling", pool=sid)
-                return None
-            _log.warning(
-                "BL-023b session re-entry: claim 404 session=%s → register once",
-                sid,
-            )
-            time.sleep(_REENTRY_BACKOFF_S)
-            if not self._register_pool_session(base, sid, kind, label, caps_src):
-                self._arm_reentry_cooldown()
-                return None
-            result = self._post_result(
-                claim_url,
-                body,
-                expect_commands=True,
-                timeout_s=max(5.0, float(self._cfg.timeout_s)),
-            )
-            if not result.ok or not isinstance(result.payload, dict):
-                with self._lock:
-                    self._pool_registered = False
-                self._arm_reentry_cooldown()
-                _diag("claim_reentry_retry_fail", pool=sid, status=result.status)
-                return None
-        elif not result.ok or not isinstance(result.payload, dict):
-            with self._lock:
-                self._pool_registered = False
-            _diag(
-                "claim_http_empty",
-                pool=sid,
-                kind=self._cfg.kind,
-                label=self._cfg.label,
-                status=result.status,
-            )
-            return None
-        resp = result.payload
-        job = resp.get("job")
-        if not isinstance(job, dict) or not job.get("job_id"):
-            _diag("claim_no_job", pool=sid, kind=self._cfg.kind, resp_keys=list(resp.keys()))
-            return None
-        model_id = str(job.get("model_id") or "").strip()
-        if not model_id:
-            _log.warning("claim missing model_id — refusing bind")
-            _diag("claim_missing_model_id", pool=sid, job_id=job.get("job_id"))
-            return None
-        token = str(job.get("claim_token") or "")
-        jid = str(job["job_id"])
-        worker_id = str(job.get("worker_id") or job.get("session_id") or sid)
-        with self._lock:
-            self._claim_token = token or None
-        self.bind_job(jid, model_id=model_id)
-        self.set_metrics(
-            {
-                "run_state": "training",
-                "state": "training",
-                "job_id": jid,
-                "model_id": model_id,
-                "worker_id": worker_id,
-            }
-        )
-        cfg_keys = sorted((job.get("config") or {}).keys()) if isinstance(job.get("config"), dict) else []
-        _diag(
-            "claim_ok",
-            pool=sid,
-            worker_id=worker_id,
-            job_id=jid,
-            model_id=model_id,
-            kind=self._cfg.kind,
-            label=self._cfg.label,
-            job_kind=job.get("kind"),
-            config_keys=cfg_keys,
-            pipeline=((job.get("config") or {}) if isinstance(job.get("config"), dict) else {}).get("meta"),
-        )
-        return dict(job)
-
-    def ack_work(
-        self, *, result: Mapping[str, Any] | None = None
-    ) -> dict[str, Any] | None:
-        """Ack the bound job on TM and unbind. None = claim not released."""
-        with self._lock:
-            jid = self._job_id
-            token = self._claim_token
-        if not jid or not token:
-            _log.warning(
-                "ack_work skipped — missing job_id=%r claim_token=%s (claim not released)",
-                jid,
-                "set" if token else "missing",
-            )
-            return None
-        base = self._cfg.uri.rstrip("/")
-        resp = self._post_json(
-            f"{base}/api/work/{urllib.parse.quote(jid, safe='')}/ack",
-            {"claim_token": token, "result": dict(result or {})},
-            expect_commands=True,
-            timeout_s=max(5.0, float(self._cfg.timeout_s)),
-        )
-        if not isinstance(resp, dict):
-            _log.warning(
-                "ack_work HTTP failed job=%s — claim still held on TM (not released)",
-                jid,
-            )
-            return None
-        self.unbind_job()
-        self.set_metrics({"run_state": "idle", "state": "idle"})
-        # WARNING so it shows next to HTTP warnings (INFO is often filtered).
-        _log.warning(
-            "[ManagerHeartbeat] released claim job=%s state=%s — ack ok",
-            jid,
-            resp.get("state"),
-        )
-        return resp
-
-    def fail_work(
-        self, *, error: str, requeue: bool = True
-    ) -> dict[str, Any] | None:
-        """Fail the bound job on TM and unbind. None = claim not released."""
-        with self._lock:
-            jid = self._job_id
-            token = self._claim_token
-        if not jid or not token:
-            _log.warning(
-                "fail_work skipped — missing job_id=%r claim_token=%s (claim not released)",
-                jid,
-                "set" if token else "missing",
-            )
-            return None
-        base = self._cfg.uri.rstrip("/")
-        resp = self._post_json(
-            f"{base}/api/work/{urllib.parse.quote(jid, safe='')}/fail",
-            {"claim_token": token, "error": str(error), "requeue": bool(requeue)},
-            expect_commands=True,
-            timeout_s=max(5.0, float(self._cfg.timeout_s)),
-        )
-        if not isinstance(resp, dict):
-            _log.warning(
-                "fail_work HTTP failed job=%s — claim still held on TM (not released)",
-                jid,
-            )
-            return None
-        self.unbind_job()
-        self.set_metrics({"run_state": "idle", "state": "failure"})
-        _log.warning(
-            "[ManagerHeartbeat] released claim job=%s state=%s — fail ok",
-            jid,
-            resp.get("state"),
-        )
-        return resp
+    def pool_session_id(self) -> str:
+        """Backward-compat alias for ``agent_id`` (no pool architecture)."""
+        return self._cfg.instance_id
 
     @property
     def active_checkpoint(self) -> dict[str, Any] | None:
@@ -647,12 +208,9 @@ class ManagerHeartbeat:
             self._in_flight = True
             self._last_sent_at = now
             metrics = dict(self._metrics)
-            job_bound = self._job_bound
-            need_register = job_bound and not self._registered
-            need_pool = not self._pool_registered
         t = threading.Thread(
             target=self._worker,
-            args=(need_register, need_pool, metrics, job_bound),
+            args=(metrics,),
             name="tm-heartbeat",
             daemon=True,
         )
@@ -772,12 +330,8 @@ class ManagerHeartbeat:
         if not self._cfg.enabled or not self._cfg.uri:
             return False
         base = self._cfg.uri.rstrip("/")
-        with self._lock:
-            bound_model = self._bound_model_id
-            job_id = self._job_id
-            pool_id = self._cfg.instance_id
-        # Tape belongs to the TM agent (job.model_id), not the pool worker id.
-        instance_id = bound_model or pool_id
+        # Tape belongs to this process's control-plane identity (no pool/job).
+        instance_id = self._cfg.instance_id
         payload: dict[str, Any] = {
             "instance_id": instance_id,
             "doc_type": str(doc_type),
@@ -805,11 +359,8 @@ class ManagerHeartbeat:
                     ok=ok,
                     doc_type=doc_type,
                     post_instance_id=instance_id,
-                    bound_model_id=bound_model,
-                    job_id=job_id,
                     version=(body or {}).get("version"),
                     blob_key=blob_key,
-                    mismatch=bool(bound_model and bound_model != instance_id),
                 )
                 return ok
         except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as exc:
@@ -818,42 +369,19 @@ class ManagerHeartbeat:
                 "ledger_append_fail",
                 doc_type=doc_type,
                 post_instance_id=instance_id,
-                bound_model_id=bound_model,
-                job_id=job_id,
                 error=str(exc),
             )
             return False
 
-    def _worker(
-        self,
-        need_register: bool,
-        need_pool: bool,
-        metrics: dict[str, Any],
-        job_bound: bool = False,
-    ) -> None:
+    def _worker(self, metrics: dict[str, Any]) -> None:
         cfg = self._cfg
         base = cfg.uri.rstrip("/")
         try:
-            # Pool capacity always. Agent HB only while job-bound to a TM model_id.
-            self._sync_pool_session(base, need_pool=need_pool, metrics=metrics)
-            # Pause/cancel may have released the job during pool HB.
-            if not self.job_bound:
-                return
-            if not job_bound:
-                return
-            with self._lock:
-                model_id = self._bound_model_id
-            if not model_id:
-                _log.warning("job-bound heartbeat without model_id — skip agent HB")
-                return
+            agent_id = cfg.instance_id
             self._flush_acks(base)
-            # Agent must already exist in TM (initialized there). Heartbeat only —
-            # do not invent / upsert an agent from the worker process.
-            if need_register:
-                with self._lock:
-                    self._registered = True
+            # Heartbeat the configured agent so TM can dial out control commands.
             body = self._post_json(
-                f"{base}/api/instances/{urllib.parse.quote(model_id, safe='')}/heartbeat",
+                f"{base}/api/instances/{urllib.parse.quote(agent_id, safe='')}/heartbeat",
                 {"metrics": metrics},
                 expect_commands=True,
             )
@@ -887,129 +415,8 @@ class ManagerHeartbeat:
             with self._lock:
                 self._in_flight = False
 
-    @staticmethod
-    def _pool_status_from_metrics(metrics: Mapping[str, Any]) -> str:
-        raw = metrics.get("run_state") or metrics.get("state") or ""
-        rs = str(raw).strip().lower()
-        if rs in ("training", "running", "busy"):
-            return "busy"
-        return "idle"
-
-    def _sync_pool_session(
-        self, base: str, *, need_pool: bool, metrics: Mapping[str, Any]
-    ) -> None:
-        """Register + heartbeat this process as a TM pool worker (capacity only)."""
-        cfg = self._cfg
-        sid = cfg.instance_id
-        caps_src = list(cfg.capabilities)
-        if need_pool:
-            self._register_pool_session(base, sid, cfg.kind, cfg.label, caps_src)
-        status = self._pool_status_from_metrics(metrics)
-        meta: dict[str, Any] = {"kind": cfg.kind}
-        with self._lock:
-            jid = self._job_id
-        if jid:
-            meta["job_id"] = jid
-        hb_url = f"{base}/api/workers/{urllib.parse.quote(sid, safe='')}/heartbeat"
-        hb_body = {"status": status, "meta": meta}
-        result = self._post_result(hb_url, hb_body, expect_commands=True)
-
-        if result.ok and isinstance(result.payload, dict):
-            self._finish_pool_hb_ok(result.payload, sid, jid)
-            return
-
-        if result.transport_fail or (
-            not result.ok and not self._is_session_identity_404(result, hb_url)
-        ):
-            with self._lock:
-                self._pool_registered = False
-            self._note_pool_hb_failure()
-            return
-
-        # Rule 2 session-identity 404 → bounded re-entry (Rules 1 + 3).
-        with self._lock:
-            if self._job_bound:
-                self._claim_suspect = True
-            self._pool_registered = False
-            streak_before = int(self._hb_fail_streak)
-        if self._reentry_cooling():
-            _log.warning(
-                "BL-023b session re-entry: HB 404 session=%s but cooling — skip register",
-                sid,
-            )
-            if self.claim_suspect:
-                self._park_after_failed_reentry()
-            return
-
-        _log.warning(
-            "BL-023b session re-entry: HB 404 session=%s → register once (no site-interrupt streak)",
-            sid,
-        )
-        time.sleep(_REENTRY_BACKOFF_S)
-        if not self._register_pool_session(base, sid, cfg.kind, cfg.label, caps_src):
-            self._arm_reentry_cooldown()
-            if self.claim_suspect:
-                self._park_after_failed_reentry()
-            with self._lock:
-                # Rule: 404 must not increment site-interrupt streak.
-                self._hb_fail_streak = streak_before
-            return
-
-        retry = self._post_result(hb_url, hb_body, expect_commands=True)
-        if retry.ok and isinstance(retry.payload, dict):
-            with self._lock:
-                self._hb_fail_streak = streak_before
-            self._finish_pool_hb_ok(retry.payload, sid, jid)
-            return
-
-        with self._lock:
-            self._pool_registered = False
-            self._hb_fail_streak = streak_before
-        self._arm_reentry_cooldown()
-        if self.claim_suspect:
-            self._park_after_failed_reentry()
-        elif retry.transport_fail:
-            self._note_pool_hb_failure()
-
-    def _finish_pool_hb_ok(
-        self, body: dict[str, Any], sid: str, jid: str | None
-    ) -> None:
-        self._note_pool_hb_success()
-        if body.get("should_exit"):
-            _log.info(
-                "training-manager pool drain requested for session=%s", sid
-            )
-        if body.get("release_job") and self.job_bound:
-            site_hold = self.site_interrupt_hold
-            _log.info(
-                "training-manager release_job for session=%s job=%s", sid, jid
-            )
-            self.unbind_job()
-            with self._lock:
-                self._claim_suspect = False
-            if site_hold:
-                self.set_metrics({"run_state": "paused", "state": "paused"})
-            else:
-                self.set_metrics({"run_state": "idle", "state": "paused"})
-        elif self.claim_suspect and self.job_bound:
-            with self._lock:
-                self._claim_suspect = False
-            _log.info(
-                "BL-023b: claim validated after session re-entry session=%s job=%s",
-                sid,
-                jid,
-            )
-
     def _flush_acks(self, base: str) -> None:
-        with self._lock:
-            model_id = self._bound_model_id
-        if not model_id:
-            while True:
-                try:
-                    self._pending_acks.get_nowait()
-                except queue.Empty:
-                    return
-            return
+        agent_id = self._cfg.instance_id
         while True:
             try:
                 cid, ok, detail = self._pending_acks.get_nowait()
@@ -1019,7 +426,7 @@ class ManagerHeartbeat:
             if detail:
                 payload["detail"] = detail
             self._post_json(
-                f"{base}/api/instances/{urllib.parse.quote(model_id, safe='')}/commands/{cid}/ack",
+                f"{base}/api/instances/{urllib.parse.quote(agent_id, safe='')}/commands/{cid}/ack",
                 payload,
                 expect_commands=False,
             )
@@ -1222,8 +629,8 @@ def maybe_from_settings(
     if not enabled or not uri:
         return None
 
-    pool_id = instance_id.strip() or new_pool_session_id()
-    base_label = str(label) if label else f"pool-{pool_id}"
+    instance_id = instance_id.strip() or new_instance_id()
+    base_label = str(label) if label else f"engine-{instance_id}"
     if ledger_enabled:
         final_caps = caps if caps else (
             "train_step",
@@ -1263,7 +670,7 @@ def maybe_from_settings(
         ManagerHeartbeatConfig(
             enabled=True,
             uri=uri,
-            instance_id=pool_id,
+            instance_id=instance_id,
             kind=kind,
             label=final_label,
             advertise_url=advertise_url,

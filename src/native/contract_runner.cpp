@@ -511,10 +511,12 @@ static void adam_apply_mhsa(ContractExecCtx* ctx, float decay_factor) {
             m->max_seq_len * D, a, ctx->lr, decay_factor);
     }
     if (m->W_in && m->dW_in && m->ms_W_in && m->vs_W_in) {
+        // W_in is [D_in, D] (D_in = raw token width; 0 → legacy square proj).
+        const int64_t D_in = (m->D_in > 0) ? m->D_in : D;
         adam_update_tensor(
             m->W_in, m->dW_in, m->ms_W_in, m->vs_W_in,
             m->W_in_next, m->ms_W_in_next, m->vs_W_in_next,
-            D * D, a, ctx->lr, decay_factor);
+            D_in * D, a, ctx->lr, decay_factor);
         adam_update_tensor(
             m->b_in, m->db_in, m->ms_b_in, m->vs_b_in,
             m->b_in_next, m->ms_b_in_next, m->vs_b_in_next,
