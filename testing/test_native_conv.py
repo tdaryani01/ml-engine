@@ -19,6 +19,8 @@ from utils.conv_dispatch import (
 # Reuse native-vs-NumPy dX/dW matrix from gradient harness (run via test_gradient_check.py).
 from testing.test_gradient_check import CONV_DX_KERNEL_PAD_CASES  # noqa: F401 — re-export for callers
 
+import pytest
+
 RTOL = 1e-4
 ATOL = 1e-4
 
@@ -33,6 +35,10 @@ FWD_KERNEL_PAD_CASES = [
     (7, 1),
 ]
 
+# Padded-fallback dW cases the script driver exercises; each spawns a
+# subprocess, so this stays the curated subset rather than all 14 dX cases.
+FALLBACK_DW_KERNEL_PAD_CASES = [(3, 1), (5, 1), (5, 2), (7, 1)]
+
 
 def _make_conv_tensors(k: int, pad: int, *, n: int = 2, c_in: int = 3, h: int = 14, w: int = 14, c_out: int = 8):
     rng = np.random.default_rng(42 + k * 11 + pad)
@@ -44,6 +50,7 @@ def _make_conv_tensors(k: int, pad: int, *, n: int = 2, c_in: int = 3, h: int = 
     return x, weight, bias, out_h, out_w
 
 
+@pytest.mark.parametrize("k,pad", FWD_KERNEL_PAD_CASES)
 def test_native_forward_matches_numpy_reference(k: int, pad: int) -> None:
     x, weight, bias, out_h, out_w = _make_conv_tensors(k, pad)
     out_ref = np.zeros((x.shape[0], weight.shape[0], out_h, out_w), dtype=np.float32)
@@ -150,7 +157,10 @@ def test_conv_block_forward_padded_output_matches_numpy(k: int = 3) -> None:
     print(f"[PASSED] conv_block padded output matches numpy (k={k})")
 
 
-def test_fallback_conv_block_backward_padded_dw(k: int, pad: int, h: int = 28, w_log: int = 28) -> None:
+@pytest.mark.parametrize("k,pad", FALLBACK_DW_KERNEL_PAD_CASES)
+def test_fallback_conv_block_backward_padded_dw(
+    k: int, pad: int, h: int = 28, w_log: int = 28
+) -> None:
     """Regression: generic fallback dW on SIMD-padded rows (28/32 geometry)."""
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     code = f"""
@@ -232,7 +242,7 @@ if __name__ == "__main__":
     test_native_dx_covered_by_gradient_matrix()
     test_native_conv_uses_generic_fallback_dispatch()
     test_conv_block_forward_padded_output_matches_numpy(3)
-    for kernel, pad in ((3, 1), (5, 1), (5, 2), (7, 1)):
+    for kernel, pad in FALLBACK_DW_KERNEL_PAD_CASES:
         test_fallback_conv_block_backward_padded_dw(kernel, pad)
     print("=" * 60)
     print("[SUCCESS] All native conv regression tests passed.")

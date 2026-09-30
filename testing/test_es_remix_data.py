@@ -46,6 +46,10 @@ def _bare_agent(*, remix=True, command_id=0):
     agent._es_park_hold = True
     agent._es_tripped = True
     agent._checkpoint_version = None
+    # Bound by run_lease -> TrainingEngine; None until bind_engine_* runs.
+    # An Autopilot ES trip with no pause bound is a hard error by design.
+    agent._engine_stop = None
+    agent._engine_pause = None
     return agent
 
 
@@ -102,12 +106,8 @@ def test_regression_es_autopilot_trip_awaits_tm_no_act(monkeypatch):
     posts: list[tuple[str, dict]] = []
 
     class HB:
-        cfg = SimpleNamespace(instance_id="draw-test", timeout_s=0.5)
-        job_bound = True
-
-        @property
-        def bound_model_id(self) -> str:
-            return "tm-brain"
+        # Direct execution: the trip path uses the TM agent id.
+        agent_id = "tm-brain"
 
         def post_json(self, path, body, timeout_s=15.0):
             posts.append((path, dict(body)))
@@ -133,21 +133,45 @@ def test_regression_es_autopilot_trip_awaits_tm_no_act(monkeypatch):
     assert DrawStudentAgent.train_tick(agent) is False
 
 
-def test_regression_pause_gate_clears_when_unbound(monkeypatch):
-    """UI Resume unbinds the lease; local user hold must not block reclaim."""
+def test_regression_pause_gate_follows_local_user_hold(monkeypatch):
+    """Direct execution: the gate is the local human hold — no lease binding.
+
+    ``pause_gate`` blocks training while ``_user_pause_hold`` is set; only a
+    non-``tm_brain`` Start/Resume clears it (a TM-driven resume stays blocked
+    so a board Pause cannot be overridden by the brain). Autopilot ES soft-hold
+    is a separate, non-durable park handled by ``train_tick``.
+    """
     monkeypatch.setattr(
         "examples.closed_loop_draw.agent.make_target", _fake_make_target
+    )
+    monkeypatch.setattr(
+        DrawStudentAgent,
+        "apply_run_config",
+        lambda self, config, *, rebuild=False: {},
     )
     agent = _bare_agent()
     agent._user_pause_hold = True
     agent._es_park_hold = False
+    agent.hb = SimpleNamespace(
+        agent_id="draw-test",
+        mark_command_seen=lambda *_a, **_k: None,
+        queue_ack=lambda *_a, **_k: None,
+    )
+    agent._live_config = lambda: {}
+    agent._print_config = lambda *_a, **_k: None
 
-    class HB:
-        cfg = SimpleNamespace(instance_id="pool-1")
-        job_bound = False
-        site_interrupt_hold = False
+    assert agent.pause_gate() is True
 
-    agent.hb = HB()
+    tm_resume = SimpleNamespace(
+        id="c-tm", action="resume", payload={"source": "tm_brain"}
+    )
+    assert DrawStudentAgent.on_engine_start_resume(agent, tm_resume) is False
+    assert agent.pause_gate() is True  # TM cannot clear the human hold
+
+    user_resume = SimpleNamespace(
+        id="c-user", action="resume", payload={"source": "user"}
+    )
+    assert DrawStudentAgent.on_engine_start_resume(agent, user_resume) is True
     assert agent.pause_gate() is False
     assert agent._user_pause_hold is False
 
@@ -183,6 +207,9 @@ def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
         lambda self: (True, 30),
     )
     monkeypatch.setattr(DrawStudentAgent, "_set_status", lambda self, *a, **k: None)
+    # Autopilot ES park requires the engine pause hook by contract (run_lease
+    # binds it to TrainingEngine.request_pause).
+    agent.bind_engine_pause(lambda: None)
 
     posts = []
 
@@ -213,8 +240,8 @@ def test_regression_es_shadow_does_not_remix_before_restore(monkeypatch):
     assert not any("/tm-brain/act" in p[0] for p in posts)
 
 
-def test_regression_es_autopilot_uses_bound_model_not_pool_session(monkeypatch):
-    """BL-024: trip uses bound agent id for metrics; no /act to pool session."""
+def test_regression_es_autopilot_uses_agent_id_not_pool_session(monkeypatch):
+    """BL-024: the trip path uses the TM agent id; no /act to a pool session."""
     monkeypatch.setattr(
         "examples.closed_loop_draw.agent.make_target", _fake_make_target
     )
@@ -248,11 +275,9 @@ def test_regression_es_autopilot_uses_bound_model_not_pool_session(monkeypatch):
     published: list[dict] = []
 
     class HB:
-        cfg = SimpleNamespace(instance_id="22409324")  # pool session
-
-        @property
-        def bound_model_id(self) -> str:
-            return "tm-brain"
+        # Direct execution: the durable identity is the TM agent id
+        # (ManagerHeartbeat.agent_id) — no leased pool row to consult.
+        agent_id = "tm-brain"
 
         def post_json(self, path, body, timeout_s=15.0):
             raise AssertionError(f"no HTTP on Autopilot ES trip: {path}")
@@ -264,7 +289,6 @@ def test_regression_es_autopilot_uses_bound_model_not_pool_session(monkeypatch):
             return None
 
     agent.hb = HB()
-    agent.hb.job_bound = True
     pauses: list[str] = []
     agent.bind_engine_pause(lambda: pauses.append("pause"))
     DrawStudentAgent._maybe_es_shadow(agent)
@@ -283,8 +307,15 @@ def test_regression_restore_ack_remixes_terrain_once(monkeypatch):
     agent._remix_after_restore = True
 
     class HB:
+        # Direct execution: ``_tm_agent_id()`` reads the durable TM agent
+        # id, and the post-restore onset rewind probes session-health.
+        agent_id = "draw-test"
+
         def fetch_blob(self, _key):
             return b"blob"
+
+        def get_json(self, _path, timeout_s=3.0):
+            return {}
 
         def set_active_checkpoint(self, _ckpt):
             return None
@@ -367,7 +398,7 @@ def test_regression_after_restore_remixes_if_restore_deferred(monkeypatch):
 
 
 def test_regression_manual_es_does_not_apply_restore(monkeypatch):
-    """Start without Autopilot: ES ends the job — never restore / park claimed."""
+    """Start without Autopilot: ES ends the job — never restore / park / remix."""
     monkeypatch.setattr(
         "examples.closed_loop_draw.agent.make_target", _fake_make_target
     )
@@ -388,7 +419,7 @@ def test_regression_manual_es_does_not_apply_restore(monkeypatch):
 
     statuses: list[str] = []
     stops: list[str] = []
-    acks: list[dict] = []
+    posts: list[tuple[str, dict]] = []
 
     monkeypatch.setattr(
         DrawStudentAgent,
@@ -402,15 +433,13 @@ def test_regression_manual_es_does_not_apply_restore(monkeypatch):
 
     monkeypatch.setattr(DrawStudentAgent, "_set_status", _capture_status)
 
-    posts = []
-
     class HB:
-        cfg = SimpleNamespace(instance_id="draw-test")
-        job_bound = True
-        job_id = "job-manual-es"
+        # Direct execution: there is no leased job to ack — manual ES stops the
+        # engine locally instead of reporting back through a work queue.
+        agent_id = "draw-test"
 
         def post_json(self, path, body, timeout_s=15.0):
-            posts.append((path, body))
+            posts.append((path, dict(body)))
             return {
                 "decision": {
                     "action": "restore_best",
@@ -422,35 +451,20 @@ def test_regression_manual_es_does_not_apply_restore(monkeypatch):
                 "actuation": {"applied": False},
             }
 
-        def ack_work(self, *, result=None):
-            acks.append(dict(result or {}))
-            self.job_bound = False
-            return {"job_id": "job-manual-es", "state": "done"}
-
     agent.hb = HB()
     agent.bind_engine_stop(lambda: stops.append("stop"))
     DrawStudentAgent._maybe_es_shadow(agent)
 
-    # Manual: no tm-brain/act (durable episodes look like live steering in UI).
-    assert not any(
-        isinstance(p, str) and "/tm-brain/act" in p for p, _ in posts
-    )
+    # Manual: brain is informational only — no act, restore, park or remix.
+    assert posts == []
     assert agent._es_park_hold is False
     assert agent._es_run_done is True
     assert agent._paused is False
     assert agent._remix_after_restore is False
     assert agent._pending_outcome_episode is None
-    assert not any(p[0] == "desired" for p in posts if isinstance(p, tuple))
-    assert not any(
-        isinstance(p, str) and p.endswith("/control/pause") for p, _ in posts
-    )
     assert "es-stop:manual" in statuses
     assert not any(s.startswith("es-act:") for s in statuses)
     assert stops == ["stop"]
-    assert len(acks) == 1
-    assert acks[0].get("reason") == "es_manual_stop"
-    assert acks[0].get("ok") is True
-    assert agent.hb.job_bound is False
 
 
 def test_regression_after_restore_prefers_feed_stock_over_local_remix(monkeypatch):

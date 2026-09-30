@@ -154,11 +154,6 @@ class ManagerHeartbeat:
         return self._cfg.instance_id
 
     @property
-    def pool_session_id(self) -> str:
-        """Backward-compat alias for ``agent_id`` (no pool architecture)."""
-        return self._cfg.instance_id
-
-    @property
     def active_checkpoint(self) -> dict[str, Any] | None:
         with self._lock:
             return None if self._active_checkpoint is None else dict(self._active_checkpoint)

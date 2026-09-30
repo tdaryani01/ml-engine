@@ -49,8 +49,9 @@ def _bare_agent():
 def _health_hb(health: dict):
     class HB:
         cfg = SimpleNamespace(instance_id="draw-test", timeout_s=0.5)
-        job_bound = True
-        bound_model_id = "tm-brain"
+        # Direct execution: the durable control-plane identity is the TM
+        # agent id (``ManagerHeartbeat.agent_id``), not a leased pool row.
+        agent_id = "draw-test"
 
         def get_json(self, path, timeout_s=3.0):
             assert "session-health" in path
