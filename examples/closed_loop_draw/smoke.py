@@ -15,6 +15,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
+from examples.closed_loop_draw.goal import DrawGoal
 from examples.closed_loop_draw.assemble import assemble, load_config, make_target
 from src.closed_loop import TokenInterleaver
 from utils.conv_dispatch import bootstrap_im2col_gemm_runtime
@@ -36,9 +37,7 @@ def main() -> int:
         g0 = app.conditioning.embeddings.copy()
 
         result = app.trainer.rollout_train(
-            command_ids=command_ids,
-            target=target,
-            max_steps=app.max_steps,
+            goal=DrawGoal(command_ids=command_ids, target=target),
             lr=app.lr,
             apply_updates=True,
         )

@@ -1,10 +1,22 @@
 # src/closed_loop/protocols.py
-"""Plug points for closed-loop trajectory training."""
+"""Generic plug points for closed-loop trajectory training.
+
+Phase 1: the trainer is NOT yet wired to these protocols. They exist so the
+boundaries (Environment / Actor / LossEvaluator) are explicit and the
+app-layer adapters can be validated against them.
+"""
 from __future__ import annotations
 
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
+
+# Opaque per-batch goal payload. Interpreted ONLY by the Actor / Environment /
+# LossEvaluator. For drawing this is ``command_ids`` (policy condition); the
+# loss evaluator receives whatever payload it was configured for.
+Goal = Any
+# Opaque observation tensor with a leading batch dimension.
+Obs = np.ndarray
 
 
 @runtime_checkable
@@ -32,37 +44,91 @@ class UpstreamEncoder(Protocol):
 class Environment(Protocol):
     """Differentiable (or soft) world step; owns obs state."""
 
-    def reset(self, batch_size: int) -> np.ndarray:
-        """Return initial observation (B, …)."""
+    def obs_spec(self) -> tuple[int, ...]:
+        """Shape of a single observation, excluding the batch dimension."""
         ...
 
-    def step(self, action: np.ndarray) -> np.ndarray:
-        """Apply action → next obs; stash info needed for ``action_grad``."""
+    def reset(self, batch_size: int, goal: Goal) -> Obs:
+        """Return initial observation (B, …) for the batch."""
         ...
 
-    def action_grad(self, d_obs: np.ndarray) -> np.ndarray:
-        """
-        ∂L/∂action from ∂L/∂obs_after_step (and any deferred canvas chain).
-
-        Must match the last ``step`` call. May also accumulate ∂L/∂obs_before
-        into an internal buffer for BPTT through the observation chain.
-        """
-        ...
-
-    def pop_obs_grad(self) -> np.ndarray | None:
-        """Optional ∂L/∂obs_before from the last ``action_grad`` (for encoder path)."""
+    def step(self, action: np.ndarray) -> Obs:
+        """Apply action → next obs; stash info needed for the reverse pass."""
         ...
 
 
 @runtime_checkable
-class TrajectoryLoss(Protocol):
-    """Pluggable per-step (or terminal) checker."""
+class DifferentiableEnvironment(Environment, Protocol):
+    """Environment that exposes observation history + transition gradients."""
 
-    def step_loss(self, obs: np.ndarray, target: np.ndarray, t: int) -> float:
+    def obs_at(self, t: int) -> Obs:
+        """Observation produced at step ``t`` (0-indexed)."""
+        ...
+
+    def step_backward(
+        self, t: int, d_obs_after: Obs
+    ) -> tuple[np.ndarray, Obs | None]:
+        """∂L/∂action_t and carried ∂L/∂prior_obs_t (or None)."""
+        ...
+
+    def aux_loss(self) -> tuple[float, list[np.ndarray]]:
+        """Trajectory prior: ``(loss, [∂loss/∂action_t])``."""
+        ...
+
+
+@runtime_checkable
+class Actor(Protocol):
+    """Policy plugin: obs history → action.
+
+    Owns goal conditioning and the token grammar. For the draw stack this
+    absorbs ConditioningBank, the V→D and A→D LinearAdapters, MHSANetwork, and
+    TokenInterleaver.
+    """
+
+    action_dim: int
+
+    def reset(self, batch_size: int, goal: Goal, max_steps: int) -> None:
+        """Clear caches and bind the goal + trajectory length for a new rollout."""
+        ...
+
+    def act(self, obs: Obs) -> np.ndarray:
+        """Forward one step → action (B, action_dim); caches internals."""
+        ...
+
+    def accumulate_grads(self, t: int, d_action: np.ndarray) -> None:
+        """Reverse-pass step: accumulate ∂L/∂action_t (no optimizer step)."""
+        ...
+
+    def backward_done(self) -> None:
+        """Flush deferred grads after the reverse sweep."""
+        ...
+
+    def apply_updates(self, lr: float) -> None:
+        """Single optimizer step over all actor params."""
+        ...
+
+    def zero_grad(self) -> None:
+        """Clear accumulated parameter grads."""
+        ...
+
+    def checkpoint(self, version: int, val_loss: float) -> bytes:
+        """Serialize actor weights + config for a checkpoint blob."""
+        ...
+
+    def seq_len(self, t: int) -> int:
+        """Policy token-grammar length when predicting the action at step ``t``."""
+        ...
+
+
+@runtime_checkable
+class LossEvaluator(Protocol):
+    """Per-step (or terminal) checker scored against an opaque goal payload."""
+
+    def step_loss(self, obs: Obs, goal: Goal, t: int) -> float:
         """Scalar loss contribution at step t (after env.step)."""
         ...
 
-    def step_obs_grad(self, obs: np.ndarray, target: np.ndarray, t: int) -> np.ndarray:
+    def step_obs_grad(self, obs: Obs, goal: Goal, t: int) -> np.ndarray:
         """∂(step_loss)/∂obs at step t."""
         ...
 
@@ -86,5 +152,22 @@ class ConditioningBankProto(Protocol):
         ...
 
 
+# Back-compat: the trainer (until Phase 2) imports the old name.
+TrajectoryLoss = LossEvaluator
+
 # Marker for optional stash bags during rollout (app-defined).
 RolloutAux = dict[str, Any]
+
+
+__all__ = [
+    "Actor",
+    "ConditioningBankProto",
+    "DifferentiableEnvironment",
+    "Environment",
+    "Goal",
+    "LossEvaluator",
+    "Obs",
+    "RolloutAux",
+    "TrajectoryLoss",
+    "UpstreamEncoder",
+]
