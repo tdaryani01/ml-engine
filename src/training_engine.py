@@ -1712,6 +1712,27 @@ class TrainingEngine:
         """End of one session: drain inflight work (engine stays alive for more sessions)."""
         sess = self._require_session(session)
         self.drain_pending(sess)
+        self._push_run_end(sess)
+
+    def _push_run_end(self, sess: TrainingSession) -> None:
+        """Fit contract: record how this fit ended in the ledger (best-effort, never raises)."""
+        try:
+            es = getattr(sess, "_fit_es_state", None) or {}
+            best_val = es.get("best_val_loss")
+            if best_val is not None and not np.isfinite(float(best_val)):
+                best_val = None
+            body = {
+                "reason": getattr(sess, "_fit_stop_reason", None) or "success",
+                "best_version": es.get("best_version"),
+                "best_val_loss": None if best_val is None else float(best_val),
+                "best_epoch": es.get("best_epoch"),
+                "epochs_run": int(getattr(sess, "_fit_epochs_done", 0)),
+                "steps": int(getattr(sess, "steps_completed", 0)),
+            }
+            with self._ledger_lock:
+                self.ledger.push_run_end(body)
+        except Exception:  # noqa: BLE001
+            logging.exception("[TrainingEngine] run.end document failed")
 
     def close(self) -> None:
         """Tear down native workers and ledger store (call when engine is done)."""

@@ -22,6 +22,9 @@ STEP_CONSOLIDATED = "step.consolidated"
 STEP_METRICS = "step.metrics"
 STEP_COMPLETE = "step.complete"
 CHECKPOINT = "checkpoint"
+# Fit contract: one document per fit saying HOW it ended (es_trip | success), so a ledger
+# reader (the execution engine) needs neither logs nor process state.
+RUN_END = "run.end"
 BRANCH_FORK = "branch.fork"
 REWIND = "rewind"
 PATH_RECORD = "path.record"
@@ -448,6 +451,10 @@ class TrainingLedger:
             "is_local_best_val": is_best,
         }
         return self.push(self._envelope(STEP_METRICS, body, version=version, step_id=step_id))
+
+    def push_run_end(self, body: dict[str, Any]) -> int:
+        """Fit-contract terminal document: ``reason`` (es_trip | success), best version/val, epochs."""
+        return self.push(self._envelope(RUN_END, dict(body), version=self.version))
 
     def _metrics_body(
         self,

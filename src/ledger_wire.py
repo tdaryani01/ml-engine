@@ -21,6 +21,7 @@ _DOC_TYPE_TO_ID: dict[str, int] = {
     "step.metrics": 4,
     "checkpoint": 5,
     "branch.fork": 6,
+    "run.end": 10,
     "rewind": 7,
     "path.record": 8,
     "step.complete": 9,
@@ -381,6 +382,9 @@ def _pack_body(doc_type: str, body: dict[str, Any]) -> bytes:
                 _pack_str(json.dumps(body.get("settings_delta", {}), separators=(",", ":"))),
             ]
         )
+    if doc_type == "run.end":
+        # Fit contract terminal document: small JSON body (reason, best version/val, epochs).
+        return _pack_str(json.dumps(body, separators=(",", ":")))
     raise ValueError(f"unsupported doc_type for binary pack: {doc_type!r}")
 
 
@@ -415,6 +419,9 @@ def _unpack_body(doc_type: str, data: memoryview) -> dict[str, Any]:
             "settings_delta": json.loads(settings_raw) if settings_raw else {},
             "checkpoint_version": int(cp_version),
         }
+    if doc_type == "run.end":
+        raw, _ = _unpack_str(data, 0)
+        return json.loads(raw) if raw else {}
     raise ValueError(f"unsupported doc_type for binary unpack: {doc_type!r}")
 
 
