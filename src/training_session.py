@@ -450,6 +450,8 @@ class TrainingSession:
         current_val_loss = self.model.compute_total_loss(val_preds, y_val_target)
         current_val_raw_cost = self.model.calculate_raw_cost(val_preds, y_val_target)
         self.val_history.append(current_val_loss)
+        if self.engine is not None and hasattr(self.engine, "on_epoch_end"):
+            self.engine.on_epoch_end(self, epoch, float(epoch_train_loss), float(current_val_loss))
 
         self._evaluate_epoch_performance(
             epoch,

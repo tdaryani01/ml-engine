@@ -103,3 +103,17 @@ def test_fit_can_start_from_a_checkpoint_document_with_weights_and_adam_state() 
         # back the WEIGHTS; the optimizer restarts. Documented fit-contract behavior for this family.
         assert int(v0[0].body["optimizer"]["t"]) == 0
         _ = document_from_bytes
+
+
+def test_every_epoch_records_train_and_validation_loss_in_the_ledger() -> None:
+    """The dashboards need a validation curve; ME computes val once per epoch, so it must land in the ledger."""
+    from src.ledger import STEP_METRICS
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _fit(tmp, early_stopping=False, patience=3, epochs=4, noise=0.5)
+        store = FileLedgerStore(os.path.join(tmp, "ledger"))
+        docs = [d for d in store.scan(1) if d.doc_type == STEP_METRICS]
+    assert len(docs) == 4
+    for d in docs:
+        assert d.body["val_loss"] is not None
+        assert d.body["train_loss"] is not None

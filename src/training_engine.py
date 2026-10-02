@@ -1714,6 +1714,21 @@ class TrainingEngine:
         self.drain_pending(sess)
         self._push_run_end(sess)
 
+    def on_epoch_end(
+        self, sess: TrainingSession, epoch: int, train_loss: float, val_loss: float
+    ) -> None:
+        """Fit contract: one ``step.metrics`` document per epoch carrying train AND validation loss."""
+        try:
+            with self._ledger_lock:
+                self.ledger.push_step_metrics(
+                    step_id=int(getattr(sess, "steps_completed", 0) or epoch),
+                    version=int(self.ledger.version),
+                    train_loss=float(train_loss),
+                    val_loss=float(val_loss),
+                )
+        except Exception:  # noqa: BLE001
+            logging.exception("[TrainingEngine] epoch metrics document failed")
+
     def _push_run_end(self, sess: TrainingSession) -> None:
         """Fit contract: record how this fit ended in the ledger (best-effort, never raises)."""
         try:
