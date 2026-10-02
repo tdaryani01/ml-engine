@@ -284,6 +284,9 @@ class LedgerSettings:
     # Pluggable persistence. Default = file_streaming (current SyncJournalWriter path).
     # noop = tests / Docker (engine+contract, no journal I/O). Future: cache, queue, redis.
     store_backend: str = "file_streaming"
+    # Fit contract: start this fit from the weights in a ledger checkpoint document (a file
+    # holding ``document_to_bytes(checkpoint)``). Adam restarts (begin_fit clears it).
+    restore_checkpoint_path: str | None = None
 
 @dataclass(frozen=True)
 class TrainingManagerSettings:

@@ -24,7 +24,7 @@ from src.data.tabular_loader import TabularCSVLoader
 from src.ledger import RUN_END, FileLedgerStore
 
 
-def _fit(tmp: str, *, early_stopping: bool, patience: int, epochs: int, noise: float):
+def _fit(tmp: str, *, early_stopping: bool, patience: int, epochs: int, noise: float, restore: str | None = None):
     rng = np.random.default_rng(0)
     n = 200
     X = rng.normal(size=(n, 2))
@@ -45,7 +45,9 @@ def _fit(tmp: str, *, early_stopping: bool, patience: int, epochs: int, noise: f
         early_stopping_enabled=early_stopping,
         patience=patience,
         min_delta=1e-3,
-        ledger_settings=LedgerSettings(enabled=True, path="ledger", checkpoint_every_steps=25),
+        ledger_settings=LedgerSettings(
+            enabled=True, path="ledger", checkpoint_every_steps=25, restore_checkpoint_path=restore
+        ),
         output_dir=tmp,
         training_manager=None,
         model_id="run-end-test",
@@ -73,3 +75,31 @@ def test_early_stop_writes_run_end_es_trip_with_best_version() -> None:
     assert body["best_version"] is not None
     assert body["best_val_loss"] is not None
     assert int(body["epochs_run"]) < 200
+
+
+# --- fit contract: start a fit from a given checkpoint document ---------------------------
+
+
+def test_fit_can_start_from_a_checkpoint_document_with_weights_and_adam_state() -> None:
+    from src.ledger import CHECKPOINT, document_from_bytes, document_to_bytes
+
+    with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+        _fit(tmp_a, early_stopping=False, patience=3, epochs=3, noise=0.1)
+        store = FileLedgerStore(os.path.join(tmp_a, "ledger"))
+        cps = [d for d in store.scan(1) if d.doc_type == CHECKPOINT and d.version and d.version > 0]
+        assert cps, "first fit must have produced a non-zero checkpoint"
+        src_doc = cps[-1]
+        ckpt_path = os.path.join(tmp_b, "restore.ckpt")
+        with open(ckpt_path, "wb") as fh:
+            fh.write(document_to_bytes(src_doc))
+
+        _fit(tmp_b, early_stopping=False, patience=3, epochs=1, noise=0.1, restore=ckpt_path)
+        store_b = FileLedgerStore(os.path.join(tmp_b, "ledger"))
+        v0 = [d for d in store_b.scan(1) if d.doc_type == CHECKPOINT and d.version == 0]
+        assert v0, "second fit must record its starting weights as checkpoint v0"
+        for a, b in zip(src_doc.body["weights"], v0[0].body["weights"]):
+            np.testing.assert_allclose(np.asarray(a), np.asarray(b))
+        # ME clears Adam tracking vectors at the start of every fit (begin_fit): a restore brings
+        # back the WEIGHTS; the optimizer restarts. Documented fit-contract behavior for this family.
+        assert int(v0[0].body["optimizer"]["t"]) == 0
+        _ = document_from_bytes

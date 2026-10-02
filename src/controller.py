@@ -131,6 +131,24 @@ class ModelController:
             return True
         return False
 
+    def restore_from_checkpoint_doc(self, path: str) -> int:
+        """Fit contract: load weights from a ledger checkpoint document file. Returns its version."""
+        from src.ledger import document_from_bytes, restore_model_checkpoint
+
+        if self.model is None:
+            raise ValueError("[Model Controller] Cannot restore before the network is initialized.")
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if not data:
+            raise ValueError(f"empty checkpoint document: {path}")
+        doc = document_from_bytes(data)
+        body = getattr(doc, "body", None)
+        if not isinstance(body, dict) or "weights" not in body:
+            raise ValueError(f"checkpoint document has no weights: {path}")
+        restore_model_checkpoint(self.model, body)
+        logging.info("[Model Controller] Restored weights from checkpoint document %s", path)
+        return int(getattr(doc, "version", 0) or 0)
+
     def predict(self, raw_data_matrix: np.ndarray) -> np.ndarray:
         """Normalizes features (if provider attached) and runs forward inference."""
         if self.model is None:
@@ -170,6 +188,9 @@ class ModelController:
 
         engine = None
         ledger_on = ledger_settings is not None and ledger_settings.enabled
+        restore_path = getattr(ledger_settings, "restore_checkpoint_path", None) if ledger_settings is not None else None
+        if restore_path:
+            self.restore_from_checkpoint_doc(str(restore_path))
         from src.manager_heartbeat import maybe_from_settings
         from src.training_engine import create_training_engine
 
