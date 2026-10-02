@@ -30,7 +30,12 @@ from utils.runtime import (
 
 from utils.perf_experiments import apply_im2col_gemm_perf_defaults, experiment_summary
 
-BOOT_YAML = "config/config.yaml"
+# Fit contract: a launcher (the execution engine) points ME at its own boot YAML, e.g. one with
+# training_manager.enabled=false and park_when_idle=false so ME runs one fit and EXITS instead of
+# heartbeating to TM and parking.
+import os as _os
+
+BOOT_YAML = _os.environ.get("ML_ENGINE_BOOT_YAML", "config/config.yaml")
 
 # Config provenance is fixed for the life of the process, and it is resolved
 # BEFORE NumPy/SciPy BLAS first touch so thread env is pinned either way.
