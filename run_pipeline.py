@@ -88,6 +88,9 @@ import numpy as np
 
 def _build_provider_and_controller(cfg: PipelineConfig):
     """Assemble data provider + initialized network from a PipelineConfig."""
+    from utils.seeding import seed_everything
+
+    seed_everything(getattr(cfg.optimization, "seed", None))
     is_cnn = cfg.architecture.model_type == ModelType.CNN
     is_mhsa = cfg.architecture.model_type == ModelType.MHSA
     source_mode = cfg.ingestion.source_mode

@@ -243,6 +243,8 @@ class OptimizationConfig:
     min_delta: float
     gradient_clipping_max_norm: float
     num_threads: int
+    # Fit contract: seeds numpy's global RNG once at run start (None = unseeded, as before).
+    seed: int | None = None
 
 
 @dataclass(frozen=True)
