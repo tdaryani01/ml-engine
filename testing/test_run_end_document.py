@@ -63,6 +63,8 @@ def test_budget_exhausted_writes_run_end_success() -> None:
     body = docs[0].body
     assert body["reason"] == "success"
     assert int(body["epochs_run"]) == 3
+    # The final model is recorded as a checkpoint so a ledger reader can announce it.
+    assert body["final_version"] is not None
 
 
 def test_early_stop_writes_run_end_es_trip_with_best_version() -> None:
@@ -117,3 +119,13 @@ def test_every_epoch_records_train_and_validation_loss_in_the_ledger() -> None:
     for d in docs:
         assert d.body["val_loss"] is not None
         assert d.body["train_loss"] is not None
+
+
+def test_a_budget_ended_fit_records_a_final_checkpoint_at_the_final_version() -> None:
+    from src.ledger import CHECKPOINT
+
+    with tempfile.TemporaryDirectory() as tmp:
+        docs = _fit(tmp, early_stopping=False, patience=3, epochs=2, noise=0.1)
+        store = FileLedgerStore(os.path.join(tmp, "ledger"))
+        cps = {d.version for d in store.scan(1) if d.doc_type == CHECKPOINT}
+    assert docs[0].body["final_version"] in cps

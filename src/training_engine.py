@@ -1745,6 +1745,20 @@ class TrainingEngine:
                 "steps": int(getattr(sess, "steps_completed", 0)),
             }
             with self._ledger_lock:
+                # A budget-ended fit has no "best" restore: record the final model as a checkpoint
+                # so a ledger reader (EE) can announce it. An early stop already has its best one.
+                if body["reason"] != "es_trip":
+                    final_v = int(self.ledger.version)
+                    self.ledger.push_checkpoint(
+                        sess.model,
+                        version=final_v,
+                        val_loss=best_val,
+                        is_local_best=False,
+                        model_instance_id=self._ledger_model_instance_id(sess),
+                    )
+                    body["final_version"] = final_v
+                else:
+                    body["final_version"] = body.get("best_version")
                 self.ledger.push_run_end(body)
         except Exception:  # noqa: BLE001
             logging.exception("[TrainingEngine] run.end document failed")
