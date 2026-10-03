@@ -41,6 +41,7 @@ def _make_mhsa(
     seed: int = 0,
     use_input_proj: bool = False,
     action_mode: str = "continuous",
+    action_temperature: float = 1.0,
 ):
     bootstrap_im2col_gemm_runtime()
     np.random.seed(seed)
@@ -60,6 +61,7 @@ def _make_mhsa(
             "use_pos_encoding": False,
             "use_input_proj": use_input_proj,
             "action_mode": action_mode,
+            "action_temperature": action_temperature,
         },
         contract_list_enabled=True,
         lam_l2=0.0,
@@ -151,6 +153,81 @@ def test_mhsa_discrete_forward_logits_and_ce():
         print("[PASSED] mhsa: discrete logits + CE train (grads free, loss drops)")
     finally:
         _close(model)
+
+
+def test_mhsa_discrete_temperature_default_is_noop_vs_baked_1_0():
+    """BL-030c compat guard: T defaults to 1.0 — identical loss/grad to a
+    model that never heard of ``action_temperature`` at all."""
+    X = np.random.randn(4, 4, 16).astype(np.float64)
+    y = np.zeros((4, 3), dtype=np.float64)
+    y[np.arange(4), np.random.randint(0, 3, size=4)] = 1.0
+
+    baseline = _make_mhsa(
+        d_model=16, num_heads=2, action_dim=3, seed=7, action_mode="discrete"
+    )
+    explicit_t1 = _make_mhsa(
+        d_model=16,
+        num_heads=2,
+        action_dim=3,
+        seed=7,
+        action_mode="discrete",
+        action_temperature=1.0,
+    )
+    try:
+        loss_a, gw_a, _, _ = baseline.run_contract_train_step(
+            X, y, lr=1e-2, apply_adam=True
+        )
+        loss_b, gw_b, _, _ = explicit_t1.run_contract_train_step(
+            X, y, lr=1e-2, apply_adam=True
+        )
+        assert loss_a == loss_b, f"T=1.0 (default vs explicit) diverged: {loss_a} vs {loss_b}"
+        for ga, gb in zip(gw_a, gw_b):
+            assert np.array_equal(ga, gb), "T=1.0 gradients must be bit-identical"
+        print("[PASSED] mhsa: action_temperature default (1.0) is a strict no-op")
+    finally:
+        _close(baseline)
+        _close(explicit_t1)
+
+
+def test_mhsa_discrete_temperature_changes_loss_and_grad():
+    """T != 1.0 actually changes the softmax distribution / CE loss / grad —
+    the reserved knob has a real, measurable effect once armed."""
+    X = np.random.randn(4, 4, 16).astype(np.float64)
+    y = np.zeros((4, 3), dtype=np.float64)
+    y[np.arange(4), np.random.randint(0, 3, size=4)] = 1.0
+
+    cool = _make_mhsa(
+        d_model=16,
+        num_heads=2,
+        action_dim=3,
+        seed=7,
+        action_mode="discrete",
+        action_temperature=1.0,
+    )
+    hot = _make_mhsa(
+        d_model=16,
+        num_heads=2,
+        action_dim=3,
+        seed=7,
+        action_mode="discrete",
+        action_temperature=2.5,
+    )
+    try:
+        loss_cool, gw_cool, _, _ = cool.run_contract_train_step(
+            X, y, lr=1e-2, apply_adam=True
+        )
+        loss_hot, gw_hot, _, _ = hot.run_contract_train_step(
+            X, y, lr=1e-2, apply_adam=True
+        )
+        assert np.isfinite(loss_hot) and loss_hot > 0.0
+        assert loss_cool != loss_hot, "T=2.5 must change the CE loss vs T=1.0"
+        assert not np.allclose(gw_cool[-1], gw_hot[-1]), (
+            "T=2.5 must change the action-head gradient vs T=1.0"
+        )
+        print("[PASSED] mhsa: action_temperature != 1.0 changes loss + grad")
+    finally:
+        _close(cool)
+        _close(hot)
 
 
 def test_mhsa_train_step_smoke():
@@ -606,6 +683,8 @@ if __name__ == "__main__":
     test_mhsa_compile_ops()
     test_mhsa_naive_forward_actions()
     test_mhsa_discrete_forward_logits_and_ce()
+    test_mhsa_discrete_temperature_default_is_noop_vs_baked_1_0()
+    test_mhsa_discrete_temperature_changes_loss_and_grad()
     test_mhsa_train_step_smoke()
     test_mhsa_stacked_smoke()
     test_mhsa_rejects_bad_geometry()

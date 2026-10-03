@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 
+from examples.closed_loop_draw.goal import DrawGoal
 from examples.closed_loop_draw.assemble import load_config
 from examples.closed_loop_draw.commands import COMMANDS, STOCK_COMMAND_IDS
 
@@ -54,9 +55,7 @@ def _train_block(
     last = 0.0
     for _ in range(max(1, int(n_traj))):
         result = app.trainer.rollout_train(
-            command_ids=command_ids,
-            target=target,
-            max_steps=app.max_steps,
+            goal=DrawGoal(command_ids=command_ids, target=target),
             lr=float(lr),
             apply_updates=True,
         )

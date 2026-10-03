@@ -29,7 +29,8 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from examples.closed_loop_draw.assemble import assemble, load_config, rollout_forward_frames
+from examples.closed_loop_draw.goal import DrawGoal
+from examples.closed_loop_draw.assemble import assemble, load_config
 from examples.closed_loop_draw.commands import (
     COMMANDS,
     STOCK_COMMAND_IDS,
@@ -40,6 +41,12 @@ from examples.closed_loop_draw.commands import (
 from examples.closed_loop_draw.sketch_pad import SketchPad
 from examples.closed_loop_draw.viz import canvas_to_u8
 from utils.conv_dispatch import bootstrap_im2col_gemm_runtime
+
+
+
+def _rollout_frames(app, ids):
+    """Inference frames via the generic trainer (rollout_eval)."""
+    return app.trainer.rollout_eval(goal=DrawGoal.render(ids)).extras["frames"]
 
 
 class DrawInteractiveApp:
@@ -219,7 +226,7 @@ class DrawInteractiveApp:
     def _preview_rollout(self) -> None:
         ids = np.full(1, self.command_id, dtype=np.int64)
         frame = None
-        for frame in rollout_forward_frames(self.app, command_ids=ids):
+        for frame in _rollout_frames(self.app, ids):
             pass
         if frame is not None:
             self._show_canvas(frame)
@@ -323,7 +330,7 @@ class DrawInteractiveApp:
         ids = np.full(1, self.command_id, dtype=np.int64)
         n = self.app.max_steps
         self.status_var.set(f"drawing '{self.command_name}' …")
-        for i, frame in enumerate(rollout_forward_frames(self.app, command_ids=ids)):
+        for i, frame in enumerate(_rollout_frames(self.app, ids)):
             if self._closing:
                 return
             self._show_canvas(frame)
@@ -494,9 +501,7 @@ class DrawInteractiveApp:
                 )
 
             result = self.app.trainer.rollout_train(
-                command_ids=ids,
-                target=target,
-                max_steps=self.app.max_steps,
+                goal=DrawGoal(command_ids=ids, target=target),
                 lr=lr,
                 apply_updates=True,
             )
@@ -549,8 +554,8 @@ class DrawInteractiveApp:
             )
             if do_preview:
                 frame = None
-                for frame in rollout_forward_frames(
-                    self.app, command_ids=np.full(1, self.command_id, dtype=np.int64)
+                for frame in _rollout_frames(
+                    self.app, np.full(1, self.command_id, dtype=np.int64)
                 ):
                     pass
                 if frame is not None:
@@ -604,8 +609,8 @@ class DrawInteractiveApp:
         tag = "  [restored best]" if restored else ""
         ratio = last / max(empty_loss, 1e-8)
         frame = None
-        for frame in rollout_forward_frames(
-            self.app, command_ids=np.full(1, self.command_id, dtype=np.int64)
+        for frame in _rollout_frames(
+            self.app, np.full(1, self.command_id, dtype=np.int64)
         ):
             pass
         if frame is not None:
@@ -644,9 +649,7 @@ class DrawInteractiveApp:
                     cid, batch_size=B, height=self.H, width=self.W, channels=self.C
                 )
             result = self.app.trainer.rollout_train(
-                command_ids=ids,
-                target=target,
-                max_steps=self.app.max_steps,
+                goal=DrawGoal(command_ids=ids, target=target),
                 lr=self.app.lr,
                 apply_updates=True,
             )

@@ -2,7 +2,6 @@
 import logging
 from typing import Tuple, List, Optional
 import numpy as np
-import pika
 import time
 from src.data.base_provider import BaseDataProvider
 from config.constants import DataKeys
@@ -51,6 +50,8 @@ class StreamDataProvider(BaseDataProvider):
     def _bootstrap_broker_connection(self) -> None:
         """Establishes connection and declares durable queues on the AMQP broker."""
         try:
+            import pika  # lazy: only the AMQP stream provider needs it
+
             params = pika.URLParameters(self.amqp_url)
             self._connection = pika.BlockingConnection(params)
             self._channel = self._connection.channel()

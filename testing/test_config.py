@@ -201,6 +201,176 @@ def test_ledger_native_async_submit_from_config() -> None:
     print("[PASSED] ledger native_async_submit: both states hydrate via schema")
 
 
+def _tm_payload(**overrides) -> dict:
+    """A complete, authoritative TM job ``config`` mapping (MHSA)."""
+    payload = {
+        "meta": {
+            "pipeline_name": "tm_job",
+            "stage": "dev",
+            "suppress_logging": True,
+            "logging_level": "warning",
+            "output_dir": "out",
+        },
+        "ingestion": {
+            "source_mode": "csv",
+            "data_file_path": "data/samples/mhsa/cue_recall_quick.npz",
+            "feature_names": "auto",
+            "splits": {"train": 0.7, "val": 0.15},
+            "drain_on_empty": False,
+            "val_queue_name": "",
+            "amqp_url": "",
+            "queue_name": "",
+        },
+        "architecture": {
+            "model_type": "mhsa",
+            "backend": "native",
+            "num_classes": 4,
+            "hidden_layers": [],
+            "p_dropout": 0.0,
+            "use_batch_norm": False,
+            "bn_momentum": 0.9,
+            "mhsa": {"d_model": 64, "num_heads": 4, "max_seq_len": 32, "action_dim": 4},
+        },
+        "optimization": {
+            "optimizer": "adam",
+            "epochs_full_dataset": 1,
+            "steps_streaming": 1,
+            "batch_size": 8,
+            "learning_rate": 0.001,
+            "lr_scheduler": "none",
+            "scheduler_decay_rate": 0.98,
+            "scheduler_epochs_per_drop": 10,
+            "scheduler_drop_ratio": 0.5,
+            "early_stopping_enabled": False,
+            "patience": 10,
+            "min_delta": 1e-4,
+            "gradient_clipping_max_norm": 5.0,
+            "num_threads": 4,
+        },
+        "regularization": {"lam_l1": 0.0, "lam_l2": 0.0, "sparsity_tolerance": 1e-5},
+        "transformations": {"fourier_expansion": {"enabled": False, "num_frequencies": 4}},
+        "persistence": {"load_saved_model": False, "model_asset_path": "x.npz"},
+        "diagnostics": {
+            "enabled": False,
+            "metric_to_plot": "loss",
+            "save_raw_logs": False,
+            "figure_width": 8,
+            "figure_height": 6,
+            "plot_style": "default",
+            "output_format": "png",
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _geom(obj, name):
+    """Read a geometry field from either a schema dataclass or a raw mapping."""
+    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name)
+
+
+def test_local_config_has_no_schema_template() -> None:
+    """Standalone hydration is untouched: no TM template leaks into local YAML."""
+    cfg = load_production_config(str(CONFIG_DIR / "config.yaml"))
+    assert cfg.architecture.schema_template is None
+    print("[PASSED] local YAML: schema_template absent (standalone unchanged)")
+
+
+def test_tm_config_strict_rejects_partial_payload() -> None:
+    from config.config_loader import TMConfigError, parse_tm_production_config
+
+    try:
+        parse_tm_production_config({"optimization": {"learning_rate": 0.0003}})
+    except TMConfigError as exc:
+        assert "architecture" in str(exc)
+    else:
+        raise AssertionError("strict TM parse must reject a partial payload")
+    print("[PASSED] TM strict: partial payload rejected with TMConfigError")
+
+
+def test_tm_config_strict_requires_mhsa_geometry() -> None:
+    from config.config_loader import TMConfigError, parse_tm_production_config
+
+    payload = _tm_payload()
+    payload["architecture"] = {
+        k: v for k, v in payload["architecture"].items() if k != "mhsa"
+    }
+    try:
+        parse_tm_production_config(payload)
+    except TMConfigError as exc:
+        assert "mhsa" in str(exc)
+    else:
+        raise AssertionError("missing MHSA geometry must raise TMConfigError")
+    print("[PASSED] TM strict: missing MHSA geometry rejected")
+
+
+def test_tm_config_retains_host_identity() -> None:
+    from config.config_loader import parse_tm_production_config
+
+    cfg = parse_tm_production_config(
+        _tm_payload(),
+        host_identity={
+            "enabled": True,
+            "uri": "http://boot-tm",
+            "kind": "engine",
+            "instance_id": "host-7",
+            "m2m": {"client_id": "x"},
+        },
+    )
+    assert cfg.training_manager.enabled is True
+    assert cfg.training_manager.uri == "http://boot-tm"
+    assert cfg.training_manager.instance_id == "host-7"
+    assert cfg.training_manager.m2m == {"client_id": "x"}
+    print("[PASSED] TM strict: host identity retained from boot")
+
+
+def test_tm_config_schema_template_supplies_geometry() -> None:
+    from config.config_loader import parse_tm_production_config
+
+    payload = _tm_payload()
+    payload["architecture"] = {
+        k: v for k, v in payload["architecture"].items() if k != "mhsa"
+    }
+    payload["schema_template"] = {
+        "d_model": 128,
+        "num_heads": 8,
+        "max_seq_len": 64,
+        "action_dim": 4,
+        "ffn_mult": 2,
+        "num_layers": 3,
+    }
+    cfg = parse_tm_production_config(payload)
+    mhsa = cfg.architecture.mhsa
+    assert mhsa is not None
+    assert (
+        int(_geom(mhsa, "d_model")),
+        int(_geom(mhsa, "num_heads")),
+        int(_geom(mhsa, "max_seq_len")),
+    ) == (128, 8, 64)
+    assert int(_geom(mhsa, "ffn_mult")) == 2
+    assert int(_geom(mhsa, "num_layers")) == 3
+    assert cfg.architecture.schema_template is not None
+    assert cfg.architecture.schema_template.d_model == 128
+    print("[PASSED] TM strict: schema_template supplies/overlays MHSA geometry")
+
+
+def test_config_source_detection_payload_markers() -> None:
+    from config.config_source import (
+        ConfigSource,
+        resolve_config_source,
+        tm_payload_declares_authority,
+    )
+
+    assert tm_payload_declares_authority({"schema_template": {}}) is True
+    assert tm_payload_declares_authority({"architecture": {"model_type": "mhsa"}}) is True
+    assert tm_payload_declares_authority({"optimization": {"learning_rate": 1e-3}}) is False
+    assert resolve_config_source(payload={"optimization": {}}) == ConfigSource.LOCAL
+    assert (
+        resolve_config_source(payload={"config_version": 3}) == ConfigSource.TRAINING_MANAGER
+    )
+    print("[PASSED] config_source: payload markers resolve provenance explicitly")
+
+
 CONFIG_TESTS = [
     test_production_yaml_files_parse,
     test_production_config_hydrates,
@@ -212,6 +382,12 @@ CONFIG_TESTS = [
     test_runtime_threads_fallback_to_config_when_unset,
     test_runtime_threads_override_from_runtime_yaml,
     test_ledger_native_async_submit_from_config,
+    test_local_config_has_no_schema_template,
+    test_tm_config_strict_rejects_partial_payload,
+    test_tm_config_strict_requires_mhsa_geometry,
+    test_tm_config_retains_host_identity,
+    test_tm_config_schema_template_supplies_geometry,
+    test_config_source_detection_payload_markers,
 ]
 
 
@@ -232,3 +408,21 @@ if __name__ == "__main__":
         sys.exit(1)
     print(f"[SUCCESS] All {len(CONFIG_TESTS)} config smoke tests passed.")
     print("=" * 60)
+
+
+def test_schema_template_carries_input_dim_through_typed_mhsa_config():
+    """Decoupled geometry must survive the typed parser (no silent drop)."""
+    from config.constants import ModelType
+    from config.schema import ArchitectureConfig, MHSAConfig, SchemaTemplate
+
+    base = MHSAConfig(d_model=32, num_heads=4, max_seq_len=9, action_dim=5)
+    assert base.input_dim is None
+    arch = ArchitectureConfig(
+        model_type=ModelType.MHSA, num_classes=5, hidden_layers=[], mhsa=base
+    )
+    tmpl = SchemaTemplate.from_mapping({"input_dim": 37, "num_heads": 2})
+    out = tmpl.apply_to_architecture_config(arch)
+    assert out.mhsa.input_dim == 37
+    assert out.mhsa.num_heads == 2
+    # Untouched fields keep their configured values.
+    assert out.mhsa.d_model == 32 and out.mhsa.max_seq_len == 9

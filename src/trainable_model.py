@@ -159,9 +159,16 @@ class TrainableModel(ABC):
         apply_adam: bool = False,
         step_token: int | None = None,
         tick_fn: Callable[[], None] | None = None,
+        sample_weights: np.ndarray | None = None,
     ) -> tuple[float, list, list, int]:
         if self._contract_runtime is None:
             raise RuntimeError("Contract path not initialized")
         return self._contract_runtime.run_step(
-            X, y, lr, apply_adam=apply_adam, step_token=step_token, tick_fn=tick_fn
+            X,
+            y,
+            lr,
+            apply_adam=apply_adam,
+            step_token=step_token,
+            tick_fn=tick_fn,
+            sample_weights=sample_weights,
         )

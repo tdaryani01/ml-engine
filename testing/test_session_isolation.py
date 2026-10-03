@@ -204,7 +204,15 @@ def test_engine_two_sessions_round_robin():
 
     with tempfile.TemporaryDirectory() as tmp:
         store = FileLedgerStore(tmp)
-        ledger = TrainingLedger(store=store, branch_id="main", architecture_id="mlp")
+        # Direct execution keys durable docs by the TM agent id; "unbound"
+        # is the documented sentinel meaning "no durable identity" -> docs
+        # are tagged with the session id (see controller.py).
+        ledger = TrainingLedger(
+            store=store,
+            branch_id="main",
+            architecture_id="mlp",
+            model_instance_id="unbound",
+        )
         engine = TrainingEngine(
             ledger=ledger,
             config=LedgerConfig(checkpoint_every_steps=100, checkpoint_on_local_best=False),
@@ -310,7 +318,15 @@ def test_concurrent_engine_sessions_run_step():
     _mlp, prov, X, y = _mlp_prov_bundle(11)
     with tempfile.TemporaryDirectory() as tmp:
         store = FileLedgerStore(tmp)
-        ledger = TrainingLedger(store=store, branch_id="main", architecture_id="mlp")
+        # Direct execution keys durable docs by the TM agent id; "unbound"
+        # is the documented sentinel meaning "no durable identity" -> docs
+        # are tagged with the session id (see controller.py).
+        ledger = TrainingLedger(
+            store=store,
+            branch_id="main",
+            architecture_id="mlp",
+            model_instance_id="unbound",
+        )
         engine = TrainingEngine(
             ledger=ledger,
             config=LedgerConfig(checkpoint_every_steps=1, checkpoint_on_local_best=False),
@@ -381,7 +397,15 @@ def test_ledger_multi_session_restore_isolation():
     _mlp, prov, X, y = _mlp_prov_bundle(21)
     with tempfile.TemporaryDirectory() as tmp:
         store = FileLedgerStore(tmp)
-        ledger = TrainingLedger(store=store, branch_id="main", architecture_id="mlp")
+        # Direct execution keys durable docs by the TM agent id; "unbound"
+        # is the documented sentinel meaning "no durable identity" -> docs
+        # are tagged with the session id (see controller.py).
+        ledger = TrainingLedger(
+            store=store,
+            branch_id="main",
+            architecture_id="mlp",
+            model_instance_id="unbound",
+        )
         engine = TrainingEngine(
             ledger=ledger,
             config=LedgerConfig(checkpoint_every_steps=1, checkpoint_on_local_best=False),
@@ -446,7 +470,15 @@ def test_end_and_resume_session():
     _mlp, prov, X, y = _mlp_prov_bundle(31)
     with tempfile.TemporaryDirectory() as tmp:
         store = FileLedgerStore(tmp)
-        ledger = TrainingLedger(store=store, branch_id="main", architecture_id="mlp")
+        # Direct execution keys durable docs by the TM agent id; "unbound"
+        # is the documented sentinel meaning "no durable identity" -> docs
+        # are tagged with the session id (see controller.py).
+        ledger = TrainingLedger(
+            store=store,
+            branch_id="main",
+            architecture_id="mlp",
+            model_instance_id="unbound",
+        )
         engine = TrainingEngine(
             ledger=ledger,
             config=LedgerConfig(checkpoint_every_steps=1, checkpoint_on_local_best=False),

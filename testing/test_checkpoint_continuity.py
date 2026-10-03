@@ -102,8 +102,15 @@ def test_regression_restore_applies_checkpoint_config(monkeypatch):
     }
 
     class HB:
+        # Direct execution: ``_tm_agent_id()`` reads the durable TM agent
+        # id, and the post-restore onset rewind probes session-health.
+        agent_id = "draw-test"
+
         def fetch_blob(self, _key):
             return b"blob"
+
+        def get_json(self, _path, timeout_s=3.0):
+            return {}
 
         def set_active_checkpoint(self, _ckpt):
             return None
@@ -194,58 +201,95 @@ def test_regression_es_restore_keeps_ckpt_knobs_plate_is_resume_overlay():
     }
 
 
-def test_regression_claim_resume_checkpoint_restores_before_overlay(monkeypatch):
-    """Any-worker claim with resume_checkpoint pin restores ckpt; overlay only."""
+def test_regression_restore_applies_checkpoint_config_before_weights(monkeypatch):
+    """Continuity: the checkpoint config is re-applied BEFORE the weights.
+
+    Direct execution has no claim / ``resume_checkpoint`` pin any more — a
+    restore is an explicit engine command carrying ``blob_key`` + ``version``
+    (``_restore_from_command``). What must survive is the ordering and the
+    provenance of the hot knobs: config from the CHECKPOINT, never from a job
+    overlay stamp, and always applied before weights land on the app.
+    """
     agent = object.__new__(DrawStudentAgent)
-    agent.cfg = {"closed_loop": {"sigma": 0.06}, "optimization": {"learning_rate": 1e-3}}
+    agent.cfg = {
+        "closed_loop": {"sigma": 0.06, "train_patience": 32},
+        "optimization": {"learning_rate": 1e-3},
+    }
     agent.lr = 1e-3
     agent._sigma = 0.06
-    agent._traj = 0
-    agent._es_park_hold = True
-    agent._user_pause_hold = True
-    agent._last_loss = None
+    agent._train_patience = 32
+    agent._traj = 9
+    agent._stale = 4
+    agent._es_tripped = True
+    agent._remix_data_on_es = False
+    agent._remix_after_restore = False
+    agent._last_loss = 0.2
+    agent._checkpoint_version = None
+    agent._config_version = None
+    agent._handled_onset_version = None
     agent.app = object()
-    agent._configured = False
-    agent.hb = SimpleNamespace(cfg=SimpleNamespace(instance_id="pool-test"))
 
-    restored = []
+    order: list[str] = []
 
-    def fake_restore(self, *, version, blob_key, command_id):
-        restored.append((version, blob_key, command_id))
-        self.lr = 0.004
-        self._sigma = 0.22
-        self.cfg = {
-            "closed_loop": {"sigma": 0.22},
-            "optimization": {"learning_rate": 0.004},
-        }
-        self._traj = int(version)
-        return True
+    def fake_apply(self, config, *, rebuild=False):
+        del rebuild
+        order.append("config")
+        opt = config.get("optimization") or {}
+        cl = config.get("closed_loop") or {}
+        if "learning_rate" in opt:
+            self.lr = float(opt["learning_rate"])
+        if "sigma" in cl:
+            self._sigma = float(cl["sigma"])
+        if "train_patience" in cl:
+            self._train_patience = int(cl["train_patience"])
+        return {"learning_rate": self.lr}
 
-    monkeypatch.setattr(DrawStudentAgent, "_restore_checkpoint", fake_restore)
-
-    job = {
-        "job_id": "j1",
-        "model_id": "draw-1",
-        "config": {
-            "source": "user",
-            "feed": {"on_es": "noop"},
-            "closed_loop": {"sigma": 0.99},
-            "optimization": {"learning_rate": 9.0},
+    monkeypatch.setattr(DrawStudentAgent, "apply_run_config", fake_apply)
+    monkeypatch.setattr(
+        "examples.closed_loop_draw.agent.load_checkpoint_blob",
+        lambda _data: {
+            "weights": {"x": 1},
+            "config": {
+                "closed_loop": {"sigma": 0.19, "train_patience": 77},
+                "optimization": {"learning_rate": 0.0025},
+            },
+            "knobs": {},
         },
-        "data": {
-            "resume_checkpoint": {
-                "version": 40,
-                "blob_key": "ckpts/draw-1/v40.pkl",
-            }
-        },
-    }
-    assert DrawStudentAgent.on_claim_config(agent, job) is True
-    assert restored == [(40, "ckpts/draw-1/v40.pkl", None)]
-    # Hot knobs from restore, not from stale Start stamp.
-    assert agent.lr == 0.004
-    assert agent._sigma == 0.22
-    assert agent.cfg["source"] == "user"
-    assert agent.cfg["feed"]["on_es"] == "noop"
-    assert agent.cfg["closed_loop"]["sigma"] == 0.22
-    assert agent._es_park_hold is False
-    assert agent._user_pause_hold is False
+    )
+    monkeypatch.setattr(
+        "examples.closed_loop_draw.agent.apply_checkpoint_blob",
+        lambda _app, _body: order.append("weights"),
+    )
+
+    class HB:
+        agent_id = "draw-test"
+
+        def fetch_blob(self, _key):
+            return b"blob"
+
+        def get_json(self, _path, timeout_s=3.0):
+            return {}
+
+        def set_active_checkpoint(self, _ckpt):
+            return None
+
+        def queue_ack(self, *_a, **_k):
+            return None
+
+    agent.hb = HB()
+    cmd = SimpleNamespace(
+        id="c-restore",
+        payload={"blob_key": "ckpts/draw-1/v40.pkl", "version": 40},
+    )
+    DrawStudentAgent._restore_from_command(agent, cmd)
+
+    assert order == ["config", "weights"]
+    # Hot knobs come from the checkpoint, not from any Start/job stamp.
+    assert agent.lr == 0.0025
+    assert agent._sigma == 0.19
+    assert agent._train_patience == 77
+    assert agent._checkpoint_version == 40
+    assert agent._config_version == 40
+    assert agent._traj == 40
+    assert agent._stale == 0
+    assert agent._es_tripped is False

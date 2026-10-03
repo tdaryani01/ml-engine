@@ -151,12 +151,22 @@ def test_conv_backends_numba_pinned_during_fit():
     s = _settings(4)
     prev = numba.get_num_threads()
     expected = 1
+    # NUMBA_NUM_THREADS (env) caps the process-wide pool at import time. When
+    # that cap is already the pinned value there is no pin to observe, so
+    # skip instead of failing a perfectly legal environment.
+    ceiling = int(numba.config.NUMBA_NUM_THREADS)
+    if ceiling <= expected:
+        print(
+            f"[SKIPPED] numba pool capped at {ceiling} "
+            f"(NUMBA_NUM_THREADS); cannot observe a pin to {expected}"
+        )
+        return
     try:
-        numba.set_num_threads(8)
+        numba.set_num_threads(ceiling)
         for backend in (EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM):
             with training_threadpool(s, backend):
                 assert numba.get_num_threads() == expected
-        assert numba.get_num_threads() == 8
+        assert numba.get_num_threads() == ceiling
     finally:
         numba.set_num_threads(prev)
     print(f"[PASSED] native + im2col+gemm: numba pinned to {expected} during fit")

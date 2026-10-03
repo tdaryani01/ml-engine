@@ -86,13 +86,14 @@ void fuse_dout_transpose(
         0);
 
     const int32_t omp_n = omp_threads_for_phase();
-    #pragma omp parallel for num_threads(omp_n) collapse(3) schedule(static) if(omp_n > 1)
+    // collapse(2) over n x h: the collapsed loops must be perfectly nested, so
+    // the per-n offsets are computed inside the h body (was an invalid
+    // collapse(3) with statements between the n and h loops; GCC 13 rejects).
+    #pragma omp parallel for num_threads(omp_n) collapse(2) schedule(static) if(omp_n > 1)
     for (int64_t n = 0; n < N; ++n) {
-        const int64_t row_n_offset = n * spatial;
-        const int64_t n_plane = n * C_out * out_h * dout_w_stride;
         for (int64_t h = 0; h < out_h; ++h) {
-            const int64_t row_h_offset = row_n_offset + h * out_w;
-            const int64_t nh_base = n_plane + h * dout_w_stride;
+            const int64_t row_h_offset = n * spatial + h * out_w;
+            const int64_t nh_base = n * C_out * out_h * dout_w_stride + h * dout_w_stride;
             for (int64_t w = 0; w < out_w; ++w) {
                 const int64_t row_idx = row_h_offset + w;
                 const float* src_base = dout + nh_base + w;

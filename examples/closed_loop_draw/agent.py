@@ -2,7 +2,8 @@
 """
 Closed-loop draw config for the training engine (like CNN/MLP — not a second loop).
 
-TrainingEngine owns claim / HB / command drain. This module supplies:
+TrainingEngine owns HB / command drain (direct execution — no pool claim).
+This module supplies:
   - train_tick (external_step)
   - control hooks (start/resume config, pause holds, draw-blob restore)
   - ES / tm-brain act + remix (draw-specific physiology)
@@ -26,6 +27,7 @@ _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
+from examples.closed_loop_draw.goal import DrawGoal
 from examples.closed_loop_draw.assemble import assemble, load_config, make_target
 from examples.closed_loop_draw.commands import STOCK_COMMAND_IDS
 from examples.closed_loop_draw.draw_checkpoint import (
@@ -35,6 +37,7 @@ from examples.closed_loop_draw.draw_checkpoint import (
     load_checkpoint_blob,
     public_run_config,
 )
+from config.config_source import tm_payload_declares_authority
 from src.manager_heartbeat import _diag, maybe_from_settings
 from utils.conv_dispatch import bootstrap_im2col_gemm_runtime
 
@@ -178,7 +181,7 @@ class DrawStudentAgent:
         self._engine_pause: Callable[[], None] | None = None
 
     def bind_engine_stop(self, stop: Callable[[], None] | None) -> None:
-        """Wire TrainingEngine.request_stop so manual ES can finish the lease."""
+        """Wire TrainingEngine.request_stop so manual ES can end the run."""
         self._engine_stop = stop
 
     def bind_engine_pause(self, pause: Callable[[], None] | None) -> None:
@@ -189,18 +192,14 @@ class DrawStudentAgent:
         self.app.close()
 
     def _tm_agent_id(self) -> str:
-        """TM agent id for control-plane routes and ckpt keys.
-
-        Pool workers keep ``hb.cfg.instance_id`` as the anonymous session id.
-        Job-bound routes must use ``bound_model_id`` (e.g. tm-brain) or ES act
-        404s against the session.
-        """
-        mid = getattr(self.hb, "bound_model_id", None)
-        if callable(mid):
-            mid = mid()
-        if isinstance(mid, str) and mid.strip():
-            return mid.strip()
-        return str(getattr(self.hb.cfg, "instance_id", "") or "").strip()
+        """TM agent id for control-plane routes and ckpt keys (direct execution)."""
+        agent_id = str(self.hb.agent_id or "").strip()
+        if not agent_id:
+            raise RuntimeError(
+                "DrawStudentAgent: manager heartbeat has no agent_id "
+                "(training_manager.instance_id missing from boot config)"
+            )
+        return agent_id
 
     @staticmethod
     def _deep_merge(base: dict, overlay: dict) -> dict:
@@ -244,7 +243,12 @@ class DrawStudentAgent:
         self._best_probe = None
 
     def apply_run_config(self, config: dict | None, *, rebuild: bool = False) -> dict:
-        """Apply YAML-shaped or flat knobs (claim + brain resume share this path)."""
+        """Live reconfiguration (checkpoint restore / brain retune) — deep-merge.
+
+        This is the only place ``_deep_merge`` onto the current ``self.cfg`` is
+        allowed. A config that asserts TM authority never comes here — it goes
+        through ``_apply_strict_tm_config`` (see ``on_engine_start_resume``).
+        """
         if not isinstance(config, dict) or not config:
             return {}
         overlay_keys = {"source", "autopilot", "gym"}
@@ -272,100 +276,48 @@ class DrawStudentAgent:
         self._configured = True
         return confirmed
 
-    def on_claim_config(self, job: dict) -> bool:
-        """Configure from job; if resume_checkpoint pinned, restore that ckpt first."""
-        try:
-            cfg = dict(job.get("config") or {})
-            data = dict(job.get("data") or {})
-            _diag(
-                "agent_claim_config_enter",
-                job_id=job.get("job_id"),
-                model_id=job.get("model_id"),
-                pool=self.hb.cfg.instance_id,
-                config_keys=sorted(cfg.keys()),
-                has_resume=bool(
-                    isinstance(data.get("resume_checkpoint"), dict)
-                    or isinstance(cfg.get("resume_checkpoint"), dict)
-                ),
-                boot_assembled=True,
-                configured=self._configured,
-            )
-            resume = data.get("resume_checkpoint")
-            if not isinstance(resume, dict):
-                resume = cfg.get("resume_checkpoint")
-            if isinstance(resume, dict) and resume.get("blob_key"):
-                ok = self._restore_checkpoint(
-                    version=resume.get("version"),
-                    blob_key=str(resume["blob_key"]),
-                    command_id=None,
-                )
-                if not ok:
-                    _diag("agent_claim_config_resume_fail", job_id=job.get("job_id"))
-                    return False
-                # Overlay feed/autopilot only — hot knobs come from the checkpoint.
-                for k, v in job_overlay_only(cfg).items():
-                    self.cfg[k] = copy.deepcopy(v)
-                self._autopilot = bool(cfg.get("autopilot", False)) or (
-                    str(cfg.get("source") or "").strip().lower() == "autopilot"
-                )
-                self._es_park_hold = False
-                self._es_run_done = False
-                self._user_pause_hold = False
-                clear_si = getattr(self.hb, "clear_site_interrupt", None)
-                if callable(clear_si):
-                    clear_si()
-                _emit(
-                    f"claim-config:resume-ckpt="
-                    f"v{resume.get('version')} job={job.get('job_id')}",
-                    traj=self._traj,
-                )
-                _diag(
-                    "agent_claim_config_resume_ok",
-                    job_id=job.get("job_id"),
-                    version=resume.get("version"),
-                )
-                return True
+    def _apply_strict_tm_config(self, payload: dict) -> dict:
+        """Rebuild strictly from a TM-authoritative config (no deep-merge).
 
-            raw_ver = cfg.get("config_version")
-            try:
-                self._config_version = (
-                    int(raw_ver) if raw_ver is not None else None
-                )
-            except (TypeError, ValueError):
-                self._config_version = None
-            self.apply_run_config(cfg, rebuild=True)
-            self._autopilot = bool(cfg.get("autopilot", False)) or (
-                str(cfg.get("source") or "").strip().lower() == "autopilot"
-            )
-            self._es_park_hold = False
-            self._es_run_done = False
-            self._user_pause_hold = False
-            clear_si = getattr(self.hb, "clear_site_interrupt", None)
-            if callable(clear_si):
-                clear_si()
-            _emit(
-                f"claim-config:job={job.get('job_id')} "
-                f"model={job.get('model_id')} "
-                f"config_v={self._config_version}",
-                traj=self._traj,
-            )
-            _diag(
-                "agent_claim_config_rebuild_ok",
-                job_id=job.get("job_id"),
-                model_id=job.get("model_id"),
-                config_v=self._config_version,
-                sigma=self._sigma,
-                lr=float(self.lr),
-                max_steps=self._max_steps,
-            )
-            return True
-        except Exception as exc:  # noqa: BLE001
-            _emit(f"claim-config:fail:{exc}", traj=self._traj)
-            _diag("agent_claim_config_fail", error=str(exc), job_id=job.get("job_id"))
-            return False
+        The TM config is the sole topology authority. Boot YAML contributes only
+        this host's ``training_manager`` identity and default ``output_dir``.
+        Missing required keys raise ``TMConfigError`` *before* anything is
+        swapped, so a rejected config leaves the running app untouched and the
+        engine acks the Start/Resume with the error text.
+        """
+        from config.config_loader import parse_tm_production_config
+
+        boot = self._boot_cfg if isinstance(self._boot_cfg, dict) else {}
+        identity = copy.deepcopy(boot.get("training_manager") or {}) or None
+        output_dir = (boot.get("meta") or {}).get("output_dir")
+        strict_cfg = parse_tm_production_config(
+            payload,
+            profile="closed_loop",
+            host_identity=identity,
+            output_dir=output_dir,
+        )
+        seed = int((strict_cfg.get("optimization") or {}).get("seed", 0))
+        try:
+            self.app.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self.cfg = strict_cfg
+        self.app = assemble(strict_cfg, seed=seed)
+        # Feed/autopilot/gym overlay keys ride along with the config.
+        for k, v in job_overlay_only(payload).items():
+            self.cfg[k] = copy.deepcopy(v)
+        self._reload_live_knobs()
+        raw_ver = payload.get("config_version")
+        try:
+            self._config_version = int(raw_ver) if raw_ver is not None else None
+        except (TypeError, ValueError):
+            self._config_version = None
+        self._configured = True
+        _emit("config:strict:tm", traj=self._traj)
+        return self._live_config()
 
     def on_release_config(self) -> None:
-        """Reset to bootstrap YAML when lease returns to the pool."""
+        """Reset to bootstrap YAML on cancel/stop (TrainingEngine hook)."""
         seed = int(self._boot_cfg.get("optimization", {}).get("seed", 0))
         try:
             self.app.close()
@@ -380,7 +332,7 @@ class DrawStudentAgent:
         self._es_run_done = False
         self._user_pause_hold = False
         self._remix_after_restore = False
-        _emit("config:reset:pool", traj=self._traj)
+        _emit("config:reset:boot", traj=self._traj)
 
     def _set_status(self, state: str, *, loss: float | None = None) -> None:
         """Publish metrics always; print only when the run status changes."""
@@ -452,9 +404,7 @@ class DrawStudentAgent:
         _diag(
             "agent_step_append",
             traj=version,
-            pool=self.hb.cfg.instance_id,
-            bound=getattr(self.hb, "_bound_model_id", None),
-            job=getattr(self.hb, "_job_id", None),
+            agent=self._tm_agent_id(),
             train=train,
             val=val,
         )
@@ -643,13 +593,23 @@ class DrawStudentAgent:
             return False
         if src != "tm_brain":
             self._user_pause_hold = False
-            clear_si = getattr(self.hb, "clear_site_interrupt", None)
-            if callable(clear_si):
-                clear_si()
         cfg = (
             payload.get("config") if isinstance(payload.get("config"), dict) else None
         )
-        confirmed = self.apply_run_config(cfg, rebuild=False)
+        if tm_payload_declares_authority(cfg):
+            # TM dictates topology → strict parse; TMConfigError propagates and
+            # the engine acks this command ok=False with the missing keys.
+            try:
+                confirmed = self._apply_strict_tm_config(cfg)
+            except Exception as exc:  # noqa: BLE001
+                _emit(f"config:strict:rejected:{exc}", traj=self._traj)
+                raise
+            self._autopilot = bool(cfg.get("autopilot", False)) or (
+                str(cfg.get("source") or "").strip().lower() == "autopilot"
+            )
+        else:
+            # Knob overlay (brain retune / feed) — merge onto the live config.
+            confirmed = self.apply_run_config(cfg, rebuild=False)
         self._es_park_hold = False
         self._es_run_done = False
         if src == "tm_brain" and phase == "after_restore":
@@ -667,12 +627,6 @@ class DrawStudentAgent:
             traj=self._traj,
         )
         return True
-
-    def on_site_interrupt(self) -> None:
-        """BL-023: TM unreachable long enough — park like a user Pause."""
-        self._user_pause_hold = True
-        self._paused = True
-        _emit("paused:site_interrupt", loss=self._last_loss, traj=self._traj)
 
     def on_engine_pause(self, cmd) -> None:
         payload = dict(cmd.payload or {})
@@ -700,20 +654,13 @@ class DrawStudentAgent:
         return True
 
     def pause_gate(self) -> bool:
-        """Durable pause only (human / site-interrupt) — blocks claim/unpause.
+        """Durable (human) pause — blocks unpause until a non-brain Start/Resume.
 
         Autopilot ES soft-hold is train_tick + local engine pause (not here).
-        After UI Resume unbound the lease, clear ``_user_pause_hold`` so the
-        worker can reclaim the requeued job.
+        ``_user_pause_hold`` is cleared only by ``on_engine_start_resume``
+        (non-``tm_brain`` source) or ``on_engine_cancel``.
         """
-        if bool(getattr(self.hb, "site_interrupt_hold", False)):
-            return True
-        if not self._user_pause_hold:
-            return False
-        if not bool(getattr(self.hb, "job_bound", False)):
-            self._user_pause_hold = False
-            return False
-        return True
+        return bool(self._user_pause_hold)
 
     def train_tick(self) -> bool:
         """One closed-loop traj for TrainingEngine.external_step."""
@@ -754,12 +701,9 @@ class DrawStudentAgent:
         Session-health may still list onset_version > traj; those belong to the
         abandoned timeline and must not re-arm ES at the restored point.
         """
-        get_json = getattr(self.hb, "get_json", None)
-        if not callable(get_json):
-            return
+        path = f"/api/instances/{self._tm_agent_id()}/session-health"
         try:
-            path = f"/api/instances/{self._tm_agent_id()}/session-health"
-            health = get_json(path, timeout_s=3.0)
+            health = self.hb.get_json(path, timeout_s=3.0)
         except Exception:  # noqa: BLE001 — restore must not fail on health probe
             return
         if not health:
@@ -934,8 +878,7 @@ class DrawStudentAgent:
         self._set_status(trip, loss=self._last_loss)
 
         # Manual Start (no Autopilot): ES ends the run. Brain is informational
-        # only — never restore/retune/park claimed (Resume → "cannot resume
-        # job in state claimed" was the bug).
+        # only — never restore/retune/park.
         if not self._autopilot:
             self._manual_es_inform_and_finish()
             return
@@ -943,15 +886,15 @@ class DrawStudentAgent:
         # BL-024 / BL-027: Autopilot continuous — publish trip + soft hold +
         # local engine pause. TM ES driver sees metrics.state (es-onset/es-trip),
         # runs restore+plate, and resumes via control commands. No /work/pause
-        # and no /tm-brain/act (train blew 15s). Soft hold must not release the
-        # lease; train_tick no-ops while _es_park_hold.
+        # and no /tm-brain/act (train blew 15s). train_tick no-ops while
+        # _es_park_hold.
         self._es_park_hold = True
-        pause = getattr(self, "_engine_pause", None)
-        if callable(pause) and bool(getattr(self.hb, "job_bound", False)):
-            try:
-                pause()
-            except Exception:  # noqa: BLE001
-                _emit("es-stop:engine_pause_fail", traj=self._traj)
+        if self._engine_pause is None:
+            raise RuntimeError(
+                "Autopilot ES trip with no engine pause bound — "
+                "build_closed_loop_engine must call bind_engine_pause"
+            )
+        self._engine_pause()
         if self._es_apply and self._remix_data_on_es:
             # Arm remix; cleared/consumed on after_restore if feed stock applied.
             self._remix_after_restore = True
@@ -967,39 +910,13 @@ class DrawStudentAgent:
         self._es_run_done = True
         self._paused = False
         self._set_status("es-stop:manual", loss=self._last_loss)
-        stop = self._engine_stop
-        if callable(stop):
-            try:
-                stop()
-            except Exception:  # noqa: BLE001
-                _emit("es-stop:engine_stop_fail", traj=self._traj)
-        else:
-            _emit("es-stop:no_engine_stop", traj=self._traj)
-        # Training finished → release the claim (ack).
-        ack = getattr(self.hb, "ack_work", None)
-        if callable(ack) and bool(getattr(self.hb, "job_bound", False)):
-            try:
-                out = ack(
-                    result={
-                        "ok": True,
-                        "reason": "es_manual_stop",
-                        "model_id": self._tm_agent_id(),
-                    }
-                )
-                if out is not None:
-                    jid = out.get("job_id") or getattr(self.hb, "job_id", None)
-                    _emit(
-                        f"claim-released:job={jid} reason=es_manual_stop",
-                        traj=self._traj,
-                    )
-                else:
-                    _emit("es-stop:ack_rejected", traj=self._traj)
-            except Exception as exc:  # noqa: BLE001
-                _emit(f"es-stop:ack_fail:{exc}", traj=self._traj)
-        elif not bool(getattr(self.hb, "job_bound", False)):
-            _emit("es-stop:already_unbound", traj=self._traj)
-        else:
-            _emit("es-stop:no_ack_work", traj=self._traj)
+        if self._engine_stop is None:
+            raise RuntimeError(
+                "Manual ES stop with no engine stop bound — "
+                "build_closed_loop_engine must call bind_engine_stop"
+            )
+        self._engine_stop()
+        _emit("es-stop:run_finished", traj=self._traj)
 
     def _maybe_label_outcome(self) -> None:
         if not self._pending_outcome_episode or self._outcome_due_traj is None:
@@ -1025,9 +942,7 @@ class DrawStudentAgent:
         # Pause/cancel arrive via TrainingEngine.drain_manager_commands before
         # train_tick; holds are checked there. This method is the traj body only.
         result = self.app.trainer.rollout_train(
-            command_ids=self.command_ids,
-            target=self.target,
-            max_steps=self.app.max_steps,
+            goal=DrawGoal(command_ids=self.command_ids, target=self.target),
             lr=self.lr,
             apply_updates=True,
         )
@@ -1091,7 +1006,6 @@ def main() -> int:
         agent,
         model_instance_id=str(agent.hb.cfg.instance_id),
         ledger_dir=out_dir / "engine_ledger",
-        claim_inside_engine=True,
     )
     try:
         engine.run()

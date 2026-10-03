@@ -287,7 +287,38 @@ class MhsaBinding(ctypes.Structure):
         ("vs_pos_next", ctypes.c_void_p),
         # 0 = continuous (tanh + MSE), 1 = discrete (logits + softmax CE)
         ("action_mode", ctypes.c_int64),
+        # BL-030c: discrete-head softmax temperature. 1.0 = no-op. Must be
+        # set explicitly by every binder — ctypes zero-inits to 0.0, which
+        # would divide-by-zero in the kernel if left unset.
+        ("temperature", ctypes.c_float),
+        # BL-030x: optional per-row loss weights, length B, NULL ⇒ uniform.
+        # Mirrors mhsa_kernels.h. Appended last so every existing field keeps
+        # its offset (the C++ and ctypes layouts must stay byte-identical).
+        ("sample_weights", ctypes.c_void_p),
+        # Raw token width [B*T, D_in]. 0 → legacy square projection (D_in==D).
+        # Appended last so existing offsets hold; mirrors mhsa_kernels.h.
+        ("D_in", ctypes.c_int64),
     ]
+
+
+# BL-030x: ABI guard mirroring the static_asserts in src/native/mhsa_kernels.cpp.
+# The C++ struct and this ctypes mirror must agree field-for-field — if EITHER
+# side drifts, the kernel dereferences pointers at the wrong offsets with no
+# error at all, just silently corrupted weights. The C++ asserts catch a
+# C++-side change at build time; this catches a ctypes-side change at import.
+# Fail loudly instead of training on garbage. (Pinned for 64-bit targets; a
+# 32-bit build has different pointer sizes and the prebuilt .so is x86-64 only.)
+if (
+    MhsaBinding.sample_weights.offset != 6656
+    or MhsaBinding.D_in.offset != 6664
+    or ctypes.sizeof(MhsaBinding) != 6672
+):
+    raise RuntimeError(
+        "MhsaBinding ABI mismatch vs src/native/mhsa_kernels.cpp: "
+        f"sample_weights offset={MhsaBinding.sample_weights.offset} (want 6656), "
+        f"D_in offset={MhsaBinding.D_in.offset} (want 6664), "
+        f"sizeof={ctypes.sizeof(MhsaBinding)} (want 6672)"
+    )
 
 
 class ContractExecCtx(ctypes.Structure):
@@ -553,6 +584,41 @@ def shutdown_contract_async() -> None:
         set_t(ctypes.c_int32(0))
 
 
+_MHSA_ABI_VERIFIED: set[int] = set()
+
+
+def _verify_native_mhsa_abi(lib: Any) -> None:
+    """Assert the loaded native library's MhsaBinding matches the ctypes mirror.
+
+    The Python-side checks above only prove the ctypes struct is what this
+    source tree expects. A stale prebuilt conv_kernels (e.g. an old Windows DLL)
+    can still carry an older, smaller MhsaBinding — it would then read D_in and
+    later fields from the wrong offsets. The library reports its own sizeof;
+    a missing export means it predates the check and is equally stale.
+    """
+    key = id(lib)
+    if key in _MHSA_ABI_VERIFIED:
+        return
+    fn = getattr(lib, "mhsa_binding_sizeof", None)
+    if fn is None:
+        raise RuntimeError(
+            "Native library has no mhsa_binding_sizeof export — it predates the "
+            "current MhsaBinding ABI (stale conv_kernels.so/.dll). Rebuild: "
+            "bash build_native.sh (Linux) or .\\build_native.ps1 (Windows)."
+        )
+    fn.restype = ctypes.c_int64
+    fn.argtypes = []
+    native = int(fn())
+    expected = ctypes.sizeof(MhsaBinding)
+    if native != expected:
+        raise RuntimeError(
+            f"MhsaBinding ABI mismatch: native library sizeof={native}, ctypes "
+            f"mirror sizeof={expected}. The native library is stale or built "
+            "from different sources — rebuild it (build_native.sh / .ps1)."
+        )
+    _MHSA_ABI_VERIFIED.add(key)
+
+
 class ContractRuntime:
     """Binds a compiled ContractList to live CNN weights + scratch arena."""
 
@@ -572,6 +638,8 @@ class ContractRuntime:
             )
             for op in self.contract.ops
         )
+        if self._mhsa_mode:
+            _verify_native_mhsa_abi(self._lib)
         if not self._mhsa_mode:
             if len(model._dense_w_indices) < 1:
                 raise ValueError("Contract path requires at least one dense head layer")
@@ -1264,7 +1332,8 @@ class ContractRuntime:
         Hff = int(m.ffn_hidden)
         A = int(m.action_dim)
         L = int(m.num_layers)
-        key = (B, T, D, H, Hff, A, L)
+        D_in = int(getattr(m, "input_dim", D) or D)
+        key = (B, T, D, D_in, H, Hff, A, L)
         if ws.get("_key") == key:
             return
         fresh = self._alloc_mhsa_workspace_buffers(B, T)
@@ -2118,9 +2187,10 @@ class ContractRuntime:
         Hff = int(m.ffn_hidden)
         A = int(m.action_dim)
         L = int(m.num_layers)
+        D_in = int(getattr(m, "input_dim", D) or D)
         Dh = D // H
         rows = B * T
-        key = (B, T, D, H, Hff, A, L)
+        key = (B, T, D, D_in, H, Hff, A, L)
         layers_ws = []
         for _ in range(L):
             layers_ws.append(
@@ -2143,14 +2213,14 @@ class ContractRuntime:
             "actions": np.zeros((B, A), dtype=np.float32),
             "d_qkv": np.zeros((rows, 3 * D), dtype=np.float32),
             "dO": np.zeros((rows, D), dtype=np.float32),
-            "dX": np.zeros((rows, D), dtype=np.float32),
+            "dX": np.zeros((rows, D_in), dtype=np.float32),
             "d_stream": np.zeros((rows, D), dtype=np.float32),
-            "X": np.zeros((rows, D), dtype=np.float32),
+            "X": np.zeros((rows, D_in), dtype=np.float32),
             "X_emb": np.zeros((rows, D), dtype=np.float32),
             "y": np.zeros((B, A), dtype=np.float32),
             "loss": np.zeros(1, dtype=np.float32),
             "d_pos": np.zeros((int(m.max_seq_len), D), dtype=np.float32),
-            "dW_in": np.zeros((D, D), dtype=np.float32),
+            "dW_in": np.zeros((D_in, D), dtype=np.float32),
             "db_in": np.zeros(D, dtype=np.float32),
             "q_pack": np.zeros((T * Dh,), dtype=np.float32),
             "k_pack": np.zeros((T * Dh,), dtype=np.float32),
@@ -2165,7 +2235,8 @@ class ContractRuntime:
         Hff = int(m.ffn_hidden)
         A = int(m.action_dim)
         L = int(m.num_layers)
-        key = (B, T, D, H, Hff, A, L)
+        D_in = int(getattr(m, "input_dim", D) or D)
+        key = (B, T, D, D_in, H, Hff, A, L)
         if self._mhsa_ws is not None and self._mhsa_ws.get("_key") == key:
             return
         self._mhsa_ws = self._alloc_mhsa_workspace_buffers(B, T)
@@ -2260,14 +2331,25 @@ class ContractRuntime:
         slot_idx: int = 0,
         input_bank_idx: int | None = None,
         output_bank_idx: int | None = None,
+        sample_weights: np.ndarray | None = None,
     ) -> ContractExecCtx:
-        """Bind MHSA geometry + float32 banks into ContractExecCtx.mhsa."""
+        """Bind MHSA geometry + float32 banks into ContractExecCtx.mhsa.
+
+        ``sample_weights`` (BL-030x) is an optional ``(B,)`` float32 array of
+        per-row loss weights (golden anchors > 1.0). ``None`` leaves the
+        kernel's weight pointer NULL, i.e. uniform — bit-identical to the
+        pre-BL-030 backward pass.
+        """
         if X.ndim != 3:
-            raise ValueError(f"MHSA input must be (B,T,D); got shape {X.shape}")
+            raise ValueError(f"MHSA input must be (B,T,D_in); got shape {X.shape}")
         B, T, D_in = (int(X.shape[0]), int(X.shape[1]), int(X.shape[2]))
         m = self.model
-        if D_in != int(m.d_model):
-            raise ValueError(f"MHSA D mismatch: X has {D_in}, model d_model={m.d_model}")
+        model_d_in = int(getattr(m, "input_dim", m.d_model) or m.d_model)
+        if D_in != model_d_in:
+            raise ValueError(
+                f"MHSA input width mismatch: X has D_in={D_in}, "
+                f"model input_dim={model_d_in}"
+            )
         if T > int(m.max_seq_len):
             raise ValueError(f"MHSA T={T} exceeds max_seq_len={m.max_seq_len}")
 
@@ -2347,6 +2429,17 @@ class ContractRuntime:
                     f"MHSA target shape {yf.shape} != ({B}, {m.action_dim})"
                 )
             ws["y"] = yf
+        # BL-030x: keep the weight buffer alive in the workspace (same reason
+        # ws["y"] is cached — the kernel holds a raw pointer for the duration
+        # of the native call).
+        wf = None
+        if sample_weights is not None:
+            wf = np.ascontiguousarray(sample_weights, dtype=np.float32).reshape(-1)
+            if wf.shape != (B,):
+                raise ValueError(
+                    f"MHSA sample_weights shape {wf.shape} != ({B},)"
+                )
+            ws["sample_weights"] = wf
 
         opt = m.optimizer
         if apply_adam and hasattr(m, "ensure_adam_moments"):
@@ -2380,14 +2473,24 @@ class ContractRuntime:
         mb.action_dim = int(m.action_dim)
         mb.ffn_hidden = int(m.ffn_hidden)
         mb.num_layers = L
+        # Raw token width: drives the (D_in -> D) input projection in the kernel.
+        mb.D_in = D_in
         mode = getattr(m, "action_mode", "continuous")
         mode_s = getattr(mode, "value", mode)
         mb.action_mode = (
             1 if str(mode_s).lower() == "discrete" else 0
         )
+        # BL-030c: default 1.0 — must never be left at ctypes' 0.0 default.
+        mb.temperature = float(getattr(m, "action_temperature", 1.0) or 1.0)
+        # BL-030x: NULL when unweighted (= uniform 1.0 in the kernel).
+        mb.sample_weights = _ptr(wf) if wf is not None else None
 
         use_pos = bool(getattr(m, "use_pos_encoding", False) and pos_embed is not None)
-        use_proj = bool(getattr(m, "use_input_proj", False) and W_in is not None)
+        # W_in presence is the proj switch: allocated when use_input_proj OR
+        # when the raw token width differs from d_model.
+        use_proj = W_in is not None and b_in is not None
+        if W_in is not None and b_in is None:
+            raise ValueError("MHSA input projection has W_in but no b_in")
 
         for li in range(L):
             base = 4 * li
@@ -2700,13 +2803,21 @@ class ContractRuntime:
         apply_adam: bool = False,
         step_token: int | None = None,
         tick_fn: Callable[[], None] | None = None,
+        sample_weights: np.ndarray | None = None,
     ) -> tuple[float, list[np.ndarray], list[np.ndarray], int]:
-        """Sync one-shot for unit tests (blocking native invoke)."""
+        """Sync one-shot for unit tests (blocking native invoke).
+
+        ``sample_weights`` (BL-030x): optional ``(B,)`` per-row loss weights
+        applied by the MHSA action head. Ignored on the dense/conv path (which
+        has no weighting support) — ``None`` = uniform everywhere.
+        """
         del tick_fn, step_token
         if self._mhsa_mode:
             X = np.ascontiguousarray(X)
             y = np.ascontiguousarray(y)
-            ctx = self._bind_mhsa(X, y, apply_adam=apply_adam)
+            ctx = self._bind_mhsa(
+                X, y, apply_adam=apply_adam, sample_weights=sample_weights
+            )
             self._zero_mhsa_grads()
             ctx.lr = float(lr)
             ctx.skip_adam = 0 if apply_adam else 1

@@ -131,6 +131,24 @@ class ModelController:
             return True
         return False
 
+    def restore_from_checkpoint_doc(self, path: str) -> int:
+        """Fit contract: load weights from a ledger checkpoint document file. Returns its version."""
+        from src.ledger import document_from_bytes, restore_model_checkpoint
+
+        if self.model is None:
+            raise ValueError("[Model Controller] Cannot restore before the network is initialized.")
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if not data:
+            raise ValueError(f"empty checkpoint document: {path}")
+        doc = document_from_bytes(data)
+        body = getattr(doc, "body", None)
+        if not isinstance(body, dict) or "weights" not in body:
+            raise ValueError(f"checkpoint document has no weights: {path}")
+        restore_model_checkpoint(self.model, body)
+        logging.info("[Model Controller] Restored weights from checkpoint document %s", path)
+        return int(getattr(doc, "version", 0) or 0)
+
     def predict(self, raw_data_matrix: np.ndarray) -> np.ndarray:
         """Normalizes features (if provider attached) and runs forward inference."""
         if self.model is None:
@@ -154,10 +172,15 @@ class ModelController:
         output_dir: str = "diagnostics_output",
         max_epochs: int | None = None,
         manager_heartbeat: Any | None = None,
-        adopt_job: dict[str, Any] | None = None,
-        job_scoped: bool = False,
+        model_id: str | None = None,
     ) -> Tuple[List[float], List[float]]:
-        """Executes the training loop via TrainingSession (Phase C boundary)."""
+        """Executes the training loop via TrainingSession (Phase C boundary).
+
+        ``model_id`` is TM's durable model id (from the TM payload). It keys the
+        ledger so existing checkpoints are found on resume; the host
+        ``training_manager.instance_id`` is only the fallback for runs TM did
+        not source.
+        """
         if self.model is None:
             raise ValueError("[Model Controller] Execution Error: Cannot call fit before initializing the network.")
         if self.data_provider is None:
@@ -165,6 +188,9 @@ class ModelController:
 
         engine = None
         ledger_on = ledger_settings is not None and ledger_settings.enabled
+        restore_path = getattr(ledger_settings, "restore_checkpoint_path", None) if ledger_settings is not None else None
+        if restore_path:
+            self.restore_from_checkpoint_doc(str(restore_path))
         from src.manager_heartbeat import maybe_from_settings
         from src.training_engine import create_training_engine
 
@@ -179,13 +205,26 @@ class ModelController:
             ls = ledger_settings or LedgerSettings()
             ledger_dir = os.path.join(output_dir, ls.path if ledger_on else "training_ledger_noop")
             arch_id = model_type.name if hasattr(model_type, "name") else str(model_type)
-            # Ledger model id is the TM agent id. Until a job is claimed/adopted it is
-            # unbound; claim/adopt stamps job.model_id (never the pool worker id).
-            model_instance_id = "unbound"
-            if adopt_job is not None:
-                mid = str(adopt_job.get("model_id") or "").strip()
-                if mid:
-                    model_instance_id = mid
+            # Ledger key = TM's durable model id (payload); instance id only as
+            # the standalone fallback, so TM checkpoints resolve on resume.
+            def _tm_get(key: str, default: Any = None) -> Any:
+                if isinstance(training_manager, dict):
+                    return training_manager.get(key, default)
+                return getattr(training_manager, key, default)
+
+            tm_model_id = str(model_id or "").strip()
+            if tm_model_id:
+                model_instance_id = tm_model_id
+            else:
+                model_instance_id = str(_tm_get("instance_id", "") or "").strip() or "unbound"
+                if bool(_tm_get("enabled", False)):
+                    logging.warning(
+                        "[Model Controller] No TM model_id supplied; ledger keyed by "
+                        "instance_id=%s. Checkpoints saved under a TM model_id will "
+                        "not be found — pass model_id from the TM payload.",
+                        model_instance_id,
+                    )
+            authorize_on_boot = bool(_tm_get("authorize_on_boot", True))
 
             if ledger_on:
                 eng_cfg = LedgerConfig(
@@ -230,6 +269,7 @@ class ModelController:
                 config=eng_cfg,
                 manager_heartbeat=hb,
                 store_kwargs=store_kwargs or None,
+                authorize_on_boot=authorize_on_boot,
             )
             if ledger_on:
                 logging.info(
@@ -260,9 +300,7 @@ class ModelController:
                     compute_r2_score=self.compute_r2_score,
                     max_epochs=max_epochs,
                 )
-                if adopt_job is not None:
-                    engine.adopt_claimed_job(dict(adopt_job))
-                results = engine.run(job_scoped=bool(job_scoped or adopt_job is not None))
+                results = engine.run()
                 hist = results.get(session.session_id)
                 if hist is None:
                     hist = (list(session.train_history), list(session.val_history))

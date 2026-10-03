@@ -3,8 +3,24 @@
 #include "blas_dynamic.h"
 
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
+
+// BL-030x: ABI guards. MhsaBinding is mirrored field-for-field by the ctypes
+// struct in src/contract_runtime.py, so a layout drift on EITHER side makes the
+// kernel read pointers at the wrong offsets — no crash, just silently corrupted
+// weights. These two asserts pin the newest field's offset and the total size;
+// the ctypes mirror asserts the same two numbers when it is imported, so the
+// pair covers both directions. If one fires, change BOTH sides together.
+static_assert(
+    offsetof(MhsaBinding, sample_weights) == 6656,
+    "ABI mismatch: sample_weights offset changed");
+static_assert(
+    offsetof(MhsaBinding, D_in) == 6664,
+    "ABI mismatch: D_in offset changed");
+static_assert(
+    sizeof(MhsaBinding) == 6672, "ABI mismatch: MhsaBinding size changed");
 
 namespace {
 
@@ -374,6 +390,10 @@ int32_t layer_backward(
 
 extern "C" {
 
+ML_ENGINE_EXPORT int64_t mhsa_binding_sizeof(void) {
+    return static_cast<int64_t>(sizeof(MhsaBinding));
+}
+
 int32_t mhsa_block_forward(const float* X, MhsaBinding* m) {
     if (!X || !bind_ok_fwd(m)) return -2;
     const int32_t br = require_blas_ready();
@@ -385,17 +405,22 @@ int32_t mhsa_block_forward(const float* X, MhsaBinding* m) {
     const int64_t H = m->H;
     const int64_t Dh = m->d_head;
     const int64_t Hff = m->ffn_hidden;
-    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1) return -3;
+    // Raw token width. 0/absent → legacy square projection (D_in == D).
+    const int64_t D_in = (m->D_in > 0) ? m->D_in : D;
+    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1 || D_in < 1) return -3;
 
     const int64_t rows = B * T;
     const size_t bytes_D = static_cast<size_t>(rows * D) * sizeof(float);
     const bool use_proj = (m->W_in != nullptr && m->b_in != nullptr);
     const bool use_pos = (m->pos != nullptr && m->max_seq_len >= T);
     if ((use_proj || use_pos) && !m->X_emb) return -2;
+    // A dimension-changing projection is required when raw width != model width.
+    if (D_in != D && !use_proj) return -3;
 
     const float* layer0_X = X;
     if (use_proj) {
-        blas_gemm_forward(X, m->W_in, m->X_emb, rows, D, D);
+        // X [rows, D_in] @ W_in [D_in, D] -> X_emb [rows, D]
+        blas_gemm_forward(X, m->W_in, m->X_emb, rows, D, D_in);
         add_bias_rows(m->X_emb, m->b_in, rows, D);
         layer0_X = m->X_emb;
     } else if (use_pos) {
@@ -464,11 +489,27 @@ int32_t mhsa_action_backward(MhsaBinding* m) {
 
     float* dz = m->d_qkv;
     if (m->action_mode == MHSA_ACTION_MODE_DISCRETE) {
-        // Softmax + mean CE: ∂L/∂logits = (probs - one_hot) / B.
+        // Softmax(logits/T) + mean CE (BL-030c: T scalar, 1.0 = no-op —
+        // exp((logits-max)/1.0) is bit-identical to the pre-BL-030
+        // exp(logits-max)). ∂L/∂logits = (probs - target) / (T * B): the
+        // temperature scale carries into the gradient too (d(logits/T)/d
+        // logits = 1/T), not just the forward softmax — otherwise T != 1
+        // would silently miscalibrate the gradient magnitude.
+        const float T = m->temperature > 0.0f ? m->temperature : 1.0f;
+        const float inv_T = 1.0f / T;
         const float inv_B = 1.0f / static_cast<float>(B);
+        // BL-030x: per-row loss weights (golden anchors > 1.0). NULL ⇒ 1.0.
+        // ``weight`` scales BOTH the accumulated CE and the logit-gradient
+        // contribution of row b; weight == 1.0f multiplies through exactly,
+        // so an unweighted call stays bit-identical to pre-BL-030.
+        const float* row_weights = m->sample_weights;
         float loss = 0.0f;
         constexpr float kLogEps = 1e-7f;
         for (int64_t b = 0; b < B; ++b) {
+            float weight = row_weights ? row_weights[b] : 1.0f;
+            // Defensive: a negative/NaN weight would flip the loss sign or
+            // poison the gradient. Treat it as "drop this row".
+            if (!(weight > 0.0f)) weight = 0.0f;
             const float* logits = m->actions + b * A;
             const float* tgt = m->y + b * A;
             float* row = dz + b * A;
@@ -478,14 +519,14 @@ int32_t mhsa_action_backward(MhsaBinding* m) {
             }
             float sum_exp = 0.0f;
             for (int64_t a = 0; a < A; ++a) {
-                row[a] = std::exp(logits[a] - max_logit);
+                row[a] = std::exp((logits[a] - max_logit) * inv_T);
                 sum_exp += row[a];
             }
             const float inv_sum = 1.0f / sum_exp;
             for (int64_t a = 0; a < A; ++a) {
                 const float p = row[a] * inv_sum;
-                loss -= tgt[a] * std::log(p + kLogEps);
-                row[a] = inv_B * (p - tgt[a]);
+                loss -= weight * tgt[a] * std::log(p + kLogEps);
+                row[a] = inv_B * inv_T * weight * (p - tgt[a]);
             }
         }
         if (m->loss_out) m->loss_out[0] = loss * inv_B;
@@ -533,12 +574,16 @@ int32_t mhsa_block_backward(const float* X, MhsaBinding* m) {
     const int64_t Dh = m->d_head;
     const int64_t Hff = m->ffn_hidden;
     const int64_t rows = B * T;
-    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1) return -3;
+    const int64_t D_in = (m->D_in > 0) ? m->D_in : D;
+    if (B < 1 || T < 1 || D < 1 || H < 1 || Dh * H != D || Hff < 1 || D_in < 1) return -3;
 
     const bool use_proj = (m->W_in != nullptr && m->b_in != nullptr);
     const bool use_pos = (m->pos != nullptr && m->max_seq_len >= T);
     if ((use_proj || use_pos) && !m->X_emb) return -2;
     if (use_proj && (!m->dW_in || !m->db_in)) return -2;
+    // Mirror of the forward guard: without a projection, dX is [rows, D_in]
+    // and the passthrough memcpy below copies rows*D — they must match.
+    if (D_in != D && !use_proj) return -3;
 
     // Layer 0 saw X_emb when proj and/or pos ran; otherwise raw X.
     const float* X_l0 = (use_proj || use_pos) ? m->X_emb : X;
@@ -571,11 +616,11 @@ int32_t mhsa_block_backward(const float* X, MhsaBinding* m) {
     }
 
     if (use_proj) {
-        // dW_in / db_in from X_raw and d_emb; dX = d_emb @ W_in^T.
-        blas_gemm_weight_grad_rm(X, d_cur, m->dW_in, rows, D, D, 1.0f);
+        // dW_in [D_in, D] / db_in from X_raw and d_emb; dX = d_emb @ W_in^T.
+        blas_gemm_weight_grad_rm(X, d_cur, m->dW_in, rows, D, D_in, 1.0f);
         accumulate_bias_grad(d_cur, m->db_in, rows, D);
         if (m->dX) {
-            blas_gemm_input_grad_rm(d_cur, m->W_in, m->dX, rows, D, D);
+            blas_gemm_input_grad_rm(d_cur, m->W_in, m->dX, rows, D, D_in);
         }
     } else if (m->dX) {
         std::memcpy(m->dX, d_cur, static_cast<size_t>(rows * D) * sizeof(float));

@@ -94,10 +94,14 @@ class InMemoryDataProvider(BaseDataProvider):
         return self.X_train[batch_slice], self.y_train_processed[batch_slice]
 
     def get_validation_set(self) -> Tuple[np.ndarray, np.ndarray]:
-        val_x = self.splits[DataKeys.X_VAL]
-        if self.normalize_features and val_x.ndim == 2:
-            val_x = self.normalize(val_x)
-        return val_x, self.y_val_processed
+        """The validation set as RAW features.
+
+        Every consumer predicts through ``controller.predict`` (which z-scores once) and the
+        diagnostics treat it as raw, so normalizing here as well scored the validation set on
+        double-normalized inputs: wrong recorded validation loss and wrong early-stop decisions
+        for 2-D tabular models. Training batches are still normalized by this provider.
+        """
+        return self.splits[DataKeys.X_VAL], self.y_val_processed
 
     def recomment_steps(self) -> int:
         return self.num_batches

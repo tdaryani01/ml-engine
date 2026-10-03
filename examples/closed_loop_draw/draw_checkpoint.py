@@ -11,7 +11,7 @@ from src.manager_heartbeat import decode_checkpoint_blob, encode_checkpoint_blob
 
 
 def snapshot_trainable(app: DrawApp) -> dict[str, Any]:
-    """Deep-copy trainable tensors (same fields as interactive restore)."""
+    """Deep-copy trainable tensors + Adam optimizer moments (m, v, t)."""
     mhsa = app.mhsa
     cnn = app.cnn
     snap: dict[str, Any] = {
@@ -34,6 +34,35 @@ def snapshot_trainable(app: DrawApp) -> dict[str, Any]:
     if mhsa.W_in is not None:
         snap["W_in"] = np.array(mhsa.W_in, copy=True)
         snap["b_in"] = np.array(mhsa.b_in, copy=True)
+
+    # --- Adam optimizer moments for physical continuity ---
+    mhsa.ensure_adam_moments()
+    opt = mhsa.optimizer
+    snap["opt_ms_w"] = [np.array(m, copy=True) for m in opt.ms_w]
+    snap["opt_vs_w"] = [np.array(v, copy=True) for v in opt.vs_w]
+    snap["opt_ms_b"] = [np.array(m, copy=True) for m in opt.ms_b]
+    snap["opt_vs_b"] = [np.array(v, copy=True) for v in opt.vs_b]
+    if getattr(opt, "ms_g", None) is not None:
+        snap["opt_ms_g"] = [np.array(m, copy=True) for m in opt.ms_g]
+    if getattr(opt, "vs_g", None) is not None:
+        snap["opt_vs_g"] = [np.array(v, copy=True) for v in opt.vs_g]
+    if getattr(opt, "ms_beta", None) is not None:
+        snap["opt_ms_beta"] = [np.array(m, copy=True) for m in opt.ms_beta]
+    if getattr(opt, "vs_beta", None) is not None:
+        snap["opt_vs_beta"] = [np.array(v, copy=True) for v in opt.vs_beta]
+    snap["opt_t"] = int(getattr(opt, "t", 0))
+
+    # Extra MHSA-side moments (pos_embed, input_proj)
+    if mhsa.pos_embed is not None and mhsa._ms_pos is not None:
+        snap["opt_ms_pos"] = np.array(mhsa._ms_pos, copy=True)
+        snap["opt_vs_pos"] = np.array(mhsa._vs_pos, copy=True)
+    if mhsa.W_in is not None and mhsa._ms_W_in is not None:
+        snap["opt_ms_W_in"] = np.array(mhsa._ms_W_in, copy=True)
+        snap["opt_vs_W_in"] = np.array(mhsa._vs_W_in, copy=True)
+    if mhsa.b_in is not None and mhsa._ms_b_in is not None:
+        snap["opt_ms_b_in"] = np.array(mhsa._ms_b_in, copy=True)
+        snap["opt_vs_b_in"] = np.array(mhsa._vs_b_in, copy=True)
+
     return snap
 
 
@@ -77,16 +106,54 @@ def restore_trainable(app: DrawApp, snap: dict[str, Any]) -> None:
 
     mhsa.ensure_adam_moments()
     opt = mhsa.optimizer
-    _zero_like_list(getattr(opt, "ms_w", None))
-    _zero_like_list(getattr(opt, "vs_w", None))
-    _zero_like_list(getattr(opt, "ms_b", None))
-    _zero_like_list(getattr(opt, "vs_b", None))
-    _zero_like_list(getattr(opt, "ms_g", None))
-    _zero_like_list(getattr(opt, "vs_g", None))
-    _zero_like_list(getattr(opt, "ms_beta", None))
-    _zero_like_list(getattr(opt, "vs_beta", None))
-    if hasattr(opt, "t"):
-        opt.t = 0
+
+    def _load_moments(key: str, dst_list: list | None) -> None:
+        """Load moments from snap if present; otherwise zero (legacy compat)."""
+        if dst_list is None:
+            return
+        src = snap.get(key)
+        if src is not None and len(src) == len(dst_list):
+            for d, s in zip(dst_list, src):
+                d[...] = s
+        else:
+            _zero_like_list(dst_list)
+
+    _load_moments("opt_ms_w", getattr(opt, "ms_w", None))
+    _load_moments("opt_vs_w", getattr(opt, "vs_w", None))
+    _load_moments("opt_ms_b", getattr(opt, "ms_b", None))
+    _load_moments("opt_vs_b", getattr(opt, "vs_b", None))
+    _load_moments("opt_ms_g", getattr(opt, "ms_g", None))
+    _load_moments("opt_vs_g", getattr(opt, "vs_g", None))
+    _load_moments("opt_ms_beta", getattr(opt, "ms_beta", None))
+    _load_moments("opt_vs_beta", getattr(opt, "vs_beta", None))
+
+    opt.t = int(snap.get("opt_t", 0))
+
+    # Extra MHSA-side moments (pos_embed, input_proj)
+    if mhsa.pos_embed is not None and mhsa._ms_pos is not None:
+        src = snap.get("opt_ms_pos")
+        if src is not None:
+            mhsa._ms_pos[...] = src
+            mhsa._vs_pos[...] = snap.get("opt_vs_pos")
+        else:
+            mhsa._ms_pos.fill(0.0)
+            mhsa._vs_pos.fill(0.0)
+    if mhsa.W_in is not None and mhsa._ms_W_in is not None:
+        src = snap.get("opt_ms_W_in")
+        if src is not None:
+            mhsa._ms_W_in[...] = src
+            mhsa._vs_W_in[...] = snap.get("opt_vs_W_in")
+        else:
+            mhsa._ms_W_in.fill(0.0)
+            mhsa._vs_W_in.fill(0.0)
+    if mhsa.b_in is not None and mhsa._ms_b_in is not None:
+        src = snap.get("opt_ms_b_in")
+        if src is not None:
+            mhsa._ms_b_in[...] = src
+            mhsa._vs_b_in[...] = snap.get("opt_vs_b_in")
+        else:
+            mhsa._ms_b_in.fill(0.0)
+            mhsa._vs_b_in.fill(0.0)
 
 
 def knobs_from_cfg(cfg: dict[str, Any], *, lr: float) -> dict[str, Any]:

@@ -23,11 +23,11 @@ _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if _REPO not in sys.path:
     sys.path.insert(0, _REPO)
 
+from examples.closed_loop_draw.goal import DrawGoal
 from examples.closed_loop_draw.assemble import (
     assemble,
     load_config,
     make_target,
-    rollout_forward,
 )
 from examples.closed_loop_draw.viz import ascii_preview, save_canvas_npy, save_canvas_png
 from utils.conv_dispatch import bootstrap_im2col_gemm_runtime
@@ -101,7 +101,9 @@ def main() -> int:
 
     # Initial canvas dump (empty policy rollout).
     if not args.no_dump:
-        canvas0 = rollout_forward(app, command_ids=command_ids)
+        canvas0 = app.trainer.rollout_eval(
+            goal=DrawGoal.render(command_ids)
+        ).extras["frames"][-1]
         save_canvas_png(out_dir / "canvas_step0000.png", canvas0)
         save_canvas_npy(out_dir / "canvas_step0000.npy", canvas0)
         save_canvas_png(out_dir / "target.png", target)
@@ -121,9 +123,7 @@ def main() -> int:
         with open(loss_path, "w", encoding="utf-8") as loss_f:
             for i in range(1, n_traj + 1):
                 result = app.trainer.rollout_train(
-                    command_ids=command_ids,
-                    target=target,
-                    max_steps=app.max_steps,
+                    goal=DrawGoal(command_ids=command_ids, target=target),
                     lr=lr,
                     apply_updates=True,
                 )
@@ -144,7 +144,9 @@ def main() -> int:
                     )
 
                 if not args.no_dump and (i % dump_every == 0 or i == n_traj):
-                    canvas = rollout_forward(app, command_ids=command_ids)
+                    canvas = app.trainer.rollout_eval(
+                        goal=DrawGoal.render(command_ids)
+                    ).extras["frames"][-1]
                     tag = f"{i:04d}"
                     save_canvas_png(out_dir / f"canvas_step{tag}.png", canvas)
                     save_canvas_npy(out_dir / f"canvas_step{tag}.npy", canvas)

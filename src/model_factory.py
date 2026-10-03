@@ -154,7 +154,9 @@ class ModelFactory:
                 num_layers = getattr(mhsa_config, "num_layers", 1)
                 use_pos_encoding = bool(getattr(mhsa_config, "use_pos_encoding", True))
                 use_input_proj = bool(getattr(mhsa_config, "use_input_proj", False))
+                input_dim = getattr(mhsa_config, "input_dim", None)
                 action_mode = getattr(mhsa_config, "action_mode", "continuous")
+                action_temperature = getattr(mhsa_config, "action_temperature", 1.0)
             else:
                 d_model = mhsa_config["d_model"]
                 num_heads = mhsa_config["num_heads"]
@@ -164,7 +166,9 @@ class ModelFactory:
                 num_layers = mhsa_config.get("num_layers", 1)
                 use_pos_encoding = bool(mhsa_config.get("use_pos_encoding", True))
                 use_input_proj = bool(mhsa_config.get("use_input_proj", False))
+                input_dim = mhsa_config.get("input_dim")
                 action_mode = mhsa_config.get("action_mode", "continuous")
+                action_temperature = mhsa_config.get("action_temperature", 1.0)
 
             factory_kwargs.pop("use_batch_norm", None)
             factory_kwargs.pop("bn_momentum", None)
@@ -179,7 +183,9 @@ class ModelFactory:
                 num_layers=int(num_layers),
                 use_pos_encoding=use_pos_encoding,
                 use_input_proj=use_input_proj,
+                input_dim=(int(input_dim) if input_dim is not None else None),
                 action_mode=action_mode,
+                action_temperature=float(action_temperature),
                 backend=backend_val,
                 engine_ctx=engine_ctx,
                 **factory_kwargs,

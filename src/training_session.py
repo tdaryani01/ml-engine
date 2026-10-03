@@ -121,6 +121,9 @@ class TrainingSession:
         self._fit_done = False
         self._fit_epoch = 0
         self._fit_es_state: Dict[str, Any] | None = None
+        # Fit contract: why the fit ended ("es_trip" | "success"); read by the engine's run.end.
+        self._fit_stop_reason: str | None = None
+        self._fit_epochs_done: int = 0
         self._fit_is_classification = False
         self._fit_X_val = None
         self._fit_y_val = None
@@ -402,6 +405,8 @@ class TrainingSession:
             logging.info(
                 "[TrainingSession] Patched Adam state: Tracking vectors cleared for new execution pass."
             )
+        self._fit_stop_reason = None
+        self._fit_epochs_done = 0
         self._fit_es_state = {
             "best_val_loss": float("inf"),
             "best_epoch": 0,
@@ -438,12 +443,15 @@ class TrainingSession:
             self.finish_fit()
             return False
         self.train_history.append(epoch_train_loss)
+        self._fit_epochs_done += 1
 
         X_val, y_val_target = self._fit_X_val, self._fit_y_val
         val_preds = self._predict_with_thread_policy(X_val)
         current_val_loss = self.model.compute_total_loss(val_preds, y_val_target)
         current_val_raw_cost = self.model.calculate_raw_cost(val_preds, y_val_target)
         self.val_history.append(current_val_loss)
+        if self.engine is not None and hasattr(self.engine, "on_epoch_end"):
+            self.engine.on_epoch_end(self, epoch, float(epoch_train_loss), float(current_val_loss))
 
         self._evaluate_epoch_performance(
             epoch,
@@ -466,6 +474,7 @@ class TrainingSession:
                 es_state,
                 current_val_loss=current_val_loss,
             ):
+                self._fit_stop_reason = "es_trip"
                 self.finish_fit()
                 return False
         max_epochs = kw.get("max_epochs")

@@ -1,4 +1,4 @@
-# Closed-loop draw is a TrainingEngine config — one claim/HB/command loop only.
+# Closed-loop draw is a TrainingEngine config — direct run, no claim/HB loop.
 from __future__ import annotations
 
 import inspect
@@ -21,10 +21,6 @@ class _StubHB:
     _commands: list[ManagerCommand] = field(default_factory=list)
     acks: list[tuple[str, bool, str | None]] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
-    job_bound: bool = False
-    job_id: str | None = None
-    claim_calls: int = 0
-    claim_jobs: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def active_checkpoint(self) -> dict[str, Any] | None:
@@ -57,15 +53,22 @@ class _StubHB:
     def queue_ack(self, cmd_id: str, *, ok: bool, detail: str | None = None) -> None:
         self.acks.append((cmd_id, ok, detail))
 
-    def try_claim_work(self, *, lease_s: float | None = None) -> dict[str, Any] | None:
-        del lease_s
-        self.claim_calls += 1
-        if not self.claim_jobs:
-            return None
-        job = dict(self.claim_jobs.pop(0))
-        self.job_bound = True
-        self.job_id = str(job["job_id"])
-        return job
+
+def _engine(hb: Any) -> TrainingEngine:
+    tmp = tempfile.mkdtemp()
+    ledger = TrainingLedger(
+        store=FileLedgerStore(tmp),
+        branch_id="main",
+        architecture_id="closed_loop_draw",
+    )
+    return TrainingEngine(
+        ledger=ledger,
+        config=LedgerConfig(
+            checkpoint_every_steps=10**9,
+            checkpoint_on_local_best=False,
+        ),
+        manager_heartbeat=hb,  # type: ignore[arg-type]
+    )
 
 
 def test_regression_closed_loop_has_no_second_claim_loop():
@@ -85,219 +88,68 @@ def test_regression_closed_loop_has_no_second_claim_loop():
     assert "TrainingEngine" in wire_src
     assert "set_external_step" in wire_src
     assert "set_control_hooks" in wire_src
-    assert "on_claim_config" in wire_src
+    assert "on_start_resume" in wire_src
     assert "on_release_config" in wire_src
+    # No pool claim hooks anywhere in the wiring.
+    assert "on_claim_config" not in wire_src
+    assert "try_claim_work" not in wire_src
 
 
-def test_regression_claim_applies_job_config():
+def test_regression_boot_authorizes_and_drives_external_step():
+    """Standalone: authorized on boot; external_step is the train body."""
     hb = _StubHB()
-    hb.claim_jobs.append(
-        {
-            "job_id": "job-cfg",
-            "model_id": "draw-1",
-            "kind": "train",
-            "claim_token": "t",
-            "config": {"closed_loop": {"sigma": 0.12}, "optimization": {"learning_rate": 0.003}},
-        }
-    )
-    seen: list[dict[str, Any]] = []
-
-    def on_claim(job: dict[str, Any]) -> bool:
-        seen.append(dict(job))
-        return True
-
-    with tempfile.TemporaryDirectory() as tmp:
-        ledger = TrainingLedger(
-            store=FileLedgerStore(tmp),
-            branch_id="main",
-            architecture_id="closed_loop_draw",
-        )
-        engine = TrainingEngine(
-            ledger=ledger,
-            config=LedgerConfig(
-                checkpoint_every_steps=10**9,
-                checkpoint_on_local_best=False,
-            ),
-            manager_heartbeat=hb,  # type: ignore[arg-type]
-        )
-        engine.set_control_hooks(on_claim_config=on_claim)
-        assert engine._maybe_claim_tm_work() is True
-        assert len(seen) == 1
-        assert seen[0]["config"]["closed_loop"]["sigma"] == 0.12
-        assert engine._run_authorized is True
-        engine.close()
-
-
-def test_regression_release_resets_config():
-    hb = _StubHB()
-    released = {"n": 0}
-
-    def on_release() -> None:
-        released["n"] += 1
-
-    with tempfile.TemporaryDirectory() as tmp:
-        ledger = TrainingLedger(
-            store=FileLedgerStore(tmp),
-            branch_id="main",
-            architecture_id="closed_loop_draw",
-        )
-        engine = TrainingEngine(
-            ledger=ledger,
-            config=LedgerConfig(
-                checkpoint_every_steps=10**9,
-                checkpoint_on_local_best=False,
-            ),
-            manager_heartbeat=hb,  # type: ignore[arg-type]
-        )
-        engine.set_control_hooks(on_release_config=on_release)
-        engine._work_lease_active = True
-        engine._run_authorized = True
-        hb.job_bound = False
-        engine._sync_work_lease()
-        assert released["n"] == 1
-        assert engine._run_authorized is False
-        engine.close()
-
-
-def test_regression_engine_claim_drives_external_step():
-    """Idle claim authorizes run; external_step is the train body (closed-loop shape)."""
-    hb = _StubHB()
-    hb.claim_jobs.append(
-        {"job_id": "job-1", "model_id": "tm-brain", "kind": "train", "claim_token": "t"}
-    )
-    ticks = {"n": 0}
-
-    def step() -> bool:
-        ticks["n"] += 1
-        if ticks["n"] >= 2:
-            return False
-        return True
-
-    with tempfile.TemporaryDirectory() as tmp:
-        ledger = TrainingLedger(
-            store=FileLedgerStore(tmp),
-            branch_id="main",
-            architecture_id="closed_loop_draw",
-        )
-        engine = TrainingEngine(
-            ledger=ledger,
-            config=LedgerConfig(
-                checkpoint_every_steps=10**9,
-                checkpoint_on_local_best=False,
-            ),
-            manager_heartbeat=hb,  # type: ignore[arg-type]
-        )
-        engine.set_external_step(step)
-
-        def _go() -> None:
-            engine.run()
-
-        t = threading.Thread(target=_go, daemon=True)
-        t.start()
-        deadline = time.time() + 3.0
-        while time.time() < deadline and ticks["n"] < 2:
-            time.sleep(0.02)
-        engine.request_stop()
-        t.join(timeout=3.0)
-        assert hb.claim_calls >= 1
-        assert engine._run_authorized is True
-        assert ticks["n"] >= 2
-        engine.close()
-
-
-def test_regression_pause_gate_blocks_claim():
-    hb = _StubHB()
-    hb.claim_jobs.append(
-        {"job_id": "job-blocked", "model_id": "x", "kind": "train", "claim_token": "t"}
-    )
-    with tempfile.TemporaryDirectory() as tmp:
-        ledger = TrainingLedger(
-            store=FileLedgerStore(tmp),
-            branch_id="main",
-            architecture_id="closed_loop_draw",
-        )
-        engine = TrainingEngine(
-            ledger=ledger,
-            config=LedgerConfig(
-                checkpoint_every_steps=10**9,
-                checkpoint_on_local_best=False,
-            ),
-            manager_heartbeat=hb,  # type: ignore[arg-type]
-        )
-        engine.set_control_hooks(pause_gate=lambda: True)
-        assert engine._maybe_claim_tm_work() is False
-        assert hb.claim_calls == 0
-        engine.close()
-
-
-def test_regression_bl026_engine_does_not_overwrite_metrics_while_leased():
-    """BL-026: while job_bound, engine idle must not clobber worker ES output."""
-    hb = _StubHB()
-    hb.job_bound = True
-    hb.metrics = {"state": "es-onset", "traj": 352}
-    with tempfile.TemporaryDirectory() as tmp:
-        ledger = TrainingLedger(
-            store=FileLedgerStore(tmp),
-            branch_id="main",
-            architecture_id="closed_loop_draw",
-        )
-        engine = TrainingEngine(
-            ledger=ledger,
-            config=LedgerConfig(
-                checkpoint_every_steps=10**9,
-                checkpoint_on_local_best=False,
-            ),
-            manager_heartbeat=hb,  # type: ignore[arg-type]
-        )
-        engine._work_lease_active = True
-        engine._run_authorized = True
-        engine._publish_manager_metrics("idle")
-        engine._idle_heartbeat()
-        assert hb.metrics.get("state") == "es-onset"
-        assert hb.metrics.get("traj") == 352
-        engine.close()
-
-
-def test_regression_bl027_no_desired_gate_trains_when_authorized():
-    """BL-027: authorized + job_bound, no desired field — external_step runs."""
-    hb = _StubHB()
-    hb.job_bound = True
     ticks = {"n": 0}
 
     def step() -> bool:
         ticks["n"] += 1
         return ticks["n"] < 2
 
-    with tempfile.TemporaryDirectory() as tmp:
-        ledger = TrainingLedger(
-            store=FileLedgerStore(tmp),
-            branch_id="main",
-            architecture_id="closed_loop_draw",
-        )
-        engine = TrainingEngine(
-            ledger=ledger,
-            config=LedgerConfig(
-                checkpoint_every_steps=10**9,
-                checkpoint_on_local_best=False,
-            ),
-            manager_heartbeat=hb,  # type: ignore[arg-type]
-        )
-        engine.set_external_step(step)
-        engine._work_lease_active = True
-        engine._run_authorized = True
-        engine.request_resume()
+    engine = _engine(hb)
+    engine.set_external_step(step)
 
-        def _go() -> None:
-            engine.run(job_scoped=True)
+    t = threading.Thread(target=engine.run, daemon=True)
+    t.start()
+    deadline = time.time() + 3.0
+    while time.time() < deadline and ticks["n"] < 2:
+        time.sleep(0.02)
+    engine.request_stop()
+    t.join(timeout=3.0)
+    assert engine._run_authorized is True
+    assert ticks["n"] >= 2
+    engine.close()
 
-        t = threading.Thread(target=_go, daemon=True)
-        t.start()
-        deadline = time.time() + 3.0
-        while time.time() < deadline and ticks["n"] < 2:
-            time.sleep(0.02)
-        engine.request_stop()
-        t.join(timeout=3.0)
-        assert ticks["n"] >= 2
-        assert engine._run_authorized is True
-        assert not hasattr(hb, "desired_state") or getattr(hb, "desired_state", None) is None
-        engine.close()
+
+def test_regression_pause_gate_blocks_training():
+    hb = _StubHB()
+    ticks = {"n": 0}
+    engine = _engine(hb)
+    engine.set_external_step(lambda: ticks.__setitem__("n", ticks["n"] + 1) or True)
+    engine.set_control_hooks(pause_gate=lambda: True)
+
+    t = threading.Thread(target=engine.run, daemon=True)
+    t.start()
+    time.sleep(0.15)
+    engine.request_stop()
+    t.join(timeout=3.0)
+    assert ticks["n"] == 0, "pause_gate must block training"
+    engine.close()
+
+
+def test_regression_cancel_triggers_release_config():
+    hb = _StubHB()
+    released = {"n": 0}
+    engine = _engine(hb)
+    engine.set_control_hooks(on_release_config=lambda: released.__setitem__("n", released["n"] + 1))
+
+    t = threading.Thread(target=engine.run, daemon=True)
+    t.start()
+    time.sleep(0.05)
+    hb.push_command("cancel")
+    deadline = time.time() + 2.0
+    while time.time() < deadline and engine._run_authorized:
+        time.sleep(0.02)
+    engine.request_stop()
+    t.join(timeout=3.0)
+    assert engine._run_authorized is False
+    assert released["n"] == 1
+    engine.close()

@@ -2,6 +2,8 @@
 """Canvas environment + reconstruction loss (app layer)."""
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 
 from examples.closed_loop_draw.soft_renderer import soft_stroke, soft_stroke_action_grad
@@ -13,11 +15,11 @@ class SoftCanvasEnv:
 
     step(A): C <- clip(C + soft_stroke(action_scale * A), 0, 1)
     ``action_scale`` < 1 keeps tanh actions off the ±1 cliff so ∂tanh stays alive.
-    Stores a stack for reverse ``backward_step``.
+    Stores a stack for reverse ``step_backward``.
 
     Optional ``continuity_weight``: soft prior
     ``w * mean_t ||end_t - start_{t+1}||^2`` on scaled endpoints (shape-agnostic).
-    Exposed via ``continuity_loss_and_action_grads`` for the closed-loop trainer.
+    Exposed via ``aux_loss()`` for the generic closed-loop trainer.
     """
 
     def __init__(
@@ -41,7 +43,12 @@ class SoftCanvasEnv:
         self.canvas: np.ndarray | None = None
         self.stack: list[dict] = []
 
-    def reset(self, batch_size: int) -> np.ndarray:
+    def obs_spec(self) -> tuple[int, ...]:
+        """Shape of one observation (no batch dim) — differentiability contract."""
+        return (self.channels, self.height, self.width)
+
+    def reset(self, batch_size: int, goal: Any = None) -> np.ndarray:
+        """Blank canvas for the batch. ``goal`` is unused by the canvas env."""
         B = int(batch_size)
         self.canvas = np.zeros(
             (B, self.channels, self.height, self.width), dtype=np.float32
@@ -78,13 +85,11 @@ class SoftCanvasEnv:
         self.canvas = after
         return self._obs()
 
-    def obs_before(self, t: int) -> np.ndarray:
-        return np.array(self.stack[t]["before"], copy=True)
-
-    def obs_after(self, t: int) -> np.ndarray:
+    def obs_at(self, t: int) -> np.ndarray:
+        """DifferentiableEnvironment accessor: obs produced at step ``t``."""
         return np.array(self.stack[t]["after"], copy=True)
 
-    def continuity_loss_and_action_grads(
+    def aux_loss(
         self,
     ) -> tuple[float, list[np.ndarray]]:
         """
@@ -122,16 +127,16 @@ class SoftCanvasEnv:
 
         return float(w * total / float(n_pairs)), dAs
 
-    def backward_step(
-        self, t: int, d_after: np.ndarray
+    def step_backward(
+        self, t: int, d_obs_after: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        d_after = ∂L/∂C_{t+1} (NCHW).
+        ``d_obs_after`` = ∂L/∂C_{t+1} (NCHW).
 
         Returns (dA, d_before) where dA is ∂L/∂raw_action (pre-scale).
         """
         step = self.stack[t]
-        d_after = np.ascontiguousarray(d_after, dtype=np.float32)
+        d_after = np.ascontiguousarray(d_obs_after, dtype=np.float32)
         before = step["before"]
         stroke_nchw = step["stroke_nchw"]
         pre = before + stroke_nchw
@@ -146,7 +151,7 @@ class SoftCanvasEnv:
     def action_grad(self, d_obs: np.ndarray) -> np.ndarray:
         if not self.stack:
             raise RuntimeError("action_grad without steps")
-        dA, _ = self.backward_step(len(self.stack) - 1, d_obs)
+        dA, _ = self.step_backward(len(self.stack) - 1, d_obs)
         return dA
 
     def pop_obs_grad(self) -> np.ndarray | None:
@@ -438,19 +443,33 @@ class CanvasReconstructionLoss:
         extra = np.clip(diff, 0.0, None)
         return (extra - miss) / n
 
-    def sharp_step_loss(self, obs: np.ndarray, target: np.ndarray, t: int) -> float:
+    @staticmethod
+    def _as_target(goal: Any) -> np.ndarray | None:
+        """LossEvaluator goal unwrap: raw array, or a composite with ``.target``."""
+        if isinstance(goal, np.ndarray):
+            return goal
+        return getattr(goal, "target", None)
+
+    def sharp_step_loss(self, obs: np.ndarray, goal: Any, t: int) -> float:
         """Sharp pixel (+ EDT) — scale-stable checkpoint metric across blur anneal."""
         if not self._is_scored(t):
             return 0.0
-        c = obs.astype(np.float64)
-        tgt = target.astype(np.float64)
-        return float(self._pixel_loss(c, tgt) + self._edt_loss(c, tgt))
-
-    def step_loss(self, obs: np.ndarray, target: np.ndarray, t: int) -> float:
-        if not self._is_scored(t):
+        _tgt = self._as_target(goal)
+        if _tgt is None:
             return 0.0
         c = obs.astype(np.float64)
-        tgt = target.astype(np.float64)
+        tgt = _tgt.astype(np.float64)
+        return float(self._pixel_loss(c, tgt) + self._edt_loss(c, tgt))
+
+    def step_loss(self, obs: np.ndarray, goal: Any, t: int) -> float:
+        """LossEvaluator: ``goal`` is a raw target or a composite with ``.target``."""
+        if not self._is_scored(t):
+            return 0.0
+        _tgt = self._as_target(goal)
+        if _tgt is None:
+            return 0.0
+        c = obs.astype(np.float64)
+        tgt = _tgt.astype(np.float64)
         total = 0.0
         for sigma, wn in zip(self.blur_sigmas, self._blur_w_norm):
             cb = self._gaussian_blur_nchw(c, sigma)
@@ -459,11 +478,14 @@ class CanvasReconstructionLoss:
         total += self._edt_loss(c, tgt)
         return float(total)
 
-    def step_obs_grad(self, obs: np.ndarray, target: np.ndarray, t: int) -> np.ndarray:
+    def step_obs_grad(self, obs: np.ndarray, goal: Any, t: int) -> np.ndarray:
         if not self._is_scored(t):
             return np.zeros_like(obs, dtype=np.float32)
+        _tgt = self._as_target(goal)
+        if _tgt is None:
+            return np.zeros_like(obs, dtype=np.float32)
         c = obs.astype(np.float64)
-        tgt = target.astype(np.float64)
+        tgt = _tgt.astype(np.float64)
         g = np.zeros_like(c)
         for sigma, wn in zip(self.blur_sigmas, self._blur_w_norm):
             cb = self._gaussian_blur_nchw(c, sigma)

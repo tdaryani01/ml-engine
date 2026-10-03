@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +21,55 @@ from examples.closed_loop_draw.assemble import load_config
 from examples.closed_loop_draw.gym_domain import get_gym_domain
 
 DRAWING_EXPERT_ID = "drawing-expert"
+
+# ---------------------------------------------------------------------------
+# Auth — TM fleet bearer token
+# ---------------------------------------------------------------------------
+# The worker is a *machine* client of the TM API: every request must carry a
+# Bearer token. The token is resolved exactly once at startup so a missing
+# config fails loudly there, instead of 401-ing inside the polling loop.
+# Docker Compose passes it as TM_API_KEY (see training-manager compose).
+_API_KEY_ENV = "TM_API_KEY"
+_TM_URI_ENV = "TM_URI"
+_DEFAULT_TM_URI = "http://127.0.0.1:8000"
+
+_api_key: str | None = None
+
+
+class WorkerConfigError(RuntimeError):
+    """Raised when the worker is misconfigured (e.g. missing TM_API_KEY)."""
+
+
+def configure_worker_auth(api_key: str | None = None) -> str:
+    """Resolve and cache the TM bearer token; fail fast if it is missing.
+
+    Reads ``TM_API_KEY`` when ``api_key`` is not passed. Raises
+    :class:`WorkerConfigError` on an absent/blank value so startup aborts with
+    a clear configuration error rather than a 401 mid-loop.
+    """
+    global _api_key
+    raw = api_key if api_key is not None else os.environ.get(_API_KEY_ENV)
+    key = str(raw).strip() if raw is not None else ""
+    if not key:
+        raise WorkerConfigError(
+            f"{_API_KEY_ENV} is required: the {DRAWING_EXPERT_ID} worker calls "
+            f"the TM API at {os.environ.get(_TM_URI_ENV, _DEFAULT_TM_URI)} and "
+            "must authenticate. Set TM_API_KEY in the environment."
+        )
+    _api_key = key
+    return key
+
+
+def _auth_headers() -> dict[str, str]:
+    """Bearer ``Authorization`` header for every TM request.
+
+    Defensive: if auth was never configured (e.g. a helper used stand-alone in
+    a tool/test), this resolves it via the environment and raises the same
+    clear :class:`WorkerConfigError` rather than sending an anonymous request.
+    """
+    if not _api_key:
+        configure_worker_auth()
+    return {"Authorization": f"Bearer {_api_key}"}
 
 
 def _episode_via_domain(
@@ -61,7 +111,8 @@ def _episode_via_domain(
 
 
 def _get_json(url: str, timeout_s: float = 10.0) -> Any:
-    with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+    req = urllib.request.Request(url, headers=_auth_headers(), method="GET")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -70,7 +121,7 @@ def _post_json(url: str, body: dict[str, Any], timeout_s: float = 60.0) -> dict[
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **_auth_headers()},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
@@ -237,7 +288,7 @@ def _patch_json(url: str, body: dict[str, Any], timeout_s: float = 30.0) -> dict
     req = urllib.request.Request(
         url,
         data=data,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **_auth_headers()},
         method="PATCH",
     )
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
@@ -305,6 +356,61 @@ def resolve_round_plate(
     return None
 
 
+# BL-030a Golden Anchors: programmatic curation of "perfect" trajectories.
+# A finished run that clears this outcome bar is flagged golden via
+# ``PATCH /api/tm-brain/episodes/{episode_id}/golden``. Curation is
+# best-effort — a failed request must never crash the worker or halt data
+# generation. Override the bar with TM_GOLDEN_MIN_OUTCOME.
+_GOLDEN_MIN_OUTCOME = float(os.environ.get("TM_GOLDEN_MIN_OUTCOME", "0.9"))
+
+
+def is_golden_run(row: dict[str, Any], *, min_outcome: float | None = None) -> bool:
+    """Heuristic (domain-agnostic): is this finished trajectory "perfect"?
+
+    ``outcome`` is whatever the domain adapter's ``score()`` returned
+    (higher is better). An exact zero post-run error (drawing domain
+    ``ink_post == 0``) also counts. A missing/non-numeric outcome is never
+    golden — degrade to False rather than fabricate a perfect run.
+    """
+    thr = _GOLDEN_MIN_OUTCOME if min_outcome is None else float(min_outcome)
+    try:
+        outcome = float(row.get("outcome"))
+    except (TypeError, ValueError):
+        return False
+    if outcome >= thr:
+        return True
+    try:
+        if row.get("ink_post") is not None and float(row["ink_post"]) <= 0.0:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def flag_episode_golden(
+    tm_uri: str, episode_id: str, *, timeout_s: float = 5.0
+) -> bool:
+    """Best-effort ``PATCH .../tm-brain/episodes/{id}/golden`` with true.
+
+    Never raises: curation is opportunistic, so a network error, timeout, or
+    a 404 (unknown episode) is logged and swallowed rather than propagating
+    into the run loop. Returns ``True`` only on a successful (2xx) response.
+    """
+    eid = str(episode_id or "").strip()
+    if not eid:
+        return False
+    try:
+        _patch_json(
+            f"{tm_uri.rstrip('/')}/api/tm-brain/episodes/{eid}/golden",
+            {"is_golden": True},
+            timeout_s=timeout_s,
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[gym-worker] golden flag failed ep={eid}: {exc}", flush=True)
+        return False
+
+
 def run_worker_round(
     *,
     cfg: dict[str, Any],
@@ -314,6 +420,7 @@ def run_worker_round(
     episode_fn: Callable[..., dict[str, Any]] | None = None,
     instance_tag: str = "expert-gym-worker",
     plate: dict[str, Any] | None = None,
+    golden_fn: Callable[..., bool] | None = flag_episode_golden,
 ) -> list[dict[str, Any]]:
     """Run one gym batch (batch episodes). Pause is checked by caller between rounds.
 
@@ -363,6 +470,18 @@ def run_worker_round(
             complexity=use_complexity,
         )
         rows.append(row)
+        # BL-030a: opportunistically curate a "perfect" trajectory as a
+        # Golden Anchor. Double-guarded so curation can never crash the round
+        # or halt data generation.
+        if golden_fn is not None and is_golden_run(row):
+            episode_id = str(row.get("episode_id") or "")
+            try:
+                golden_fn(tm_uri, episode_id)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"[gym-worker] golden flag failed ep={episode_id}: {exc}",
+                    flush=True,
+                )
     return rows
 
 
@@ -495,17 +614,25 @@ def worker_loop(
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="TM drawing-expert gym worker (Slice B)")
+    p = argparse.ArgumentParser(description="TM drawing-expert gym worker")
     p.add_argument(
         "--config",
         type=Path,
         default=Path("examples/closed_loop_draw/config_draw_interactive.yaml"),
     )
-    p.add_argument("--tm-uri", default="http://127.0.0.1:8000")
+    # Container/production default comes from TM_URI (compose sets it); the
+    # flag still wins for local runs.
+    p.add_argument(
+        "--tm-uri", default=os.environ.get(_TM_URI_ENV, _DEFAULT_TM_URI)
+    )
     p.add_argument("--poll-s", type=float, default=2.0)
     p.add_argument("--seed0", type=int, default=100)
     p.add_argument("--max-rounds", type=int, default=10_000)
     args = p.parse_args(argv)
+
+    # Fail fast at startup: a missing bearer token must abort with a clear
+    # configuration error here, not surface as a 401 inside the poll loop.
+    configure_worker_auth()
 
     cfg = load_config(args.config)
     cl = cfg.setdefault("closed_loop", {})

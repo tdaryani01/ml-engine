@@ -2,6 +2,7 @@
 import sys
 import os
 import numpy as np
+import pytest
 
 # Ensure project root is discoverable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -9,7 +10,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from config.constants import EngineBackend
 from utils.conv_dispatch import im2col, col2im, init_engine_backend
 
+# Same backend sweep the __main__ driver runs (module is also pytest-collected).
+_BACKENDS = [EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM, EngineBackend.NUMPY]
 
+
+@pytest.mark.parametrize("backend", _BACKENDS)
 def test_im2col_output_shape(backend: EngineBackend):
     """Verify output 2D matrix shape from 4D input tensor."""
     init_engine_backend(backend)
@@ -29,6 +34,7 @@ def test_im2col_output_shape(backend: EngineBackend):
     print(f"[PASSED] [{backend.value}] im2col output shape verified.")
 
 
+@pytest.mark.parametrize("backend", _BACKENDS)
 def test_im2col_col2im_roundtrip_gradient(backend: EngineBackend):
     """Verify col2im correctly accumulates gradients across sliding window patches."""
     init_engine_backend(backend)

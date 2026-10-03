@@ -2,10 +2,21 @@
 import os
 import logging
 import numpy as np
-import matplotlib.pyplot as plt
 from config.schema import PipelineConfig
 from config.constants import DataKeys
-from mpl_toolkits.mplot3d import Axes3D
+
+
+class _LazyPlt:
+    """matplotlib is only needed when diagnostics actually plot; a headless/black-box run
+    (diagnostics disabled) must not require it just to import this module."""
+
+    def __getattr__(self, name):
+        import matplotlib.pyplot as _plt
+
+        return getattr(_plt, name)
+
+
+plt = _LazyPlt()
 
 class NeuralNetworkDiagnostics:
     @staticmethod

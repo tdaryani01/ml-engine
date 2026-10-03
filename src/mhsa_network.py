@@ -36,7 +36,9 @@ class MHSANetwork(TrainableModel):
         num_layers: int = 1,
         use_pos_encoding: bool = True,
         use_input_proj: bool = False,
+        input_dim: int | None = None,
         action_mode: str = "continuous",
+        action_temperature: float = 1.0,
         backend: EngineBackend = EngineBackend.NATIVE,
         engine_ctx=None,
         lam_l1: float = 0.01,
@@ -58,6 +60,11 @@ class MHSANetwork(TrainableModel):
             raise ValueError(
                 f"action_mode must be 'continuous' or 'discrete', got {action_mode!r}"
             )
+        action_temperature = float(action_temperature)
+        if action_temperature <= 0.0:
+            raise ValueError(
+                f"action_temperature must be > 0, got {action_temperature}"
+            )
         kwargs.pop("p_dropout", None)
         kwargs.pop("use_batch_norm", None)
         kwargs.pop("bn_momentum", None)
@@ -76,6 +83,10 @@ class MHSANetwork(TrainableModel):
         self.engine_ctx = engine_ctx or create_engine_context(backend)
         self.backend = self.engine_ctx.backend
         self.d_model = int(d_model)
+        # Raw token/tensor width. Defaults to d_model (no projection). When it
+        # differs from d_model — or use_input_proj=True — a W_in [input_dim, D]
+        # projection decouples the environment's token width from model width.
+        self.input_dim = int(input_dim) if input_dim is not None else self.d_model
         self.num_heads = int(num_heads)
         self.d_head = self.d_model // self.num_heads
         self.max_seq_len = int(max_seq_len)
@@ -86,6 +97,10 @@ class MHSANetwork(TrainableModel):
         self.use_pos_encoding = bool(use_pos_encoding)
         self.use_input_proj = bool(use_input_proj)
         self.action_mode = mode
+        # BL-030c: discrete-head softmax temperature. 1.0 (default) is a
+        # strict no-op — exp((logits - max)/1.0) is exp(logits - max)
+        # unchanged. Reserved knob until a caller actually sets it != 1.0.
+        self.action_temperature = action_temperature
 
         self.weights: list[np.ndarray] = []
         self.biases: list[np.ndarray] = []
@@ -119,7 +134,7 @@ class MHSANetwork(TrainableModel):
 
         logging.info(
             "[MHSA] layers=%d d_model=%d heads=%d d_head=%d T_max=%d action_dim=%d "
-            "ffn=%d pos=%s in_proj=%s action_mode=%s",
+            "ffn=%d input_dim=%d pos=%s in_proj=%s action_mode=%s",
             self.num_layers,
             self.d_model,
             self.num_heads,
@@ -127,6 +142,7 @@ class MHSANetwork(TrainableModel):
             self.max_seq_len,
             self.action_dim,
             self.ffn_hidden,
+            self.input_dim,
             self.use_pos_encoding,
             self.use_input_proj,
             self.action_mode,
@@ -180,8 +196,8 @@ class MHSANetwork(TrainableModel):
             self.pos_embed = None
             self._ms_pos = None
             self._vs_pos = None
-        if self.use_input_proj:
-            self.W_in = self._xavier(D, D)
+        if self.use_input_proj or self.input_dim != D:
+            self.W_in = self._xavier(self.input_dim, D)
             self.b_in = np.zeros((1, D), dtype=np.float32)
             self._ms_W_in = np.zeros_like(self.W_in)
             self._vs_W_in = np.zeros_like(self.W_in)
@@ -205,7 +221,7 @@ class MHSANetwork(TrainableModel):
             if self._ms_pos is None or self._ms_pos.shape != self.pos_embed.shape:
                 self._ms_pos = np.zeros_like(self.pos_embed)
                 self._vs_pos = np.zeros_like(self.pos_embed)
-        if self.use_input_proj and self.W_in is not None:
+        if self.W_in is not None:
             if self._ms_W_in is None or self._ms_W_in.shape != self.W_in.shape:
                 self._ms_W_in = np.zeros_like(self.W_in)
                 self._vs_W_in = np.zeros_like(self.W_in)
@@ -251,6 +267,13 @@ class MHSANetwork(TrainableModel):
         if self.action_mode == "discrete":
             # Mean CE over batch; output is logits.
             z = output.astype(np.float64, copy=False)
+            # BL-030c (review R30): scale by the same temperature the native
+            # kernel's softmax uses (mhsa_kernels.cpp mhsa_action_backward),
+            # so this Python-reported loss matches the native training loss
+            # bit-for-bit at T=1.0 and stays consistent at T != 1.0.
+            temperature = float(getattr(self, "action_temperature", 1.0) or 1.0)
+            if temperature != 1.0:
+                z = z / temperature
             z = z - z.max(axis=1, keepdims=True)
             log_p = z - np.log(np.exp(z).sum(axis=1, keepdims=True))
             return float(-np.mean(np.sum(y.astype(np.float64) * log_p, axis=1)))

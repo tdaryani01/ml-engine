@@ -8,18 +8,71 @@ except NameError:
 
 import logging
 
-from config.config_loader import load_production_config
+from config.config_loader import (
+    load_boot_host_context,
+    load_production_config,
+    parse_tm_production_config,
+)
+from config.config_source import (
+    ConfigSource,
+    detect_config_source,
+    load_tm_payload,
+    tm_payload_model_id,
+)
 from config.constants import EngineBackend
-from utils.runtime import apply_process_env, configure_runtime, load_runtime_settings, training_threadpool
+from utils.runtime import (
+    apply_process_env,
+    configure_runtime,
+    load_runtime_settings,
+    log_runtime_settings,
+    training_threadpool,
+)
 
 from utils.perf_experiments import apply_im2col_gemm_perf_defaults, experiment_summary
 
-# Pin thread env + native OpenBLAS before NumPy/SciPy BLAS first touch.
-_cfg = load_production_config("config/config.yaml")
-if _cfg.architecture.backend == EngineBackend.IM2COL_GEMM:
-    apply_im2col_gemm_perf_defaults()
-apply_process_env(load_runtime_settings(), overwrite=True, if_unset=False)
-configure_runtime(_cfg.architecture.backend, log=False, overwrite_env=True)
+# Fit contract: a launcher (the execution engine) points ME at its own boot YAML, e.g. one with
+# training_manager.enabled=false and park_when_idle=false so ME runs one fit and EXITS instead of
+# heartbeating to TM and parking.
+import os as _os
+
+BOOT_YAML = _os.environ.get("ML_ENGINE_BOOT_YAML", "config/config.yaml")
+
+# Config provenance is fixed for the life of the process, and it is resolved
+# BEFORE NumPy/SciPy BLAS first touch so thread env is pinned either way.
+#   LOCAL: config.yaml is the config.
+#   TRAINING_MANAGER: the TM payload ($ML_ENGINE_TM_PAYLOAD) is parsed strictly
+#   (no YAML gap-filling); boot YAML supplies only host identity + output_dir.
+_CONFIG_SOURCE = detect_config_source()
+_TM_PAYLOAD: dict | None = None
+if _CONFIG_SOURCE == ConfigSource.TRAINING_MANAGER:
+    _TM_PAYLOAD = load_tm_payload()
+    _host_identity, _host_output_dir = load_boot_host_context(BOOT_YAML)
+    _cfg = parse_tm_production_config(
+        _TM_PAYLOAD,
+        host_identity=_host_identity,
+        output_dir=_host_output_dir,
+    )
+    if _cfg.architecture.backend == EngineBackend.IM2COL_GEMM:
+        apply_im2col_gemm_perf_defaults()
+    # Thread budget + async knob come from the payload; runtime.yaml still
+    # supplies the process env (OMP_MAX_ACTIVE_LEVELS, PYTHONUNBUFFERED, …).
+    _RUNTIME = configure_runtime(
+        _cfg.architecture.backend,
+        config_path=BOOT_YAML,
+        num_threads=_cfg.optimization.num_threads,
+        native_async_submit=bool(getattr(_cfg.ledger, "native_async_submit", False)),
+        config_source=_CONFIG_SOURCE,
+        overwrite_env=True,
+        if_unset_env=False,
+        log=False,
+    )
+else:
+    # Pin thread env + native OpenBLAS before NumPy/SciPy BLAS first touch.
+    _cfg = load_production_config(BOOT_YAML)
+    if _cfg.architecture.backend == EngineBackend.IM2COL_GEMM:
+        apply_im2col_gemm_perf_defaults()
+    apply_process_env(load_runtime_settings(), overwrite=True, if_unset=False)
+    _RUNTIME = configure_runtime(_cfg.architecture.backend, log=False, overwrite_env=True)
 
 from config.constants import IngestionMode, ModelType, DataKeys
 from config.schema import PipelineConfig
@@ -27,17 +80,17 @@ from src.data.base_loader import BaseDataLoader
 from src.data.in_memory_provider import InMemoryDataProvider
 from src.data.stream_provider import StreamDataProvider
 from src.controller import ModelController
-from src.pool_worker import restore_job_weights, run_pool_worker_loop
 from utils.logger import initialize_global_logging
 from utils.diagnostics import NeuralNetworkDiagnostics
 
 import numpy as np
 
-BOOT_YAML = "config/config.yaml"
-
 
 def _build_provider_and_controller(cfg: PipelineConfig):
     """Assemble data provider + initialized network from a PipelineConfig."""
+    from utils.seeding import seed_everything
+
+    seed_everything(getattr(cfg.optimization, "seed", None))
     is_cnn = cfg.architecture.model_type == ModelType.CNN
     is_mhsa = cfg.architecture.model_type == ModelType.MHSA
     source_mode = cfg.ingestion.source_mode
@@ -140,7 +193,7 @@ def _fit_assembled(
     source_mode,
     *,
     manager_heartbeat=None,
-    adopt_job=None,
+    model_id: str | None = None,
 ) -> None:
     controller.fit(
         steps=steps,
@@ -153,8 +206,7 @@ def _fit_assembled(
         training_manager=cfg.training_manager,
         output_dir=cfg.meta.output_dir,
         manager_heartbeat=manager_heartbeat,
-        adopt_job=adopt_job,
-        job_scoped=adopt_job is not None,
+        model_id=model_id,
     )
 
     if cfg.architecture.backend == EngineBackend.IM2COL_GEMM:
@@ -183,17 +235,11 @@ def _fit_assembled(
         )
 
 
-def _run_oneshot(cfg: PipelineConfig, runtime) -> None:
-    """Local / TM-disabled: assemble from boot YAML and train once."""
+def _run_oneshot(
+    cfg: PipelineConfig, runtime, *, manager_heartbeat=None, model_id: str | None = None
+) -> None:
+    """Direct run: assemble from the resolved config and train once."""
     controller, data_provider, steps, source_mode = _build_provider_and_controller(cfg)
-    with training_threadpool(runtime, cfg.architecture.backend):
-        _fit_assembled(cfg, controller, data_provider, steps, source_mode)
-
-
-def _run_claimed_job(cfg: PipelineConfig, hb, job: dict, runtime) -> None:
-    """Claim path: config already materialized; build weights, train this lease only."""
-    controller, data_provider, steps, source_mode = _build_provider_and_controller(cfg)
-    restore_job_weights(hb, controller.model, job)
     with training_threadpool(runtime, cfg.architecture.backend):
         _fit_assembled(
             cfg,
@@ -201,45 +247,48 @@ def _run_claimed_job(cfg: PipelineConfig, hb, job: dict, runtime) -> None:
             data_provider,
             steps,
             source_mode,
-            manager_heartbeat=hb,
-            adopt_job=job,
+            manager_heartbeat=manager_heartbeat,
+            model_id=model_id,
         )
 
 
 def execute_training_pipeline():
-    """Boot → (pool idle wait | oneshot assemble+train)."""
-    cfg = load_production_config(BOOT_YAML)
+    """Boot → resolve config (local YAML or strict TM payload) → train directly."""
+    # Resolved at import (before BLAS first touch); see the top of this module.
+    cfg = _cfg
+    model_id = tm_payload_model_id(_TM_PAYLOAD)
     initialize_global_logging(cfg)
-    runtime = configure_runtime(
-        cfg.architecture.backend,
-        config_path=BOOT_YAML,
-        overwrite_env=True,
-        if_unset_env=False,
-    )
+    if _CONFIG_SOURCE == ConfigSource.TRAINING_MANAGER:
+        runtime = _RUNTIME
+        log_runtime_settings(runtime, cfg.architecture.backend)
+        logging.info(
+            "[pipeline] TM-sourced config (model_id=%s, threads=%d)",
+            model_id or "-",
+            runtime.num_threads,
+        )
+    else:
+        runtime = configure_runtime(
+            cfg.architecture.backend,
+            config_path=BOOT_YAML,
+            overwrite_env=True,
+            if_unset_env=False,
+        )
     logging.warning(experiment_summary())
 
     tm = cfg.training_manager
-    if not getattr(tm, "enabled", False):
-        _run_oneshot(cfg, runtime)
-        return
+    hb = None
+    if getattr(tm, "enabled", False):
+        from src.manager_heartbeat import maybe_from_settings
 
-    from src.manager_heartbeat import maybe_from_settings
-    from examples.closed_loop_draw.run_lease import tm_dict_from_heartbeat
+        hb = maybe_from_settings(tm, ledger_enabled=bool(cfg.ledger.enabled))
+        if hb is None:
+            raise RuntimeError(
+                "training_manager.enabled but heartbeat client failed to build"
+            )
 
-    hb = maybe_from_settings(tm, ledger_enabled=bool(cfg.ledger.enabled))
-    if hb is None:
-        raise RuntimeError("training_manager.enabled but heartbeat client failed to build")
-
-    def _run_supervised(job_cfg: PipelineConfig, heartbeat, job: dict) -> None:
-        _run_claimed_job(job_cfg, heartbeat, job, runtime)
-
-    run_pool_worker_loop(
-        boot_yaml=BOOT_YAML,
-        boot_cfg=cfg,
-        hb=hb,
-        run_supervised_job=_run_supervised,
-        boot_tm=tm_dict_from_heartbeat(hb),
-    )
+    # Direct run: the heartbeat (when present) is control/metrics/ledger only;
+    # training_manager.authorize_on_boot decides train-now vs wait-for-Start.
+    _run_oneshot(cfg, runtime, manager_heartbeat=hb, model_id=model_id)
 
 
 if __name__ == "__main__":

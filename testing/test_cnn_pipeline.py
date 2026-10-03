@@ -2,12 +2,16 @@
 import sys
 import os
 import numpy as np
+import pytest
 
 # Ensure project root is discoverable
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.controller import ModelController
 from config.constants import ModelType, LRHierarchy, IngestionMode, EngineBackend
+
+# Same backend sweep the __main__ driver runs (module is also pytest-collected).
+_BACKENDS = [EngineBackend.NATIVE, EngineBackend.IM2COL_GEMM, EngineBackend.NUMPY]
 
 
 class DummyImageProvider:
@@ -43,6 +47,7 @@ class DummyImageProvider:
         return x
 
 
+@pytest.mark.parametrize("backend", _BACKENDS)
 def test_full_cnn_training_cycle(backend: EngineBackend):
     print(f"\n--- Testing Backend: {backend.value} ---")
     cnn_cfg = {
