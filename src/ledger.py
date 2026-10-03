@@ -371,6 +371,8 @@ class TrainingLedger:
     version: int = 0
     frozen: bool = False
     _best_val_loss: float = field(default=float("inf"), repr=False)
+    # The run config this ledger's checkpoints belong to (set once by the controller); stored in every checkpoint.
+    run_config: dict[str, Any] | None = field(default=None, repr=False)
 
     def _envelope(
         self,
@@ -536,6 +538,11 @@ class TrainingLedger:
     ) -> int:
         body = capture_model_checkpoint(model, version, val_loss=val_loss)
         body["is_local_best"] = is_local_best
+        if self.run_config:
+            from src.checkpoint_knobs import knobs_from_config
+
+            body["config"] = self.run_config
+            body["knobs"] = knobs_from_config(self.run_config)
         doc = self._envelope(
             CHECKPOINT,
             body,

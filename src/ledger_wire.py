@@ -325,6 +325,11 @@ def pack_checkpoint_body(body: dict[str, Any]) -> bytes:
             _pack_optimizer(body["optimizer"]),
         ]
     )
+    # The run config and its knobs travel with the model state, so Live and restore find them in the checkpoint.
+    extra = {k: body[k] for k in ("config", "knobs") if isinstance(body.get(k), dict)}
+    blob = json.dumps(extra, separators=(",", ":"), default=str).encode("utf-8") if extra else b""
+    parts.append(struct.pack("<I", len(blob)))
+    parts.append(blob)
     return b"".join(parts)
 
 
@@ -351,6 +356,11 @@ def unpack_checkpoint_body(data: bytes | memoryview) -> dict[str, Any]:
     body["gammas"], off = _unpack_array_list(buf, off)
     body["betas"], off = _unpack_array_list(buf, off)
     body["optimizer"], off = _unpack_optimizer(buf, off)
+    if off + 4 <= len(buf):  # checkpoints written before config + knobs were stored simply end here
+        (n,) = struct.unpack_from("<I", buf, off)
+        off += 4
+        if n:
+            body.update(json.loads(bytes(buf[off : off + n]).decode("utf-8")))
     return body
 
 
