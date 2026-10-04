@@ -134,3 +134,16 @@ def test_the_launcher_hands_the_corpus_to_the_payload_and_the_check_judges_it(tm
     one = chk._check_corpus(spec_from_staged(cfg, _corpus(tmp_path / "one.jsonl", tapes=1)))
     assert not one["ok"]
     assert not chk._check_corpus(spec_from_staged(cfg, None))["ok"]
+
+
+def test_the_last_checkpoint_of_a_fit_holds_the_best_weights_and_reads_back_as_a_model(tmp_path) -> None:
+    from src.launcher.checkpoint import imitation_model_from_checkpoint_bytes
+    from src.ledger import document_to_bytes
+
+    docs = _run(tmp_path, _payload(tmp_path / "a", _corpus(tmp_path / "c.jsonl"), steps=10))
+    end = docs[-1].body
+    final = [d for d in docs if d.doc_type == "checkpoint" and d.version == end["final_version"]][-1]
+    best = [d for d in docs if d.doc_type == "checkpoint" and d.version == end["best_version"]][-1]
+    got = imitation_model_from_checkpoint_bytes(document_to_bytes(final))
+    assert got["blob"] == imitation_model_from_checkpoint_bytes(document_to_bytes(best))["blob"]
+    assert got["val_loss"] == end["best_val_loss"]

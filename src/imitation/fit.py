@@ -113,8 +113,10 @@ def fit_imitation(
         if patience > 0 and bad >= patience:
             reason = "es_trip"
             break
-    if reason == "success" and done and done not in written and blob is not None:
-        checkpoint(done, best_val if best_val != float("inf") else 0.0, best=False, b=blob)
+    if reason == "success" and done and best_blob is not None:
+        # One model per fit, the BEST one: the final slot holds the best weights (as an early stop leaves them), so whatever
+        # publishes this fit's model reads one checkpoint and never has to pick.
+        checkpoint(done, best_val if best_val != float("inf") else 0.0, best=True, b=best_blob)
     end = {"reason": reason, "epochs_run": done, "best_version": best_round or None,
            "best_val_loss": None if best_val == float("inf") else float(best_val), "final_version": done or None,
            "split": rep, "events": events}
