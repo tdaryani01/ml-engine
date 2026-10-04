@@ -466,7 +466,10 @@ def _parse_tm_closed_loop_config(
                 + ", ".join(missing_keys)
             )
         if template is not None:
-            geometry = template.to_mhsa_mapping()
+            geometry = dict(template.to_mhsa_mapping())
+            # The policy's dims may be authored in the payload's own mhsa block (as for the supervised profile);
+            # the schema only has to supply what that block does not.
+            geometry.update({k: v for k, v in dict(cfg.get("mhsa") or {}).items() if v is not None})
             missing_geo = [
                 key for key in ("d_model", "num_heads") if geometry.get(key) is None
             ]

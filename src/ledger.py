@@ -554,6 +554,32 @@ class TrainingLedger:
         self.store.put_checkpoint(doc)
         return lsn
 
+    def push_checkpoint_state(
+        self,
+        state: dict[str, Any],
+        version: int,
+        val_loss: float | None = None,
+        is_local_best: bool = False,
+        model_instance_id: str | None = None,
+    ) -> int:
+        """A checkpoint for a model that is not a plain network: its state is named arrays (plus config and knobs)."""
+        body: dict[str, Any] = {
+            "version": version, "val_loss": val_loss, "is_local_best": is_local_best,
+            "weights": [], "biases": [], "gammas": None, "betas": None,
+            "optimizer": {"type": "none", "t": 0, "beta1": 0.0, "beta2": 0.0, "eps": 0.0,
+                          **{k: None for k in ("ms_w", "vs_w", "ms_b", "vs_b", "ms_g", "vs_g", "ms_beta", "vs_beta")}},
+            "state": {k: np.array(v, copy=True) for k, v in state.items()},
+        }
+        if self.run_config:
+            from src.checkpoint_knobs import knobs_from_config
+
+            body["config"] = self.run_config
+            body["knobs"] = knobs_from_config(self.run_config)
+        doc = self._envelope(CHECKPOINT, body, version=version, step_id=version, model_instance_id=model_instance_id)
+        lsn = self.push(doc)
+        self.store.put_checkpoint(doc)
+        return lsn
+
     def scan_session(
         self, session_id: str, doc_type: str | None = None
     ) -> Iterator[LedgerDocument]:
