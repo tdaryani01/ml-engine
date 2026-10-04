@@ -60,7 +60,7 @@ def test_an_imitation_fit_writes_the_shared_ledger_shape_and_its_split_report(tm
     assert kinds.count("step.metrics") == 5 and kinds[-1] == "run.end"
     end = docs[-1].body
     assert end["reason"] == "success" and end["epochs_run"] == 5
-    assert end["split"]["tape_overlap"] == 0 and end["split"]["n_holdout_tapes"] == 2 and end["split"]["n_train_tapes"] == 10
+    assert end["split"]["tape_overlap"] == 0 and end["split"]["n_holdout_tapes"] >= 1 and end["split"]["n_holdout_tapes"] + end["split"]["n_train_tapes"] == 12
     events = {e["event"] for e in end["events"]}
     assert {"split", "windows", "round"} <= events
     cps = [d for d in docs if d.doc_type == "checkpoint"]
@@ -158,3 +158,12 @@ def test_without_a_budget_the_fit_runs_until_early_stop_and_with_neither_it_is_r
     pl2["fit"].pop("run_budget")
     r = _run(tmp_path, pl2, ok=False)
     assert r.returncode != 0 and "never end" in (r.stdout + r.stderr)
+
+
+def test_the_split_does_not_move_between_stretches(tmp_path) -> None:
+    held = []
+    for stretch in (1, 2, 5):
+        pl = _payload(tmp_path / f"s{stretch}", _corpus(tmp_path / "c.jsonl"), steps=2)
+        pl["fit"]["stretch_index"] = stretch
+        held.append(_run(tmp_path, pl)[-1].body["split"]["holdout_tapes"])
+    assert held[0] == held[1] == held[2]

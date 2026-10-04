@@ -36,8 +36,9 @@ def run_imitation_payload(payload: dict[str, Any], *, boot_yaml: str) -> int:
             raise ValueError(f"checkpoint {restore} carries no brain weights to restore")
         init_blob = blob_from_state(body["state"])
 
-    # Autopilot: stretch N uses seed + N - 1, so a retry from the same weights splits and shuffles differently.
-    seed = int(fit.get("seed") or im.get("seed") or 0) + max(0, int(fit.get("stretch_index") or 1) - 1)
+    # The split seed is the RUN's, the same for every stretch: Autopilot chains fits (each restores the last fit's weights), so
+    # a tape held out in one fit must be held out in all of them. It must never vary with the stretch number.
+    seed = int(fit.get("seed") or im.get("seed") or 0)
     lr = float(fit.get("lr") or (cfg.get("optimization") or {}).get("learning_rate") or 0.0)
     if lr <= 0.0:
         raise ValueError("an imitation fit needs a learning rate above 0 (fit.lr or optimization.learning_rate)")
