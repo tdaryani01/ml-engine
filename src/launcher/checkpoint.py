@@ -52,6 +52,16 @@ def read_physical_version(checkpoint_path: Path | None) -> int:
     return 0
 
 
+def base_version(checkpoint_path: Path | None, *, requested: int | None = None, run_head: int = 0) -> int:
+    """The version a fit's first step is numbered after. Versions only go up: a fit that restores an EARLIER checkpoint (Autopilot
+    branching from the best one) loads those weights but carries on from the highest version the run has already reached, so a
+    chart of the run never runs backwards. ``run_head`` is that highest version (0 for a run that has none yet)."""
+    base = read_physical_version(checkpoint_path)
+    if base <= 0 and requested is not None:
+        base = max(0, int(requested))
+    return max(base, max(0, int(run_head or 0)))
+
+
 class CheckpointConfigError(Exception):
     """``status`` is the HTTP code an API would map it to (400 bad request, 404 missing or undecodable)."""
 

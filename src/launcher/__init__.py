@@ -6,7 +6,7 @@ the parser that judges it, and the ledger reader next to the document format, so
 the snapshots (units, queues, mailboxes, placements) is the engine's own business and stays out of this module.
 """
 
-from src.launcher.checkpoint import CheckpointConfigError, config_from_checkpoint_bytes, imitation_model_from_checkpoint_bytes, read_physical_version
+from src.launcher.checkpoint import CheckpointConfigError, base_version, config_from_checkpoint_bytes, imitation_model_from_checkpoint_bytes, read_physical_version
 from src.launcher.check import check_config, scan_plate
 from src.launcher.early_stop import FitSpecError, apply_early_stop
 from src.launcher.payload import FamilyFitSpec, SupervisedFitSpec, build_boot_yaml, build_pipeline_payload
@@ -15,7 +15,7 @@ from src.launcher.staged import KIND_PIPELINE, KIND_RUN, KIND_SUPERVISED, load_s
 from src.launcher.tail import LedgerTail
 
 __all__ = [
-    "CheckpointConfigError", "FamilyFitSpec", "FitSpecError", "LedgerTail", "MeFitError", "SupervisedFitSpec", "apply_early_stop",
+    "CheckpointConfigError", "base_version", "FamilyFitSpec", "FitSpecError", "LedgerTail", "MeFitError", "SupervisedFitSpec", "apply_early_stop",
     "build_boot_yaml", "build_pipeline_payload", "KIND_PIPELINE", "KIND_RUN", "KIND_SUPERVISED", "check_config", "config_from_checkpoint_bytes", "imitation_model_from_checkpoint_bytes", "load_staged", "me_launch_options", "scan_plate", "plate_root",
     "read_physical_version", "resolve_plate", "run_me_fit", "spec_from_staged",
 ]
