@@ -63,3 +63,19 @@ def test_a_closed_loop_run_can_continue_from_a_checkpoint_and_early_stop_ends_it
     first_val = [d.body["val_loss"] for d in second if d.doc_type == "step.metrics"][0]
     cold_val = [d.body["val_loss"] for d in first if d.doc_type == "step.metrics"][0]
     assert first_val != cold_val  # it started from the trained state, not from scratch
+
+
+def test_a_spent_budget_trains_nothing_and_a_zero_learning_rate_is_refused(tmp_path) -> None:
+    pl = _payload(tmp_path / "a", steps=5)
+    pl["fit"]["resume_from"] = 5  # the whole budget is already behind this run
+    docs = _run(tmp_path, pl)
+    assert [d.doc_type for d in docs] == ["run.end"] and docs[0].body["reason"] == "success" and docs[0].body["epochs_run"] == 0
+
+    bad = _payload(tmp_path / "b", steps=5)
+    bad["fit"]["lr"] = 0.0
+    bad["optimization"]["learning_rate"] = 0.0
+    (tmp_path / "payload.json").write_text(json.dumps(bad))
+    (tmp_path / "boot.yaml").write_text(f'meta:\n  pipeline_name: "t"\n  stage: "dev"\n  suppress_logging: true\n  logging_level: "warning"\n  output_dir: "{tmp_path}/out"\ntraining_manager:\n  enabled: false\n  park_when_idle: false\n')
+    env = dict(os.environ, ML_ENGINE_TM_PAYLOAD=str(tmp_path / "payload.json"), ML_ENGINE_BOOT_YAML=str(tmp_path / "boot.yaml"), ML_ENGINE_CONFIG_SOURCE="training_manager")
+    r = subprocess.run([sys.executable, "run_pipeline.py"], cwd=str(ROOT), env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode != 0 and "learning rate above 0" in (r.stdout + r.stderr)

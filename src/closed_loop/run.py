@@ -54,12 +54,19 @@ def run_closed_loop_payload(payload: dict[str, Any], *, boot_yaml: str) -> int:
                             architecture_id="closed_loop")
     ledger.run_config = led.get("run_config") or None
     budget = int(fit.get("run_budget") or 0)
-    steps = max(1, budget - int(fit.get("resume_from") or 0)) if budget else int((cfg.get("closed_loop") or {}).get("max_steps") or 1)
+    remaining = budget - int(fit.get("resume_from") or 0) if budget else int((cfg.get("closed_loop") or {}).get("max_steps") or 1)
+    lr = float(fit.get("lr") or (cfg.get("optimization") or {}).get("learning_rate") or 0.0)
+    if lr <= 0.0:
+        raise ValueError("a closed-loop fit needs a learning rate above 0 (fit.lr or optimization.learning_rate)")
     try:
+        if remaining <= 0:  # the run budget is already used up: nothing to train, end like a finished run
+            ledger.push_run_end({"reason": "success", "epochs_run": 0, "best_version": None, "best_val_loss": None, "final_version": None})
+            logging.warning("[closed-loop] budget %s already used (resume_from %s): nothing to do", budget, fit.get("resume_from"))
+            return 0
         end = fit_closed_loop(
             run, ledger,
-            lr=float(fit.get("lr") or (cfg.get("optimization") or {}).get("learning_rate") or 0.0),
-            steps=steps,
+            lr=lr,
+            steps=remaining,
             patience=int(fit.get("patience") or 0),
             es_warmup=int(fit.get("es_warmup") if fit.get("es_warmup") is not None else 10),
             checkpoint_every=int(fit.get("checkpoint_every") or led.get("checkpoint_every_steps") or 25),
