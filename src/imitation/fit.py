@@ -41,7 +41,7 @@ def fit_imitation(
     ledger: Any,
     *,
     lr: float,
-    steps: int,
+    steps: int | None,
     seed: int = 0,
     holdout_frac: float = 0.2,
     steps_per_round: int = 5,
@@ -78,7 +78,7 @@ def fit_imitation(
 
     best_val, best_round, best_blob = float("inf"), 0, init_blob
     blob, bad, reason, done, written = init_blob, 0, "success", 0, set()
-    rounds = max(1, -(-int(steps) // max(1, int(steps_per_round))))
+    rounds = None if steps is None else max(1, -(-int(steps) // max(1, int(steps_per_round))))  # None: until early stop
 
     def checkpoint(version: int, val: float, *, best: bool, b: bytes) -> None:
         if version in written and not best:
@@ -86,7 +86,9 @@ def fit_imitation(
         ledger.push_checkpoint_state(blob_state(b), version, val_loss=val, is_local_best=best, model_instance_id=model_instance_id)
         written.add(version)
 
-    for r in range(1, rounds + 1):
+    r = 0
+    while rounds is None or r < rounds:
+        r += 1
         if should_stop():
             break
         blob, m = train_imitation(train_eps, steps=int(steps_per_round), lr=float(lr), init_blob=blob, holdout_episodes=hold_eps, **kw)

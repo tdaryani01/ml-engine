@@ -147,3 +147,14 @@ def test_the_last_checkpoint_of_a_fit_holds_the_best_weights_and_reads_back_as_a
     got = imitation_model_from_checkpoint_bytes(document_to_bytes(final))
     assert got["blob"] == imitation_model_from_checkpoint_bytes(document_to_bytes(best))["blob"]
     assert got["val_loss"] == end["best_val_loss"]
+
+
+def test_without_a_budget_the_fit_runs_until_early_stop_and_with_neither_it_is_refused(tmp_path) -> None:
+    pl = _payload(tmp_path / "a", _corpus(tmp_path / "c.jsonl"), patience=3)
+    pl["fit"].pop("run_budget")
+    end = _run(tmp_path, pl)[-1].body
+    assert end["reason"] == "es_trip" and end["epochs_run"] > 3
+    pl2 = _payload(tmp_path / "b", tmp_path / "c.jsonl")
+    pl2["fit"].pop("run_budget")
+    r = _run(tmp_path, pl2, ok=False)
+    assert r.returncode != 0 and "never end" in (r.stdout + r.stderr)

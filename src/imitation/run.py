@@ -43,20 +43,26 @@ def run_imitation_payload(payload: dict[str, Any], *, boot_yaml: str) -> int:
         raise ValueError("an imitation fit needs a learning rate above 0 (fit.lr or optimization.learning_rate)")
     per_round = max(1, int(im.get("steps_per_round") or 5))
     budget = int(fit.get("run_budget") or 0)
-    steps = (budget - int(fit.get("resume_from") or 0)) if budget else int(im.get("steps") or 100)
+    patience = int(fit.get("patience") or 0)
+    if budget:
+        steps: int | None = budget - int(fit.get("resume_from") or 0)
+    elif patience > 0:
+        steps = None  # no budget declared: the fit runs until early stopping ends it
+    else:
+        raise ValueError("an imitation fit needs a run budget or an early-stop patience: with neither it would never end")
 
     store = create_ledger_store(str(led.get("store_backend") or "file_streaming"), ledger_dir)
     ledger = TrainingLedger(store=store, branch_id=str(led.get("branch_id") or "main"), model_instance_id=str(payload.get("model_id") or "imitation"),
                             architecture_id="imitation")
     ledger.run_config = led.get("run_config") or None
     try:
-        if steps <= 0:
+        if steps is not None and steps <= 0:
             ledger.push_run_end({"reason": "success", "epochs_run": 0, "best_version": None, "best_val_loss": None, "final_version": None})
             return 0
         end = fit_imitation(
             episodes, ledger,
             lr=lr, steps=steps, seed=seed, holdout_frac=float(im.get("holdout_frac") or 0.2), steps_per_round=per_round,
-            patience=int(fit.get("patience") or 0),
+            patience=patience,
             es_warmup=int(fit.get("es_warmup") if fit.get("es_warmup") is not None else 3),
             checkpoint_every=int(fit.get("checkpoint_every") or 5),
             train_kwargs={k: im[k] for k in _TRAIN_KEYS if im.get(k) is not None},
