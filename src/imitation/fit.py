@@ -36,6 +36,23 @@ def blob_from_state(state: dict[str, Any]) -> bytes:
     return np.asarray(state["blob"], dtype=np.uint8).tobytes()
 
 
+def _benchmark(blob: bytes, episodes: list[Any], train_eps: list[Any], wanted: set[str], events: list[dict[str, Any]], *, history_k: int) -> dict[str, Any]:
+    """Score the published weights on the run's frozen benchmark tapes: the one number comparable across a run's fits.
+
+    A benchmark tape that is in THIS fit's train set would make the number fiction, so that fails the fit."""
+    from tm_brain_contracts.native_core import evaluate_imitation
+
+    in_train = sorted(wanted & {e.instance_id for e in train_eps})
+    if in_train:
+        _emit(events, "leakage.DETECTED", kind="benchmark_in_train", tapes=in_train[:20], n=len(in_train))
+        raise LeakageError(f"{len(in_train)} benchmark tape(s) are in this fit's train set")
+    m = evaluate_imitation(blob, [e for e in episodes if e.instance_id in wanted], history_k=history_k)
+    out = {"log_loss": m["log_loss"], "accuracy": m["accuracy"], "n_windows": m["n_windows"], "tapes_requested": len(wanted),
+           "tapes_found": m["n_tapes"]}
+    _emit(events, "benchmark" if m["n_windows"] else "benchmark.EMPTY", **out)
+    return out
+
+
 def fit_imitation(
     episodes: list[Any],
     ledger: Any,
@@ -51,6 +68,7 @@ def fit_imitation(
     es_min_delta: float = 1e-4,
     train_kwargs: dict[str, Any] | None = None,
     init_blob: bytes | None = None,
+    benchmark_tapes: list[str] | None = None,
     model_instance_id: str | None = None,
     should_stop: Callable[[], bool] = lambda: False,
 ) -> dict[str, Any]:
@@ -119,8 +137,13 @@ def fit_imitation(
         # One model per fit, the BEST one: the final slot holds the best weights (as an early stop leaves them), so whatever
         # publishes this fit's model reads one checkpoint and never has to pick.
         checkpoint(done, best_val if best_val != float("inf") else 0.0, best=True, b=best_blob)
+    published = best_blob if best_blob is not None else blob
+    bench: dict[str, Any] | None = None
+    if benchmark_tapes and published is not None:
+        bench = _benchmark(published, episodes, train_eps, set(benchmark_tapes), events, history_k=kw.get("history_k", HISTORY_K))
     end = {"reason": reason, "epochs_run": done, "best_version": best_round or None,
            "best_val_loss": None if best_val == float("inf") else float(best_val), "final_version": done or None,
-           "split": rep, "events": events}
+           "split": rep, "events": events,
+           "benchmark_loss": None if bench is None else bench["log_loss"], "benchmark": bench}
     ledger.push_run_end(end)
     return end
