@@ -99,7 +99,8 @@ def spec_from_staged(
         if checkpoint_every:
             fit["checkpoint_every"] = int(checkpoint_every)
         return FamilyFitSpec(model_id=str(raw.get("model_id") or "ee-fit"), config=dict(raw.get("config") or {}), fit=fit,
-                             checkpoint_every=int(fit.get("checkpoint_every") or 25))
+                             checkpoint_every=int(fit.get("checkpoint_every") or 25),
+                             data_path=(str(data_path) if data_path is not None else None))
 
     if raw["kind"] == KIND_PIPELINE:
         cfg = dict(raw.get("config") or {})
