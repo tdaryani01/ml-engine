@@ -212,11 +212,11 @@ def run_me_fit(
             best_val = ended.get("best_val_loss")
             if best_val is not None:
                 last_val = float(best_val)
-            yield _snap("es_trip", trip_rel, doc)
+            yield {**_snap("es_trip", trip_rel, doc), "run_end": ended}
         else:
             final_rel = ended.get("final_version")
             doc = _checkpoint_doc(work / "out" / "ledger", pending_cp, final_rel)
-            yield _snap("train", int(final_rel) if final_rel is not None else trip_rel, doc)
+            yield {**_snap("train", int(final_rel) if final_rel is not None else trip_rel, doc), "run_end": ended}
     finally:
         _terminate(proc)
         log.close()

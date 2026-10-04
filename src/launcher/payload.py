@@ -32,6 +32,7 @@ class FamilyFitSpec:
     fit: dict[str, Any] = field(default_factory=dict)
     checkpoint_every: int = DEFAULT_CHECKPOINT_EVERY
     num_threads: int = 2
+    data_path: str | None = None  # a frozen corpus the engine was handed (imitation family); None for the rollout families
 
 
 @dataclass(frozen=True)
@@ -274,7 +275,7 @@ def _from_family(spec: FamilyFitSpec, *, work_dir: Path, restore: Path | None) -
     base = copy.deepcopy(spec.config)
     cfg: dict[str, Any] = {k: v for k, v in base.items() if k not in _TM_ONLY}
     cfg["optimization"] = {**(cfg.get("optimization") or {}), "num_threads": int(spec.num_threads)}
-    keys = ("run_budget", "resume_from", "patience", "es_warmup", "checkpoint_every", "lr", "es_min_delta", "rotate_on_es", "stretch_index")
+    keys = ("run_budget", "resume_from", "patience", "es_warmup", "checkpoint_every", "lr", "es_min_delta", "rotate_on_es", "stretch_index", "seed")
     cfg["fit"] = {k: spec.fit[k] for k in keys if spec.fit.get(k) is not None}
     cfg["meta"] = {"pipeline_name": "ee_fit", "stage": "dev", "suppress_logging": True, "logging_level": "warning",
                    "output_dir": str(Path(work_dir) / "out")}
@@ -282,6 +283,8 @@ def _from_family(spec: FamilyFitSpec, *, work_dir: Path, restore: Path | None) -
     cfg["ledger"] = {"path": "ledger", "store_backend": "file_streaming", "branch_id": "main", "run_config": base,
                      **({"restore_checkpoint_path": str(restore)} if restore is not None else {})}
     cfg["model_id"] = spec.model_id
+    if spec.data_path:
+        cfg["imitation"] = {**(cfg.get("imitation") or {}), "corpus_path": str(spec.data_path)}
     return cfg
 
 

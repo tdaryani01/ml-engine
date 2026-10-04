@@ -122,3 +122,16 @@ def test_checkpoint_readers_refuse_what_they_cannot_read(tmp_path) -> None:
     with pytest.raises(CheckpointConfigError) as e:
         config_from_checkpoint_bytes(b"not a checkpoint")
     assert e.value.status == 404
+
+
+def test_versions_only_go_up_when_a_fit_restores_an_earlier_checkpoint(tmp_path) -> None:
+    import json
+
+    from src.launcher import base_version
+
+    ckpt = tmp_path / "c.json"
+    ckpt.write_bytes(json.dumps({"version": 125}).encode())
+    assert base_version(ckpt) == 125  # a fresh run: the checkpoint's own version
+    assert base_version(ckpt, run_head=204) == 204  # the run already reached 204: restore the weights, keep counting up
+    assert base_version(ckpt, run_head=100) == 125  # an older head never pulls it back
+    assert base_version(None, requested=7) == 7 and base_version(None, run_head=9) == 9 and base_version(None) == 0

@@ -49,7 +49,14 @@ if _CONFIG_SOURCE == ConfigSource.TRAINING_MANAGER:
     # One run path for every family: a closed-loop payload is assembled from its named options and run here.
     from config.config_loader import _unwrap_job_config
 
-    if str(((_unwrap_job_config(_TM_PAYLOAD).get("assembly") or {}).get("family_id")) or "").strip().lower() == "closed_loop":
+    _family = str(((_unwrap_job_config(_TM_PAYLOAD).get("assembly") or {}).get("family_id")) or "").strip().lower()
+    if _family == "imitation":
+        import sys as _sys
+
+        from src.imitation.run import run_imitation_payload
+
+        _sys.exit(run_imitation_payload(_unwrap_job_config(_TM_PAYLOAD), boot_yaml=BOOT_YAML))
+    if _family == "closed_loop":
         import sys as _sys
 
         _opt = _unwrap_job_config(_TM_PAYLOAD).get("optimization") or {}

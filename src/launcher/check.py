@@ -54,16 +54,34 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def check_config(config_path: Path | str) -> dict[str, Any]:
+def _check_corpus(spec: FamilyFitSpec) -> dict[str, Any]:
+    """An imitation fit reads a frozen corpus: it must load, and hold at least two tapes (one to hold out)."""
+    from src.imitation.corpus import CorpusError, load_corpus
+
+    if not spec.data_path:  # the corpus is frozen when the fit starts, so Start's check has none to read yet
+        return {"ok": True, "errors": [], "warnings": ["the corpus is checked when the fit starts"], "manifest": {}}
+    try:
+        eps = load_corpus(spec.data_path)
+    except CorpusError as exc:
+        return {"ok": False, "errors": [str(exc)], "warnings": [], "manifest": {}}
+    tapes = {e.instance_id for e in eps}
+    manifest = {"rows": len(eps), "tapes": len(tapes), "sha256": _sha256(Path(spec.data_path)), "source": Path(spec.data_path).name}
+    errors = [] if len(tapes) >= 2 else ["the corpus has one tape: there is nothing to hold out for validation"]
+    return {"ok": not errors, "errors": errors, "warnings": [], "manifest": manifest}
+
+
+def check_config(config_path: Path | str, data_path: Path | str | None = None) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
     manifest: dict[str, Any] = {}
     try:
-        spec = spec_from_staged(config_path, None)
+        spec = spec_from_staged(config_path, data_path)
     except (ValueError, OSError) as exc:
         return {"ok": False, "errors": [str(exc)], "warnings": [], "manifest": {}}
     if spec is None:
         return {"ok": False, "errors": ["this is not an ML engine run config"], "warnings": [], "manifest": {}}
+    if isinstance(spec, FamilyFitSpec) and str(((spec.config.get("assembly") or {}).get("family_id")) or "").lower() == "imitation":
+        return _check_corpus(spec)
     if isinstance(spec, FamilyFitSpec):  # no data file to scan: ML engine builds the run from named options and validates them
         return {"ok": True, "errors": [], "warnings": [], "manifest": {}}
 
