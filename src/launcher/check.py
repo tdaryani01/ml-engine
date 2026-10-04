@@ -1,0 +1,114 @@
+"""Preflight for a staged ME config (BL-EX-025 ``check``): everything EE would otherwise discover mid-run.
+
+Reads the plate, describes it (a manifest: counts and a hash, never rows), checks it against the model's config,
+and asks ME's strict parser to accept the payload. Nothing here trains.
+"""
+
+from __future__ import annotations
+
+import csv
+import hashlib
+import tempfile
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+from src.launcher.payload import FamilyFitSpec, build_pipeline_payload
+from src.launcher.staged import spec_from_staged
+
+MIN_ROWS_WARN = 50
+
+
+def scan_plate(path: Path) -> tuple[list[str], int, Counter, list[str]]:
+    """Header, row count, label counts (last column) and any non-numeric cell problems (first few)."""
+    problems: list[str] = []
+    labels: Counter = Counter()
+    rows = 0
+    with path.open(newline="", encoding="utf-8") as fh:
+        reader = csv.reader(fh)
+        header = next(reader, [])
+        for line_no, row in enumerate(reader, start=2):
+            if not row:
+                continue
+            rows += 1
+            if len(row) != len(header):
+                if len(problems) < 3:
+                    problems.append(f"line {line_no} has {len(row)} columns, expected {len(header)}")
+                continue
+            for cell in row:
+                try:
+                    float(cell)
+                except ValueError:
+                    if len(problems) < 3:
+                        problems.append(f"line {line_no} has a non-numeric value")
+                    break
+            labels[row[-1].strip()] += 1
+    return header, rows, labels, problems
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_config(config_path: Path | str) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    manifest: dict[str, Any] = {}
+    try:
+        spec = spec_from_staged(config_path, None)
+    except (ValueError, OSError) as exc:
+        return {"ok": False, "errors": [str(exc)], "warnings": [], "manifest": {}}
+    if spec is None:
+        return {"ok": False, "errors": ["this is not an ML engine run config"], "warnings": [], "manifest": {}}
+    if isinstance(spec, FamilyFitSpec):  # no data file to scan: ML engine builds the run from named options and validates them
+        return {"ok": True, "errors": [], "warnings": [], "manifest": {}}
+
+    plate = Path(spec.data_path)
+    header, rows, labels, problems = scan_plate(plate)
+    manifest = {
+        "rows": rows, "columns": header, "label_counts": dict(labels), "sha256": _sha256(plate),
+        "source": plate.name, "model_type": spec.model_type,
+    }
+    errors.extend(problems)
+    if len(header) < 2:
+        errors.append("the plate needs at least one feature column and a target column")
+    if rows == 0:
+        errors.append("the plate has no rows")
+    elif rows < MIN_ROWS_WARN:
+        warnings.append(f"only {rows} rows: validation will be very noisy")
+
+    distinct = len(labels)
+    if spec.model_type == "binary_classification" and rows:
+        if not set(labels) <= {"0", "1", "0.0", "1.0"}:
+            errors.append(f"binary classification needs 0/1 labels; found {sorted(labels)[:6]}")
+        elif distinct < 2:
+            errors.append("binary classification needs both classes present; the plate has one")
+    elif spec.model_type == "multi_class" and rows:
+        if distinct > spec.num_classes:
+            errors.append(f"the plate has {distinct} distinct labels but the model has num_classes={spec.num_classes}")
+        elif distinct < spec.num_classes:
+            warnings.append(f"the plate has {distinct} distinct labels but the model expects {spec.num_classes}")
+    elif spec.model_type == "regression" and rows and distinct <= 2:
+        warnings.append(
+            f"this is a regression model but the target has only {distinct} distinct value(s): "
+            "it looks like a classification target"
+        )
+    if labels and rows and max(labels.values()) / rows > 0.9 and spec.model_type != "regression":
+        warnings.append("one class is more than 90% of the rows")
+
+    if not errors:
+        try:
+            from config.config_loader import parse_tm_production_config  # type: ignore[import-not-found]
+
+            with tempfile.TemporaryDirectory() as tmp:
+                parse_tm_production_config(build_pipeline_payload(spec, work_dir=Path(tmp)), profile="pipeline")
+        except Exception as exc:  # noqa: BLE001 - ME's own parser is the judge
+            errors.append(f"ML engine rejects this configuration: {exc}")
+    return {"ok": not errors, "errors": errors, "warnings": warnings, "manifest": manifest}
+
+
+_scan = scan_plate  # (older private name)
