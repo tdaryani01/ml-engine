@@ -108,3 +108,18 @@ def test_state_survives_the_checkpoint_bytes_and_restores_exactly() -> None:
         np.testing.assert_allclose(np.asarray(again[k]).reshape(-1), np.asarray(state[k]).reshape(-1), rtol=1e-6, atol=1e-9)
     for r in (run, fresh):
         r.close()
+
+
+def test_autopilot_starts_each_stretch_on_the_plate_after_the_one_the_last_early_stop_left() -> None:
+    from src.closed_loop.run import rotate_plates
+
+    cfg = _cfg()
+    run = assemble_closed_loop(cfg, seed=0)
+    ids = run.data.stock_ids
+    first = run.data.command_id
+    assert rotate_plates(run, {"rotate_on_es": True, "stretch_index": 1}) == 0 and run.data.command_id == first  # first stretch: no rotation
+    assert rotate_plates(run, {"rotate_on_es": False, "stretch_index": 4}) == 0 and run.data.command_id == first  # policy off: stay put
+    assert rotate_plates(run, {"rotate_on_es": True, "stretch_index": 3}) == 2
+    assert run.data.command_id == ids[(ids.index(first) + 2) % len(ids)]
+    assert run.data.val_goal(1).command_ids[0] != run.data.command_id  # validation stays on a different plate than training
+    run.close()

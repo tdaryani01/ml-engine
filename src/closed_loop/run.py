@@ -7,6 +7,17 @@ from pathlib import Path
 from typing import Any
 
 
+def rotate_plates(run: Any, fit: dict[str, Any]) -> int:
+    """Autopilot: every earlier stretch that ended in an early stop moved the training plate on, so stretch N starts on the
+    plate N-1 steps after the first. Stateless (the stretch index says how many), so each fit is a fresh run."""
+    if not fit.get("rotate_on_es"):
+        return 0
+    n = max(0, int(fit.get("stretch_index") or 1) - 1)
+    for _ in range(n):
+        run.data.next_plate()
+    return n
+
+
 def run_closed_loop_payload(payload: dict[str, Any], *, boot_yaml: str) -> int:
     from config.config_loader import load_boot_host_context, parse_tm_production_config
     from src.closed_loop.assembler import assemble_closed_loop
@@ -23,10 +34,13 @@ def run_closed_loop_payload(payload: dict[str, Any], *, boot_yaml: str) -> int:
     out_dir = Path(str((cfg.get("meta") or {}).get("output_dir") or host_output_dir or "diagnostics_output/closed_loop"))
     ledger_dir = out_dir / str(led.get("path") or "ledger")
     ledger_dir.mkdir(parents=True, exist_ok=True)
-    seed = int((cfg.get("optimization") or {}).get("seed") or fit.get("seed") or 0)
+    # Autopilot: stretch N shuffles with seed + N - 1, so a retry from the same weights is a new run, not a copy.
+    seed = int((cfg.get("optimization") or {}).get("seed") or fit.get("seed") or 0) + max(0, int(fit.get("stretch_index") or 1) - 1)
     seed_everything(seed)
     logging.warning("[closed-loop] assembling %s", (cfg.get("assembly") or {}).get("modules"))
     run = assemble_closed_loop(cfg, seed=seed)
+
+    rotate_plates(run, fit)
 
     restore = led.get("restore_checkpoint_path")
     if restore:
