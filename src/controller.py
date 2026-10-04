@@ -272,6 +272,7 @@ class ModelController:
                 authorize_on_boot=authorize_on_boot,
             )
             if ledger_on:
+                engine.ledger.run_config = getattr(ls, "run_config", None)
                 logging.info(
                     "[Model Controller] Training ledger enabled: %s backend=%s instance_id=%s",
                     ledger_dir,

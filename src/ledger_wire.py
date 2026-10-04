@@ -325,7 +325,27 @@ def pack_checkpoint_body(body: dict[str, Any]) -> bytes:
             _pack_optimizer(body["optimizer"]),
         ]
     )
+    # The run config and its knobs travel with the model state, so Live and restore find them in the checkpoint.
+    extra = {k: body[k] for k in ("config", "knobs") if isinstance(body.get(k), dict)}
+    blob = json.dumps(extra, separators=(",", ":"), default=str).encode("utf-8") if extra else b""
+    parts.append(struct.pack("<I", len(blob)))
+    parts.append(blob)
+    # Model state that is not a plain network (a closed-loop model's encoder, policy, adapters, optimizer moments):
+    # named arrays, packed after the config and knobs.
+    state = body.get("state")
+    if isinstance(state, dict) and state:
+        names = list(state)
+        parts.append(b"\x01")
+        parts.append(_pack_str_list(names))
+        parts.append(_pack_array_list([np.asarray(state[n]) for n in names]))
+    else:
+        parts.append(b"\x00")
     return b"".join(parts)
+
+
+def _pack_str_list(items: list[str]) -> bytes:
+    blob = json.dumps(items, separators=(",", ":")).encode("utf-8")
+    return struct.pack("<I", len(blob)) + blob
 
 
 def unpack_checkpoint_body(data: bytes | memoryview) -> dict[str, Any]:
@@ -351,6 +371,20 @@ def unpack_checkpoint_body(data: bytes | memoryview) -> dict[str, Any]:
     body["gammas"], off = _unpack_array_list(buf, off)
     body["betas"], off = _unpack_array_list(buf, off)
     body["optimizer"], off = _unpack_optimizer(buf, off)
+    if off + 4 <= len(buf):  # checkpoints written before config + knobs were stored simply end here
+        (n,) = struct.unpack_from("<I", buf, off)
+        off += 4
+        if n:
+            body.update(json.loads(bytes(buf[off : off + n]).decode("utf-8")))
+        off += n
+        if off < len(buf) and buf[off] == 1:
+            off += 1
+            (nlen,) = struct.unpack_from("<I", buf, off)
+            off += 4
+            names = json.loads(bytes(buf[off : off + nlen]).decode("utf-8"))
+            off += nlen
+            arrays, off = _unpack_array_list(buf, off)
+            body["state"] = dict(zip(names, arrays or []))
     return body
 
 

@@ -289,6 +289,8 @@ class LedgerSettings:
     # Fit contract: start this fit from the weights in a ledger checkpoint document (a file
     # holding ``document_to_bytes(checkpoint)``). Adam restarts (begin_fit clears it).
     restore_checkpoint_path: str | None = None
+    # The run config as TM sent it; written into every checkpoint (not read from YAML).
+    run_config: dict | None = None
 
 @dataclass(frozen=True)
 class TrainingManagerSettings:

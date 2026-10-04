@@ -46,6 +46,18 @@ _CONFIG_SOURCE = detect_config_source()
 _TM_PAYLOAD: dict | None = None
 if _CONFIG_SOURCE == ConfigSource.TRAINING_MANAGER:
     _TM_PAYLOAD = load_tm_payload()
+    # One run path for every family: a closed-loop payload is assembled from its named options and run here.
+    from config.config_loader import _unwrap_job_config
+
+    if str(((_unwrap_job_config(_TM_PAYLOAD).get("assembly") or {}).get("family_id")) or "").strip().lower() == "closed_loop":
+        import sys as _sys
+
+        _opt = _unwrap_job_config(_TM_PAYLOAD).get("optimization") or {}
+        if _opt.get("num_threads") and not _os.environ.get("OMP_NUM_THREADS"):
+            _os.environ["OMP_NUM_THREADS"] = _os.environ["OPENBLAS_NUM_THREADS"] = str(int(_opt["num_threads"]))
+        from src.closed_loop.run import run_closed_loop_payload
+
+        _sys.exit(run_closed_loop_payload(_unwrap_job_config(_TM_PAYLOAD), boot_yaml=BOOT_YAML))
     _host_identity, _host_output_dir = load_boot_host_context(BOOT_YAML)
     _cfg = parse_tm_production_config(
         _TM_PAYLOAD,

@@ -1,5 +1,6 @@
 # config/config_loader.py
 import copy
+import dataclasses
 import os
 from typing import Any, Mapping
 
@@ -411,11 +412,15 @@ def parse_tm_production_config(
             )
         raw["architecture"] = architecture_raw
 
+    public_config = copy.deepcopy(raw)  # what TM sent, before host-local identity is added
     identity = _with_tm_start_policy(_identity_to_mapping(host_identity), raw)
     if identity is not None:
         raw["training_manager"] = identity
 
-    return parse_production_config(raw)
+    parsed = parse_production_config(raw)
+    # A caller may hand in the config to store (``ledger.run_config``: what the user's TM sent, before any adaptation).
+    stored = parsed.ledger.run_config or public_config
+    return dataclasses.replace(parsed, ledger=dataclasses.replace(parsed.ledger, run_config=stored))
 
 
 def _parse_tm_closed_loop_config(
@@ -461,7 +466,10 @@ def _parse_tm_closed_loop_config(
                 + ", ".join(missing_keys)
             )
         if template is not None:
-            geometry = template.to_mhsa_mapping()
+            geometry = dict(template.to_mhsa_mapping())
+            # The policy's dims may be authored in the payload's own mhsa block (as for the supervised profile);
+            # the schema only has to supply what that block does not.
+            geometry.update({k: v for k, v in dict(cfg.get("mhsa") or {}).items() if v is not None})
             missing_geo = [
                 key for key in ("d_model", "num_heads") if geometry.get(key) is None
             ]
