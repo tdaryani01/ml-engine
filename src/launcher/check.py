@@ -58,8 +58,8 @@ def _check_corpus(spec: FamilyFitSpec) -> dict[str, Any]:
     """An imitation fit reads a frozen corpus: it must load, and hold at least two tapes (one to hold out)."""
     from src.imitation.corpus import CorpusError, load_corpus
 
-    if not spec.data_path:
-        return {"ok": False, "errors": ["this model trains on a frozen corpus and none was handed over"], "warnings": [], "manifest": {}}
+    if not spec.data_path:  # the corpus is frozen when the fit starts, so Start's check has none to read yet
+        return {"ok": True, "errors": [], "warnings": ["the corpus is checked when the fit starts"], "manifest": {}}
     try:
         eps = load_corpus(spec.data_path)
     except CorpusError as exc:

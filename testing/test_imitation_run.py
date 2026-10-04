@@ -133,7 +133,7 @@ def test_the_launcher_hands_the_corpus_to_the_payload_and_the_check_judges_it(tm
     assert ok["ok"] and ok["manifest"]["tapes"] == 12 and ok["manifest"]["rows"] == 144
     one = chk._check_corpus(spec_from_staged(cfg, _corpus(tmp_path / "one.jsonl", tapes=1)))
     assert not one["ok"]
-    assert not chk._check_corpus(spec_from_staged(cfg, None))["ok"]
+    assert chk._check_corpus(spec_from_staged(cfg, None))["warnings"]
 
 
 def test_the_last_checkpoint_of_a_fit_holds_the_best_weights_and_reads_back_as_a_model(tmp_path) -> None:
