@@ -125,12 +125,17 @@ def fit_imitation(
         blob, m = train_imitation(train_eps, steps=int(steps_per_round), lr=float(lr), init_blob=blob, holdout_episodes=hold_eps,
                                   sampler_seed=int(seed) * 1_000_003 + r, **kw)
         done = r
-        train_loss, val_loss = m.get("train_log_loss"), m.get("holdout_log_loss")
+        # The train loss a chart shows is the NATURAL slice (not selected for difficulty), the one comparable with validation; the all-rows
+        # number sits above validation by construction (the train set is enriched with hard rehearsal/golden rows the held-out tapes lack).
+        train_all = m.get("train_log_loss")
+        train_loss = m.get("train_log_loss_natural") if m.get("train_log_loss_natural") is not None else train_all
+        val_loss = m.get("holdout_log_loss")
         if val_loss is None:
             raise LeakageError("no held-out windows were scored")
         ledger.push_step_metrics(r, r, float(train_loss), float(val_loss))
         ledger.version = r
-        _emit(events, "round", round=r, train_log_loss=train_loss, holdout_log_loss=val_loss,
+        _emit(events, "round", round=r, train_log_loss=train_loss, train_log_loss_all=train_all, train_by_source=m.get("train_log_loss_by_source"),
+              holdout_log_loss=val_loss,
               holdout_accuracy=m.get("holdout_accuracy"), n_train=m.get("n_train"), n_holdout=m.get("n_holdout"))
         # The best is tracked from the FIRST round: warm-up only means a bad round is not counted yet (a restored checkpoint is often at its
         # best in the first rounds, and the loss swings a lot early; overwriting the best with the latest warm-up round lost it).
