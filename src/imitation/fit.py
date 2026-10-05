@@ -51,7 +51,11 @@ def _benchmark(
         raise LeakageError(f"{len(in_train)} benchmark tape(s) are in this fit's train set")
     bench_eps = [e for e in episodes if e.instance_id in wanted]
     child = tape_losses(blob, bench_eps, history_k=history_k)
-    out: dict[str, Any] = {"log_loss": (sum(child.values()) / len(child)) if child else None, "n_tapes": len(child),
+    import hashlib
+
+    # Which benchmark this is: scores are comparable only between fits that share it (TM freezes the tapes for a run).
+    bench_id = hashlib.sha256("\n".join(sorted(wanted)).encode("utf-8")).hexdigest()[:12]
+    out: dict[str, Any] = {"id": bench_id, "log_loss": (sum(child.values()) / len(child)) if child else None, "n_tapes": len(child),
                            "tapes_requested": len(wanted), "parent": None, "delta": None, "se": None, "z": None}
     if parent_blob is not None and child:
         cmp = paired_tape_comparison(tape_losses(parent_blob, bench_eps, history_k=history_k), child)
@@ -154,6 +158,7 @@ def fit_imitation(
            "best_val_loss": None if best_val == float("inf") else float(best_val), "final_version": done or None,
            "split": rep, "events": events,
            "benchmark_loss": None if bench is None else bench["log_loss"], "benchmark_z": None if bench is None else bench["z"],
-           "benchmark_n_tapes": None if bench is None else bench["n_tapes"], "benchmark": bench}
+           "benchmark_n_tapes": None if bench is None else bench["n_tapes"], "benchmark_id": None if bench is None else bench["id"],
+           "benchmark": bench}
     ledger.push_run_end(end)
     return end
