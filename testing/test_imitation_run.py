@@ -230,3 +230,27 @@ def test_the_benchmark_tapes_can_be_named_by_tagging_their_rows(tmp_path) -> Non
     corpus.write_text("\n".join(json.dumps({**r, "mix_source": "benchmark"} if r["instance_id"] in held else r) for r in rows))
     end = _run(tmp_path, _payload(tmp_path / "a", corpus, steps=2))[-1].body
     assert end["benchmark_n_tapes"] == len(held)
+
+
+def test_the_best_round_is_kept_through_the_warm_up_and_only_later_bad_rounds_count(monkeypatch) -> None:
+    from tm_brain_contracts import DecisionEpisode
+    from tm_brain_contracts import native_core
+
+    from src.imitation.fit import fit_imitation
+
+    scripted = iter([0.50, 0.20, 0.90, 0.90, 0.90, 0.90, 0.90, 0.90])  # the best is round 2, INSIDE the 3-round warm-up
+    seen = []
+
+    def fake_train(eps, **kw):
+        loss = next(scripted)
+        seen.append(loss)
+        return f"w{len(seen)}".encode(), {"train_log_loss": loss, "holdout_log_loss": loss, "holdout_accuracy": 0.5, "n_train": 1, "n_holdout": 1}
+
+    monkeypatch.setattr(native_core, "train_imitation", fake_train)
+    eps = [DecisionEpisode.from_public(_row(f"t{t}", i)) for t in range(10) for i in range(4)]
+    led = _Ledger()
+    end = fit_imitation(eps, led, lr=0.01, steps=None, seed=0, steps_per_round=1, patience=3, es_warmup=3, train_kwargs={"history_k": 2})
+    assert end["best_version"] == 2 and end["best_val_loss"] == 0.20  # not round 3 (0.90), which the old rule made the baseline
+    assert end["reason"] == "es_trip" and end["epochs_run"] == 6  # warm-up rounds 1-3 uncounted, then rounds 4, 5, 6 are the three bad ones
+    best_cp = [a for k, a in led.docs if k == "checkpoint" and a[1] == end["best_version"]][-1]
+    assert best_cp[0]["blob"].tobytes() == b"w2"  # the checkpoint an early stop publishes (the best version's) holds round 2's weights

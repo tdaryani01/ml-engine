@@ -129,14 +129,13 @@ def fit_imitation(
         ledger.version = r
         _emit(events, "round", round=r, train_log_loss=train_loss, holdout_log_loss=val_loss,
               holdout_accuracy=m.get("holdout_accuracy"), n_train=m.get("n_train"), n_holdout=m.get("n_holdout"))
-        if r <= es_warmup:
-            improved, bad = True, 0
-        else:
-            improved = val_loss < best_val - es_min_delta
+        # The best is tracked from the FIRST round: warm-up only means a bad round is not counted yet (a restored checkpoint is often at its
+        # best in the first rounds, and the loss swings a lot early; overwriting the best with the latest warm-up round lost it).
+        improved = val_loss < best_val - es_min_delta
         if improved:
             best_val, best_round, best_blob, bad = float(val_loss), r, blob, 0
             checkpoint(r, float(val_loss), best=True, b=blob)
-        else:
+        elif r > es_warmup:
             bad += 1
         if checkpoint_every and r % int(checkpoint_every) == 0:
             checkpoint(r, float(val_loss), best=False, b=blob)
