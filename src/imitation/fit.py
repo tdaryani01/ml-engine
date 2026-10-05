@@ -106,6 +106,7 @@ def fit_imitation(
         _emit(events, "leakage.DETECTED", kind="identical_windows", overlap=n_over, of=n_hold)
 
     best_val, best_round, best_blob = float("inf"), 0, init_blob
+    best_train: float | None = None
     blob, bad, reason, done, written = init_blob, 0, "success", 0, set()
     rounds = None if steps is None else max(1, -(-int(steps) // max(1, int(steps_per_round))))  # None: until early stop
 
@@ -136,6 +137,7 @@ def fit_imitation(
         improved = val_loss < best_val - es_min_delta
         if improved:
             best_val, best_round, best_blob, bad = float(val_loss), r, blob, 0
+            best_train = float(train_loss)
             checkpoint(r, float(val_loss), best=True, b=blob)
         elif r > es_warmup:
             bad += 1
@@ -157,6 +159,9 @@ def fit_imitation(
         bench = _benchmark(published, init_blob, episodes, train_eps, wanted, events, history_k=kw.get("history_k", HISTORY_K))
     end = {"reason": reason, "epochs_run": done, "best_version": best_round or None,
            "best_val_loss": None if best_val == float("inf") else float(best_val), "final_version": done or None,
+           # The losses OF THE PUBLISHED CHECKPOINT's round: what a chart must show for this fit (the last round's train loss is a different,
+           # often diverged, model). The runner reads these.
+           "published_val_loss": None if best_val == float("inf") else float(best_val), "published_train_loss": best_train,
            "split": rep, "events": events,
            "benchmark_loss": None if bench is None else bench["log_loss"], "benchmark_z": None if bench is None else bench["z"],
            "benchmark_n_tapes": None if bench is None else bench["n_tapes"], "benchmark_id": None if bench is None else bench["id"],

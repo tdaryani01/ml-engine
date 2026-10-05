@@ -212,10 +212,15 @@ def run_me_fit(
             best_val = ended.get("best_val_loss")
             if best_val is not None:
                 last_val = float(best_val)
+            if ended.get("published_train_loss") is not None:  # the train loss of the SAME round as the val loss above
+                last_train = float(ended["published_train_loss"])
             yield {**_snap("es_trip", trip_rel, doc), "run_end": ended}
         else:
             final_rel = ended.get("final_version")
             doc = _checkpoint_doc(work / "out" / "ledger", pending_cp, final_rel)
+            if ended.get("published_val_loss") is not None and ended.get("published_train_loss") is not None:
+                # A family whose final checkpoint holds its BEST weights reports that round's losses (not the last round's).
+                last_val, last_train = float(ended["published_val_loss"]), float(ended["published_train_loss"])
             yield {**_snap("train", int(final_rel) if final_rel is not None else trip_rel, doc), "run_end": ended}
     finally:
         _terminate(proc)

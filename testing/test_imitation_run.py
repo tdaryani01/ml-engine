@@ -254,3 +254,22 @@ def test_the_best_round_is_kept_through_the_warm_up_and_only_later_bad_rounds_co
     assert end["reason"] == "es_trip" and end["epochs_run"] == 6  # warm-up rounds 1-3 uncounted, then rounds 4, 5, 6 are the three bad ones
     best_cp = [a for k, a in led.docs if k == "checkpoint" and a[1] == end["best_version"]][-1]
     assert best_cp[0]["blob"].tobytes() == b"w2"  # the checkpoint an early stop publishes (the best version's) holds round 2's weights
+
+
+def test_the_final_snapshot_reports_the_published_rounds_train_and_val_together(tmp_path) -> None:
+    """The chart pairs the two numbers of ONE round. It used to pair the best val loss with the LAST round's train loss."""
+    from src.launcher import FamilyFitSpec, run_me_fit
+
+    corpus = _corpus(tmp_path / "c.jsonl", tapes=16)
+    spec = FamilyFitSpec(model_id="b", config={"assembly": {"family_id": "imitation"},
+                                               "imitation": {"steps_per_round": 2, "batch_size": 32, "history_k": 2,
+                                                             "architecture": {"d_model": 16, "num_heads": 2, "num_layers": 1, "ffn_mult": 2}}},
+                         fit={"lr": 0.002, "patience": 3, "es_warmup": 1, "checkpoint_every": 100, "seed": 3}, data_path=str(corpus))
+    snaps = list(run_me_fit(spec, work_dir=tmp_path / "w", should_stop=lambda: False))
+    final = snaps[-1]
+    end = final["run_end"]
+    assert end["reason"] == "es_trip"
+    rounds = [e for e in end["events"] if e["event"] == "round"]
+    best = next(r for r in rounds if r["round"] == end["best_version"])
+    assert final["loss"] == best["holdout_log_loss"] and final["train_loss"] == best["train_log_loss"]
+    assert rounds[-1]["train_log_loss"] != best["train_log_loss"]  # the last round is a different model: that was the old pairing
