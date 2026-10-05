@@ -281,3 +281,32 @@ def test_each_round_reports_the_chart_train_loss_the_all_rows_loss_and_the_per_f
     assert rounds and all({"train_log_loss", "train_log_loss_all", "train_by_source"} <= set(r) for r in rounds)
     steps = [d.body["train_loss"] for d in docs if d.doc_type == "step.metrics"]
     assert steps == [r["train_log_loss"] for r in rounds]  # the ledger (and so the chart) carries the same number
+
+
+def test_the_benchmark_can_overrule_the_validation_pick_with_the_last_round(monkeypatch) -> None:
+    from tm_brain_contracts import DecisionEpisode
+    from tm_brain_contracts import native_core
+
+    from src.imitation import fit as fitmod
+
+    scripted = iter([0.20, 0.30])  # validation prefers round 1; the benchmark prefers round 2
+    n = []
+
+    def fake_train(eps, **kw):
+        loss = next(scripted)
+        n.append(loss)
+        return f"w{len(n)}".encode(), {"train_log_loss": loss, "holdout_log_loss": loss, "holdout_accuracy": 0.5, "n_train": 1, "n_holdout": 1}
+
+    scores = {b"w1": 0.50, b"w2": 0.40, b"init": 0.60}
+
+    def fake_bench(blob, parent, eps, train_eps, wanted, events, *, history_k):
+        return {"id": "x", "log_loss": scores[blob], "n_tapes": 3, "tapes_requested": 3, "parent": None, "delta": None, "se": None, "z": None}
+
+    monkeypatch.setattr(native_core, "train_imitation", fake_train)
+    monkeypatch.setattr(fitmod, "_benchmark", fake_bench)
+    eps = [DecisionEpisode.from_public(_row(f"t{t}", i)) for t in range(10) for i in range(4)]
+    led = _Ledger()
+    end = fitmod.fit_imitation(eps, led, lr=0.01, steps=2, seed=0, steps_per_round=1, patience=0, es_warmup=0, train_kwargs={"history_k": 2},
+                               init_blob=b"init", benchmark_tapes=["t0"])
+    assert end["best_version"] == 2 and end["published_val_loss"] == 0.30 and end["benchmark_loss"] == 0.40
+    assert any(e["event"] == "publish.by_benchmark" for e in end["events"])
