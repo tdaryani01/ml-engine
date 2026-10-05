@@ -135,7 +135,7 @@ def fit_imitation(
         if val_loss is None:
             raise LeakageError("no held-out windows were scored")
         last_val, last_train = float(val_loss), float(train_loss)
-        ledger.push_step_metrics(r, r, float(train_loss), float(val_loss))
+        ledger.push_step_metrics(r, r, float(train_loss), float(val_loss), train_by_source=m.get("train_log_loss_by_source"))
         ledger.version = r
         _emit(events, "round", round=r, train_log_loss=train_loss, train_log_loss_all=train_all, train_by_source=m.get("train_log_loss_by_source"),
               holdout_log_loss=val_loss,

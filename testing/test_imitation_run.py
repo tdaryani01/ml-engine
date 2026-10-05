@@ -281,6 +281,8 @@ def test_each_round_reports_the_chart_train_loss_the_all_rows_loss_and_the_per_f
     assert rounds and all({"train_log_loss", "train_log_loss_all", "train_by_source"} <= set(r) for r in rounds)
     steps = [d.body["train_loss"] for d in docs if d.doc_type == "step.metrics"]
     assert steps == [r["train_log_loss"] for r in rounds]  # the ledger (and so the chart) carries the same number
+    by_src = [d.body.get("train_by_source") for d in docs if d.doc_type == "step.metrics"]
+    assert all(b is None or all(isinstance(v, float) for v in b.values()) for b in by_src)  # plain per-feed losses (when the corpus has feeds), for the chart
 
 
 def test_the_benchmark_can_overrule_the_validation_pick_with_the_last_round(monkeypatch) -> None:
