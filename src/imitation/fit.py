@@ -120,7 +120,9 @@ def fit_imitation(
         r += 1
         if should_stop():
             break
-        blob, m = train_imitation(train_eps, steps=int(steps_per_round), lr=float(lr), init_blob=blob, holdout_episodes=hold_eps, **kw)
+        # The batch sampler advances every round (it restarts from seed 0 on every call otherwise, and the fit retrains the same few batches).
+        blob, m = train_imitation(train_eps, steps=int(steps_per_round), lr=float(lr), init_blob=blob, holdout_episodes=hold_eps,
+                                  sampler_seed=int(seed) * 1_000_003 + r, **kw)
         done = r
         train_loss, val_loss = m.get("train_log_loss"), m.get("holdout_log_loss")
         if val_loss is None:
