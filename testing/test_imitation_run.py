@@ -167,3 +167,65 @@ def test_the_split_does_not_move_between_stretches(tmp_path) -> None:
         pl["fit"]["stretch_index"] = stretch
         held.append(_run(tmp_path, pl)[-1].body["split"]["holdout_tapes"])
     assert held[0] == held[1] == held[2]
+
+
+def test_the_published_weights_are_scored_on_the_frozen_benchmark_tapes(tmp_path) -> None:
+    from tm_brain_contracts import DecisionEpisode
+    from tm_brain_contracts.windows import split_by_tape
+
+    corpus = _corpus(tmp_path / "c.jsonl", tapes=16)
+    eps = [DecisionEpisode.from_public(json.loads(l)) for l in corpus.read_text().splitlines()]
+    held = split_by_tape(eps, seed=3)[2]["holdout_tapes"]
+    pl = _payload(tmp_path / "a", corpus, steps=4)
+    pl["imitation"]["benchmark_tapes"] = held
+    end = _run(tmp_path, pl)[-1].body
+    assert end["benchmark_loss"] is not None and end["benchmark"]["n_tapes"] == len(held) and end["benchmark_n_tapes"] == len(held)
+    assert any(e["event"] == "benchmark" for e in end["events"])
+
+
+def test_a_benchmark_tape_that_is_in_train_fails_the_fit(tmp_path) -> None:
+    from tm_brain_contracts import DecisionEpisode
+    from tm_brain_contracts.windows import split_by_tape
+
+    corpus = _corpus(tmp_path / "c.jsonl", tapes=16)
+    eps = [DecisionEpisode.from_public(json.loads(l)) for l in corpus.read_text().splitlines()]
+    train_tape = sorted({e.instance_id for e in split_by_tape(eps, seed=3)[0]})[0]
+    pl = _payload(tmp_path / "a", corpus, steps=2)
+    pl["imitation"]["benchmark_tapes"] = [train_tape]
+    r = _run(tmp_path, pl, ok=False)
+    assert r.returncode != 0 and "benchmark tape" in (r.stdout + r.stderr)
+
+
+def test_a_fit_that_restores_reports_how_clearly_it_beats_its_parent_by_tape(tmp_path) -> None:
+    from tm_brain_contracts import DecisionEpisode
+    from tm_brain_contracts.windows import split_by_tape
+    from src.ledger import document_to_bytes
+
+    corpus = _corpus(tmp_path / "c.jsonl", tapes=40, rows=8)
+    eps = [DecisionEpisode.from_public(json.loads(l)) for l in corpus.read_text().splitlines()]
+    held = split_by_tape(eps, seed=3)[2]["holdout_tapes"]
+    first_pl = _payload(tmp_path / "a", corpus, steps=2)
+    first_pl["imitation"]["benchmark_tapes"] = held
+    first = _run(tmp_path, first_pl)
+    assert first[-1].body["benchmark_z"] is None  # a cold start has no parent to compare with
+    last = max([d for d in first if d.doc_type == "checkpoint"], key=lambda d: d.version)
+    (tmp_path / "r.ckpt").write_bytes(document_to_bytes(last))
+    pl = _payload(tmp_path / "b", corpus, steps=8, restore=tmp_path / "r.ckpt")
+    pl["imitation"]["benchmark_tapes"] = held
+    end = _run(tmp_path, pl)[-1].body
+    b = end["benchmark"]
+    assert b["parent"] is not None and b["delta"] == pytest.approx(b["parent"] - b["log_loss"]) and b["n_tapes"] == len(held)
+    assert b["z"] is None or isinstance(b["z"], float)
+
+
+def test_the_benchmark_tapes_can_be_named_by_tagging_their_rows(tmp_path) -> None:
+    from tm_brain_contracts import DecisionEpisode
+    from tm_brain_contracts.windows import split_by_tape
+
+    corpus = _corpus(tmp_path / "c.jsonl", tapes=16)
+    rows = [json.loads(l) for l in corpus.read_text().splitlines()]
+    eps = [DecisionEpisode.from_public(r) for r in rows]
+    held = set(split_by_tape(eps, seed=3)[2]["holdout_tapes"])
+    corpus.write_text("\n".join(json.dumps({**r, "mix_source": "benchmark"} if r["instance_id"] in held else r) for r in rows))
+    end = _run(tmp_path, _payload(tmp_path / "a", corpus, steps=2))[-1].body
+    assert end["benchmark_n_tapes"] == len(held)

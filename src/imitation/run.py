@@ -67,7 +67,8 @@ def run_imitation_payload(payload: dict[str, Any], *, boot_yaml: str) -> int:
             es_warmup=int(fit.get("es_warmup") if fit.get("es_warmup") is not None else 3),
             checkpoint_every=int(fit.get("checkpoint_every") or 5),
             train_kwargs={k: im[k] for k in _TRAIN_KEYS if im.get(k) is not None},
-            init_blob=init_blob, model_instance_id=ledger.model_instance_id,
+            init_blob=init_blob, benchmark_tapes=(list(im.get("benchmark_tapes")) if im.get("benchmark_tapes") else None),
+            model_instance_id=ledger.model_instance_id,
         )
         logging.warning("[imitation] done: %s", {k: v for k, v in end.items() if k != "events"})
     finally:
