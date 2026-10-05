@@ -159,6 +159,7 @@ def fit_imitation(
            "split": rep, "events": events,
            "benchmark_loss": None if bench is None else bench["log_loss"], "benchmark_z": None if bench is None else bench["z"],
            "benchmark_n_tapes": None if bench is None else bench["n_tapes"], "benchmark_id": None if bench is None else bench["id"],
+           "benchmark_parent_loss": None if bench is None else bench["parent"],
            "benchmark": bench}
     ledger.push_run_end(end)
     return end
