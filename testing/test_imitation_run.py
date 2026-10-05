@@ -273,3 +273,11 @@ def test_the_final_snapshot_reports_the_published_rounds_train_and_val_together(
     best = next(r for r in rounds if r["round"] == end["best_version"])
     assert final["loss"] == best["holdout_log_loss"] and final["train_loss"] == best["train_log_loss"]
     assert rounds[-1]["train_log_loss"] != best["train_log_loss"]  # the last round is a different model: that was the old pairing
+
+
+def test_each_round_reports_the_chart_train_loss_the_all_rows_loss_and_the_per_feed_losses(tmp_path) -> None:
+    docs = _run(tmp_path, _payload(tmp_path / "a", _corpus(tmp_path / "c.jsonl"), steps=4))
+    rounds = [e for e in docs[-1].body["events"] if e["event"] == "round"]
+    assert rounds and all({"train_log_loss", "train_log_loss_all", "train_by_source"} <= set(r) for r in rounds)
+    steps = [d.body["train_loss"] for d in docs if d.doc_type == "step.metrics"]
+    assert steps == [r["train_log_loss"] for r in rounds]  # the ledger (and so the chart) carries the same number
