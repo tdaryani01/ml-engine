@@ -216,6 +216,7 @@ def test_a_fit_that_restores_reports_how_clearly_it_beats_its_parent_by_tape(tmp
     b = end["benchmark"]
     assert b["parent"] is not None and b["delta"] == pytest.approx(b["parent"] - b["log_loss"]) and b["n_tapes"] == len(held)
     assert b["z"] is None or isinstance(b["z"], float)
+    assert end["benchmark_parent_loss"] == b["parent"] and end["benchmark_parent_loss"] is not None  # the parent scored on the same tapes
 
 
 def test_the_benchmark_tapes_can_be_named_by_tagging_their_rows(tmp_path) -> None:
