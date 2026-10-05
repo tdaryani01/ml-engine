@@ -435,6 +435,7 @@ class TrainingLedger:
         train_loss: float,
         val_loss: float | None = None,
         verdict: str = VERDICT_HEALTHY,
+        train_by_source: dict[str, Any] | None = None,
     ) -> int:
         gap = None
         if val_loss is not None:
@@ -452,6 +453,13 @@ class TrainingLedger:
             "verdict": verdict,
             "is_local_best_val": is_best,
         }
+        if train_by_source:
+            # Per-feed train losses (live / rehearsal / golden / ...): a chart can show which feed drives the loss.
+            body["train_by_source"] = {
+                str(k): float(v["log_loss"] if isinstance(v, dict) else v)
+                for k, v in train_by_source.items()
+                if (v.get("log_loss") if isinstance(v, dict) else v) is not None
+            }
         return self.push(self._envelope(STEP_METRICS, body, version=version, step_id=step_id))
 
     def push_run_end(self, body: dict[str, Any]) -> int:
