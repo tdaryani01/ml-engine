@@ -108,6 +108,7 @@ def fit_imitation(
     best_val, best_round, best_blob = float("inf"), 0, init_blob
     best_train: float | None = None
     blob, bad, reason, done, written = init_blob, 0, "success", 0, set()
+    last_blob, last_val, last_train = None, None, None
     rounds = None if steps is None else max(1, -(-int(steps) // max(1, int(steps_per_round))))  # None: until early stop
 
     def checkpoint(version: int, val: float, *, best: bool, b: bytes) -> None:
@@ -125,6 +126,7 @@ def fit_imitation(
         blob, m = train_imitation(train_eps, steps=int(steps_per_round), lr=float(lr), init_blob=blob, holdout_episodes=hold_eps,
                                   sampler_seed=int(seed) * 1_000_003 + r, **kw)
         done = r
+        last_blob = blob
         # The train loss a chart shows is the NATURAL slice (not selected for difficulty), the one comparable with validation; the all-rows
         # number sits above validation by construction (the train set is enriched with hard rehearsal/golden rows the held-out tapes lack).
         train_all = m.get("train_log_loss")
@@ -132,6 +134,7 @@ def fit_imitation(
         val_loss = m.get("holdout_log_loss")
         if val_loss is None:
             raise LeakageError("no held-out windows were scored")
+        last_val, last_train = float(val_loss), float(train_loss)
         ledger.push_step_metrics(r, r, float(train_loss), float(val_loss))
         ledger.version = r
         _emit(events, "round", round=r, train_log_loss=train_loss, train_log_loss_all=train_all, train_by_source=m.get("train_log_loss_by_source"),
@@ -152,21 +155,31 @@ def fit_imitation(
         if patience > 0 and bad >= patience:
             reason = "es_trip"
             break
-    if reason == "success" and done and best_blob is not None:
-        # One model per fit, the BEST one: the final slot holds the best weights (as an early stop leaves them), so whatever
-        # publishes this fit's model reads one checkpoint and never has to pick.
-        checkpoint(done, best_val if best_val != float("inf") else 0.0, best=True, b=best_blob)
-    published = best_blob if best_blob is not None else blob
+    published, pub_val, pub_train, pub_round = (best_blob if best_blob is not None else blob), best_val, best_train, best_round
     bench: dict[str, Any] | None = None
+    switched = False
     # The benchmark tapes are the ones the corpus tags as such (TM re-freezes them per fit) plus any named in the config.
     wanted = set(benchmark_tapes or []) | {e.instance_id for e in episodes if getattr(e, "mix_source", None) == "benchmark"}
     if wanted and published is not None:
-        bench = _benchmark(published, init_blob, episodes, train_eps, wanted, events, history_k=kw.get("history_k", HISTORY_K))
-    end = {"reason": reason, "epochs_run": done, "best_version": best_round or None,
+        hk = kw.get("history_k", HISTORY_K)
+        bench = _benchmark(published, init_blob, episodes, train_eps, wanted, events, history_k=hk)
+        # The validation loss picks the candidate, the benchmark (many more tapes, never trained on) picks the winner: the last round is
+        # scored too, and published instead when it scores lower on the benchmark.
+        if last_blob is not None and last_blob is not best_blob and bench.get("log_loss") is not None:
+            alt = _benchmark(last_blob, init_blob, episodes, train_eps, wanted, events, history_k=hk)
+            if alt.get("log_loss") is not None and alt["log_loss"] < bench["log_loss"]:
+                _emit(events, "publish.by_benchmark", chose="last", round=done, best_round=best_round,
+                      last=alt["log_loss"], best=bench["log_loss"])
+                published, pub_val, pub_train, pub_round, bench, switched = last_blob, last_val, last_train, done, alt, True
+    if done and published is not None and (switched or (reason == "success" and best_blob is not None)):
+        # One model per fit: the final slot holds the published weights, so whatever publishes this fit's model reads one checkpoint
+        # and never has to pick.
+        checkpoint(done, pub_val if pub_val not in (None, float("inf")) else 0.0, best=True, b=published)
+    end = {"reason": reason, "epochs_run": done, "best_version": pub_round or None,
            "best_val_loss": None if best_val == float("inf") else float(best_val), "final_version": done or None,
            # The losses OF THE PUBLISHED CHECKPOINT's round: what a chart must show for this fit (the last round's train loss is a different,
            # often diverged, model). The runner reads these.
-           "published_val_loss": None if best_val == float("inf") else float(best_val), "published_train_loss": best_train,
+           "published_val_loss": None if pub_val in (None, float("inf")) else float(pub_val), "published_train_loss": pub_train,
            "split": rep, "events": events,
            "benchmark_loss": None if bench is None else bench["log_loss"], "benchmark_z": None if bench is None else bench["z"],
            "benchmark_n_tapes": None if bench is None else bench["n_tapes"], "benchmark_id": None if bench is None else bench["id"],
