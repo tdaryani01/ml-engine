@@ -260,4 +260,85 @@ class TeacherForcingFeedback:
         return RolloutResult(total_loss=mean, actions=actions, seq_lens=trainer._seq_lens(), extras={"step_losses": [mean]})
 
 
-__all__ = ["BackpropFeedback", "ClosedLoopTrainer", "PolicyGradientFeedback", "RolloutResult", "TeacherForcingFeedback"]
+
+class CategoricalPolicyGradientFeedback:
+    """Feedback by policy gradient for a DISCRETE choice (which of K options to take): REINFORCE with a batch-mean baseline.
+
+    The actor's output is K logits. The environment may expose ``action_mask() -> (B, K) bool`` (options that are allowed now);
+    masked options are never sampled. The executed action is a one-hot (B, K). The gradient on the logits is
+    ``-advantage * (onehot - probs)`` plus an entropy bonus; it goes through the actor's ``accumulate_grads``. The reward comes from
+    ``loss_fn.step_reward(obs, goal, t) -> (B,)``. Validation (``apply_updates=False``) takes the most likely option, with no
+    gradients."""
+
+    def __init__(self, *, entropy_weight: float = 0.01, gamma: float = 1.0, normalize_advantage: bool = False, seed: int = 0) -> None:
+        self.entropy_weight, self.gamma = float(entropy_weight), float(gamma)
+        self.normalize_advantage = bool(normalize_advantage)
+        self._rng = np.random.default_rng(int(seed))
+
+    @staticmethod
+    def _probs(logits: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
+        z = np.asarray(logits, dtype=np.float64)
+        if mask is not None:
+            z = np.where(mask, z, -1e9)
+        z = z - z.max(axis=1, keepdims=True)
+        e = np.exp(z)
+        return e / e.sum(axis=1, keepdims=True)
+
+    def run(self, trainer: "ClosedLoopTrainer", *, goal: Goal, lr: float, apply_updates: bool = True) -> RolloutResult:
+        reward_fn = getattr(trainer.loss_fn, "step_reward", None)
+        if not callable(reward_fn):
+            raise RuntimeError("CategoricalPolicyGradientFeedback needs a loss evaluator with step_reward(obs, goal, t) -> (B,)")
+        actor, env, T = trainer.actor, trainer.env, trainer.max_steps
+        explore = bool(apply_updates)
+        batch = _goal_batch_size(goal)
+        actor.zero_grad()
+        actor.reset(batch, goal, T)
+        obs = env.reset(batch, goal)
+        actions: list[np.ndarray] = []
+        rewards: list[np.ndarray] = []
+        probs_hist: list[np.ndarray] = []
+        picks: list[np.ndarray] = []
+        step_losses: list[float] = []
+        for t in range(1, T + 1):
+            logits = np.ascontiguousarray(actor.act(obs), dtype=np.float32)
+            mask_fn = getattr(env, "action_mask", None)
+            mask = np.asarray(mask_fn(), dtype=bool) if callable(mask_fn) else None
+            probs = self._probs(logits, mask)
+            if explore:
+                u = self._rng.random((batch, 1))
+                pick = np.minimum((np.cumsum(probs, axis=1) < u).sum(axis=1), probs.shape[1] - 1)
+            else:
+                pick = probs.argmax(axis=1)
+            onehot = np.zeros_like(probs, dtype=np.float32)
+            onehot[np.arange(batch), pick] = 1.0
+            actions.append(onehot)
+            probs_hist.append(probs)
+            picks.append(onehot)
+            obs = env.step(onehot)
+            rewards.append(np.asarray(reward_fn(obs, goal, t - 1), dtype=np.float32).reshape(batch))
+            step_losses.append(float(trainer.loss_fn.step_loss(obs, goal, t - 1)) if callable(getattr(trainer.loss_fn, "step_loss", None)) else float(-rewards[-1].mean()))
+        if explore:
+            returns = np.zeros((T, batch), dtype=np.float32)
+            running = np.zeros(batch, dtype=np.float32)
+            for t in range(T - 1, -1, -1):
+                running = rewards[t] + np.float32(self.gamma) * running
+                returns[t] = running
+            adv = returns - returns.mean(axis=1, keepdims=True)
+            if self.normalize_advantage:
+                adv = adv / (adv.std(axis=1, keepdims=True) + 1e-8)
+            for t in range(T, 0, -1):
+                p, oh = probs_hist[t - 1], picks[t - 1]
+                grad = -adv[t - 1][:, None] * (oh - p)
+                if self.entropy_weight:
+                    logp = np.log(np.clip(p, 1e-12, 1.0))
+                    ent = -(p * logp).sum(axis=1, keepdims=True)
+                    grad = grad + self.entropy_weight * p * (logp + ent)  # the gradient of minus the entropy bonus
+                actor.accumulate_grads(t, grad.astype(np.float32))
+            actor.backward_done()
+            actor.apply_updates(lr)
+        else:
+            actor.zero_grad()
+        return RolloutResult(total_loss=float(sum(step_losses)), actions=actions, seq_lens=trainer._seq_lens(), extras={"step_losses": step_losses})
+
+
+__all__ = ["BackpropFeedback", "CategoricalPolicyGradientFeedback", "ClosedLoopTrainer", "PolicyGradientFeedback", "RolloutResult", "TeacherForcingFeedback"]
