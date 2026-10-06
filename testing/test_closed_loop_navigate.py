@@ -133,3 +133,12 @@ def test_the_schema_loss_type_picks_the_route_loss_and_the_network_is_a_need() -
     assert modules_from_config({"assembly": {"modules": mods}, "schema_template": {"loss_type": "route_time"}})["loss"] == "route_time"
     out = assembly_needs(MODS)["needs"]
     assert [n["name"] for n in out] == ["graph_path"] and out[0]["required"] is True
+
+
+def test_the_fit_reports_how_many_routes_arrive_and_how_slow_they_are(tmp_path) -> None:
+    run = assemble_closed_loop(_cfg(_grid(tmp_path / "g.npz")), seed=0)
+    led = _Ledger()
+    fit_closed_loop(run, led, lr=0.003, steps=200, patience=0, checkpoint_every=200)
+    last = [e for e in led.extra if e][-1]
+    assert 0.0 <= last["val_arrival_rate"] <= 1.0 and last["val_arrival_rate"] > 0.5  # most held-out routes arrive after training
+    assert last["val_median_time_ratio"] >= 1.0  # no route is quicker than the quickest one

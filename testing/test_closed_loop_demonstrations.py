@@ -40,6 +40,8 @@ class _Ledger:
 
     def push_step_metrics(self, step, version, train, val, **kw):
         self.docs.append(("step", step, train, val))
+        self.extra = getattr(self, "extra", [])
+        self.extra.append(kw.get("extra_metrics"))
 
     def push_run_end(self, end):
         self.docs.append(("end", end))

@@ -52,9 +52,11 @@ def fit_closed_loop(
         if should_stop():
             break
         train_loss = terminal_loss(run.trainer.rollout_train(goal=run.data.train_goal(i), lr=lr))
-        val_loss = terminal_loss(run.trainer.rollout_train(goal=run.data.val_goal(i), lr=lr, apply_updates=False))
+        val_result = run.trainer.rollout_train(goal=run.data.val_goal(i), lr=lr, apply_updates=False)
+        val_loss = terminal_loss(val_result)
         done = i
-        ledger.push_step_metrics(i, i, train_loss, val_loss)
+        held_out = {f"val_{k}": v for k, v in ((getattr(val_result, "extras", None) or {}).get("metrics") or {}).items()}
+        ledger.push_step_metrics(i, i, train_loss, val_loss, extra_metrics=held_out or None)
         ledger.version = i
 
         if i <= es_warmup:  # warm-up: always the baseline, never a bad streak

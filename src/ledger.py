@@ -436,6 +436,7 @@ class TrainingLedger:
         val_loss: float | None = None,
         verdict: str = VERDICT_HEALTHY,
         train_by_source: dict[str, Any] | None = None,
+        extra_metrics: dict[str, float] | None = None,
     ) -> int:
         gap = None
         if val_loss is not None:
@@ -453,6 +454,9 @@ class TrainingLedger:
             "verdict": verdict,
             "is_local_best_val": is_best,
         }
+        if extra_metrics:
+            # Named numbers a family wants shown beside the losses (a preference model's accuracy, a router's arrival rate).
+            body["extra_metrics"] = {str(k): float(v) for k, v in extra_metrics.items() if v is not None and float(v) == float(v)}
         if train_by_source:
             # Per-feed train losses (live / rehearsal / golden / ...): a chart can show which feed drives the loss.
             body["train_by_source"] = {

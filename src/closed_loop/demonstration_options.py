@@ -256,6 +256,10 @@ class BradleyTerryMargin:
         d_margin_d_action = 2.0 * (goal.actions[:, t] - goal.rejected[:, t])
         return (d_loss_d_margin[:, None] * d_margin_d_action / len(action)).astype(np.float32)
 
+    def step_metrics(self, action: np.ndarray, goal: PreferenceGoal, t: int) -> dict[str, float]:
+        """How often the policy's action is nearer the chosen one than the rejected one (the number a person judging it wants)."""
+        return {"accuracy": self.accuracy(action, goal, t)}
+
     @staticmethod
     def accuracy(action: np.ndarray, goal: PreferenceGoal, t: int) -> float:
         """How often the policy's action is closer to the chosen one than to the rejected one (for checking, not training)."""
