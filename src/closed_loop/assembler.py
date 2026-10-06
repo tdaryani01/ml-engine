@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.closed_loop.registry import SEATS, loss_options_for, loss_types_of, resolve
-from src.closed_loop.trainer import BackpropFeedback, ClosedLoopTrainer, PolicyGradientFeedback
+from src.closed_loop.trainer import BackpropFeedback, ClosedLoopTrainer, PolicyGradientFeedback, TeacherForcingFeedback
 
 
 @dataclass
@@ -54,7 +54,7 @@ def modules_from_config(cfg: dict[str, Any]) -> dict[str, str]:
     return {s: str(modules[s]).strip() for s in SEATS}
 
 
-_FEEDBACK_PARAMS = {"backprop": (), "policy_gradient": ("noise_std", "gamma", "normalize_advantage")}
+_FEEDBACK_PARAMS = {"backprop": (), "policy_gradient": ("noise_std", "gamma", "normalize_advantage"), "teacher_forcing": ()}
 
 
 def feedback_from_config(cfg: dict[str, Any], *, seed: int = 0) -> Any:
@@ -72,6 +72,8 @@ def feedback_from_config(cfg: dict[str, Any], *, seed: int = 0) -> Any:
         raise ValueError(f"feedback {kind!r} takes {list(_FEEDBACK_PARAMS[kind]) or 'no parameters'}, not {unknown}")
     if kind == "backprop":
         return BackpropFeedback()
+    if kind == "teacher_forcing":
+        return TeacherForcingFeedback()
     return PolicyGradientFeedback(seed=int(seed), **spec)
 
 

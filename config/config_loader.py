@@ -33,7 +33,7 @@ _REQUIRED_CNN_KEYS = ("input_shape", "spatial_pipeline")
 
 # Closed-loop dispatch payload: the app-layer topology lives under ``closed_loop``.
 _REQUIRED_CLOSED_LOOP_SECTIONS = ("closed_loop", "optimization")
-_REQUIRED_CLOSED_LOOP_KEYS = ("max_steps", "batch_size", "canvas")
+_REQUIRED_CLOSED_LOOP_KEYS = ("max_steps", "batch_size")  # an option that needs more (a canvas size, say) checks its own keys
 
 # Non-config control keys that may ride along in a TM payload.
 _TM_CONTROL_KEYS = (

@@ -16,7 +16,12 @@ _SCALARS = frozenset({"opt_t"})  # stored as arrays; the wire gives them back as
 
 
 def capture_state(actor: Any) -> dict[str, np.ndarray]:
-    """Copies of every trainable tensor and optimizer moment, flattened to ``{name: array}``."""
+    """Copies of every trainable tensor and optimizer moment, flattened to ``{name: array}``.
+
+    An actor that owns its state says so with ``state_arrays()`` / ``load_state_arrays(flat)``; the others are the canvas stack's."""
+    own = getattr(actor, "state_arrays", None)
+    if callable(own):
+        return {k: np.array(v, copy=True) for k, v in own().items()}
     from examples.closed_loop_draw.draw_checkpoint import snapshot_trainable
 
     flat: dict[str, np.ndarray] = {}
@@ -30,6 +35,10 @@ def capture_state(actor: Any) -> dict[str, np.ndarray]:
 
 
 def restore_state(actor: Any, flat: dict[str, np.ndarray]) -> None:
+    own = getattr(actor, "load_state_arrays", None)
+    if callable(own):
+        own({k: np.asarray(v) for k, v in flat.items()})
+        return
     from examples.closed_loop_draw.draw_checkpoint import restore_trainable
 
     grouped: dict[str, Any] = {}
