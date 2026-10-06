@@ -13,7 +13,7 @@ Seats: env ``road_graph``, loss ``route_time`` (schema ``loss_type`` ``route_tim
 and policy ``mlp`` are shared (the policy's action_dim is K: one logit per road slot).
 
 Config (``closed_loop``): ``graph_path`` (the ``.npz``), ``max_steps``, ``batch_size``, ``max_roads`` (K, default 6), ``obs_dim``
-(9 + 6K) and ``action_dim`` (K), ``route_destinations`` (default 48), ``route_min_edges`` / ``route_max_edges`` (route length range in
+(9 + 6K) and ``action_dim`` (K), ``val_routes`` (held-out routes per evaluation, default max(batch_size, 128)), ``route_destinations`` (default 48), ``route_min_edges`` / ``route_max_edges`` (route length range in
 median-edge-times, default 3 and 25), ``arrival_bonus`` (default 1), ``fail_penalty`` (default 2), ``val_fraction``.
 """
 from __future__ import annotations
@@ -246,6 +246,8 @@ class RoadRoutes:
         cl = cfg["closed_loop"]
         self.g = load_graph(cl)
         self.batch = int(cl["batch_size"])
+        # The held-out routes: more than a training batch, because a sampled policy's held-out number swings by several points on a few dozen.
+        self.val_routes = int(cl.get("val_routes", max(self.batch, 128)))
         self.seed = int(cl.get("seed") or (cfg.get("optimization") or {}).get("seed") or 0)
         rng = np.random.default_rng([self.seed, 3])
         lo, hi = float(cl.get("route_min_edges", 3)) * self.g.edge_time, float(cl.get("route_max_edges", 25)) * self.g.edge_time
@@ -278,7 +280,7 @@ class RoadRoutes:
         return self._draw(np.random.default_rng([self.seed, self._stretch, self._plate, int(step)]), self.train_cases, self.batch)
 
     def val_goal(self, step: int) -> RouteGoal:
-        return self._draw(np.random.default_rng([self.seed, 7]), self.val_cases, self.batch)
+        return self._draw(np.random.default_rng([self.seed, 7]), self.val_cases, self.val_routes)
 
     def next_plate(self) -> None:
         self._plate += 1

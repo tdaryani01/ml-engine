@@ -142,3 +142,12 @@ def test_the_fit_reports_how_many_routes_arrive_and_how_slow_they_are(tmp_path) 
     last = [e for e in led.extra if e][-1]
     assert 0.0 <= last["val_arrival_rate"] <= 1.0 and last["val_arrival_rate"] > 0.5  # most held-out routes arrive after training
     assert last["val_median_time_ratio"] >= 1.0  # no route is quicker than the quickest one
+
+
+def test_the_held_out_set_is_bigger_than_a_training_batch_and_the_same_every_time(tmp_path) -> None:
+    run = assemble_closed_loop(_cfg(_grid(tmp_path / "g.npz"), batch_size=16), seed=0)
+    first, again = run.data.val_goal(1), run.data.val_goal(9)
+    assert first.batch_size == 128 and run.data.train_goal(1).batch_size == 16  # more held-out routes than a training batch
+    assert (first.origin == again.origin).all() and (first.dest == again.dest).all()  # and the same routes every evaluation, so fits stay comparable
+    small = assemble_closed_loop(_cfg(_grid(tmp_path / "g.npz"), val_routes=40), seed=0)
+    assert small.data.val_goal(1).batch_size == 40  # configurable
