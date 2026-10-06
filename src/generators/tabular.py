@@ -27,6 +27,24 @@ def _majority(y: np.ndarray) -> float:
     return float(np.bincount(y.astype(int)).max() / len(y))
 
 
+def _bayes(prob_one: np.ndarray, y: np.ndarray) -> dict[str, float]:
+    """The best any model can do when the true chance of class 1 is known: its log-loss (nats) and its accuracy."""
+    p = np.clip(prob_one, 1e-12, 1 - 1e-12)
+    return {"best_possible_loss": float(-np.mean(np.where(y == 1, np.log(p), np.log(1 - p)))),
+            "best_possible": float(np.mean((p > 0.5) == (y == 1)))}
+
+
+def _phi(x: np.ndarray) -> np.ndarray:
+    from math import erf, sqrt
+
+    return 0.5 * (1.0 + np.vectorize(erf)(x / sqrt(2.0)))
+
+
+def _concept_direction(seed: int, n: int) -> np.ndarray:
+    u = np.random.default_rng([int(seed), 2]).standard_normal(n)  # the first draw of the concept stream, as ``_make`` takes it
+    return u / np.linalg.norm(u)
+
+
 class _Classifier(Generator):
     binary_only = False
 
@@ -60,6 +78,19 @@ class Blobs(_Classifier):
         y = rng.integers(0, 2, size=p["rows"])
         centre = (y[:, None] * 2 - 1) * (p["separation"] / 2.0) * u[None, :]
         return Data(centre + p["noise"] * rng.standard_normal((p["rows"], _nf(p))), y, "classification", 2)
+
+
+def _blobs_baseline(self, shapes, params, seed):
+    out = _Classifier.baseline(self, shapes, params, seed)
+    p = self.resolve(params)
+    d = self.build(shapes, {**(params or {}), "rows": 4000}, seed, "heldout")
+    u = _concept_direction(seed, _nf(p))
+    logit = p["separation"] * (d.X @ u) / p["noise"] ** 2
+    out.update(_bayes(1.0 / (1.0 + np.exp(-logit)), d.y))
+    return out
+
+
+Blobs.baseline = _blobs_baseline  # type: ignore[method-assign]
 
 
 class Moons(_Classifier):
@@ -98,6 +129,16 @@ class Xor(_Classifier):
         return Data(X, np.where(flip, 1 - y, y), "classification", 2)
 
 
+def _xor_baseline(self, shapes, params, seed):
+    out = _Classifier.baseline(self, shapes, params, seed)
+    q = self.resolve(params)["label_noise"]
+    out.update({"best_possible": 1.0 - q, "best_possible_loss": 0.0 if q <= 0 else float(-(q * np.log(q) + (1 - q) * np.log(1 - q)))})
+    return out
+
+
+Xor.baseline = _xor_baseline  # type: ignore[method-assign]
+
+
 class LinearBoundary(_Classifier):
     name, label = "tabular_linear", "Linear boundary"
     description = "The class is which side of a random hyperplane a point falls on, with noise near the boundary."
@@ -112,6 +153,19 @@ class LinearBoundary(_Classifier):
         w /= np.linalg.norm(w)
         X = rng.standard_normal((p["rows"], _nf(p)))
         return Data(X, ((X @ w + p["noise"] * rng.standard_normal(p["rows"])) > 0).astype(int), "classification", 2)
+
+
+def _linear_baseline(self, shapes, params, seed):
+    out = _Classifier.baseline(self, shapes, params, seed)
+    p = self.resolve(params)
+    d = self.build(shapes, {**(params or {}), "rows": 4000}, seed, "heldout")
+    w = _concept_direction(seed, _nf(p))
+    z = d.X @ w
+    out.update(_bayes(_phi(z / p["noise"]) if p["noise"] > 0 else (z > 0).astype(float), d.y))
+    return out
+
+
+LinearBoundary.baseline = _linear_baseline  # type: ignore[method-assign]
 
 
 class Clusters(_Classifier):

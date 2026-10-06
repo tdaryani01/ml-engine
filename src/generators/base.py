@@ -47,6 +47,14 @@ class Data:
     classes: int | None = None
 
 
+@dataclass
+class ArrayData:
+    """What a closed-loop generator builds: named arrays, written as the ``.npz`` the family's data option reads."""
+
+    arrays: dict[str, np.ndarray]
+    task: str = "arrays"
+
+
 class Generator:
     """Subclass, set the class attributes, implement ``_fields``, ``_make`` and ``baseline``, and ``register`` it."""
 
@@ -144,4 +152,4 @@ def generators(model_class: str | None = None) -> list[Generator]:
 
 
 def _load_builtin() -> None:
-    from src.generators import tabular as _t  # noqa: F401  (registers the built-in generators on import)
+    from src.generators import closed_loop as _c, perceptual as _p, tabular as _t  # noqa: F401  (registers the built-in generators on import)

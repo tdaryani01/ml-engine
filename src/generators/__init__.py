@@ -8,9 +8,9 @@ import csv
 from pathlib import Path
 from typing import Any
 
-from src.generators.base import Data, Field, Generator, generators, get, register
+from src.generators.base import ArrayData, Data, Field, Generator, generators, get, register
 
-__all__ = ["Data", "Field", "Generator", "baseline", "build", "canonical_spec", "check", "describe", "generators", "get", "register", "write_csv"]
+__all__ = ["ArrayData", "Data", "Field", "Generator", "baseline", "build", "canonical_spec", "check", "describe", "generators", "get", "register", "write", "write_csv", "write_npz"]
 
 
 def describe(model_class: str | None = None) -> list[dict[str, Any]]:
@@ -79,3 +79,18 @@ def write_csv(data: Data, path: Path | str) -> Path:
         for row, y in zip(data.X, data.y):
             w.writerow([f"{v:.6f}" for v in row] + [str(int(y)) if data.task == "classification" else f"{float(y):.6f}"])
     return p
+
+
+def write_npz(data: ArrayData, path: Path | str) -> Path:
+    """The arrays as the ``.npz`` a closed-loop family's data option reads."""
+    import numpy as np
+
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(p, **data.arrays)
+    return p
+
+
+def write(data: Data | ArrayData, path: Path | str) -> Path:
+    """Write the data in the form its model class reads: a CSV plate for tabular models, an ``.npz`` for the closed-loop families."""
+    return write_npz(data, path) if isinstance(data, ArrayData) else write_csv(data, path)

@@ -29,7 +29,8 @@ def test_each_class_lists_the_generators_that_can_feed_it() -> None:
     assert names("binary_classification") >= {"tabular_blobs", "tabular_moons", "tabular_xor", "tabular_linear"}
     assert names("multi_class") >= {"tabular_clusters", "tabular_random_network"}
     assert names("regression") == {"tabular_sine_mix", "tabular_polynomial", "tabular_linear_regression"}
-    assert names("cnn") == set()  # no generator for it yet: the form offers none
+    assert names("cnn") == {"image_shapes", "image_gratings"} and names("mhsa") == {"seq_recall", "seq_marked_total"}
+    assert names("some_unknown_class") == set()  # a class with no generator: the form offers none
     for d in g.describe():
         for f in d["fields"]:
             assert f["minimum"] is None or f["maximum"] is None or f["minimum"] <= f["default"] <= f["maximum"], (d["name"], f["name"])
