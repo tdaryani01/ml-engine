@@ -214,6 +214,6 @@ def demonstrations(cfg: dict[str, Any]):
 
 
 needs.declare_needs("data", "demonstrations", [
-    {"name": "demonstrations_path", "kind": "file", "label": "Demonstrations (.npz)", "required": True,
+    {"name": "demonstrations_path", "kind": "file", "label": "Demonstrations (.npz)", "required": True, "config_key": "closed_loop.demonstrations_path",
      "hint": "Recorded observations (episodes, steps, obs_dim) and actions (episodes, steps, action_dim). It is read on this computer and never sent to TM."},
 ])

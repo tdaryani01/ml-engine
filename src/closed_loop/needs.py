@@ -3,7 +3,10 @@
 An option declares its needs by name; the Desktop reads them for the model's chosen options from its own ML engine (the one
 that will run the model) and asks the user at Add time. The answers stay on that machine. A need is
 
-    {"name": str, "kind": "file" | "folder" | "number" | "secret", "label": str, "hint": str, "required": bool, "default": Any}
+    {"name": str, "kind": "file" | "folder" | "number" | "secret", "label": str, "hint": str, "required": bool, "default": Any,
+     "config_key": "closed_loop.some_key" | None}
+
+``config_key`` says where the user's answer goes in the run config (dotted path); the Desktop sets it there, over anything TM sent.
 
 ``assembly_needs`` never raises: it returns what it found, so a page can show every problem at once.
 """
@@ -28,7 +31,8 @@ def _clean(raw: dict[str, Any]) -> dict[str, Any]:
     if kind not in KINDS:
         raise ValueError(f"need {name!r}: kind must be one of {KINDS}, not {kind!r}")
     return {"name": name, "kind": kind, "label": str(raw.get("label") or name), "hint": str(raw.get("hint") or ""),
-            "required": bool(raw.get("required", True)), "default": raw.get("default")}
+            "required": bool(raw.get("required", True)), "default": raw.get("default"),
+            "config_key": (str(raw["config_key"]).strip() or None) if raw.get("config_key") else None}
 
 
 def declare_needs(seat: str, name: str, needs: list[dict[str, Any]]) -> None:
@@ -36,6 +40,29 @@ def declare_needs(seat: str, name: str, needs: list[dict[str, Any]]) -> None:
     if seat not in registry.SEATS + registry.OPTIONAL_SEATS:
         raise ValueError(f"unknown seat {seat!r}")
     _NEEDS[(seat, name)] = [_clean(n) for n in needs]
+
+
+def apply_answers(config: dict[str, Any], needs: list[dict[str, Any]], answers: dict[str, Any]) -> dict[str, Any]:
+    """A copy of a run config with the user's answers set at each need's ``config_key``. The user's answer always wins; for a file,
+    folder or secret a value TM sent at that key is removed when the user gave none (TM never names a path or holds a secret)."""
+    import copy
+
+    out = copy.deepcopy(config)
+    for n in needs:
+        key = n.get("config_key")
+        if not key:
+            continue
+        parts = key.split(".")
+        node = out
+        for part in parts[:-1]:
+            node = node.setdefault(part, {}) if isinstance(node.get(part, {}), dict) else node.setdefault(part, {})
+        raw = answers.get(n["name"])
+        value = "" if raw is None else str(raw).strip()
+        if value:
+            node[parts[-1]] = float(value) if n["kind"] == "number" else value
+        elif n["kind"] in ("file", "folder", "secret"):
+            node.pop(parts[-1], None)
+    return out
 
 
 def assembly_needs(modules: dict[str, str]) -> dict[str, Any]:
@@ -93,4 +120,4 @@ def check_answers(needs: list[dict[str, Any]], answers: dict[str, Any]) -> list[
     return problems
 
 
-__all__ = ["KINDS", "assembly_needs", "check_answers", "declare_needs"]
+__all__ = ["KINDS", "apply_answers", "assembly_needs", "check_answers", "declare_needs"]
