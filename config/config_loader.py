@@ -465,7 +465,9 @@ def _parse_tm_closed_loop_config(
                 "TM closed-loop payload closed_loop missing required key(s): "
                 + ", ".join(missing_keys)
             )
-        if template is not None:
+        # Only an MHSA policy has MHSA dims (a payload that names no policy is the original MHSA stack).
+        policy = str((((cfg.get("assembly") or {}).get("modules")) or {}).get("policy") or "mhsa").strip().lower()
+        if template is not None and policy == "mhsa":
             geometry = dict(template.to_mhsa_mapping())
             # The policy's dims may be authored in the payload's own mhsa block (as for the supervised profile);
             # the schema only has to supply what that block does not.
