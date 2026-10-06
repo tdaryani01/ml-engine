@@ -33,8 +33,9 @@ def _goal(cfg):
 
 
 def test_the_registry_knows_the_built_in_options_by_the_names_tm_uses() -> None:
-    assert options("encoder") == ["cnn_upstream"] and options("policy") == ["mhsa"]
-    assert options("env") == ["soft_canvas"] and options("loss") == ["canvas_reconstruction"]
+    # the names TM's catalog uses are there (other families register more options beside them)
+    assert "cnn_upstream" in options("encoder") and "mhsa" in options("policy")
+    assert "soft_canvas" in options("env") and "canvas_reconstruction" in options("loss")
 
 
 def test_an_unknown_option_is_refused_and_names_what_is_available() -> None:

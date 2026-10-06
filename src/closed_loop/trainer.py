@@ -222,4 +222,42 @@ class PolicyGradientFeedback:
         )
 
 
-__all__ = ["BackpropFeedback", "ClosedLoopTrainer", "PolicyGradientFeedback", "RolloutResult"]
+class TeacherForcingFeedback:
+    """Feedback by imitation: the actor sees the recorded observations and is scored on the recorded actions.
+
+    The environment only replays observations (``reset``/``step``); the loss option provides ``step_action_loss(action, goal, t)``
+    and ``step_action_grad(action, goal, t)`` against the recorded action. The gradient goes through the actor's own
+    ``accumulate_grads``. Validation (``apply_updates=False``) computes the same losses without gradients."""
+
+    def run(self, trainer: "ClosedLoopTrainer", *, goal: Goal, lr: float, apply_updates: bool = True) -> RolloutResult:
+        loss_fn = trainer.loss_fn
+        for need in ("step_action_loss", "step_action_grad"):
+            if not callable(getattr(loss_fn, need, None)):
+                raise RuntimeError(f"TeacherForcingFeedback needs a loss evaluator with {need}(action, goal, t)")
+        actor, env, T = trainer.actor, trainer.env, trainer.max_steps
+        batch = _goal_batch_size(goal)
+        actor.zero_grad()
+        actor.reset(batch, goal, T)
+        obs = env.reset(batch, goal)
+        actions: list[np.ndarray] = []
+        step_losses: list[float] = []
+        grads: list[np.ndarray] = []
+        for t in range(1, T + 1):
+            action = np.ascontiguousarray(actor.act(obs), dtype=np.float32)
+            actions.append(action)
+            step_losses.append(float(loss_fn.step_action_loss(action, goal, t - 1)))
+            if apply_updates:
+                grads.append(np.asarray(loss_fn.step_action_grad(action, goal, t - 1), dtype=np.float32))
+            obs = env.step(action)
+        if apply_updates:
+            for t in range(T, 0, -1):
+                actor.accumulate_grads(t, grads[t - 1])
+            actor.backward_done()
+            actor.apply_updates(lr)
+        else:
+            actor.zero_grad()
+        mean = float(np.mean(step_losses))  # one number per trajectory: the fit loop reads the last entry of step_losses
+        return RolloutResult(total_loss=mean, actions=actions, seq_lens=trainer._seq_lens(), extras={"step_losses": [mean]})
+
+
+__all__ = ["BackpropFeedback", "ClosedLoopTrainer", "PolicyGradientFeedback", "RolloutResult", "TeacherForcingFeedback"]
