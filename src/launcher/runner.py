@@ -107,6 +107,7 @@ def run_me_fit(
     epoch = 0
     last_train = 1.0
     last_val: float | None = None
+    last_extra: dict[str, float] | None = None  # named numbers a family reports beside the losses (held-out accuracy, arrival rate, ...)
     last_version = int(base_traj)
     started = time.monotonic()
     ended: dict[str, Any] | None = None
@@ -124,6 +125,8 @@ def run_me_fit(
             "phase": phase,
             "version": int(base_traj) + int(rel_version),
         }
+        if last_extra:
+            s["extra_metrics"] = dict(last_extra)
         if doc is not None:
             s["checkpoint_bytes"] = _restamp(doc, int(base_traj) + int(rel_version))
         return s
@@ -160,6 +163,8 @@ def run_me_fit(
                     if t == "step.metrics" and m.get("val_loss") is not None:
                         last_val = float(m["val_loss"])
                         epoch += 1
+                    if t == "step.metrics" and isinstance(m.get("extra_metrics"), dict):
+                        last_extra = {str(k): float(v) for k, v in m["extra_metrics"].items()}
                     rel = int(d.version or step)
                     last_version = int(base_traj) + rel
                     cp = pending_cp.pop(rel, None)
@@ -170,6 +175,8 @@ def run_me_fit(
                     v = d.body.get("val_loss")
                     if v is not None:
                         last_val = float(v)
+                    if isinstance(d.body.get("extra_metrics"), dict):
+                        last_extra = {str(k): float(x) for k, x in d.body["extra_metrics"].items()}
                 elif t == "checkpoint":
                     rel = int(d.version or 0)
                     if rel <= 0:

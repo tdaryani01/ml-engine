@@ -242,10 +242,15 @@ class TeacherForcingFeedback:
         actions: list[np.ndarray] = []
         step_losses: list[float] = []
         grads: list[np.ndarray] = []
+        step_metric = getattr(loss_fn, "step_metrics", None)  # optional: named numbers per step (averaged over the trajectory)
+        metric_sums: dict[str, float] = {}
         for t in range(1, T + 1):
             action = np.ascontiguousarray(actor.act(obs), dtype=np.float32)
             actions.append(action)
             step_losses.append(float(loss_fn.step_action_loss(action, goal, t - 1)))
+            if callable(step_metric):
+                for k, v in step_metric(action, goal, t - 1).items():
+                    metric_sums[k] = metric_sums.get(k, 0.0) + float(v)
             if apply_updates:
                 grads.append(np.asarray(loss_fn.step_action_grad(action, goal, t - 1), dtype=np.float32))
             obs = env.step(action)
@@ -257,7 +262,10 @@ class TeacherForcingFeedback:
         else:
             actor.zero_grad()
         mean = float(np.mean(step_losses))  # one number per trajectory: the fit loop reads the last entry of step_losses
-        return RolloutResult(total_loss=mean, actions=actions, seq_lens=trainer._seq_lens(), extras={"step_losses": [mean]})
+        extras: dict[str, Any] = {"step_losses": [mean]}
+        if metric_sums:
+            extras["metrics"] = {k: v / T for k, v in metric_sums.items()}
+        return RolloutResult(total_loss=mean, actions=actions, seq_lens=trainer._seq_lens(), extras=extras)
 
 
 
@@ -338,7 +346,11 @@ class CategoricalPolicyGradientFeedback:
             actor.apply_updates(lr)
         else:
             actor.zero_grad()
-        return RolloutResult(total_loss=float(sum(step_losses)), actions=actions, seq_lens=trainer._seq_lens(), extras={"step_losses": step_losses})
+        extras = {"step_losses": step_losses}
+        episode_metrics = getattr(trainer.loss_fn, "episode_metrics", None)  # optional: named numbers for the whole episode
+        if callable(episode_metrics):
+            extras["metrics"] = dict(episode_metrics(obs, goal))
+        return RolloutResult(total_loss=float(sum(step_losses)), actions=actions, seq_lens=trainer._seq_lens(), extras=extras)
 
 
 __all__ = ["BackpropFeedback", "CategoricalPolicyGradientFeedback", "ClosedLoopTrainer", "PolicyGradientFeedback", "RolloutResult", "TeacherForcingFeedback"]

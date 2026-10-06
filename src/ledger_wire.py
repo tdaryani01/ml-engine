@@ -228,6 +228,9 @@ def _unpack_step_consolidated(data: memoryview) -> tuple[dict[str, Any], int]:
     }, struct.calcsize("<QQQ")
 
 
+_STEP_METRICS_EXTRA_KEYS = ("extra_metrics", "train_by_source")
+
+
 def _pack_step_metrics(body: dict[str, Any]) -> bytes:
     val = body.get("val_loss")
     has_val = val is not None
@@ -240,6 +243,13 @@ def _pack_step_metrics(body: dict[str, Any]) -> bytes:
         parts.append(struct.pack("<dd", float(val), float(gap if gap is not None else 0.0)))
     parts.append(_pack_str(str(body.get("verdict", "HEALTHY"))))
     parts.append(struct.pack("<B", 1 if body.get("is_local_best_val") else 0))
+    # Named numbers a run reports beside the losses (per-feed train losses, a family's held-out accuracy ...): an optional JSON tail, so
+    # documents written without it still read, and a reader that stops after the fixed part ignores it.
+    extra = {k: body[k] for k in _STEP_METRICS_EXTRA_KEYS if isinstance(body.get(k), dict) and body[k]}
+    if extra:
+        blob = json.dumps(extra, separators=(",", ":")).encode("utf-8")
+        parts.append(struct.pack("<I", len(blob)))
+        parts.append(blob)
     return b"".join(parts)
 
 
@@ -266,6 +276,13 @@ def _unpack_step_metrics(data: memoryview) -> tuple[dict[str, Any], int]:
         "verdict": verdict,
         "is_local_best_val": is_best,
     }
+    if off + 4 <= len(data):  # documents written before the optional tail existed simply end here
+        (n,) = struct.unpack_from("<I", data, off)
+        off += 4
+        if n and off + n <= len(data):
+            tail = json.loads(bytes(data[off : off + n]).decode("utf-8"))
+            body.update({k: v for k, v in tail.items() if k in _STEP_METRICS_EXTRA_KEYS})
+        off += n
     return body, off
 
 

@@ -224,6 +224,21 @@ class RouteTime:
         return float(np.mean(o[:, 5] * self.g.t_scale / goal.optimal + self.fail * (o[:, 7] < 0.5) - 1.0))
 
 
+def _episode_metrics(self, obs: np.ndarray, goal: RouteGoal) -> dict[str, float]:
+    """After a whole route: how many arrived, and how long the ones that did took compared with the quickest route."""
+    o = np.asarray(obs, dtype=np.float64)
+    arrived = o[:, 7] > 0.5
+    out = {"arrival_rate": float(arrived.mean())}
+    if arrived.any():
+        ratio = o[arrived, 5] * self.g.t_scale / goal.optimal[arrived]
+        out["median_time_ratio"] = float(np.median(ratio))
+        out["mean_time_ratio"] = float(ratio.mean())
+    return out
+
+
+RouteTime.episode_metrics = _episode_metrics  # type: ignore[attr-defined]
+
+
 class RoadRoutes:
     """Origin-destination pairs. Some destinations are held out whole, so validation is on places never trained toward."""
 

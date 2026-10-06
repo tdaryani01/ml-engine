@@ -708,3 +708,19 @@ if __name__ == "__main__":
         sys.exit(1)
     print(f"[SUCCESS] All {len(PHASE_E_TESTS)} Phase E tests passed.")
     print("=" * 60)
+
+
+def test_step_metrics_carry_named_extras_and_documents_without_them_still_read() -> None:
+    from src import ledger_wire as w
+
+    plain = {"step_id": 3, "version": 3, "train_loss": 0.5, "val_loss": 0.4, "train_val_gap": -0.1, "verdict": "HEALTHY", "is_local_best_val": True}
+    old = w._pack_step_metrics(plain)  # what a writer without extras produced
+    got, off = w._unpack_step_metrics(memoryview(old))
+    assert off == len(old) and "extra_metrics" not in got and got["val_loss"] == 0.4
+
+    rich = {**plain, "extra_metrics": {"val_accuracy": 0.93, "val_arrival_rate": 1.0}, "train_by_source": {"live": 0.1, "golden": 0.2}}
+    packed = w._pack_step_metrics(rich)
+    back, off = w._unpack_step_metrics(memoryview(packed))
+    assert off == len(packed) and back["extra_metrics"] == {"val_accuracy": 0.93, "val_arrival_rate": 1.0}
+    assert back["train_by_source"] == {"live": 0.1, "golden": 0.2} and back["val_loss"] == 0.4 and back["is_local_best_val"] is True
+    assert w._pack_step_metrics(rich).startswith(old)  # the fixed part is unchanged: a reader that stops after it still works

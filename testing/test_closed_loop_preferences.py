@@ -83,3 +83,32 @@ def test_the_schema_loss_type_picks_the_preference_loss_and_the_file_is_a_need()
     assert modules_from_config({"assembly": {"modules": mods}, "schema_template": {"loss_type": "preference"}})["loss"] == "preference_margin"
     out = assembly_needs(MODS)
     assert [n["name"] for n in out["needs"]] == ["preferences_path"] and out["needs"][0]["config_key"] == "closed_loop.preferences_path"
+
+
+def test_the_fit_reports_the_held_out_accuracy_beside_the_loss(tmp_path) -> None:
+    rng = np.random.default_rng(0)
+    obs = rng.standard_normal((60, 4, 3)).astype(np.float32)
+    chosen = np.tanh(obs @ rng.standard_normal((3, 2))).astype(np.float32)
+    other = np.tanh(obs @ rng.standard_normal((3, 2))).astype(np.float32)  # an equally plausible action that was ranked lower
+    np.savez(tmp_path / "p.npz", observations=obs, chosen_actions=chosen, rejected_actions=other)
+    run = assemble_closed_loop(_cfg(tmp_path / "p.npz"), seed=0)
+    led = _Ledger()
+    fit_closed_loop(run, led, lr=0.02, steps=300, patience=0, checkpoint_every=300)
+    acc = [e["val_accuracy"] for e in led.extra if e]
+    assert len(acc) == 300 and all(0.0 <= a <= 1.0 for a in acc)
+    assert np.mean(acc[-10:]) >= 0.95 and np.mean(acc[-10:]) > acc[0] + 0.2  # the number a person judging it wants, rising to nearly always right
+
+
+def test_the_runner_carries_the_extra_metrics_out_with_each_snapshot(tmp_path) -> None:
+    from src.launcher import FamilyFitSpec, run_me_fit
+
+    rng = np.random.default_rng(0)
+    obs = rng.standard_normal((40, 4, 3)).astype(np.float32)
+    chosen = np.tanh(obs @ rng.standard_normal((3, 2))).astype(np.float32)
+    np.savez(tmp_path / "p.npz", observations=obs, chosen_actions=chosen, rejected_actions=np.tanh(obs @ rng.standard_normal((3, 2))).astype(np.float32))
+    cfg = _cfg(tmp_path / "p.npz", max_steps=4)
+    cfg["assembly"]["family_id"] = "closed_loop"  # the runner picks the pipeline from the family
+    spec = FamilyFitSpec(model_id="m", config=cfg, fit={"run_budget": 40, "patience": 0, "checkpoint_every": 20, "lr": 0.02}, num_threads=1)
+    snaps = list(run_me_fit(spec, work_dir=tmp_path / "w", should_stop=lambda: False))
+    carried = [s["extra_metrics"] for s in snaps if s.get("extra_metrics")]
+    assert carried and all("val_accuracy" in c for c in carried)  # what the Desktop turns into the thin row's extra metrics
