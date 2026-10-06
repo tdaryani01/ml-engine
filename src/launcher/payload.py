@@ -172,7 +172,7 @@ def _from_pipeline(spec: SupervisedFitSpec, *, work_dir: Path, restore: Path | N
     cfg["ledger"] = {
         "enabled": True, "path": "ledger", "store_backend": "file_streaming", "branch_id": "main",
         "checkpoint_every_steps": int(spec.checkpoint_every), "checkpoint_on_local_best": True,
-        "contract_list_enabled": False, "native_async_submit": False,
+        "contract_list_enabled": arch.get("model_type") == "mhsa", "native_async_submit": False,  # the mhsa model trains only through its contract list
         # The checkpoint stores the config TM sent (not this adapted copy), so Live and restore hand TM back its own config.
         "run_config": copy.deepcopy(base),
         **({"restore_checkpoint_path": str(restore)} if restore is not None else {}),
@@ -222,7 +222,7 @@ def build_pipeline_payload(
         "branch_id": "main",
         "checkpoint_every_steps": int(spec.checkpoint_every),
         "checkpoint_on_local_best": True,
-        "contract_list_enabled": False,
+        "contract_list_enabled": spec.model_type == "mhsa",  # the mhsa model trains only through its contract list
         "native_async_submit": False,
     }
     if restore_checkpoint_path is not None:

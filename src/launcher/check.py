@@ -70,6 +70,32 @@ def _check_corpus(spec: FamilyFitSpec) -> dict[str, Any]:
     return {"ok": not errors, "errors": errors, "warnings": [], "manifest": manifest}
 
 
+def _check_arrays(spec: Any, plate: Path) -> dict[str, Any]:
+    """An ``.npz`` for an image model (``X`` (N, C, H, W), ``y`` (N,)) or a sequence model (``X`` (N, T, D), ``y`` (N, A))."""
+    import numpy as np
+
+    errors: list[str] = []
+    manifest: dict[str, Any] = {}
+    try:
+        with np.load(plate) as z:
+            keys = set(z.files)
+            if not {"X", "y"} <= keys:
+                errors.append(f"{plate.name} needs the arrays 'X' and 'y'; it has {sorted(keys)}")
+            else:
+                x, y = z["X"], z["y"]
+                want = {"cnn": (4, "images (N, channels, height, width)"), "mhsa": (3, "sequences (N, steps, d_model)")}.get(spec.model_type)
+                if want is None:
+                    errors.append(f"a {spec.model_type} model reads a CSV plate, not an .npz")
+                elif x.ndim != want[0]:
+                    errors.append(f"X must be {want[1]}; it is {tuple(x.shape)}")
+                if len(x) != len(y):
+                    errors.append(f"X has {len(x)} rows but y has {len(y)}")
+                manifest = {"rows": int(len(x)), "x_shape": list(x.shape[1:]), "sha256": _sha256(plate), "source": plate.name, "model_type": spec.model_type}
+    except (OSError, ValueError) as exc:
+        errors.append(f"{plate.name} is not a readable .npz ({type(exc).__name__})")
+    return {"ok": not errors, "errors": errors, "warnings": [], "manifest": manifest}
+
+
 def check_config(config_path: Path | str, data_path: Path | str | None = None) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -86,6 +112,8 @@ def check_config(config_path: Path | str, data_path: Path | str | None = None) -
         return {"ok": True, "errors": [], "warnings": [], "manifest": {}}
 
     plate = Path(spec.data_path)
+    if plate.suffix.lower() == ".npz":  # images and sequences are arrays, not a CSV plate
+        return _check_arrays(spec, plate)
     header, rows, labels, problems = scan_plate(plate)
     manifest = {
         "rows": rows, "columns": header, "label_counts": dict(labels), "sha256": _sha256(plate),
