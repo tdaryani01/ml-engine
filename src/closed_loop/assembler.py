@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.closed_loop.registry import SEATS, loss_options_for, loss_types_of, resolve
-from src.closed_loop.trainer import BackpropFeedback, ClosedLoopTrainer, PolicyGradientFeedback, TeacherForcingFeedback
+from src.closed_loop.trainer import BackpropFeedback, ClosedLoopTrainer, PolicyGradientFeedback, TeacherForcingFeedback, CategoricalPolicyGradientFeedback
 
 
 @dataclass
@@ -54,7 +54,7 @@ def modules_from_config(cfg: dict[str, Any]) -> dict[str, str]:
     return {s: str(modules[s]).strip() for s in SEATS}
 
 
-_FEEDBACK_PARAMS = {"backprop": (), "policy_gradient": ("noise_std", "gamma", "normalize_advantage"), "teacher_forcing": ()}
+_FEEDBACK_PARAMS = {"backprop": (), "policy_gradient": ("noise_std", "gamma", "normalize_advantage"), "teacher_forcing": (), "categorical_policy_gradient": ("entropy_weight", "gamma", "normalize_advantage")}
 
 
 def feedback_from_config(cfg: dict[str, Any], *, seed: int = 0) -> Any:
@@ -74,15 +74,21 @@ def feedback_from_config(cfg: dict[str, Any], *, seed: int = 0) -> Any:
         return BackpropFeedback()
     if kind == "teacher_forcing":
         return TeacherForcingFeedback()
+    if kind == "categorical_policy_gradient":
+        return CategoricalPolicyGradientFeedback(seed=int(seed), **spec)
     return PolicyGradientFeedback(seed=int(seed), **spec)
+
+
+def kind_of(feedback: Any) -> str:
+    return "categorical_policy_gradient" if isinstance(feedback, CategoricalPolicyGradientFeedback) else "policy_gradient"
 
 
 def assemble_closed_loop(cfg: dict[str, Any], *, seed: int = 0) -> ClosedLoopRun:
     mods = modules_from_config(cfg)
     loss = resolve("loss", mods["loss"])(cfg)
     feedback = feedback_from_config(cfg, seed=seed)
-    if isinstance(feedback, PolicyGradientFeedback) and not callable(getattr(loss, "step_reward", None)):  # before anything native is opened
-        raise ValueError(f"feedback 'policy_gradient' needs a loss option with step_reward; {mods['loss']!r} has none")
+    if isinstance(feedback, (PolicyGradientFeedback, CategoricalPolicyGradientFeedback)) and not callable(getattr(loss, "step_reward", None)):  # before anything native is opened
+        raise ValueError(f"feedback {kind_of(feedback)!r} needs a loss option with step_reward; {mods['loss']!r} has none")
     encoder = resolve("encoder", mods["encoder"])(cfg, seed)
     actor = resolve("policy", mods["policy"])(cfg, encoder, seed)
     env = resolve("env", mods["env"])(cfg)

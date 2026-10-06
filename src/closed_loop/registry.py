@@ -54,7 +54,7 @@ def resolve(seat: str, name: str) -> Callable[..., Any]:
 
 
 def _load_builtin_options() -> None:
-    from src.closed_loop import data as _d, demonstration_options as _i, options as _, reach_options as _r  # noqa: F401  (registers the built-in options on import)
+    from src.closed_loop import data as _d, demonstration_options as _i, options as _, reach_options as _r, navigate_options as _n  # noqa: F401  (registers the built-in options on import)
 
 
 __all__ = ["OPTIONAL_SEATS", "SEATS", "options", "register", "resolve"]
