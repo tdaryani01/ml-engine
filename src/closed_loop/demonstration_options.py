@@ -206,6 +206,8 @@ class Demonstrations:
         if len(self.train_idx) == 0:
             raise ValueError(f"{path}: no training episodes are left after holding out {n_val}")
         self._plate = 0
+        # Each fit of a chain (Autopilot) is a stretch: it must draw NEW training batches, not replay the first fit's.
+        self._stretch = max(0, int(((cfg.get("fit") or {}).get("stretch_index")) or 1) - 1)
 
     def _batch(self, idx: np.ndarray) -> DemoGoal:
         return self._goal(*[a[idx] for a in self.arrays])
@@ -214,7 +216,7 @@ class Demonstrations:
         return DemoGoal(observations, actions)
 
     def train_goal(self, step: int) -> DemoGoal:
-        rng = np.random.default_rng([self.seed, self._plate, int(step)])
+        rng = np.random.default_rng([self.seed, self._stretch, self._plate, int(step)])
         take = rng.choice(self.train_idx, size=self.batch_size, replace=len(self.train_idx) < self.batch_size)
         return self._batch(take)
 
