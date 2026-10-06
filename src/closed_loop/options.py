@@ -59,7 +59,7 @@ def soft_canvas(cfg: dict[str, Any]):
     )
 
 
-@register("loss", "canvas_reconstruction")
+@register("loss", "canvas_reconstruction", loss_types=("mse",))
 def canvas_reconstruction(cfg: dict[str, Any]):
     from examples.closed_loop_draw.env import CanvasReconstructionLoss
 
