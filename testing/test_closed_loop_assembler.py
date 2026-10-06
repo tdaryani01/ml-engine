@@ -189,3 +189,19 @@ def test_policy_gradient_is_refused_at_assembly_when_the_loss_has_no_reward() ->
     cfg["closed_loop"]["feedback"] = "policy_gradient"
     with pytest.raises(ValueError, match="needs a loss option with step_reward"):
         assemble_closed_loop(cfg, seed=0)
+
+
+def _payload(policy):
+    return {"assembly": {"modules": {"encoder": "identity", "policy": policy, "env": "demo_replay", "loss": "action_mse", "data": "demonstrations"}},
+            "closed_loop": {"max_steps": 4, "batch_size": 8}, "optimization": {"learning_rate": 0.01},
+            "schema_template": {"schema_version": "1.0", "task_class": "imitate", "loss_type": "action_mse",
+                                "inputs": [{"name": "observation", "type": "float32", "shape": ["__OBSERVATION_DIM__"]}],
+                                "outputs": [{"name": "action", "type": "float32", "shape": ["__ACTION_DIM__"]}]}}
+
+
+def test_a_schema_asks_for_mhsa_dims_only_when_the_policy_is_mhsa() -> None:
+    from config.config_loader import TMConfigError, parse_tm_production_config
+
+    assert parse_tm_production_config(_payload("mlp"), profile="closed_loop")["closed_loop"]["max_steps"] == 4  # an MLP policy has no MHSA dims
+    with pytest.raises(TMConfigError, match="d_model"):
+        parse_tm_production_config(_payload("mhsa"), profile="closed_loop")
