@@ -123,3 +123,39 @@ def test_autopilot_starts_each_stretch_on_the_plate_after_the_one_the_last_early
     assert run.data.command_id == ids[(ids.index(first) + 2) % len(ids)]
     assert run.data.val_goal(1).command_ids[0] != run.data.command_id  # validation stays on a different plate than training
     run.close()
+
+
+def _mods(loss=None):
+    m = {"encoder": "cnn_upstream", "policy": "mhsa", "env": "soft_canvas"}
+    if loss:
+        m["loss"] = loss
+    return m
+
+
+def test_a_loss_the_assembly_leaves_out_is_the_one_the_schema_loss_type_names() -> None:
+    cfg = {"assembly": {"modules": _mods()}, "schema_template": {"loss_type": "MSE"}}
+    assert modules_from_config(cfg)["loss"] == "canvas_reconstruction"
+
+
+def test_a_loss_that_does_not_implement_the_schema_loss_type_is_refused() -> None:
+    cfg = {"assembly": {"modules": _mods("canvas_reconstruction")}, "schema_template": {"loss_type": "pairwise"}}
+    with pytest.raises(ValueError, match="implements \\['mse'\\].*loss_type 'pairwise'"):
+        modules_from_config(cfg)
+
+
+def test_a_schema_loss_type_nothing_implements_is_refused_when_the_assembly_names_no_loss() -> None:
+    with pytest.raises(ValueError, match="no loss option implements the schema loss_type 'pairwise'"):
+        modules_from_config({"assembly": {"modules": _mods()}, "schema_template": {"loss_type": "pairwise"}})
+
+
+def test_two_losses_for_one_loss_type_need_the_assembly_to_choose(monkeypatch) -> None:
+    from src.closed_loop import registry
+
+    monkeypatch.setitem(registry._LOSS_TYPES, "another_mse", ("mse",))
+    with pytest.raises(ValueError, match="several loss options.*another_mse.*canvas_reconstruction"):
+        modules_from_config({"assembly": {"modules": _mods()}, "schema_template": {"loss_type": "mse"}})
+    assert modules_from_config({"assembly": {"modules": _mods("canvas_reconstruction")}, "schema_template": {"loss_type": "mse"}})["loss"] == "canvas_reconstruction"
+
+
+def test_without_a_schema_loss_type_the_named_loss_is_used_as_before() -> None:
+    assert modules_from_config({"assembly": {"modules": _mods("canvas_reconstruction")}})["loss"] == "canvas_reconstruction"

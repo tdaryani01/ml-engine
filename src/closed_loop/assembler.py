@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from src.closed_loop.registry import SEATS, resolve
+from src.closed_loop.registry import SEATS, loss_options_for, loss_types_of, resolve
 from src.closed_loop.trainer import ClosedLoopTrainer
 
 
@@ -28,10 +28,29 @@ class ClosedLoopRun:
 
 
 def modules_from_config(cfg: dict[str, Any]) -> dict[str, str]:
+    """The option each seat uses. The schema's ``loss_type`` is data and the loss option is code, so they must agree: a loss the
+    assembly names must implement the schema's ``loss_type`` (refused otherwise), and a loss the assembly leaves out is the one
+    option that implements it (refused when none or several do)."""
     modules = dict(((cfg.get("assembly") or {}).get("modules")) or {})
+    loss_type = str(((cfg.get("schema_template") or {}).get("loss_type")) or "").strip().lower()
+    if loss_type and not str(modules.get("loss") or "").strip():
+        found = loss_options_for(loss_type)
+        if len(found) == 1:
+            modules["loss"] = found[0]
+        elif len(found) > 1:
+            raise ValueError(f"schema loss_type {loss_type!r} is implemented by several loss options ({', '.join(found)}); name one in assembly.modules.loss")
+        else:
+            raise ValueError(f"no loss option implements the schema loss_type {loss_type!r}")
     missing = [s for s in SEATS if not str(modules.get(s) or "").strip()]
     if missing:
         raise ValueError("assembly.modules must name an option for every seat; missing: " + ", ".join(missing))
+    named = str(modules["loss"]).strip()
+    declared = loss_types_of(named)
+    if loss_type and declared and loss_type not in declared:
+        raise ValueError(
+            f"loss option {named!r} implements {list(declared)} but the schema says loss_type {loss_type!r}"
+            + (f" (options for it: {', '.join(loss_options_for(loss_type))})" if loss_options_for(loss_type) else "")
+        )
     return {s: str(modules[s]).strip() for s in SEATS}
 
 
