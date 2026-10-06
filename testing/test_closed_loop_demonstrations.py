@@ -97,3 +97,43 @@ def test_the_demonstrations_option_asks_the_user_for_the_file() -> None:
 
     out = assembly_needs(MODS)
     assert [n["name"] for n in out["needs"]] == ["demonstrations_path"] and out["needs"][0]["kind"] == "file" and out["missing"] == []
+
+
+def test_the_history_policy_sees_its_last_observations_newest_first_zero_padded() -> None:
+    from src.closed_loop.demonstration_options import MlpHistoryActor
+
+    a = MlpHistoryActor(2, 1, 4, history=3, seed=0)
+    a.reset(2, None, 5)
+    seen = []
+    for t in range(1, 5):
+        obs = np.full((2, 2), float(t), dtype=np.float32)
+        a.act(obs)
+        seen.append(a._cache[-1][0][0].tolist())  # the input of the first sample at step t
+    assert seen[0] == [1, 1, 0, 0, 0, 0]  # step 1: the present, then nothing yet
+    assert seen[1] == [2, 2, 1, 1, 0, 0]
+    assert seen[3] == [4, 4, 3, 3, 2, 2]  # the last three, newest first
+    a.reset(2, None, 5)
+    a.act(np.full((2, 2), 9.0, dtype=np.float32))
+    assert a._cache[-1][0][0].tolist() == [9, 9, 0, 0, 0, 0]  # a new episode forgets the old one
+
+
+def test_memory_solves_what_the_current_observation_cannot(tmp_path) -> None:
+    """The action to copy is a function of the PREVIOUS step's observation: a policy that sees only the present cannot know it."""
+    rng = np.random.default_rng(0)
+    obs = rng.standard_normal((80, 8, 3)).astype(np.float32)
+    expert = rng.standard_normal((3, 2)).astype(np.float32)
+    act = np.zeros((80, 8, 2), dtype=np.float32)
+    act[:, 1:] = np.tanh(obs[:, :-1] @ expert)  # at step t the expert acts on what it saw at t - 1
+    np.savez(tmp_path / "d.npz", observations=obs, actions=act)
+
+    def held_out(policy, history):
+        cfg = _cfg(tmp_path / "d.npz", max_steps=8, obs_dim=3, action_dim=2, hidden=32, history=history)
+        cfg["assembly"]["modules"]["policy"] = policy
+        run = assemble_closed_loop(cfg, seed=0)
+        led = _Ledger()
+        fit_closed_loop(run, led, lr=0.02, steps=400, patience=0, checkpoint_every=400)
+        v = [d[3] for d in led.docs if d[0] == "step"]
+        return float(np.mean(v[-10:]))
+
+    blind, remembers = held_out("mlp", 1), held_out("mlp_history", 2)
+    assert remembers < 0.25 * blind  # with one step of memory the held-out error is a fraction of the memoryless one

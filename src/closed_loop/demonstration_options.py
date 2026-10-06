@@ -64,8 +64,11 @@ class MlpActor:
     def reset(self, batch_size: int, goal: Any, max_steps: int) -> None:
         self._cache = []
 
+    def _features(self, obs: np.ndarray) -> np.ndarray:
+        return np.ascontiguousarray(obs, dtype=np.float32).reshape(len(obs), -1)
+
     def act(self, obs: np.ndarray) -> np.ndarray:
-        x = np.ascontiguousarray(obs, dtype=np.float32).reshape(len(obs), -1)
+        x = self._features(obs)
         h = np.tanh(x @ self.params["W1"] + self.params["b1"])
         self._cache.append((x, h))
         return (h @ self.params["W2"] + self.params["b2"]).astype(np.float32)
@@ -118,6 +121,30 @@ class MlpActor:
             self._m[k][...] = flat.get(f"m_{k}", np.zeros_like(self._m[k]))
             self._v[k][...] = flat.get(f"v_{k}", np.zeros_like(self._v[k]))
         self._t = int(np.asarray(flat.get("opt_t", [0])).reshape(-1)[0])
+
+
+class MlpHistoryActor(MlpActor):
+    """The MLP policy with a short memory: it sees its last ``history`` observations, newest first, zero-padded at the start of an episode.
+
+    Memory is what lets a policy tell where it has just been (a loop, a dead end) or what just changed; the observation alone cannot."""
+
+    def __init__(self, obs_dim: int, action_dim: int, hidden: int, history: int, *, seed: int = 0) -> None:
+        if history < 1:
+            raise ValueError("closed_loop.history must be at least 1")
+        super().__init__(obs_dim * history, action_dim, hidden, seed=seed)
+        self.obs_dim, self.history = int(obs_dim), int(history)
+        self._past: list[np.ndarray] = []
+
+    def reset(self, batch_size: int, goal: Any, max_steps: int) -> None:
+        super().reset(batch_size, goal, max_steps)
+        self._past = []
+
+    def _features(self, obs: np.ndarray) -> np.ndarray:
+        now = np.ascontiguousarray(obs, dtype=np.float32).reshape(len(obs), -1)
+        self._past.append(now)
+        window = self._past[-self.history:][::-1]  # newest first
+        window += [np.zeros_like(now)] * (self.history - len(window))
+        return np.concatenate(window, axis=1)
 
 
 class ReplayEnv:
@@ -254,6 +281,12 @@ def identity_encoder(cfg: dict[str, Any], seed: int):
 def mlp_policy(cfg: dict[str, Any], encoder: Any, seed: int):
     cl = cfg["closed_loop"]
     return MlpActor(int(cl["obs_dim"]), int(cl["action_dim"]), int(cl.get("hidden", 32)), seed=seed)
+
+
+@register("policy", "mlp_history")
+def mlp_history_policy(cfg: dict[str, Any], encoder: Any, seed: int):
+    cl = cfg["closed_loop"]
+    return MlpHistoryActor(int(cl["obs_dim"]), int(cl["action_dim"]), int(cl.get("hidden", 32)), int(cl.get("history", 4)), seed=seed)
 
 
 @register("env", "demo_replay")
