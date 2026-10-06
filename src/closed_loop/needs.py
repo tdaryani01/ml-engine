@@ -59,6 +59,8 @@ def apply_answers(config: dict[str, Any], needs: list[dict[str, Any]], answers: 
         raw = answers.get(n["name"])
         value = "" if raw is None else str(raw).strip()
         if value:
+            if n["kind"] in ("file", "folder"):
+                value = str(Path(value).expanduser())  # a "~" is the user's shell shorthand: the run needs the real path
             node[parts[-1]] = float(value) if n["kind"] == "number" else value
         elif n["kind"] in ("file", "folder", "secret"):
             node.pop(parts[-1], None)

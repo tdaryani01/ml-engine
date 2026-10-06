@@ -69,3 +69,11 @@ def test_answers_land_at_the_needs_config_key_over_what_tm_sent() -> None:
     assert "path" not in gone["closed_loop"]  # no answer: a path TM sent is not used
     made = nd.apply_answers({}, [nd._clean(needs[0])], {"f": "/a"})
     assert made == {"closed_loop": {"path": "/a"}}
+
+
+def test_a_home_shorthand_in_a_file_or_folder_answer_becomes_the_real_path(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    needs = [nd._clean({"name": "f", "kind": "file", "config_key": "closed_loop.path"}), nd._clean({"name": "d", "kind": "folder", "config_key": "closed_loop.dir"}),
+             nd._clean({"name": "s", "kind": "secret", "config_key": "closed_loop.key"})]
+    out = nd.apply_answers({}, needs, {"f": "~/data/a.npz", "d": "~/out", "s": "~keep-as-is"})
+    assert out["closed_loop"] == {"path": f"{tmp_path}/data/a.npz", "dir": f"{tmp_path}/out", "key": "~keep-as-is"}  # a secret is not a path
