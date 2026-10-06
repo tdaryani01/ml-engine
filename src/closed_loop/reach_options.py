@@ -202,6 +202,8 @@ class ReachTargets:
         self.start_noise = float(cl.get("start_noise", 0.05))
         path = str(cl.get("targets_path") or "").strip()
         self._plate = 0
+        # Each fit of a chain (Autopilot) is a stretch: it must draw NEW training batches, not replay the first fit's.
+        self._stretch = max(0, int(((cfg.get("fit") or {}).get("stretch_index")) or 1) - 1)
         if path:
             with np.load(path, allow_pickle=False) as z:
                 if "targets" not in z:
@@ -227,7 +229,7 @@ class ReachTargets:
         return ReachGoal(pts, rng.uniform(-self.start_noise, self.start_noise, size=(len(pts), self.n)))
 
     def train_goal(self, step: int) -> ReachGoal:
-        rng = np.random.default_rng([self.seed, self._plate, int(step)])
+        rng = np.random.default_rng([self.seed, self._stretch, self._plate, int(step)])
         if self.train_pts is None:
             pts = self._workspace(rng, self.batch_size)
         else:

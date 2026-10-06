@@ -262,6 +262,8 @@ class RoadRoutes:
         n_val = max(1, int(round(len(self.cases) * float(cl.get("val_fraction", 0.2)))))
         self.val_cases, self.train_cases = self.cases[:n_val], self.cases[n_val:]
         self._plate = 0
+        # Each fit of a chain (Autopilot) is a stretch: it must draw NEW training batches, not replay the first fit's.
+        self._stretch = max(0, int(((cfg.get("fit") or {}).get("stretch_index")) or 1) - 1)
 
     def _draw(self, rng: np.random.Generator, cases: list, count: int) -> RouteGoal:
         pick = rng.integers(0, len(cases), size=count)
@@ -273,7 +275,7 @@ class RoadRoutes:
         return RouteGoal(origin, dest, opt)
 
     def train_goal(self, step: int) -> RouteGoal:
-        return self._draw(np.random.default_rng([self.seed, self._plate, int(step)]), self.train_cases, self.batch)
+        return self._draw(np.random.default_rng([self.seed, self._stretch, self._plate, int(step)]), self.train_cases, self.batch)
 
     def val_goal(self, step: int) -> RouteGoal:
         return self._draw(np.random.default_rng([self.seed, 7]), self.val_cases, self.batch)
