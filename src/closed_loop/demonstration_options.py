@@ -143,23 +143,31 @@ class ActionMse:
 
 
 class Demonstrations:
-    """Training batches from the training episodes; one fixed validation batch from whole held-out episodes."""
+    """Training batches from the training episodes; one fixed validation batch from whole held-out episodes.
+
+    A subclass names its file key (``PATH_KEY``), the arrays it reads (``ARRAYS``: the first is the observations, the second the
+    target actions, the rest ride along) and the goal it builds (``_goal``)."""
+
+    PATH_KEY = "demonstrations_path"
+    ARRAYS: tuple[str, ...] = ("observations", "actions")
 
     def __init__(self, cfg: dict[str, Any]) -> None:
         cl = cfg["closed_loop"]
-        path = str(cl.get("demonstrations_path") or "").strip()
+        path = str(cl.get(self.PATH_KEY) or "").strip()
         if not path:
-            raise ValueError("closed_loop.demonstrations_path is required (the .npz of recorded observations and actions)")
+            raise ValueError(f"closed_loop.{self.PATH_KEY} is required (the .npz with {', '.join(self.ARRAYS)})")
         with np.load(path, allow_pickle=False) as z:
-            if "observations" not in z or "actions" not in z:
-                raise ValueError(f"{path}: needs 'observations' (episodes, steps, obs_dim) and 'actions' (episodes, steps, action_dim)")
-            obs, act = np.asarray(z["observations"], np.float32), np.asarray(z["actions"], np.float32)
+            missing = [k for k in self.ARRAYS if k not in z]
+            if missing:
+                raise ValueError(f"{path}: needs {', '.join(repr(k) for k in self.ARRAYS)} (episodes, steps, features); missing {missing}")
+            arrays = [np.asarray(z[k], np.float32) for k in self.ARRAYS]
         steps = int(cl["max_steps"])
-        if obs.ndim != 3 or act.ndim != 3 or obs.shape[:2] != act.shape[:2]:
-            raise ValueError(f"{path}: observations and actions must be (episodes, steps, features) with the same episodes and steps")
-        if obs.shape[1] < steps:
-            raise ValueError(f"{path}: episodes have {obs.shape[1]} steps but closed_loop.max_steps is {steps}")
-        self.obs, self.act = obs[:, :steps], act[:, :steps]
+        if any(a.ndim != 3 or a.shape[:2] != arrays[0].shape[:2] for a in arrays):
+            raise ValueError(f"{path}: {', '.join(self.ARRAYS)} must be (episodes, steps, features) with the same episodes and steps")
+        if arrays[0].shape[1] < steps:
+            raise ValueError(f"{path}: episodes have {arrays[0].shape[1]} steps but closed_loop.max_steps is {steps}")
+        self.arrays = [a[:, :steps] for a in arrays]
+        self.obs, self.act = self.arrays[0], self.arrays[1]
         n = len(self.obs)
         if n < 2:
             raise ValueError(f"{path}: need at least 2 episodes (one is held out for validation)")
@@ -173,7 +181,10 @@ class Demonstrations:
         self._plate = 0
 
     def _batch(self, idx: np.ndarray) -> DemoGoal:
-        return DemoGoal(self.obs[idx], self.act[idx])
+        return self._goal(*[a[idx] for a in self.arrays])
+
+    def _goal(self, observations: np.ndarray, actions: np.ndarray) -> DemoGoal:
+        return DemoGoal(observations, actions)
 
     def train_goal(self, step: int) -> DemoGoal:
         rng = np.random.default_rng([self.seed, self._plate, int(step)])
@@ -185,6 +196,53 @@ class Demonstrations:
 
     def next_plate(self) -> None:
         self._plate += 1
+
+
+@dataclass
+class PreferenceGoal(DemoGoal):
+    """Observations, the action that was chosen and the one that was rejected at each step."""
+
+    rejected: np.ndarray = None  # (B, T, action_dim)
+
+
+class BradleyTerryMargin:
+    """Pairwise preference loss on the policy's action ``a``: ``softplus(-beta * (|a - rejected|^2 - |a - chosen|^2))``.
+
+    The policy is rewarded for being closer to the chosen action than to the rejected one; ``beta`` sets how sharp the
+    preference is. (Bradley-Terry: the probability that chosen beats rejected is ``sigmoid(beta * margin)``.)"""
+
+    def __init__(self, beta: float) -> None:
+        if beta <= 0:
+            raise ValueError("closed_loop.preference_beta must be > 0")
+        self.beta = float(beta)
+
+    def _margin(self, action: np.ndarray, goal: PreferenceGoal, t: int) -> np.ndarray:
+        c, r = goal.actions[:, t], goal.rejected[:, t]
+        return np.sum((action - r) ** 2, axis=1) - np.sum((action - c) ** 2, axis=1)
+
+    def step_action_loss(self, action: np.ndarray, goal: PreferenceGoal, t: int) -> float:
+        return float(np.mean(np.logaddexp(0.0, -self.beta * self._margin(action, goal, t))))
+
+    def step_action_grad(self, action: np.ndarray, goal: PreferenceGoal, t: int) -> np.ndarray:
+        m = self._margin(action, goal, t)
+        d_loss_d_margin = -self.beta / (1.0 + np.exp(np.clip(self.beta * m, -50.0, 50.0)))  # -beta * sigmoid(-beta * m)
+        d_margin_d_action = 2.0 * (goal.actions[:, t] - goal.rejected[:, t])
+        return (d_loss_d_margin[:, None] * d_margin_d_action / len(action)).astype(np.float32)
+
+    @staticmethod
+    def accuracy(action: np.ndarray, goal: PreferenceGoal, t: int) -> float:
+        """How often the policy's action is closer to the chosen one than to the rejected one (for checking, not training)."""
+        return float(np.mean(np.sum((action - goal.actions[:, t]) ** 2, axis=1) < np.sum((action - goal.rejected[:, t]) ** 2, axis=1)))
+
+
+class Preferences(Demonstrations):
+    """Like demonstrations, with a rejected action beside each chosen one."""
+
+    PATH_KEY = "preferences_path"
+    ARRAYS = ("observations", "chosen_actions", "rejected_actions")
+
+    def _goal(self, observations: np.ndarray, chosen: np.ndarray, rejected: np.ndarray) -> PreferenceGoal:
+        return PreferenceGoal(observations, chosen, rejected)
 
 
 @register("encoder", "identity")
@@ -216,4 +274,21 @@ def demonstrations(cfg: dict[str, Any]):
 needs.declare_needs("data", "demonstrations", [
     {"name": "demonstrations_path", "kind": "file", "label": "Demonstrations (.npz)", "required": True, "config_key": "closed_loop.demonstrations_path",
      "hint": "Recorded observations (episodes, steps, obs_dim) and actions (episodes, steps, action_dim). It is read on this computer and never sent to TM."},
+])
+
+
+@register("loss", "preference_margin", loss_types=("preference",))
+def preference_margin(cfg: dict[str, Any]):
+    return BradleyTerryMargin(float(cfg["closed_loop"].get("preference_beta", 4.0)))
+
+
+@register("data", "preferences")
+def preferences(cfg: dict[str, Any]):
+    return Preferences(cfg)
+
+
+needs.declare_needs("data", "preferences", [
+    {"name": "preferences_path", "kind": "file", "label": "Preferences (.npz)", "required": True, "config_key": "closed_loop.preferences_path",
+     "hint": "Observations (episodes, steps, obs_dim) with the chosen and the rejected action at each step (episodes, steps, action_dim). "
+             "It is read on this computer and never sent to TM."},
 ])
