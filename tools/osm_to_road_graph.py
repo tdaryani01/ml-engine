@@ -8,7 +8,8 @@ Input: the JSON an Overpass query returns with ``out geom`` for the drivable way
 
 Output: ``node_xy`` (metres, a local projection around the area's centre), directed ``edge_from``/``edge_to`` and ``edge_time`` (seconds,
 from each road's length and its ``maxspeed`` or a default for its kind), ``node_lonlat`` for reference. One-way streets are one-way;
-only the largest strongly connected part is kept, so every kept place can be reached from every other.
+only the largest strongly connected part is kept, so every kept place can be reached from every other. Points where a road only bends are
+merged, so a road runs from intersection to intersection and every step of a route is a real choice (or a real continuation).
 
     python tools/osm_to_road_graph.py extract.json road_graph.npz
 """
@@ -76,6 +77,62 @@ def _largest_scc(n: int, src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     return np.asarray(comp) == int(np.argmax(sizes))
 
 
+def _contract_pass_through(n: int, src: np.ndarray, dst: np.ndarray, time: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Merge the points where a road merely bends: a node with one road in and one out (one-way), or the same two neighbours both
+    ways (two-way), carries no choice, so the roads either side of it become one road with their times added.
+
+    Returns the kept nodes (indices into the old ones) and the new edges (in the new indices)."""
+    out: dict[int, dict[int, float]] = {i: {} for i in range(n)}
+    inc: dict[int, set[int]] = {i: set() for i in range(n)}
+    for a, b, w in zip(src.tolist(), dst.tolist(), time.tolist()):
+        if a != b and (b not in out[a] or w < out[a][b]):
+            out[a][b] = w
+            inc[b].add(a)
+    alive = set(range(n))
+    changed = True
+    while changed:
+        changed = False
+        for v in list(alive):
+            o, i = set(out[v]), inc[v]
+            if len(o) == 1 and len(i) == 1:
+                (a,), (b,) = i, o
+                if a != b:
+                    w = out[a][v] + out[v][b]
+                    if b not in out[a] or w < out[a][b]:
+                        out[a][b] = w
+                    inc[b].add(a)
+                    _drop(v, out, inc)
+                    alive.discard(v)
+                    changed = True
+            elif len(o) == 2 and o == i:
+                a, b = sorted(o)
+                for x, y in ((a, b), (b, a)):
+                    w = out[x][v] + out[v][y]
+                    if y not in out[x] or w < out[x][y]:
+                        out[x][y] = w
+                    inc[y].add(x)
+                _drop(v, out, inc)
+                alive.discard(v)
+                changed = True
+    keep = np.array(sorted(alive), dtype=np.int64)
+    new = {int(old): k for k, old in enumerate(keep)}
+    e_from, e_to, e_t = [], [], []
+    for a in keep.tolist():
+        for b, w in out[a].items():
+            e_from.append(new[a])
+            e_to.append(new[b])
+            e_t.append(w)
+    return keep, np.array(e_from), np.array(e_to), np.array(e_t)
+
+
+def _drop(v: int, out: dict[int, dict[int, float]], inc: dict[int, set[int]]) -> None:
+    for b in out[v]:
+        inc[b].discard(v)
+    for a in inc[v]:
+        out[a].pop(v, None)
+    out[v], inc[v] = {}, set()
+
+
 def road_graph_from_overpass(data: dict[str, Any]) -> dict[str, np.ndarray]:
     ids: dict[int, int] = {}
     lonlat: list[tuple[float, float]] = []
@@ -117,8 +174,10 @@ def road_graph_from_overpass(data: dict[str, Any]) -> dict[str, np.ndarray]:
     keep = _largest_scc(len(xy), src, dst)
     remap = np.cumsum(keep) - 1
     ok = keep[src] & keep[dst] & (metres > 0)
-    return {"node_xy": xy[keep], "node_lonlat": ll[keep], "edge_from": remap[src[ok]], "edge_to": remap[dst[ok]],
-            "edge_time": metres[ok] / (kmh[ok] / 3.6)}
+    node_idx = np.where(keep)[0]
+    times = metres[ok] / (kmh[ok] / 3.6)
+    kept, e_from, e_to, e_time = _contract_pass_through(len(node_idx), remap[src[ok]], remap[dst[ok]], times)
+    return {"node_xy": xy[keep][kept], "node_lonlat": ll[keep][kept], "edge_from": e_from, "edge_to": e_to, "edge_time": e_time}
 
 
 def main(argv: list[str]) -> int:
