@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from src.closed_loop.registry import SEATS, loss_options_for, loss_types_of, resolve
-from src.closed_loop.trainer import ClosedLoopTrainer
+from src.closed_loop.trainer import BackpropFeedback, ClosedLoopTrainer, PolicyGradientFeedback
 
 
 @dataclass
@@ -54,13 +54,37 @@ def modules_from_config(cfg: dict[str, Any]) -> dict[str, str]:
     return {s: str(modules[s]).strip() for s in SEATS}
 
 
+_FEEDBACK_PARAMS = {"backprop": (), "policy_gradient": ("noise_std", "gamma", "normalize_advantage")}
+
+
+def feedback_from_config(cfg: dict[str, Any], *, seed: int = 0) -> Any:
+    """The trainer's feedback strategy from ``closed_loop.feedback``: a name (``"backprop"`` or ``"policy_gradient"``) or
+    ``{"kind": name, ...parameters}``. Absent: ``None``, which is backprop (the trainer's default)."""
+    raw = (cfg.get("closed_loop") or {}).get("feedback")
+    if raw in (None, "", {}):
+        return None
+    spec = {"kind": raw} if isinstance(raw, str) else dict(raw)
+    kind = str(spec.pop("kind", "backprop")).strip().lower()
+    if kind not in _FEEDBACK_PARAMS:
+        raise ValueError(f"unknown feedback {kind!r}; available: {', '.join(sorted(_FEEDBACK_PARAMS))}")
+    unknown = sorted(set(spec) - set(_FEEDBACK_PARAMS[kind]))
+    if unknown:
+        raise ValueError(f"feedback {kind!r} takes {list(_FEEDBACK_PARAMS[kind]) or 'no parameters'}, not {unknown}")
+    if kind == "backprop":
+        return BackpropFeedback()
+    return PolicyGradientFeedback(seed=int(seed), **spec)
+
+
 def assemble_closed_loop(cfg: dict[str, Any], *, seed: int = 0) -> ClosedLoopRun:
     mods = modules_from_config(cfg)
+    loss = resolve("loss", mods["loss"])(cfg)
+    feedback = feedback_from_config(cfg, seed=seed)
+    if isinstance(feedback, PolicyGradientFeedback) and not callable(getattr(loss, "step_reward", None)):  # before anything native is opened
+        raise ValueError(f"feedback 'policy_gradient' needs a loss option with step_reward; {mods['loss']!r} has none")
     encoder = resolve("encoder", mods["encoder"])(cfg, seed)
     actor = resolve("policy", mods["policy"])(cfg, encoder, seed)
     env = resolve("env", mods["env"])(cfg)
-    loss = resolve("loss", mods["loss"])(cfg)
-    trainer = ClosedLoopTrainer(actor=actor, env=env, loss_fn=loss, max_steps=int(cfg["closed_loop"]["max_steps"]))
+    trainer = ClosedLoopTrainer(actor=actor, env=env, loss_fn=loss, max_steps=int(cfg["closed_loop"]["max_steps"]), feedback=feedback)
     data_option = str(((cfg.get("assembly") or {}).get("modules") or {}).get("data") or "stock_commands")
     data = resolve("data", data_option)(cfg)
     return ClosedLoopRun(trainer=trainer, encoder=encoder, actor=actor, env=env, loss=loss, data=data, cfg=cfg)

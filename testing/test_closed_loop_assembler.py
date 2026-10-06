@@ -159,3 +159,32 @@ def test_two_losses_for_one_loss_type_need_the_assembly_to_choose(monkeypatch) -
 
 def test_without_a_schema_loss_type_the_named_loss_is_used_as_before() -> None:
     assert modules_from_config({"assembly": {"modules": _mods("canvas_reconstruction")}})["loss"] == "canvas_reconstruction"
+
+
+def test_the_feedback_comes_from_the_closed_loop_config_and_defaults_to_backprop() -> None:
+    from src.closed_loop.assembler import feedback_from_config
+    from src.closed_loop.trainer import BackpropFeedback, PolicyGradientFeedback
+
+    assert feedback_from_config({"closed_loop": {}}) is None  # the trainer's own default
+    assert isinstance(feedback_from_config({"closed_loop": {"feedback": "backprop"}}), BackpropFeedback)
+    pg = feedback_from_config({"closed_loop": {"feedback": {"kind": "policy_gradient", "noise_std": 0.3, "gamma": 0.9}}}, seed=5)
+    assert isinstance(pg, PolicyGradientFeedback) and pg.noise_std == 0.3 and pg.gamma == 0.9
+    assert isinstance(feedback_from_config({"closed_loop": {"feedback": "policy_gradient"}}), PolicyGradientFeedback)
+
+
+def test_an_unknown_feedback_or_parameter_is_refused() -> None:
+    from src.closed_loop.assembler import feedback_from_config
+
+    with pytest.raises(ValueError, match="unknown feedback 'ppo'.*backprop.*policy_gradient"):
+        feedback_from_config({"closed_loop": {"feedback": "ppo"}})
+    with pytest.raises(ValueError, match="takes \\['noise_std', 'gamma', 'normalize_advantage'\\], not \\['lr'\\]"):
+        feedback_from_config({"closed_loop": {"feedback": {"kind": "policy_gradient", "lr": 1}}})
+    with pytest.raises(ValueError, match="takes no parameters"):
+        feedback_from_config({"closed_loop": {"feedback": {"kind": "backprop", "noise_std": 0.1}}})
+
+
+def test_policy_gradient_is_refused_at_assembly_when_the_loss_has_no_reward() -> None:
+    cfg = _cfg()
+    cfg["closed_loop"]["feedback"] = "policy_gradient"
+    with pytest.raises(ValueError, match="needs a loss option with step_reward"):
+        assemble_closed_loop(cfg, seed=0)
