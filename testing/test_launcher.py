@@ -135,3 +135,27 @@ def test_versions_only_go_up_when_a_fit_restores_an_earlier_checkpoint(tmp_path)
     assert base_version(ckpt, run_head=204) == 204  # the run already reached 204: restore the weights, keep counting up
     assert base_version(ckpt, run_head=100) == 125  # an older head never pulls it back
     assert base_version(None, requested=7) == 7 and base_version(None, run_head=9) == 9 and base_version(None) == 0
+
+
+def test_an_mhsa_fit_turns_the_contract_list_on_and_other_models_leave_it_off(tmp_path) -> None:
+    from src.launcher import SupervisedFitSpec, build_pipeline_payload
+
+    mh = SupervisedFitSpec(model_type="mhsa", data_path=str(tmp_path / "s.npz"), num_classes=4, mhsa={"d_model": 16, "num_heads": 2, "max_seq_len": 8, "action_dim": 4})
+    assert build_pipeline_payload(mh, work_dir=tmp_path)["ledger"]["contract_list_enabled"] is True
+    mlp = SupervisedFitSpec(model_type="regression", data_path=str(tmp_path / "p.csv"), feature_names=("a",))
+    assert build_pipeline_payload(mlp, work_dir=tmp_path)["ledger"]["contract_list_enabled"] is False
+
+
+def test_the_data_check_reads_an_npz_for_images_and_sequences(tmp_path) -> None:
+    import numpy as np
+
+    from src.launcher.check import _check_arrays
+    from src.launcher import SupervisedFitSpec
+
+    np.savez(tmp_path / "i.npz", X=np.zeros((10, 1, 8, 8), np.float32), y=np.zeros(10, np.int32))
+    cnn = SupervisedFitSpec(model_type="cnn", data_path=str(tmp_path / "i.npz"), num_classes=2)
+    ok = _check_arrays(cnn, tmp_path / "i.npz")
+    assert ok["ok"] and ok["manifest"]["rows"] == 10 and ok["manifest"]["x_shape"] == [1, 8, 8]
+    assert not _check_arrays(SupervisedFitSpec(model_type="mhsa", data_path="x", num_classes=2), tmp_path / "i.npz")["ok"]  # images are not sequences
+    np.savez(tmp_path / "bad.npz", X=np.zeros((3, 1, 8, 8)))
+    assert "needs the arrays" in _check_arrays(cnn, tmp_path / "bad.npz")["errors"][0]
