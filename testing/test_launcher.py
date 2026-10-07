@@ -172,3 +172,26 @@ def test_a_tm_cnn_or_mhsa_config_without_hidden_layers_is_accepted_by_the_parser
                "architecture": {"model_type": mt, "num_classes": 4, **extra}, "optimization": {"epochs_full_dataset": 1, "batch_size": 8, "learning_rate": 0.01}}
         spec = SupervisedFitSpec(model_type=mt, data_path=str(tmp_path / "d.npz"), num_classes=4, pipeline=cfg)
         parse_tm_production_config(build_pipeline_payload(spec, work_dir=tmp_path), profile="pipeline")
+
+
+def test_a_process_slow_to_exit_does_not_fail_a_fit_that_finished(monkeypatch) -> None:
+    import subprocess
+
+    from src.launcher import runner
+
+    class Slow:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("run_pipeline.py", timeout)
+
+    monkeypatch.setattr(runner, "_STOP_GRACE_S", 0.01)
+    monkeypatch.setattr(runner, "_EXIT_GRACE_S", 0.01)
+    runner._terminate(Slow())  # no exception: the fit's own outcome stands

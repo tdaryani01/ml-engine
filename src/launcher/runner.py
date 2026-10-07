@@ -56,7 +56,10 @@ def _terminate(proc: subprocess.Popen) -> None:
         proc.wait(timeout=_STOP_GRACE_S)
     except subprocess.TimeoutExpired:
         proc.kill()
-        proc.wait(timeout=_STOP_GRACE_S)
+        try:
+            proc.wait(timeout=_EXIT_GRACE_S)
+        except subprocess.TimeoutExpired:
+            pass  # a process slow to die is the OS's to reap; it must not turn a fit that already finished into a failed one
 
 
 def run_me_fit(
