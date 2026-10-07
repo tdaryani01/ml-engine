@@ -159,3 +159,39 @@ def test_the_data_check_reads_an_npz_for_images_and_sequences(tmp_path) -> None:
     assert not _check_arrays(SupervisedFitSpec(model_type="mhsa", data_path="x", num_classes=2), tmp_path / "i.npz")["ok"]  # images are not sequences
     np.savez(tmp_path / "bad.npz", X=np.zeros((3, 1, 8, 8)))
     assert "needs the arrays" in _check_arrays(cnn, tmp_path / "bad.npz")["errors"][0]
+
+
+def test_a_tm_cnn_or_mhsa_config_without_hidden_layers_is_accepted_by_the_parser(tmp_path) -> None:
+    from config.config_loader import parse_tm_production_config
+
+    from src.launcher import SupervisedFitSpec, build_pipeline_payload
+
+    for mt, extra in (("cnn", {"cnn": {"input_shape": [1, 8, 8], "dense_head": [8], "spatial_pipeline": [{"type": "flatten"}]}}),
+                      ("mhsa", {"mhsa": {"d_model": 16, "num_heads": 2, "num_layers": 1, "ffn_mult": 2, "max_seq_len": 8, "action_dim": 4}})):
+        cfg = {"ingestion": {"source_mode": "csv", "data_file_path": "x.npz", "feature_names": "auto", "splits": {"train": 0.7, "val": 0.15}, "drain_on_empty": False},
+               "architecture": {"model_type": mt, "num_classes": 4, **extra}, "optimization": {"epochs_full_dataset": 1, "batch_size": 8, "learning_rate": 0.01}}
+        spec = SupervisedFitSpec(model_type=mt, data_path=str(tmp_path / "d.npz"), num_classes=4, pipeline=cfg)
+        parse_tm_production_config(build_pipeline_payload(spec, work_dir=tmp_path), profile="pipeline")
+
+
+def test_a_process_slow_to_exit_does_not_fail_a_fit_that_finished(monkeypatch) -> None:
+    import subprocess
+
+    from src.launcher import runner
+
+    class Slow:
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+        def wait(self, timeout=None):
+            raise subprocess.TimeoutExpired("run_pipeline.py", timeout)
+
+    monkeypatch.setattr(runner, "_STOP_GRACE_S", 0.01)
+    monkeypatch.setattr(runner, "_EXIT_GRACE_S", 0.01)
+    runner._terminate(Slow())  # no exception: the fit's own outcome stands

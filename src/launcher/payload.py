@@ -148,8 +148,7 @@ def _from_pipeline(spec: SupervisedFitSpec, *, work_dir: Path, restore: Path | N
     arch.setdefault("p_dropout", 0.0)
     arch.setdefault("use_batch_norm", False)
     arch.setdefault("bn_momentum", 0.9)
-    if arch.get("model_type") not in ("mhsa", "cnn"):
-        arch.setdefault("hidden_layers", [])
+    arch.setdefault("hidden_layers", [])  # ML engine's parser requires it, even for cnn and mhsa, which have none of their own
     opt = cfg.setdefault("optimization", {})
     for k, v in (("optimizer", "adam"), ("steps_streaming", 1), ("lr_scheduler", "none"), ("scheduler_decay_rate", 0.98),
                  ("scheduler_epochs_per_drop", 10), ("scheduler_drop_ratio", 0.5), ("gradient_clipping_max_norm", 5.0),
