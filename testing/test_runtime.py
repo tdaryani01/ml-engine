@@ -222,3 +222,7 @@ def test_a_pinned_omp_team_never_exceeds_the_fit_thread_budget():
             assert int(s.env["OMP_NUM_THREADS"]) <= s.effective_omp_thread_limit()
     hand_built = RuntimeSettings(num_threads=1, platform="linux", omp_threads=4)
     assert hand_built.effective_omp_threads() == 1
+    # an explicit limit below the budget is the same failure shape: the team must not exceed it either
+    limited = RuntimeSettings(num_threads=4, platform="linux", omp_threads=4, omp_thread_limit=2)
+    assert limited.effective_omp_threads() == 2
+    assert int(limited.process_env()["OMP_NUM_THREADS"]) <= limited.effective_omp_thread_limit()

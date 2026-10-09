@@ -95,7 +95,8 @@ class RuntimeSettings:
     def effective_omp_threads(self) -> int:
         """OpenMP team size (runtime OMP_NUM_THREADS auto|N, then async default)."""
         if self.omp_threads is not None:
-            return max(1, min(int(self.omp_threads), int(self.num_threads)))  # never above the budget (see _resolve_omp_team_size)
+            # Never above the budget, and never above an explicit OMP_THREAD_LIMIT below it (see _resolve_omp_team_size).
+            return max(1, min(int(self.omp_threads), int(self.num_threads), int(self.effective_omp_thread_limit())))
         if self.native_async_submit:
             return max(1, self.num_threads - 1)
         return self.num_threads
