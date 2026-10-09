@@ -95,7 +95,8 @@ class RuntimeSettings:
     def effective_omp_threads(self) -> int:
         """OpenMP team size (runtime OMP_NUM_THREADS auto|N, then async default)."""
         if self.omp_threads is not None:
-            return int(self.omp_threads)
+            # Never above the budget, and never above an explicit OMP_THREAD_LIMIT below it (see _resolve_omp_team_size).
+            return max(1, min(int(self.omp_threads), int(self.num_threads), int(self.effective_omp_thread_limit())))
         if self.native_async_submit:
             return max(1, self.num_threads - 1)
         return self.num_threads
@@ -220,7 +221,10 @@ def _resolve_omp_team_size(
         if native_async:
             return max(1, num_threads - 1)
         return num_threads
-    return int(omp_spec)
+    # A pin is an upper bound, never more than the fit's budget: OMP_THREAD_LIMIT mirrors the budget, and our OpenBLAS is an
+    # OpenMP build, so a GEMM that asks for a team larger than the limit waits forever for threads that cannot exist
+    # (the supervised MHSA "hang" with num_threads=1 under the runtime.yaml pin of 4).
+    return max(1, min(int(omp_spec), int(num_threads)))
 
 
 # TM-sourced runs: the payload's thread budget / async knob, recorded the first
@@ -385,6 +389,9 @@ def load_runtime_settings(
     # Cap stays at full budget (threadpoolctl / OMP_THREAD_LIMIT); team size is
     # omp_threads. Async+auto: e.g. limit=4, OMP_NUM_THREADS=3.
     omp_cap = omp_limit if omp_limit is not None else threads
+    # The exported team never exceeds the exported limit: a GEMM that asks for more threads than the limit allows waits
+    # forever on an OpenMP build of OpenBLAS (see _resolve_omp_team_size).
+    omp_threads = max(1, min(int(omp_threads), int(omp_cap)))
 
     # Keep resolved numeric values in env (never leave "auto" for libgomp).
     env = dict(env)

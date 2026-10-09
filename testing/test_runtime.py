@@ -193,3 +193,50 @@ if __name__ == "__main__":
     if failed:
         sys.exit(1)
     print(f"[SUCCESS] All {len(RUNTIME_TESTS)} runtime tests passed.")
+
+
+def test_a_pinned_omp_team_never_exceeds_the_fit_thread_budget():
+    """runtime.yaml pins OMP_NUM_THREADS=4; a fit with num_threads=1 must get a team of 1.
+
+    OMP_THREAD_LIMIT mirrors the budget and our OpenBLAS is an OpenMP build: a GEMM large enough for its threaded path asked
+    for 4 threads under a limit of 1 and spun forever (the supervised MHSA fit at num_threads=1 never finished its first step).
+    """
+    import tempfile
+    from pathlib import Path
+
+    from utils.runtime import RuntimeSettings, load_runtime_settings
+
+    root = Path(__file__).resolve().parents[1]
+    cfg = root / "config" / "config.yaml"
+    with tempfile.TemporaryDirectory() as tmp:
+        pin_rt = Path(tmp) / "runtime_pin.yaml"
+        pin_rt.write_text(
+            "env:\n  OMP_NUM_THREADS: \"4\"\nlinux: {}\nwindows: {}\n"
+            "blas_threads: {native: null, numpy: null, im2col_gemm: null}\n"
+            "docker: {}\n",
+            encoding="utf-8",
+        )
+        for budget, team in ((1, 1), (2, 2), (8, 4)):
+            s = load_runtime_settings(config_path=cfg, runtime_path=pin_rt, num_threads=budget, platform="linux", native_async_submit=False)
+            assert s.effective_omp_threads() == team, (budget, s.effective_omp_threads())
+            assert int(s.env["OMP_NUM_THREADS"]) <= s.effective_omp_thread_limit()
+    hand_built = RuntimeSettings(num_threads=1, platform="linux", omp_threads=4)
+    assert hand_built.effective_omp_threads() == 1
+    # an explicit limit below the budget is the same failure shape: the team must not exceed it either
+    limited = RuntimeSettings(num_threads=4, platform="linux", omp_threads=4, omp_thread_limit=2)
+    assert limited.effective_omp_threads() == 2
+    assert int(limited.process_env()["OMP_NUM_THREADS"]) <= limited.effective_omp_thread_limit()
+    # the same through the real loader: an explicit limit below the budget clamps the EXPORTED team, not only the reported one
+    with tempfile.TemporaryDirectory() as tmp:
+        lim_rt = Path(tmp) / "runtime_limit.yaml"
+        lim_rt.write_text(
+            "omp_thread_limit: 2\nenv:\n  OMP_NUM_THREADS: \"4\"\nlinux: {}\nwindows: {}\n"
+            "blas_threads: {native: null, numpy: null, im2col_gemm: null}\n"
+            "docker: {}\n",
+            encoding="utf-8",
+        )
+        for async_flag in (False, True):
+            s = load_runtime_settings(config_path=cfg, runtime_path=lim_rt, num_threads=4, platform="linux", native_async_submit=async_flag)
+            assert s.effective_omp_thread_limit() == 2
+            assert s.effective_omp_threads() == 2
+            assert s.env["OMP_NUM_THREADS"] == "2" and s.process_env()["OMP_NUM_THREADS"] == "2"
