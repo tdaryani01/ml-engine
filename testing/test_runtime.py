@@ -226,3 +226,17 @@ def test_a_pinned_omp_team_never_exceeds_the_fit_thread_budget():
     limited = RuntimeSettings(num_threads=4, platform="linux", omp_threads=4, omp_thread_limit=2)
     assert limited.effective_omp_threads() == 2
     assert int(limited.process_env()["OMP_NUM_THREADS"]) <= limited.effective_omp_thread_limit()
+    # the same through the real loader: an explicit limit below the budget clamps the EXPORTED team, not only the reported one
+    with tempfile.TemporaryDirectory() as tmp:
+        lim_rt = Path(tmp) / "runtime_limit.yaml"
+        lim_rt.write_text(
+            "omp_thread_limit: 2\nenv:\n  OMP_NUM_THREADS: \"4\"\nlinux: {}\nwindows: {}\n"
+            "blas_threads: {native: null, numpy: null, im2col_gemm: null}\n"
+            "docker: {}\n",
+            encoding="utf-8",
+        )
+        for async_flag in (False, True):
+            s = load_runtime_settings(config_path=cfg, runtime_path=lim_rt, num_threads=4, platform="linux", native_async_submit=async_flag)
+            assert s.effective_omp_thread_limit() == 2
+            assert s.effective_omp_threads() == 2
+            assert s.env["OMP_NUM_THREADS"] == "2" and s.process_env()["OMP_NUM_THREADS"] == "2"

@@ -389,6 +389,9 @@ def load_runtime_settings(
     # Cap stays at full budget (threadpoolctl / OMP_THREAD_LIMIT); team size is
     # omp_threads. Async+auto: e.g. limit=4, OMP_NUM_THREADS=3.
     omp_cap = omp_limit if omp_limit is not None else threads
+    # The exported team never exceeds the exported limit: a GEMM that asks for more threads than the limit allows waits
+    # forever on an OpenMP build of OpenBLAS (see _resolve_omp_team_size).
+    omp_threads = max(1, min(int(omp_threads), int(omp_cap)))
 
     # Keep resolved numeric values in env (never leave "auto" for libgomp).
     env = dict(env)
