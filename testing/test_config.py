@@ -175,7 +175,8 @@ def test_runtime_threads_override_from_runtime_yaml() -> None:
         settings = load_runtime_settings(runtime_path=rt_path)
         assert settings.num_threads == override_threads
         assert settings.effective_omp_thread_limit() == override_limit
-        assert settings.env["OMP_NUM_THREADS"] == str(override_threads)
+        # The exported team never exceeds the exported limit (a team above the limit hangs an OpenMP OpenBLAS GEMM).
+        assert settings.env["OMP_NUM_THREADS"] == str(min(override_threads, override_limit))
         assert settings.env["OMP_THREAD_LIMIT"] == str(override_limit)
     print(
         f"[PASSED] runtime threads override: "
