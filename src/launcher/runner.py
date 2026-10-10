@@ -127,10 +127,13 @@ def run_me_fit(
             "train_loss": float(last_train),
             "phase": phase,
             "version": int(base_traj) + int(rel_version),
+            "val_measured": last_val is not None,
         }
         if last_extra:
             s["extra_metrics"] = dict(last_extra)
-        if doc is not None:
+        # A checkpoint is published only with a validation measurement behind it. A supervised fit validates at the end of an epoch, so a cadence checkpoint written before the first epoch of this
+        # launch has ended has none, and "loss" above is then the training loss standing in for it: published, it looked like a validation loss far below every real one and was picked as the best checkpoint.
+        if doc is not None and last_val is not None:
             s["checkpoint_bytes"] = _restamp(doc, int(base_traj) + int(rel_version))
         return s
 
@@ -186,7 +189,8 @@ def run_me_fit(
                         continue
                     abs_v = int(base_traj) + rel
                     if held is not None and held_rel == rel and abs_v % spec.checkpoint_every == 0:
-                        held["checkpoint_bytes"] = _restamp(d, abs_v)
+                        if held.get("val_measured"):
+                            held["checkpoint_bytes"] = _restamp(d, abs_v)
                     else:
                         pending_cp[rel] = d
                         if len(pending_cp) > 8:
