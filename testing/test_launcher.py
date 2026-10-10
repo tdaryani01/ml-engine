@@ -195,3 +195,15 @@ def test_a_process_slow_to_exit_does_not_fail_a_fit_that_finished(monkeypatch) -
     monkeypatch.setattr(runner, "_STOP_GRACE_S", 0.01)
     monkeypatch.setattr(runner, "_EXIT_GRACE_S", 0.01)
     runner._terminate(Slow())  # no exception: the fit's own outcome stands
+
+
+def test_a_checkpoint_is_published_only_with_a_validation_measurement_behind_it(tmp_path) -> None:
+    """A supervised fit validates when an epoch ends. A cadence checkpoint written before that (here every 3 steps, an epoch is 14) has no validation value: the snapshot used to carry the training loss
+    in its ``loss`` field and the checkpoint with it, which then looked like the best validation loss of the run. No such checkpoint is published."""
+    snaps = list(run_me_fit(_spec(tmp_path, epochs=3, checkpoint_every=3), work_dir=tmp_path / "w", should_stop=lambda: False))
+    cps = [s for s in snaps if s.get("checkpoint_bytes")]
+    assert cps, "later checkpoints are still published"
+    assert all(s["val_measured"] for s in cps)
+    assert all(abs(s["loss"] - s["train_loss"]) > 1e-12 for s in cps), "no published checkpoint stands on a training loss in place of a validation loss"
+    first_epoch_end = next(s["step"] for s in snaps if s["val_measured"])
+    assert min(s["version"] for s in cps) > first_epoch_end - 1
