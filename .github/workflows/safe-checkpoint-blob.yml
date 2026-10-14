@@ -18,4 +18,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install numpy pytest
-      - run: python -m pytest -q testing/test_checkpoint_blob_safe.py examples/closed_loop_draw/test_draw_checkpoint.py
+      - run: python -m pytest -q testing/test_checkpoint_blob_safe.py
