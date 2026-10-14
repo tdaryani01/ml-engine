@@ -30,7 +30,7 @@ def test_a_blob_that_would_run_a_command_is_refused_and_nothing_runs(tmp_path):
 
 
 def test_a_legacy_blob_of_numpy_objects_is_refused_not_loaded():
-    with pytest.raises(pickle.UnpicklingError):
+    with pytest.raises(pickle.UnpicklingError, match="re-import it"):
         decode_checkpoint_blob(pickle.dumps({"w": np.zeros(3)}))
 
 

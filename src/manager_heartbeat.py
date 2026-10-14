@@ -514,14 +514,15 @@ class _SafeUnpickler(pickle.Unpickler):
     ``pickle.loads`` on bytes somebody else wrote runs their code; this runs none (security review 2026-10-14). Legacy blobs that pickled numpy arrays as objects need a global and are refused: re-import them."""
 
     def find_class(self, module: str, name: str):
-        raise pickle.UnpicklingError(f"checkpoint blob refused: it references {module}.{name}; only plain data and raw array bytes are loaded")
+        hint = " (this looks like a checkpoint from before the safe format: re-import it)" if module.startswith("numpy") else ""
+        raise pickle.UnpicklingError(f"checkpoint blob refused: it references {module}.{name}; only plain data and raw array bytes are loaded{hint}")
 
 
 def decode_checkpoint_blob(data: bytes) -> dict[str, Any]:
     """Unpack importer checkpoint blob into a restore_model_checkpoint body.
 
     Blobs are wire-encoded (raw ndarray buffers) so numpy 1.x/2.x venvs interop.
-    Legacy plain pickles of ndarray objects still attempt to load for old MinIO keys.
+    The blob is read by a restricted unpickler that refuses every Python class (security review 2026-10-14): legacy plain pickles of ndarray OBJECTS are refused, not loaded; re-import them.
     """
     obj = _SafeUnpickler(io.BytesIO(data)).load()
     if not isinstance(obj, dict):
