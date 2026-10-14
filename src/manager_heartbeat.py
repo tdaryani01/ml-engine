@@ -10,6 +10,7 @@ Never blocks the training thread: interval gate + at-most-one daemon worker.
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 import pickle
@@ -508,13 +509,22 @@ class ManagerHeartbeat:
             return HttpResult(ok=False, status=None, payload=None, detail=str(exc))
 
 
+class _SafeUnpickler(pickle.Unpickler):
+    """A checkpoint blob is dicts, lists, numbers, strings and raw array BYTES (``_to_wire``): it never needs a Python class, so the loader refuses every global.
+    ``pickle.loads`` on bytes somebody else wrote runs their code; this runs none (security review 2026-10-14). Legacy blobs that pickled numpy arrays as objects need a global and are refused: re-import them."""
+
+    def find_class(self, module: str, name: str):
+        hint = " (this looks like a checkpoint from before the safe format: re-import it)" if module.startswith("numpy") else ""
+        raise pickle.UnpicklingError(f"checkpoint blob refused: it references {module}.{name}; only plain data and raw array bytes are loaded{hint}")
+
+
 def decode_checkpoint_blob(data: bytes) -> dict[str, Any]:
     """Unpack importer checkpoint blob into a restore_model_checkpoint body.
 
     Blobs are wire-encoded (raw ndarray buffers) so numpy 1.x/2.x venvs interop.
-    Legacy plain pickles of ndarray objects still attempt to load for old MinIO keys.
+    The blob is read by a restricted unpickler that refuses every Python class (security review 2026-10-14): legacy plain pickles of ndarray OBJECTS are refused, not loaded; re-import them.
     """
-    obj = pickle.loads(data)
+    obj = _SafeUnpickler(io.BytesIO(data)).load()
     if not isinstance(obj, dict):
         raise TypeError(f"checkpoint blob is {type(obj)!r}, expected dict")
     return _from_wire(obj)
@@ -551,6 +561,8 @@ def _from_wire(value: Any) -> Any:
             import numpy as np
 
             dtype = np.dtype(value["dtype"])
+            if dtype.hasobject:
+                raise TypeError("ndarray wire data must not be an object array")
             shape = tuple(int(x) for x in value["shape"])
             buf = value["data"]
             if not isinstance(buf, (bytes, bytearray, memoryview)):
