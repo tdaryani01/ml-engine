@@ -192,10 +192,16 @@ fi
 # ALLOW_APPROX_RECIP=1 skips it (a profiling build that does not produce results).
 if [[ "${ALLOW_APPROX_RECIP:-0}" != "1" ]]; then
   if command -v objdump >/dev/null 2>&1; then
-    approx="$(objdump -d --no-show-raw-insn "$BUILT_SO" | grep -cE '\b(v?rsqrt(ss|ps)|v?rcp(ss|ps))\b' || true)"
+    # objdump runs ALONE first: if it fails (missing or corrupt library, wrong format) the build fails; counting inside a pipeline with "|| true" would turn that failure into a count of 0 and pass.
+    if ! asm="$(objdump -d --no-show-raw-insn "$BUILT_SO")"; then
+      echo "[build] FAILED: objdump could not read $BUILT_SO, so the check for approximate rsqrt/rcp instructions could not run." >&2
+      rm -f "$BUILT_SO" "$OUT_SO"
+      exit 1
+    fi
+    approx="$(grep -cE '\b(v?rsqrt(ss|ps)|v?rcp(ss|ps))\b' <<<"$asm" || true)"
     if [[ "$approx" != "0" ]]; then
       echo "[build] FAILED: $approx approximate rsqrt/rcp instructions in $BUILT_SO (results would differ between Intel and AMD CPUs). Fix the flags, or ALLOW_APPROX_RECIP=1 for a build that produces no results." >&2
-      rm -f "$BUILT_SO"
+      rm -f "$BUILT_SO" "$OUT_SO"      # also the copy a previous build left in bin/: a failed build must not leave a library that looks usable
       exit 1
     fi
     echo "[build] check: no approximate rsqrt/rcp instruction in the library"
