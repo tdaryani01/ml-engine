@@ -2168,12 +2168,8 @@ class ContractRuntime:
             grad_biases[w_idx] = np.copy(db)
 
         loss = float(slot.loss_scalar[0])
-        if self.model.lam_l2 > 0.0:
-            l2_sum = sum(float(np.sum(w * w)) for w in self.model.weights)
-            loss += (self.model.lam_l2 / (2.0 * submitted.m)) * l2_sum
-        if self.model.lam_l1 > 0.0:
-            l1_sum = sum(float(np.sum(np.abs(w))) for w in self.model.weights)
-            loss += (self.model.lam_l1 / submitted.m) * l1_sum
+        # The reported step loss is the raw cost: a penalty term is scaled by this batch's size, so it would not be comparable with the validation loss
+        # (ml-engine#52). Training itself is unchanged: the penalties act through the gradient / optimizer update, not through this reported number.
         gw = grad_weights
         gb = grad_biases
         # X for this step is no longer guaranteed live / unique at this address.
@@ -2973,11 +2969,5 @@ class ContractRuntime:
             grad_biases[w_idx] = np.copy(layer.db)
 
         loss = float(self._loss_scalar[0])
-        # Native already computed CE in OP_DENSE_FWD; only add L1/L2 reporting terms.
-        if self.model.lam_l2 > 0.0:
-            l2_sum = sum(float(np.sum(w * w)) for w in self.model.weights)
-            loss += (self.model.lam_l2 / (2.0 * m)) * l2_sum
-        if self.model.lam_l1 > 0.0:
-            l1_sum = sum(float(np.sum(np.abs(w))) for w in self.model.weights)
-            loss += (self.model.lam_l1 / m) * l1_sum
+        # Native already computed CE in OP_DENSE_FWD; the penalty terms are not part of the reported loss (see the dense/conv step above).
         return loss, grad_weights, grad_biases

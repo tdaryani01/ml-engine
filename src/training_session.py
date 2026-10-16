@@ -23,6 +23,10 @@ import numpy as np
 
 from config.constants import DataKeys, ModelType
 
+# The losses a fit reports (train per step, validation per epoch) are the raw cost; the L2 term is not added (a caller reading an older engine finds this name missing and must
+# take the reported losses as penalised, ml-engine#52).
+REPORTED_LOSS_INCLUDES_L2 = False
+
 # model id(model) -> weakref to the live TrainingSession that owns it
 _model_session_owners: dict[int, weakref.ReferenceType] = {}
 
@@ -447,8 +451,9 @@ class TrainingSession:
 
         X_val, y_val_target = self._fit_X_val, self._fit_y_val
         val_preds = self._predict_with_thread_policy(X_val)
-        current_val_loss = self.model.compute_total_loss(val_preds, y_val_target)
+        # The reported validation loss is the raw cost, the same quantity the training loss reports (the L2 term is not part of either).
         current_val_raw_cost = self.model.calculate_raw_cost(val_preds, y_val_target)
+        current_val_loss = current_val_raw_cost
         self.val_history.append(current_val_loss)
         if self.engine is not None and hasattr(self.engine, "on_epoch_end"):
             self.engine.on_epoch_end(self, epoch, float(epoch_train_loss), float(current_val_loss))

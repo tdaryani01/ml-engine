@@ -509,7 +509,7 @@ class CNNNetwork(TrainableModel):
                     grad_biases[i] *= scaling_factor
 
         if y is not None:
-            loss = self.compute_total_loss(output, y)
+            loss = self.calculate_raw_cost(output, y)      # the reported step loss is the raw cost (ml-engine#52): the penalty terms are not part of it
         else:
             loss = 0.0
         return loss, grad_weights, grad_biases, m, None, None
