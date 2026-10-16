@@ -163,7 +163,14 @@ for src in "${SOURCES[@]}"; do
   base="$(basename "$src" .cpp)"
   obj="$BUILD_DIR/${base}.o"
   echo "[build] compile $src"
-  "$CXX" "${COMMON[@]}" "${CXXFLAGS[@]}" -c "$ROOT/$src" -o "$obj"
+  EXTRA=()
+  if [[ "$src" == *mhsa_kernels.cpp ]]; then
+    # Exact 1/sqrt in the MHSA layer norm. -ffast-math turns it into the CPU's approximate rsqrt instruction (vrsqrtss), whose last bits differ
+    # between Intel and AMD: the same MHSA fit gave different losses from step 1 on different CPUs. Only this file needs it (the conv code does not
+    # use rsqrt); testing/test_native_no_approx_rsqrt.py checks that no rsqrt / rcp instruction is in the library.
+    EXTRA=(-fno-unsafe-math-optimizations)
+  fi
+  "$CXX" "${COMMON[@]}" "${CXXFLAGS[@]}" "${EXTRA[@]}" -c "$ROOT/$src" -o "$obj"
   OBJS+=("$obj")
 done
 
