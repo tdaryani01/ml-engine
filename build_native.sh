@@ -187,6 +187,30 @@ if [[ ! -f "$BUILT_SO" ]]; then
   exit 1
 fi
 
+# The library must hold no approximate rsqrt / rcp instruction: -ffast-math turns 1/sqrt into RSQRTSS, whose last bits differ between Intel and AMD, so the same MHSA fit gives different numbers on different CPUs.
+# mhsa_kernels.cpp is compiled with -fno-unsafe-math-optimizations for that; this check makes EVERY build prove it (another gcc or LTO setup could handle the per-file flag differently).
+# ALLOW_APPROX_RECIP=1 skips it (a profiling build that does not produce results).
+if [[ "${ALLOW_APPROX_RECIP:-0}" != "1" ]]; then
+  if command -v objdump >/dev/null 2>&1; then
+    # objdump runs ALONE first: if it fails (missing or corrupt library, wrong format) the build fails; counting inside a pipeline with "|| true" would turn that failure into a count of 0 and pass.
+    if ! asm="$(objdump -d --no-show-raw-insn "$BUILT_SO")"; then
+      echo "[build] FAILED: objdump could not read $BUILT_SO, so the check for approximate rsqrt/rcp instructions could not run." >&2
+      rm -f "$BUILT_SO" "$OUT_SO"
+      exit 1
+    fi
+    # the pattern covers the SSE/AVX forms and the AVX-512 14/28-bit and FP16 forms (the first version missed vrsqrt14ps, vrcp14ps, vrsqrt28ps ...)
+    approx="$(grep -cE '\b(v?rsqrt(14|28)?(ss|ps|sd|pd|sh|ph)|v?rcp(14|28)?(ss|ps|sd|pd|sh|ph))\b' <<<"$asm" || true)"
+    if [[ "$approx" != "0" ]]; then
+      echo "[build] FAILED: $approx approximate rsqrt/rcp instructions in $BUILT_SO (results would differ between Intel and AMD CPUs). Fix the flags, or ALLOW_APPROX_RECIP=1 for a build that produces no results." >&2
+      rm -f "$BUILT_SO" "$OUT_SO"      # also the copy a previous build left in bin/: a failed build must not leave a library that looks usable
+      exit 1
+    fi
+    echo "[build] check: no approximate rsqrt/rcp instruction in the library"
+  else
+    echo "[build] WARNING: objdump not found: could not check for approximate rsqrt/rcp instructions (MHSA results may differ between Intel and AMD CPUs)" >&2
+  fi
+fi
+
 cp -f "$BUILT_SO" "$OUT_SO"
 echo "[build] Wrote $BUILT_SO"
 echo "[build] Copied -> $OUT_SO"
