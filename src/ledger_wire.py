@@ -3,12 +3,26 @@
 from __future__ import annotations
 
 import json
+import math
 import struct
 from typing import Any
 
 import numpy as np
 
 from src.training_session import TrainStepResult
+
+_F32_MAX = float(np.finfo(np.float32).max)
+
+
+def _f32(x: Any) -> float:
+    """A value for a struct ``f`` field. The wire stores the step loss and the learning rate as 32-bit floats, but the trainer computes them in 64 bits: a diverged run's loss can be finite and
+    beyond the 32-bit range (about 3.4e38), and ``struct.pack`` raises OverflowError for it, which killed the run's ledger writer ("float too large to pack with f format") instead of recording the
+    divergence. Such a value is saturated to +/-inf (a non-finite loss is something the readers already handle); NaN, inf and every in-range value pass through unchanged."""
+    v = float(x)
+    if math.isnan(v) or math.isinf(v) or abs(v) <= _F32_MAX:
+        return v
+    return math.copysign(math.inf, v)
+
 
 MAGIC = b"MLE1"
 _JOURNAL_VERSION = 1
@@ -99,7 +113,7 @@ def _unpack_array_list(buf: memoryview, off: int) -> tuple[list[np.ndarray] | No
 
 def pack_step_result(result: TrainStepResult) -> bytes:
     parts = [
-        struct.pack("<QfI", int(result.step_id), float(result.loss), int(result.m_samples)),
+        struct.pack("<QfI", int(result.step_id), _f32(result.loss), int(result.m_samples)),
         _pack_array_list(result.grad_weights),
         _pack_array_list(result.grad_biases),
         _pack_array_list(result.grad_gammas),
@@ -181,7 +195,7 @@ def _pack_step_command(body: dict[str, Any]) -> bytes:
                 "<QQfdII",
                 int(body["step_id"]),
                 int(body["base_version"]),
-                float(body["lr"]),
+                _f32(body["lr"]),
                 int(body["m_samples"]),
                 int(body.get("scheduler_epoch", 0)),
                 int(br.get("data_version", 1)),
