@@ -187,6 +187,23 @@ if [[ ! -f "$BUILT_SO" ]]; then
   exit 1
 fi
 
+# The library must hold no approximate rsqrt / rcp instruction: -ffast-math turns 1/sqrt into RSQRTSS, whose last bits differ between Intel and AMD, so the same MHSA fit gives different numbers on different CPUs.
+# mhsa_kernels.cpp is compiled with -fno-unsafe-math-optimizations for that; this check makes EVERY build prove it (another gcc or LTO setup could handle the per-file flag differently).
+# ALLOW_APPROX_RECIP=1 skips it (a profiling build that does not produce results).
+if [[ "${ALLOW_APPROX_RECIP:-0}" != "1" ]]; then
+  if command -v objdump >/dev/null 2>&1; then
+    approx="$(objdump -d --no-show-raw-insn "$BUILT_SO" | grep -cE '\b(v?rsqrt(ss|ps)|v?rcp(ss|ps))\b' || true)"
+    if [[ "$approx" != "0" ]]; then
+      echo "[build] FAILED: $approx approximate rsqrt/rcp instructions in $BUILT_SO (results would differ between Intel and AMD CPUs). Fix the flags, or ALLOW_APPROX_RECIP=1 for a build that produces no results." >&2
+      rm -f "$BUILT_SO"
+      exit 1
+    fi
+    echo "[build] check: no approximate rsqrt/rcp instruction in the library"
+  else
+    echo "[build] WARNING: objdump not found: could not check for approximate rsqrt/rcp instructions (MHSA results may differ between Intel and AMD CPUs)" >&2
+  fi
+fi
+
 cp -f "$BUILT_SO" "$OUT_SO"
 echo "[build] Wrote $BUILT_SO"
 echo "[build] Copied -> $OUT_SO"
