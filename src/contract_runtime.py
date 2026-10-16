@@ -2168,9 +2168,8 @@ class ContractRuntime:
             grad_biases[w_idx] = np.copy(db)
 
         loss = float(slot.loss_scalar[0])
-        if self.model.lam_l2 > 0.0:
-            l2_sum = sum(float(np.sum(w * w)) for w in self.model.weights)
-            loss += (self.model.lam_l2 / (2.0 * submitted.m)) * l2_sum
+        # The reported step loss is the raw cost: the L2 term is scaled by this batch's size, so it would not be comparable with the validation loss.
+        # (Training itself is unchanged: weight decay acts through the optimizer update, not through this reported number.)
         if self.model.lam_l1 > 0.0:
             l1_sum = sum(float(np.sum(np.abs(w))) for w in self.model.weights)
             loss += (self.model.lam_l1 / submitted.m) * l1_sum
@@ -2973,10 +2972,7 @@ class ContractRuntime:
             grad_biases[w_idx] = np.copy(layer.db)
 
         loss = float(self._loss_scalar[0])
-        # Native already computed CE in OP_DENSE_FWD; only add L1/L2 reporting terms.
-        if self.model.lam_l2 > 0.0:
-            l2_sum = sum(float(np.sum(w * w)) for w in self.model.weights)
-            loss += (self.model.lam_l2 / (2.0 * m)) * l2_sum
+        # Native already computed CE in OP_DENSE_FWD; only add the L1 reporting term (the L2 term is not reported: see the dense/conv step above).
         if self.model.lam_l1 > 0.0:
             l1_sum = sum(float(np.sum(np.abs(w))) for w in self.model.weights)
             loss += (self.model.lam_l1 / m) * l1_sum
