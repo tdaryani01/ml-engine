@@ -238,7 +238,7 @@ class BaseNeuralNetwork(TrainableModel):
                 if grad_biases[i] is not None:
                     grad_biases[i] *= scaling_factor
 
-        loss = self.compute_total_loss(output, y)
+        loss = self.calculate_raw_cost(output, y)      # the reported step loss is the raw cost (ml-engine#52)
         gg = grad_gammas if self.use_batch_norm else None
         gbb = grad_betas if self.use_batch_norm else None
         return loss, grad_weights, grad_biases, m, gg, gbb
