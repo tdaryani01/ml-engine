@@ -59,12 +59,27 @@ def test_cnn_step_loss_is_raw_cost_with_weight_decay():
 
 
 def test_validation_loss_reported_by_a_fit_epoch_is_the_raw_cost():
-    """``advance_fit_epoch`` hands the engine the raw validation cost, not the penalised one (the source line, read from the file: a fit needs a data provider, and the real-run check is in the PR)."""
-    import inspect
-    import re
+    """What ``advance_fit_epoch`` hands the engine as the epoch's validation loss is the raw cost, whatever the L2 weight (the value, not the shape of the code)."""
+    from src.training_session import TrainingSession
 
-    from src import training_session
+    rng = np.random.default_rng(4)
+    X = rng.normal(size=(16, 4)).astype(np.float32)
+    y = (rng.random((16, 1)) > 0.5).astype(np.float32)
+    model = _model(5.0)
+    seen = {}
 
-    src = inspect.getsource(training_session.TrainingSession.advance_fit_epoch)
-    assert re.search(r"current_val_loss\s*=\s*current_val_raw_cost", src)
-    assert "compute_total_loss" not in src
+    class Engine:
+        def on_epoch_end(self, session, epoch, train_loss, val_loss):
+            seen["val"] = val_loss
+
+    s = object.__new__(TrainingSession)
+    s.__dict__.update(dict(_fit_done=False, _fit_ready=True, _fit_kwargs={"steps": 1, "early_stopping_enabled": False, "max_epochs": 1}, _fit_epoch=0, scheduler=None, initial_lr=0.01,
+                           train_history=[], val_history=[], _fit_epochs_done=0, _fit_X_val=X, _fit_y_val=y, _fit_is_classification=True, _fit_es_state={}, model=model, engine=Engine()))
+    s._run_epoch_training_pass = lambda *a, **k: (1.0, None)
+    s._predict_with_thread_policy = lambda x: model.predict(x)
+    s._evaluate_epoch_performance = lambda *a, **k: None
+    s.finish_fit = lambda: None
+    s.advance_fit_epoch()
+    preds = model.predict(X)
+    assert seen["val"] == model.calculate_raw_cost(preds, y)
+    assert model.compute_total_loss(preds, y) > seen["val"]
