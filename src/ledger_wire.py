@@ -242,7 +242,7 @@ def _unpack_step_consolidated(data: memoryview) -> tuple[dict[str, Any], int]:
     }, struct.calcsize("<QQQ")
 
 
-_STEP_METRICS_EXTRA_KEYS = ("extra_metrics", "train_by_source")
+_STEP_METRICS_EXTRA_KEYS = ("extra_metrics", "train_by_source", "n_train")      # n_train: the training rows the fit draws from (an int; the others are dicts)
 
 
 def _pack_step_metrics(body: dict[str, Any]) -> bytes:
@@ -259,7 +259,9 @@ def _pack_step_metrics(body: dict[str, Any]) -> bytes:
     parts.append(struct.pack("<B", 1 if body.get("is_local_best_val") else 0))
     # Named numbers a run reports beside the losses (per-feed train losses, a family's held-out accuracy ...): an optional JSON tail, so
     # documents written without it still read, and a reader that stops after the fixed part ignores it.
-    extra = {k: body[k] for k in _STEP_METRICS_EXTRA_KEYS if isinstance(body.get(k), dict) and body[k]}
+    extra = {k: body[k] for k in _STEP_METRICS_EXTRA_KEYS if k != "n_train" and isinstance(body.get(k), dict) and body[k]}
+    if isinstance(body.get("n_train"), int) and body["n_train"] > 0:
+        extra["n_train"] = int(body["n_train"])
     if extra:
         blob = json.dumps(extra, separators=(",", ":")).encode("utf-8")
         parts.append(struct.pack("<I", len(blob)))

@@ -209,6 +209,11 @@ class Demonstrations:
         # Each fit of a chain (Autopilot) is a stretch: it must draw NEW training batches, not replay the first fit's.
         self._stretch = max(0, int(((cfg.get("fit") or {}).get("stretch_index")) or 1) - 1)
 
+    @property
+    def n_train(self) -> int:
+        """The training rows: the episodes left after the held-out ones."""
+        return int(len(self.train_idx))
+
     def _batch(self, idx: np.ndarray) -> DemoGoal:
         return self._goal(*[a[idx] for a in self.arrays])
 

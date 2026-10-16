@@ -115,6 +115,7 @@ def run_me_fit(
     started = time.monotonic()
     ended: dict[str, Any] | None = None
     pending_cp: dict[int, Any] = {}  # relative version -> checkpoint doc (cadence/final candidates)
+    last_n_train: int | None = None     # the training rows the fit reported (step.metrics): the same on every step
     held: dict[str, Any] | None = None
     held_rel = -1
     saw_complete = False  # a supervised fit writes step.complete per step; a closed-loop fit writes only step.metrics
@@ -131,6 +132,8 @@ def run_me_fit(
         }
         if last_extra:
             s["extra_metrics"] = dict(last_extra)
+        if last_n_train:
+            s["n_train"] = int(last_n_train)
         # A checkpoint is published only with a validation measurement behind it. A supervised fit validates at the end of an epoch, so a cadence checkpoint written before the first epoch of this
         # launch has ended has none, and "loss" above is then the training loss standing in for it: published, it looked like a validation loss far below every real one and was picked as the best checkpoint.
         if doc is not None and last_val is not None:
@@ -169,6 +172,8 @@ def run_me_fit(
                     if t == "step.metrics" and m.get("val_loss") is not None:
                         last_val = float(m["val_loss"])
                         epoch += 1
+                    if t == "step.metrics" and m.get("n_train"):
+                        last_n_train = int(m["n_train"])
                     if t == "step.metrics" and isinstance(m.get("extra_metrics"), dict):
                         last_extra = {str(k): float(v) for k, v in m["extra_metrics"].items()}
                     rel = int(d.version or step)
@@ -181,6 +186,8 @@ def run_me_fit(
                     v = d.body.get("val_loss")
                     if v is not None:
                         last_val = float(v)
+                    if d.body.get("n_train"):
+                        last_n_train = int(d.body["n_train"])
                     if isinstance(d.body.get("extra_metrics"), dict):
                         last_extra = {str(k): float(x) for k, x in d.body["extra_metrics"].items()}
                 elif t == "checkpoint":

@@ -437,6 +437,7 @@ class TrainingLedger:
         verdict: str = VERDICT_HEALTHY,
         train_by_source: dict[str, Any] | None = None,
         extra_metrics: dict[str, float] | None = None,
+        n_train: int | None = None,
     ) -> int:
         gap = None
         if val_loss is not None:
@@ -454,6 +455,9 @@ class TrainingLedger:
             "verdict": verdict,
             "is_local_best_val": is_best,
         }
+        if n_train is not None and int(n_train) > 0:
+            # The training rows the fit draws from (the pool, the same on every step and every stretch): the consumer's n_train fact. Absent = the family cannot say; never a guess.
+            body["n_train"] = int(n_train)
         if extra_metrics:
             # Named numbers a family wants shown beside the losses (a preference model's accuracy, a router's arrival rate).
             body["extra_metrics"] = {str(k): float(v) for k, v in extra_metrics.items() if v is not None and float(v) == float(v)}
