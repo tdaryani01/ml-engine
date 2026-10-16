@@ -198,7 +198,8 @@ if [[ "${ALLOW_APPROX_RECIP:-0}" != "1" ]]; then
       rm -f "$BUILT_SO" "$OUT_SO"
       exit 1
     fi
-    approx="$(grep -cE '\b(v?rsqrt(ss|ps)|v?rcp(ss|ps))\b' <<<"$asm" || true)"
+    # the pattern covers the SSE/AVX forms and the AVX-512 14/28-bit and FP16 forms (the first version missed vrsqrt14ps, vrcp14ps, vrsqrt28ps ...)
+    approx="$(grep -cE '\b(v?rsqrt(14|28)?(ss|ps|sd|pd|sh|ph)|v?rcp(14|28)?(ss|ps|sd|pd|sh|ph))\b' <<<"$asm" || true)"
     if [[ "$approx" != "0" ]]; then
       echo "[build] FAILED: $approx approximate rsqrt/rcp instructions in $BUILT_SO (results would differ between Intel and AMD CPUs). Fix the flags, or ALLOW_APPROX_RECIP=1 for a build that produces no results." >&2
       rm -f "$BUILT_SO" "$OUT_SO"      # also the copy a previous build left in bin/: a failed build must not leave a library that looks usable
