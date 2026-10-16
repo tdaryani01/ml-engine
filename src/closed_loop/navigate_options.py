@@ -267,6 +267,11 @@ class RoadRoutes:
         # Each fit of a chain (Autopilot) is a stretch: it must draw NEW training batches, not replay the first fit's.
         self._stretch = max(0, int(((cfg.get("fit") or {}).get("stretch_index")) or 1) - 1)
 
+    @property
+    def n_train(self) -> int:
+        """The training rows: the (origin, destination) pairs of the training cases, the pool the fit draws its routes from."""
+        return int(sum(len(c[1]) for c in self.train_cases))
+
     def _draw(self, rng: np.random.Generator, cases: list, count: int) -> RouteGoal:
         pick = rng.integers(0, len(cases), size=count)
         origin, dest, opt = np.zeros(count, np.int64), np.zeros(count, np.int64), np.zeros(count)

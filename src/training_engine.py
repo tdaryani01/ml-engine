@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 import numpy as np
+from config.constants import DataKeys
 
 from src.ledger import BatchRef, LedgerConfig, TrainingLedger, VERDICT_HEALTHY
 from src.manager_heartbeat import ManagerCommand, ManagerHeartbeat, decode_checkpoint_blob
@@ -1725,9 +1726,18 @@ class TrainingEngine:
                     version=int(self.ledger.version),
                     train_loss=float(train_loss),
                     val_loss=float(val_loss),
+                    n_train=self._train_rows(sess),
                 )
         except Exception:  # noqa: BLE001
             logging.exception("[TrainingEngine] epoch metrics document failed")
+
+    @staticmethod
+    def _train_rows(sess: TrainingSession) -> int | None:
+        """The training rows a supervised fit draws from (the train split of its data provider); None when the provider does not say."""
+        try:
+            return int(len(sess.data_provider.splits[DataKeys.X_TRAIN]))
+        except Exception:  # noqa: BLE001
+            return None
 
     def _push_run_end(self, sess: TrainingSession) -> None:
         """Fit contract: record how this fit ended in the ledger (best-effort, never raises)."""

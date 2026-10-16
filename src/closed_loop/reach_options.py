@@ -221,6 +221,11 @@ class ReachTargets:
             rng = np.random.default_rng([self.seed, 99])
             self.val_pts = self._workspace(rng, max(self.batch_size, 8))
 
+    @property
+    def n_train(self) -> int | None:
+        """The training rows: the target points left after the held-out ones; None when targets are sampled from the workspace (no fixed pool)."""
+        return None if self.train_pts is None else int(len(self.train_pts))
+
     def _workspace(self, rng: np.random.Generator, count: int) -> np.ndarray:
         q = self.home[None, :] + rng.uniform(-self.spread, self.spread, size=(count, self.n))
         return forward_kinematics(self.dh, q)[0]
