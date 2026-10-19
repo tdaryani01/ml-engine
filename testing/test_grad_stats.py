@@ -83,7 +83,7 @@ def test_every_step_document_carries_the_statistics_beside_a_familys_own_extras(
     assert grad_stats.drain() == {}                                                    # the document drained it
 
 
-def test_an_imitation_fit_reports_gradient_norms_through_the_contract_step(tmp_path, monkeypatch) -> None:
+def test_an_imitation_fit_reports_gradient_norms_and_the_update_ratio_through_the_contract_step(tmp_path, monkeypatch) -> None:
     """Imitation trains in the contracts' native trainer, which steps ml-engine's TrainableModel: that step is where its gradients are observed."""
     from testing.test_imitation_run import _corpus, _payload, _run
 
@@ -93,4 +93,4 @@ def test_an_imitation_fit_reports_gradient_norms_through_the_contract_step(tmp_p
     out.mkdir()
     docs = _run(tmp_path, _payload(out, corpus, steps=6))
     extras = [d.body.get("extra_metrics") or {} for d in docs if d.doc_type == "step.metrics"]
-    assert extras and all("grad_norm_mean" in e and "grad_norm_var" in e for e in extras)
+    assert extras and all({"grad_norm_mean", "grad_norm_var", "update_weight_ratio"} <= set(e) and 0.0 < e["update_weight_ratio"] < 1.0 for e in extras)

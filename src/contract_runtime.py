@@ -2790,6 +2790,28 @@ class ContractRuntime:
         ]
         return grad_weights, grad_biases, dX
 
+    def _mhsa_param_arrays(self) -> list[np.ndarray]:
+        """The float32 parameter buffers the native MHSA step updates in place (the non-bank path)."""
+        arrs: list[np.ndarray] = [*(self._mhsa_w_f32 or []), *(self._mhsa_b_f32 or [])]
+        for d in self._mhsa_ln_f32 or []:
+            arrs.extend(d.values())
+        return arrs
+
+    def _watch_update_norm(self) -> list[np.ndarray] | None:
+        """Copies of the parameters before a natively applied step, so its update can be measured (src/grad_stats.py); None when off."""
+        from src import grad_stats
+
+        return [a.copy() for a in self._mhsa_param_arrays()] if grad_stats.enabled() else None
+
+    def _update_norms(self, before: list[np.ndarray] | None) -> tuple[float, float] | None:
+        """(squared update norm, squared weight norm before the update) of the step just applied, or None when it was not watched."""
+        if before is None:
+            return None
+        from src import grad_stats
+
+        after = self._mhsa_param_arrays()
+        return grad_stats.sq_norm(a - b for a, b in zip(after, before)), grad_stats.sq_norm(before)
+
     def run_step(
         self,
         X: np.ndarray,
@@ -2818,6 +2840,7 @@ class ContractRuntime:
             ctx.lr = float(lr)
             ctx.skip_adam = 0 if apply_adam else 1
             ctx.adam.t = int(self.model.optimizer.t)
+            watch = self._watch_update_norm() if apply_adam else None
             self._activate_tenant()
             status = self._lib.run_contract_training_step(
                 ctypes.cast(self._ops, ctypes.POINTER(ContractOpRow)),
@@ -2826,6 +2849,7 @@ class ContractRuntime:
             )
             if status != 0:
                 raise RuntimeError(f"MHSA train contract failed status={status}")
+            self.last_update_norms = self._update_norms(watch)
             assert self._mhsa_ws is not None and self._mhsa_dw_f32 is not None
             assert self._mhsa_db_f32 is not None and self._mhsa_dln_f32 is not None
             m = int(X.shape[0])
