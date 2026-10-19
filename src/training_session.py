@@ -31,6 +31,16 @@ REPORTED_LOSS_INCLUDES_L2 = False
 _model_session_owners: dict[int, weakref.ReferenceType] = {}
 
 
+
+def _observe_native_grads(gw, gb) -> None:
+    """A step the native Adam applied: its gradients are all Python sees of it (src/grad_stats.py); never raises into the training step."""
+    try:
+        from src import grad_stats
+
+        grad_stats.observe_grads([*gw, *gb])
+    except Exception:  # noqa: BLE001
+        pass
+
 class SessionStatus(str, Enum):
     """Engine scheduling state. Finished sessions are dropped from the engine list."""
 
@@ -274,6 +284,7 @@ class TrainingSession:
         if out is None:
             return None
         loss, gw, gb, m = out
+        _observe_native_grads(gw, gb)
         return loss, gw, gb, m, None, None, True
 
     
@@ -334,6 +345,7 @@ class TrainingSession:
             self.model, "run_contract_train_step"
         ):
             loss, gw, gb, m = self.model.run_contract_train_step(X, y, lr, apply_adam=True)
+            _observe_native_grads(gw, gb)
         elif hasattr(self.model, "forward_train"):
             _, cache = self.model.forward_train(X)
             loss, gw, gb, m, gg, gbb = self.model._compute_grads_from_cache(cache, y)

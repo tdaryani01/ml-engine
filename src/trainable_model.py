@@ -163,7 +163,7 @@ class TrainableModel(ABC):
     ) -> tuple[float, list, list, int]:
         if self._contract_runtime is None:
             raise RuntimeError("Contract path not initialized")
-        return self._contract_runtime.run_step(
+        out = self._contract_runtime.run_step(
             X,
             y,
             lr,
@@ -172,3 +172,10 @@ class TrainableModel(ABC):
             tick_fn=tick_fn,
             sample_weights=sample_weights,
         )
+        try:  # gradient statistics (src/grad_stats.py): every caller of this step, imitation's trainer included, is covered here
+            from src import grad_stats
+
+            grad_stats.observe_grads([*out[1], *out[2]])
+        except Exception:  # noqa: BLE001
+            pass
+        return out

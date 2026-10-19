@@ -458,6 +458,11 @@ class TrainingLedger:
         if n_train is not None and int(n_train) > 0:
             # The training rows the fit draws from (the pool, the same on every step and every stretch): the consumer's n_train fact. Absent = the family cannot say; never a guess.
             body["n_train"] = int(n_train)
+        from src import grad_stats      # the gradient statistics of the steps since the last boundary ride the same channel, for every family and caller
+
+        drained = grad_stats.drain()
+        if drained:
+            extra_metrics = {**(extra_metrics or {}), **drained}
         if extra_metrics:
             # Named numbers a family wants shown beside the losses (a preference model's accuracy, a router's arrival rate).
             body["extra_metrics"] = {str(k): float(v) for k, v in extra_metrics.items() if v is not None and float(v) == float(v)}
