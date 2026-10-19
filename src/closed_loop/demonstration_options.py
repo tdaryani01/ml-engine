@@ -86,13 +86,24 @@ class MlpActor:
         pass
 
     def apply_updates(self, lr: float) -> None:
+        from src import grad_stats
+
         self._t += 1
         b1, b2, eps = 0.9, 0.999, 1e-8
+        track = grad_stats.enabled()
+        g_sq = u_sq = w_sq = 0.0
         for k, p in self.params.items():
             g = self._g[k]
             self._m[k] = b1 * self._m[k] + (1 - b1) * g
             self._v[k] = b2 * self._v[k] + (1 - b2) * g * g
-            p -= np.float32(lr) * (self._m[k] / (1 - b1**self._t)) / (np.sqrt(self._v[k] / (1 - b2**self._t)) + eps)
+            upd = np.float32(lr) * (self._m[k] / (1 - b1**self._t)) / (np.sqrt(self._v[k] / (1 - b2**self._t)) + eps)
+            if track:
+                g_sq += grad_stats.sq_norm((g,))
+                u_sq += grad_stats.sq_norm((upd,))
+                w_sq += grad_stats.sq_norm((p,))      # as it goes into the update
+            p -= upd
+        if track:
+            grad_stats.STATS.observe(g_sq, u_sq, w_sq)
         self.zero_grad()
 
     def zero_grad(self) -> None:

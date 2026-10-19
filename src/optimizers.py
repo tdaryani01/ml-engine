@@ -1,6 +1,8 @@
 # src/optimizers.py
 from abc import ABC, abstractmethod
 import numpy as np
+
+from src import grad_stats
 import logging
 
 class Optimizer(ABC):
@@ -66,6 +68,8 @@ class AdamOptimizer(Optimizer):
 
         one_minus_beta1 = 1.0 - self.beta1
         one_minus_beta2 = 1.0 - self.beta2
+        track = grad_stats.enabled()      # per-step gradient norm, applied update and weight norm, drained at the boundary (src/grad_stats.py)
+        g_sq = u_sq = w_sq = 0.0
         
         # 1. Update Core Weights and Biases
         for i in range(len(weights)):
@@ -91,8 +95,14 @@ class AdamOptimizer(Optimizer):
             if decay_factor > 0.0:
                 weights[i] -= decay_factor * weights[i]
 
-            weights[i] -= step_scale * (self.ms_w[i] / (np.sqrt(self.vs_w[i]) + eps_corrected))
-            biases[i] -= step_scale * (self.ms_b[i] / (np.sqrt(self.vs_b[i]) + eps_corrected))
+            upd_w = step_scale * (self.ms_w[i] / (np.sqrt(self.vs_w[i]) + eps_corrected))
+            upd_b = step_scale * (self.ms_b[i] / (np.sqrt(self.vs_b[i]) + eps_corrected))
+            if track:
+                g_sq += grad_stats.sq_norm((gw, gb))
+                u_sq += grad_stats.sq_norm((upd_w, upd_b))
+                w_sq += grad_stats.sq_norm((weights[i], biases[i]))      # as they are going into the update
+            weights[i] -= upd_w
+            biases[i] -= upd_b
 
         # 2. Update Batch Normalization Scaling Parameters via Adam
         if gammas is not None and grad_gammas is not None:
@@ -101,7 +111,12 @@ class AdamOptimizer(Optimizer):
                 if gg is not None:
                     self.ms_g[i] = self.beta1 * self.ms_g[i] + one_minus_beta1 * gg
                     self.vs_g[i] = self.beta2 * self.vs_g[i] + one_minus_beta2 * (gg * gg)
-                    gammas[i] -= step_scale * (self.ms_g[i] / (np.sqrt(self.vs_g[i]) + eps_corrected))
+                    upd_g = step_scale * (self.ms_g[i] / (np.sqrt(self.vs_g[i]) + eps_corrected))
+                    if track:
+                        g_sq += grad_stats.sq_norm((gg,))
+                        u_sq += grad_stats.sq_norm((upd_g,))
+                        w_sq += grad_stats.sq_norm((gammas[i],))
+                    gammas[i] -= upd_g
 
         if betas is not None and grad_betas is not None:
             for i in range(len(betas)):
@@ -109,7 +124,15 @@ class AdamOptimizer(Optimizer):
                 if gb_val is not None:
                     self.ms_beta[i] = self.beta1 * self.ms_beta[i] + one_minus_beta1 * gb_val
                     self.vs_beta[i] = self.beta2 * self.vs_beta[i] + one_minus_beta2 * (gb_val * gb_val)
-                    betas[i] -= step_scale * (self.ms_beta[i] / (np.sqrt(self.vs_beta[i]) + eps_corrected))
+                    upd_t = step_scale * (self.ms_beta[i] / (np.sqrt(self.vs_beta[i]) + eps_corrected))
+                    if track:
+                        g_sq += grad_stats.sq_norm((gb_val,))
+                        u_sq += grad_stats.sq_norm((upd_t,))
+                        w_sq += grad_stats.sq_norm((betas[i],))
+                    betas[i] -= upd_t
+
+        if track:
+            grad_stats.STATS.observe(g_sq, u_sq, w_sq)
 
 
 class SGDOptimizer(Optimizer):
@@ -143,16 +166,23 @@ class SGDOptimizer(Optimizer):
             self.setup(weights, biases, gammas, betas)
             
         decay_term = (lam_l2 / float(m_samples)) if lam_l2 > 0.0 else 0.0
+        track = grad_stats.enabled()
+        g_sq = u_sq = w_sq = 0.0
 
         # 1. Update Weights and Biases
         for i in range(len(weights)):
             gw = grad_weights[i]
+            if track:
+                g_sq += grad_stats.sq_norm((gw, grad_biases[i]))
+                w_sq += grad_stats.sq_norm((weights[i], biases[i]))      # as they are going into the update
             if decay_term > 0.0:
                 gw = gw + decay_term * weights[i]
 
             self.vs_w[i] = (self.momentum * self.vs_w[i]) + active_lr * gw
             self.vs_b[i] = (self.momentum * self.vs_b[i]) + active_lr * grad_biases[i]
             
+            if track:
+                u_sq += grad_stats.sq_norm((self.vs_w[i], self.vs_b[i]))
             weights[i] -= self.vs_w[i]
             biases[i] -= self.vs_b[i]
 
@@ -168,3 +198,6 @@ class SGDOptimizer(Optimizer):
                 if grad_betas[i] is not None:
                     self.vs_beta[i] = (self.momentum * self.vs_beta[i]) + active_lr * grad_betas[i]
                     betas[i] -= self.vs_beta[i]
+
+        if track:
+            grad_stats.STATS.observe(g_sq, u_sq, w_sq)
