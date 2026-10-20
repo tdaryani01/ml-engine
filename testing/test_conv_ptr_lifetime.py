@@ -127,6 +127,18 @@ def test_a_cnn_gives_the_same_gradients_every_time_on_the_same_cache() -> None:
     assert all(v > 0.0 for v in same_cache[0][2]), "a layer's weight gradient is zero on the first backward"
 
 
+def test_an_exported_omp_num_threads_sets_the_native_team_size(monkeypatch) -> None:
+    """A reproducible run exports OMP_NUM_THREADS=1: the engine must then use one thread, whatever runtime.yaml says."""
+    from utils.runtime import load_runtime_settings
+
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    default = load_runtime_settings().effective_omp_threads()
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    assert load_runtime_settings().effective_omp_threads() == 1
+    monkeypatch.setenv("OMP_NUM_THREADS", "")
+    assert load_runtime_settings().effective_omp_threads() == default          # empty = not set
+
+
 if __name__ == "__main__":
     test_the_copy_made_for_a_non_contiguous_view_lives_as_long_as_the_pointer()
     test_a_contiguous_array_is_pointed_at_in_place_and_none_stays_none()
