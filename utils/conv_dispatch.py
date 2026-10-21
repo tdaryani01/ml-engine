@@ -804,13 +804,25 @@ def _ensure_fast_kernels():
     _fast_kernels_loaded = True
 
 
+class _HeldPtr(ctypes.c_void_p):
+    """A ``c_void_p`` that owns the array it points into.
+
+    A non-contiguous view (for example the logical ``[:, :, :h, :w]`` slice of a SIMD-padded gradient) is copied to a contiguous temporary first. The pointer used to be the only thing returned, so the temporary was freed
+    when this function returned and the native call read freed memory: whatever the allocator had put there since (ml-engine#60: gradients that changed with the heap layout, ASLR and MALLOC_PERTURB_, a zero
+    gradient on the first backward of a process). The argument object lives until the ctypes call returns, so the array stays alive exactly as long as the native code can read it."""
+
+    _hold = None
+
+
 def _get_c_ptr(arr: np.ndarray):
-    """Safely extracts a C data pointer from a NumPy array."""
+    """Safely extracts a C data pointer from a NumPy array (an INPUT: a copy made here is read-only for the native code)."""
     if arr is None or arr.size == 0:
         return None
     if not arr.flags['C_CONTIGUOUS']:
         arr = np.ascontiguousarray(arr)
-    return ctypes.c_void_p(int(arr.ctypes.data))
+    ptr = _HeldPtr(int(arr.ctypes.data))
+    ptr._hold = arr
+    return ptr
 
 
 def _pack_w_gemm_fwd(W: np.ndarray, buf: np.ndarray | None = None) -> np.ndarray:

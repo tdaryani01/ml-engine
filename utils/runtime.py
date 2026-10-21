@@ -343,6 +343,11 @@ def load_runtime_settings(
     raw = _load_yaml(rt_path)
     resolved_platform = platform or detect_platform()
     env = _merge_env_sections(raw, resolved_platform)
+    # An OMP_NUM_THREADS exported in the process environment wins over runtime.yaml for the team size: whoever exports 1 for a reproducible run must get one thread
+    # (ml-engine#60: with more than one thread dW is summed per thread under dynamic scheduling and differs in the last bits from call to call).
+    _proc_omp = os.environ.get("OMP_NUM_THREADS")
+    if _proc_omp is not None and _proc_omp.strip() != "":
+        env["OMP_NUM_THREADS"] = _proc_omp.strip()
     threads = _resolve_num_threads(
         cfg_path,
         raw,
