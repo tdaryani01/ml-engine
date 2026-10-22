@@ -32,6 +32,17 @@
 #include <windows.h>
 #endif
 
+// std::aligned_alloc does not exist in MSVC's C runtime: use _aligned_malloc there. Memory from ml_aligned_alloc MUST be released with ml_aligned_free (never std::free) so both
+// platforms stay correct; buffers from std::malloc keep std::free.
+#ifdef _MSC_VER
+#include <malloc.h>
+static inline void* ml_aligned_alloc(size_t alignment, size_t bytes) { return _aligned_malloc(bytes, alignment); }
+static inline void ml_aligned_free(void* p) { _aligned_free(p); }
+#else
+static inline void* ml_aligned_alloc(size_t alignment, size_t bytes) { return std::aligned_alloc(alignment, bytes); }
+static inline void ml_aligned_free(void* p) { std::free(p); }
+#endif
+
 // Diagnostic: BWD_DX_MOCK_EDGES=1 skips left/right dX tiles (dx stays 0 there).
 static bool bwd_dx_mock_edges_enabled() {
     static int cached = -1;
@@ -1480,10 +1491,10 @@ static float* staged_x_pad_alloc(StagedXPad& slot, size_t need_floats) {
     if (slot.buf && need_floats <= slot.cap_floats) {
         return slot.buf;
     }
-    std::free(slot.buf);
+    ml_aligned_free(slot.buf);
     // 64B-aligned rows keep the sliding loads in the consumers off split lines.
     const size_t bytes = ((need_floats * sizeof(float)) + 63u) & ~(size_t)63u;
-    slot.buf = (float*)std::aligned_alloc(64, bytes);
+    slot.buf = (float*)ml_aligned_alloc(64, bytes);
     slot.cap_floats = slot.buf ? (bytes / sizeof(float)) : 0;
     return slot.buf;
 }
@@ -3760,11 +3771,11 @@ static float* acquire_bwd_dy_pad_buf(size_t need_floats) {
 static float* acquire_bwd_x_pad_buf(size_t need_floats) {
     if (need_floats == 0) return nullptr;
     if (need_floats > tls_x_pad_cap_floats) {
-        std::free(tls_x_pad_buf);
+        ml_aligned_free(tls_x_pad_buf);
         // 64B-aligned base: with an 8-float row stride this puts every padded
         // row start on a 32B boundary, matching the staged buffer.
         const size_t bytes = ((need_floats * sizeof(float)) + 63u) & ~(size_t)63u;
-        tls_x_pad_buf = (float*)std::aligned_alloc(64, bytes);
+        tls_x_pad_buf = (float*)ml_aligned_alloc(64, bytes);
         tls_x_pad_cap_floats = tls_x_pad_buf ? (bytes / sizeof(float)) : 0;
     }
     return tls_x_pad_buf;
@@ -3792,9 +3803,9 @@ static thread_local size_t tls_dx_cin_blocked_wt_cap = 0;
 static float* acquire_dx_cin_blocked_wt_buf(size_t need_floats) {
     if (need_floats == 0) return nullptr;
     if (need_floats > tls_dx_cin_blocked_wt_cap) {
-        std::free(tls_dx_cin_blocked_wt_buf);
+        ml_aligned_free(tls_dx_cin_blocked_wt_buf);
         const size_t bytes = ((need_floats * sizeof(float)) + 31u) & ~(size_t)31u;
-        tls_dx_cin_blocked_wt_buf = (float*)std::aligned_alloc(32, bytes);
+        tls_dx_cin_blocked_wt_buf = (float*)ml_aligned_alloc(32, bytes);
         tls_dx_cin_blocked_wt_cap = tls_dx_cin_blocked_wt_buf ? (bytes / sizeof(float)) : 0;
     }
     return tls_dx_cin_blocked_wt_buf;
@@ -3835,9 +3846,9 @@ static float* staged_dx_wt_alloc(StagedDxWt& slot, size_t need_floats) {
     if (slot.buf && need_floats <= slot.cap_floats) {
         return slot.buf;
     }
-    std::free(slot.buf);
+    ml_aligned_free(slot.buf);
     const size_t bytes = ((need_floats * sizeof(float)) + 31u) & ~(size_t)31u;
-    slot.buf = (float*)std::aligned_alloc(32, bytes);
+    slot.buf = (float*)ml_aligned_alloc(32, bytes);
     slot.cap_floats = slot.buf ? (bytes / sizeof(float)) : 0;
     return slot.buf;
 }
@@ -4328,18 +4339,18 @@ static thread_local size_t tls_brg_dx_blocked_cap = 0;
 
 static float* brg_dw_alloc(float*& slot, size_t& cap, size_t need) {
     if (need <= cap && slot) return slot;
-    std::free(slot);
+    ml_aligned_free(slot);
     const size_t bytes = ((need * sizeof(float)) + 63u) & ~(size_t)63u;
-    slot = (float*)std::aligned_alloc(64, bytes);
+    slot = (float*)ml_aligned_alloc(64, bytes);
     cap = slot ? (bytes / sizeof(float)) : 0;
     return slot;
 }
 
 static float* brg_dw_stage_alloc(BrgDwXStage& slot, size_t need) {
     if (slot.buf && need <= slot.cap_floats) return slot.buf;
-    std::free(slot.buf);
+    ml_aligned_free(slot.buf);
     const size_t bytes = ((need * sizeof(float)) + 63u) & ~(size_t)63u;
-    slot.buf = (float*)std::aligned_alloc(64, bytes);
+    slot.buf = (float*)ml_aligned_alloc(64, bytes);
     slot.cap_floats = slot.buf ? (bytes / sizeof(float)) : 0;
     return slot.buf;
 }
