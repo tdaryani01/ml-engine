@@ -44,3 +44,45 @@ jobs:
         with:
           name: ml-engine-linux-x86_64
           path: dist/
+
+  windows-x86_64:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the native library (MSVC, /arch:AVX2: already a portable baseline)
+        run: ./build_native.ps1 release
+      - name: Pack the wheel
+        run: |
+          New-Item -ItemType Directory -Force utils/bin | Out-Null
+          Copy-Item bin/conv_kernels.dll utils/bin/
+          pip install build
+          python -m build --wheel --outdir dist .
+          Get-ChildItem dist
+      - name: Install into a clean environment, away from the checkout, and check it
+        run: |
+          python -m venv $env:RUNNER_TEMP/venv
+          $py = "$env:RUNNER_TEMP/venv/Scripts/python.exe"
+          & $py -m pip install (Get-ChildItem dist/*.whl).FullName
+          Set-Location $env:RUNNER_TEMP
+          @'
+          import utils.conv_dispatch as c, src.contract
+          p = c._locate_native_dll()
+          assert p and "site-packages" in p, f"native library not found inside the installed package: {p}"
+          print("native library:", p)
+          '@ | Set-Content check.py
+          & $py check.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Manifest
+        run: |
+          python scripts/wheel_manifest.py dist "AVX2 (/arch:AVX2)" | Set-Content -Encoding utf8 dist/manifest.json
+          Get-Content dist/manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ml-engine-windows-x86_64
+          path: dist/
