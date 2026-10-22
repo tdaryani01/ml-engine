@@ -86,3 +86,42 @@ jobs:
         with:
           name: ml-engine-windows-x86_64
           path: dist/
+
+  macos-arm64:
+    # No native library here: the kernels are x86 AVX2 and an Apple Silicon CPU cannot run them. The wheel carries the Python code only; the engine then needs ML_ENGINE_NATIVE_FALLBACK=1
+    # (utils/conv_dispatch.py is strict native-only otherwise), which the Desktop launcher sets on this platform. This job proves the wheel installs and the Numba/SciPy path runs on arm64.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Pack the wheel (Python code only)
+        run: |
+          pip install build
+          python -m build --wheel --outdir dist .
+          ls -l dist
+      - name: Install into a clean environment, away from the checkout, and check it
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/*.whl
+          cd /tmp
+          ML_ENGINE_NATIVE_FALLBACK=1 /tmp/venv/bin/python - <<'PY'
+          import platform
+          import numpy as np
+          import utils.conv_dispatch as c, src.contract
+          from utils import im2col_fast
+          assert platform.machine() == "arm64", platform.machine()
+          assert c._locate_native_dll() is None, "a native library should not be in the macOS wheel"
+          assert c._native_allow_im2col_fallback()
+          x = np.arange(1 * 1 * 4 * 4, dtype=np.float32).reshape(1, 1, 4, 4)
+          col = im2col_fast.im2col_fast(x, 2, 2, 1, 0)
+          assert col.size == 9 * 4, col.shape
+          print("macOS arm64: wheel installs, no native library, Numba im2col runs", col.shape)
+          PY
+      - name: Manifest
+        run: python scripts/wheel_manifest.py dist "none (macOS arm64, Python path)" > dist/manifest.json && cat dist/manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ml-engine-macos-arm64
+          path: dist/
