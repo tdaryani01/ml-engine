@@ -38,6 +38,8 @@ jobs:
           assert p and "site-packages" in p, f"native library not found inside the installed package: {p}"
           print("native library:", p)
           PY
+      - name: The fit launcher finds run_pipeline.py in the installed package
+        run: cd /tmp && /tmp/venv/bin/python "$GITHUB_WORKSPACE/scripts/check_installed_launcher.py"
       - name: Manifest
         run: python scripts/wheel_manifest.py dist x86-64-v3 > dist/manifest.json && cat dist/manifest.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -77,6 +79,11 @@ jobs:
           print("native library:", p)
           '@ | Set-Content check.py
           & $py check.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: The fit launcher finds run_pipeline.py in the installed package
+        run: |
+          Set-Location $env:RUNNER_TEMP
+          & "$env:RUNNER_TEMP/venv/Scripts/python.exe" "$env:GITHUB_WORKSPACE/scripts/check_installed_launcher.py"
           if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Manifest
         run: |
@@ -119,6 +126,8 @@ jobs:
           assert col.size == 9 * 4, col.shape
           print("macOS arm64: wheel installs, no native library, Numba im2col runs", col.shape)
           PY
+      - name: The fit launcher finds run_pipeline.py in the installed package
+        run: cd /tmp && /tmp/venv/bin/python "$GITHUB_WORKSPACE/scripts/check_installed_launcher.py"
       - name: Manifest
         run: python scripts/wheel_manifest.py dist "none (macOS arm64, Python path)" > dist/manifest.json && cat dist/manifest.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2

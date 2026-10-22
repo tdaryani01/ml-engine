@@ -26,6 +26,9 @@ include = ["src*", "utils*", "config*", "data*"]
 exclude = ["data.shards*"]
 namespaces = true
 
+[tool.setuptools]
+py-modules = ["run_pipeline"]      # the fit launcher runs `python run_pipeline.py` from the engine root (src/launcher/runner.py)
+
 [tool.setuptools.package-data]
 utils = ["bin/*.so", "bin/*.dll"]
 config = ["*.yaml"]
