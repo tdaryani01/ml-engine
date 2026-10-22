@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Build the native library (portable baseline)
-        run: MARCH=x86-64-v3 ./build_native.sh release
+        run: MARCH=x86-64-v3 bash build_native.sh release
       - name: Pack the wheel
         run: |
           mkdir -p utils/bin
