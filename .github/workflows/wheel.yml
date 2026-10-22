@@ -1,0 +1,136 @@
+name: Build wheel
+
+# Builds the native library with a PORTABLE baseline (x86-64-v3: AVX2/FMA/BMI2, not -march=native), packs it into a wheel, installs the wheel into a clean environment away from the checkout
+# and checks that the engine imports and finds its library there. Publishes the wheel and a manifest (sha256, MARCH, compiler, commit) as a build artifact.
+on:
+  pull_request:
+    paths: [pyproject.toml, setup.py, build_native.sh, "src/native/**", ".github/workflows/wheel.yml", scripts/wheel_manifest.py]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the native library (portable baseline)
+        run: MARCH=x86-64-v3 bash build_native.sh release
+      - name: Pack the wheel
+        run: |
+          mkdir -p utils/bin
+          cp bin/conv_kernels.so utils/bin/
+          pip install build
+          python -m build --wheel --outdir dist .
+          ls -l dist
+      - name: Install into a clean environment, away from the checkout, and check it
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/venv/bin/python - <<'PY'
+          import utils.conv_dispatch as c, src.contract
+          p = c._locate_native_dll()
+          assert p and "site-packages" in p, f"native library not found inside the installed package: {p}"
+          print("native library:", p)
+          PY
+      - name: The fit launcher finds run_pipeline.py in the installed package
+        run: cd /tmp && /tmp/venv/bin/python "$GITHUB_WORKSPACE/scripts/check_installed_launcher.py"
+      - name: Manifest
+        run: python scripts/wheel_manifest.py dist x86-64-v3 > dist/manifest.json && cat dist/manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ml-engine-linux-x86_64
+          path: dist/
+
+  windows-x86_64:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the native library (MSVC with /arch:AVX2, already a portable baseline)
+        run: ./build_native.ps1 release
+      - name: Pack the wheel
+        run: |
+          New-Item -ItemType Directory -Force utils/bin | Out-Null
+          Copy-Item bin/conv_kernels.dll utils/bin/
+          pip install build
+          python -m build --wheel --outdir dist .
+          Get-ChildItem dist
+      - name: Install into a clean environment, away from the checkout, and check it
+        run: |
+          python -m venv $env:RUNNER_TEMP/venv
+          $py = "$env:RUNNER_TEMP/venv/Scripts/python.exe"
+          & $py -m pip install (Get-ChildItem dist/*.whl).FullName
+          Set-Location $env:RUNNER_TEMP
+          @'
+          import utils.conv_dispatch as c, src.contract
+          p = c._locate_native_dll()
+          assert p and "site-packages" in p, f"native library not found inside the installed package: {p}"
+          print("native library:", p)
+          '@ | Set-Content check.py
+          & $py check.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: The fit launcher finds run_pipeline.py in the installed package
+        run: |
+          Set-Location $env:RUNNER_TEMP
+          & "$env:RUNNER_TEMP/venv/Scripts/python.exe" "$env:GITHUB_WORKSPACE/scripts/check_installed_launcher.py"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+      - name: Manifest
+        run: |
+          python scripts/wheel_manifest.py dist "AVX2 (/arch:AVX2)" | Set-Content -Encoding utf8 dist/manifest.json
+          Get-Content dist/manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ml-engine-windows-x86_64
+          path: dist/
+
+  macos-arm64:
+    # No native library here: the kernels are x86 AVX2 and an Apple Silicon CPU cannot run them. The wheel carries the Python code only; the engine then needs ML_ENGINE_NATIVE_FALLBACK=1
+    # (utils/conv_dispatch.py is strict native-only otherwise), which the Desktop launcher sets on this platform. This job proves the wheel installs and the Numba/SciPy path runs on arm64.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Pack the wheel (Python code only)
+        run: |
+          pip install build
+          python -m build --wheel --outdir dist .
+          ls -l dist
+      - name: Install into a clean environment, away from the checkout, and check it
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/*.whl
+          cd /tmp
+          ML_ENGINE_NATIVE_FALLBACK=1 /tmp/venv/bin/python - <<'PY'
+          import platform
+          import numpy as np
+          import utils.conv_dispatch as c, src.contract
+          from utils import im2col_fast
+          assert platform.machine() == "arm64", platform.machine()
+          assert c._locate_native_dll() is None, "a native library should not be in the macOS wheel"
+          assert c._native_allow_im2col_fallback()
+          x = np.arange(1 * 1 * 4 * 4, dtype=np.float32).reshape(1, 1, 4, 4)
+          col = im2col_fast.im2col_fast(x, 2, 2, 1, 0)
+          assert col.size == 9 * 4, col.shape
+          print("macOS arm64: wheel installs, no native library, Numba im2col runs", col.shape)
+          PY
+      - name: The fit launcher finds run_pipeline.py in the installed package
+        run: cd /tmp && /tmp/venv/bin/python "$GITHUB_WORKSPACE/scripts/check_installed_launcher.py"
+      - name: Manifest
+        run: python scripts/wheel_manifest.py dist "none (macOS arm64, Python path)" > dist/manifest.json && cat dist/manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ml-engine-macos-arm64
+          path: dist/
