@@ -55,7 +55,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
-      - name: Build the native library (MSVC, /arch:AVX2: already a portable baseline)
+      - name: Build the native library (MSVC with /arch:AVX2, already a portable baseline)
         run: ./build_native.ps1 release
       - name: Pack the wheel
         run: |
