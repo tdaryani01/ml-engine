@@ -1,0 +1,46 @@
+name: Build wheel
+
+# Builds the native library with a PORTABLE baseline (x86-64-v3: AVX2/FMA/BMI2, not -march=native), packs it into a wheel, installs the wheel into a clean environment away from the checkout
+# and checks that the engine imports and finds its library there. Publishes the wheel and a manifest (sha256, MARCH, compiler, commit) as a build artifact.
+on:
+  pull_request:
+    paths: [pyproject.toml, setup.py, build_native.sh, "src/native/**", ".github/workflows/wheel.yml", scripts/wheel_manifest.py]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the native library (portable baseline)
+        run: MARCH=x86-64-v3 ./build_native.sh release
+      - name: Pack the wheel
+        run: |
+          mkdir -p utils/bin
+          cp bin/conv_kernels.so utils/bin/
+          pip install build
+          python -m build --wheel --outdir dist .
+          ls -l dist
+      - name: Install into a clean environment, away from the checkout, and check it
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/*.whl
+          cd /tmp
+          /tmp/venv/bin/python - <<'PY'
+          import utils.conv_dispatch as c, src.contract
+          p = c._locate_native_dll()
+          assert p and "site-packages" in p, f"native library not found inside the installed package: {p}"
+          print("native library:", p)
+          PY
+      - name: Manifest
+        run: python scripts/wheel_manifest.py dist x86-64-v3 > dist/manifest.json && cat dist/manifest.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ml-engine-linux-x86_64
+          path: dist/
