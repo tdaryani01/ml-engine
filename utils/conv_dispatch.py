@@ -419,15 +419,32 @@ _native_im2col_gemm_available = False
 _im2col_gemm_ctypes_bound = False
 
 
+_native_load_failure_seen = False
+
+
+def _native_load_failure_logged() -> bool:
+    """True when a load failure was already reported; marks it reported (one warning per process, not one per call)."""
+    global _native_load_failure_seen
+    seen, _native_load_failure_seen = _native_load_failure_seen, True
+    return seen
+
+
 def _load_conv_dll():
-    """Load conv_kernels once; shared by NATIVE and IM2COL_GEMM."""
+    """Load conv_kernels once; shared by NATIVE and IM2COL_GEMM. None when there is no library or it cannot be loaded."""
     global _primitives_lib
     if _primitives_lib is not None:
         return _primitives_lib
     lib_path = _locate_native_dll()
     if lib_path is None:
         return None
-    lib = ctypes.CDLL(lib_path)
+    try:
+        lib = ctypes.CDLL(lib_path)
+    except OSError as exc:
+        # The file is there but cannot be loaded: on Windows a missing dependency (the LLVM OpenMP runtime, libomp140.x86_64.dll, which a PC without Visual Studio does not have), or a CPU
+        # the build does not support. Treat it like "no native library": the callers then take the Numba path when ML_ENGINE_NATIVE_FALLBACK allows it, instead of dying at start-up.
+        if not _native_load_failure_logged():
+            logger.warning("native library %s could not be loaded (%s); the native kernels are unavailable", lib_path, exc)
+        return None
     if not _bind_im2col_primitives(lib):
         return None
     _bind_thread_config(lib)
