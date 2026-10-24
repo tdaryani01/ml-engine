@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -287,6 +288,13 @@ def _from_family(spec: FamilyFitSpec, *, work_dir: Path, restore: Path | None) -
     return cfg
 
 
+def _yaml_quoted(text: str) -> str:
+    r"""A YAML double-quoted scalar holding `text` exactly, in pure ASCII (runner.py writes the file with the locale codec). A JSON string is also a valid YAML double-quoted
+    string, with backslashes and quotes escaped; the one difference is a character beyond the basic plane: json writes a surrogate pair, which PyYAML reads back as two lone
+    surrogates, so such a character is written as one \U escape."""
+    return '"' + "".join(f"\\U{ord(c):08X}" if ord(c) > 0xFFFF else json.dumps(c)[1:-1] for c in text) + '"'
+
+
 def build_boot_yaml(work_dir: Path) -> str:
     """ME's boot YAML for an EE-launched fit: no heartbeat to TM, exit when the fit ends."""
     return (
@@ -295,7 +303,8 @@ def build_boot_yaml(work_dir: Path) -> str:
         '  stage: "dev"\n'
         "  suppress_logging: true\n"
         '  logging_level: "warning"\n'
-        f'  output_dir: "{Path(work_dir) / "out"}"\n'
+        # the path is quoted (see _yaml_quoted): bare, a Windows path like C:\Users\... reads as an escape and the file does not parse
+        f'  output_dir: {_yaml_quoted(str(Path(work_dir) / "out"))}\n'
         "training_manager:\n"
         "  enabled: false\n"
         "  park_when_idle: false\n"
