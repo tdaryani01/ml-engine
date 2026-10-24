@@ -63,6 +63,13 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force utils/bin | Out-Null
           Copy-Item bin/conv_kernels.dll utils/bin/
+          # The library imports Microsoft's LLVM OpenMP runtime (/openmp:llvm), which a PC without Visual Studio does not have: its loader says "Could not find module conv_kernels.dll (or one of its dependencies)".
+          # Ship the runtime beside the library (Microsoft lists it as redistributable); the loader looks in the DLL's own folder first.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $omp = Get-ChildItem -Path (Join-Path $vs 'VC\Redist\MSVC') -Recurse -Filter 'libomp140.x86_64.dll' -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch 'debug_nonredist' } | Select-Object -First 1
+          if (-not $omp) { throw 'libomp140.x86_64.dll (the OpenMP runtime the library imports) was not found in the Visual Studio redistributable folder' }
+          Write-Host "OpenMP runtime: $($omp.FullName)"
+          Copy-Item $omp.FullName utils/bin/
           pip install build
           python -m build --wheel --outdir dist .
           Get-ChildItem dist
@@ -73,10 +80,15 @@ jobs:
           & $py -m pip install (Get-ChildItem dist/*.whl).FullName
           Set-Location $env:RUNNER_TEMP
           @'
+          import ctypes, os
           import utils.conv_dispatch as c, src.contract
           p = c._locate_native_dll()
           assert p and "site-packages" in p, f"native library not found inside the installed package: {p}"
           print("native library:", p)
+          # the runtime must travel with the library, and the library must actually LOAD (finding the file is not loading it)
+          assert os.path.exists(os.path.join(os.path.dirname(p), "libomp140.x86_64.dll")), "the OpenMP runtime is not in the wheel"
+          ctypes.CDLL(p)
+          print("loaded:", p)
           '@ | Set-Content check.py
           & $py check.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
