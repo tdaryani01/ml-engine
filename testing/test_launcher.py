@@ -207,3 +207,14 @@ def test_a_checkpoint_is_published_only_with_a_validation_measurement_behind_it(
     assert all(abs(s["loss"] - s["train_loss"]) > 1e-12 for s in cps), "no published checkpoint stands on a training loss in place of a validation loss"
     first_epoch_end = next(s["step"] for s in snaps if s["val_measured"])
     assert min(s["version"] for s in cps) > first_epoch_end - 1
+
+
+def test_the_boot_yaml_parses_for_any_path_including_a_windows_one():
+    """The first real Windows fit died with a YAML 'expected escape sequence of 8 hexadecimal numbers' error: the work folder was pasted bare inside double quotes, so a drive path was read as an escape."""
+    from src.launcher import build_boot_yaml
+
+    umlauts = "D:" + chr(92) + "data with space" + chr(92) + "\u00dcn" + chr(0xEF) + chr(92) + "fit"
+    for work in (r"C:\Users\aneat\.local\share\tm-desktop\work\fit_1", "/home/u/work", umlauts, r'E:\say "hi"\x'):
+        doc = yaml.safe_load(build_boot_yaml(Path(work)))
+        assert doc["meta"]["output_dir"] == str(Path(work) / "out"), work
+        assert doc["training_manager"]["enabled"] is False and doc["meta"]["pipeline_name"] == "ee_boot"

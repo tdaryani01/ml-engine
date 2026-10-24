@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import csv
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -295,7 +296,8 @@ def build_boot_yaml(work_dir: Path) -> str:
         '  stage: "dev"\n'
         "  suppress_logging: true\n"
         '  logging_level: "warning"\n'
-        f'  output_dir: "{Path(work_dir) / "out"}"\n'
+        # a JSON string is also a valid YAML double-quoted string, with the backslashes of a Windows path escaped: written bare, "C:\Users\..." is read as the escape \U and the file does not parse
+        f'  output_dir: {json.dumps(str(Path(work_dir) / "out"))}\n'
         "training_manager:\n"
         "  enabled: false\n"
         "  park_when_idle: false\n"
