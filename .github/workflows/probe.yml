@@ -1,0 +1,29 @@
+name: Probe OpenMP runtime
+
+# Temporary: where does libomp140.x86_64.dll live on the Windows runner?
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: [.github/workflows/probe.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Find it
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          "vswhere: $vs"
+          "--- libomp / vcomp anywhere under the Visual Studio install:"
+          Get-ChildItem -Path $vs -Recurse -ErrorAction SilentlyContinue -Include 'libomp*.dll','vcomp*.dll' | Select-Object -First 30 -ExpandProperty FullName
+          "--- Redist tree (2 levels):"
+          if (Test-Path (Join-Path $vs 'VC\Redist\MSVC')) { Get-ChildItem (Join-Path $vs 'VC\Redist\MSVC') -Recurse -Depth 2 -Directory -ErrorAction SilentlyContinue | Select-Object -First 30 -ExpandProperty FullName } else { 'no VC\Redist\MSVC folder' }
+          "--- on PATH / System32:"
+          Get-Command libomp140.x86_64.dll -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          Get-ChildItem C:\Windows\System32 -Filter 'libomp*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
