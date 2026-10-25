@@ -175,6 +175,7 @@ class TrainableModel(ABC):
         try:  # gradient statistics (src/grad_stats.py): every caller of this step, imitation's trainer included, is covered here
             from src import grad_stats
 
+            grad_stats.trace_layers(out[1], out[2])      # per-step series side file (ML_GRAD_TRACE_DIR; off by default)
             norms = getattr(self._contract_runtime, "last_update_norms", None)
             if norms is None:
                 grad_stats.observe_grads([*out[1], *out[2]])

@@ -94,3 +94,35 @@ def test_an_imitation_fit_reports_gradient_norms_and_the_update_ratio_through_th
     docs = _run(tmp_path, _payload(out, corpus, steps=6))
     extras = [d.body.get("extra_metrics") or {} for d in docs if d.doc_type == "step.metrics"]
     assert extras and all({"grad_norm_mean", "grad_norm_var", "update_weight_ratio"} <= set(e) and 0.0 < e["update_weight_ratio"] < 1.0 for e in extras)
+
+
+def test_the_trace_side_file_is_off_by_default_and_writes_pooled_and_group_norms_when_on(tmp_path, monkeypatch):
+    import json
+
+    gw = [np.full((2, 2), 3.0, dtype=np.float32), np.full((2, 2), 4.0, dtype=np.float32), np.full((2, 2), 12.0, dtype=np.float32)]
+    gb = [np.zeros((1, 2), dtype=np.float32)] * 3
+    monkeypatch.delenv("ML_GRAD_TRACE_DIR", raising=False)
+    grad_stats.trace_layers(gw, gb)
+    grad_stats.drain()
+    assert not list(tmp_path.iterdir())                                                    # off: nothing recorded, nothing written
+    monkeypatch.setenv("ML_GRAD_TRACE_DIR", str(tmp_path))
+    grad_stats.trace_layers(gw, gb)
+    grad_stats.trace_layers(gw, gb)
+    grad_stats.drain()                                                                     # the boundary closes the series
+    lines = (next(tmp_path.glob("grad_trace_*.jsonl"))).read_text().splitlines()
+    rec = json.loads(lines[0])
+    assert rec["columns"] == ["pooled", "first", "middle", "head"] and len(rec["steps"]) == 2
+    pooled, first, middle, head = rec["steps"][0]
+    assert math.isclose(first, 6.0) and math.isclose(middle, 8.0) and math.isclose(head, 24.0) and math.isclose(pooled, math.sqrt(36 + 64 + 576))
+    grad_stats.drain()
+    assert len((next(tmp_path.glob("grad_trace_*.jsonl"))).read_text().splitlines()) == 1  # nothing new, nothing appended
+
+
+def test_the_trace_does_not_change_the_weights(tmp_path, monkeypatch):
+    w, b, gw, gb = _problem()
+    AdamOptimizer(lr=0.1).update(weights=w, biases=b, grad_weights=gw, grad_biases=gb, m_samples=1, lam_l2=0.0, active_lr=0.1)
+    monkeypatch.setenv("ML_GRAD_TRACE_DIR", str(tmp_path))
+    w2, b2, gw2, gb2 = _problem()
+    AdamOptimizer(lr=0.1).update(weights=w2, biases=b2, grad_weights=gw2, grad_biases=gb2, m_samples=1, lam_l2=0.0, active_lr=0.1)
+    assert np.array_equal(w[0], w2[0]) and np.array_equal(b[0], b2[0])
+    grad_stats.drain()
