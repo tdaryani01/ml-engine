@@ -54,6 +54,7 @@ class AdamOptimizer(Optimizer):
     def update(self, weights, biases, grad_weights, grad_biases, m_samples, lam_l2, active_lr, 
                gammas=None, betas=None, grad_gammas=None, grad_betas=None):
         """Performs an Adam optimization step, updating weights, biases, and optional batch normalization parameters."""
+        grad_stats.trace_layers(grad_weights, grad_biases)      # per-step series side file (ML_GRAD_TRACE_DIR; off by default)
         if not self._setup_done:
             self.setup(weights, biases, gammas, betas)
             
@@ -162,6 +163,7 @@ class SGDOptimizer(Optimizer):
     def update(self, weights, biases, grad_weights, grad_biases, m_samples, lam_l2, active_lr, 
                gammas=None, betas=None, grad_gammas=None, grad_betas=None):
         """Performs an SGD update step using momentum."""
+        grad_stats.trace_layers(grad_weights, grad_biases)      # per-step series side file (ML_GRAD_TRACE_DIR; off by default)
         if not self._setup_done:
             self.setup(weights, biases, gammas, betas)
             

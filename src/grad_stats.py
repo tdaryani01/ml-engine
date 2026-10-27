@@ -91,4 +91,55 @@ def observe_grads(grad_arrays: Iterable[object | None]) -> None:
 
 
 def drain() -> dict[str, float]:
+    try:
+        flush_trace()      # the per-step series (side file) is closed at the same boundary as the statistics
+    except Exception:  # noqa: BLE001
+        pass
     return STATS.drain() if enabled() else {}
+
+
+# ---- per-step gradient-norm series (side file, off by default) -----------------------------------------------------------------------------------------
+# ML_GRAD_TRACE_DIR=<dir> writes, at every boundary drain, one JSON line to <dir>/grad_trace_<pid>.jsonl with the per-step gradient norms of the steps since the last
+# boundary: pooled over every tensor and for three layer groups (first layer, middle layers, last layer = head). It never rides the step document or any contract.
+_TRACE_LOCK = threading.Lock()
+_TRACE_STEPS: list[list[float]] = []
+_TRACE_SEQ = 0
+
+
+def trace_dir() -> str | None:
+    return os.environ.get("ML_GRAD_TRACE_DIR") or None
+
+
+def trace_layers(grad_weights: Iterable[object | None], grad_biases: Iterable[object | None] | None = None) -> None:
+    """Record one step: [pooled, first, middle, head] gradient L2 norms from the per-layer gradients (no-op when ML_GRAD_TRACE_DIR is unset)."""
+    if trace_dir() is None:
+        return
+    gw, gb = list(grad_weights), list(grad_biases or [])
+    per = [sq_norm((gw[i], gb[i] if i < len(gb) else None)) for i in range(len(gw))]
+    if not per:
+        return
+    first, head = per[0], per[-1] if len(per) > 1 else 0.0
+    middle = sum(per[1:-1]) if len(per) > 2 else 0.0
+    row = [math.sqrt(sum(per)), math.sqrt(first), math.sqrt(middle), math.sqrt(head)]
+    with _TRACE_LOCK:
+        _TRACE_STEPS.append(row)
+
+
+def flush_trace() -> None:
+    """Append the steps recorded since the last boundary as one JSON line and reset (no-op when off or nothing was recorded)."""
+    global _TRACE_SEQ
+    d = trace_dir()
+    if d is None:
+        return
+    with _TRACE_LOCK:
+        if not _TRACE_STEPS:
+            return
+        steps, _TRACE_STEPS[:] = list(_TRACE_STEPS), []
+        _TRACE_SEQ += 1
+        seq = _TRACE_SEQ
+    import json
+
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, f"grad_trace_{os.getpid()}.jsonl"), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"seq": seq, "columns": ["pooled", "first", "middle", "head"], "steps": steps}) + "\n")
+
