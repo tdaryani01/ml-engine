@@ -11,7 +11,7 @@ class ModelSerializer:
         """Serializes current trained parameters, normalization stats, and structural metadata to a compressed asset."""
         kind = ModelSerializer._model_kind(model)
         if kind != "dense":
-            return ModelSerializer._save_cnn_or_mhsa(model, kind, file_path)
+            return ModelSerializer._save_cnn_or_mhsa(model, kind, file_path, data_provider)
 
         
         if isinstance(config, dict):
@@ -148,11 +148,16 @@ class ModelSerializer:
         raise ValueError(f"cannot describe CNN layer {name}")
 
     @staticmethod
-    def _save_cnn_or_mhsa(model, kind: str, file_path: str) -> None:
-        """A CNN or MHSA model for export to PyTorch: parameters plus the structure that is not in the weights' shapes. Inputs are used as the loader gives them (no mean/std)."""
+    def _save_cnn_or_mhsa(model, kind: str, file_path: str, data_provider=None) -> None:
+        """A CNN or MHSA model for export to PyTorch: parameters plus the structure that is not in the weights' shapes. Inputs are used as the loader gives them: the
+        provider's mean/std are not stored, but the archive records that the provider HAD a non-trivial scaling, so the export can say so."""
         import json
 
         payload = {"model_type": kind, "format": 2}
+        mean, std = getattr(data_provider, "mean", None), getattr(data_provider, "std", None)
+        if mean is not None and std is not None and not (np.all(np.asarray(mean) == 0) and np.all(np.asarray(std) == 1)):
+            payload["provider_standardised"] = True
+            print(f"[Saver] WARNING: the data provider scaled the {kind} inputs (mean/std); they are NOT stored in {file_path}, so the exported module expects inputs scaled the same way.")
         if kind == "cnn":
             payload["task_type"] = str(model.task_type)
             payload["layers_json"] = json.dumps([ModelSerializer._describe_cnn_layer(layer) for layer in model.layers])

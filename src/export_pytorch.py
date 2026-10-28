@@ -38,7 +38,7 @@ OUTPUT_TEXT = {
 
 
 class ExportError(ValueError):
-    """The archive cannot be exported (not a dense model, or something the module needs is missing)."""
+    """The archive cannot be exported (not a supported model, or something the module needs is missing or not reproducible)."""
 
 
 def _model_type(archive) -> str:
@@ -59,7 +59,7 @@ def _flat(archive, key: str, n: int):
 
 
 def read_archive(path: str) -> dict:
-    """The parts of a saved dense model that the PyTorch module needs, validated. A file that is not a saved model (text, empty, truncated) is an ExportError."""
+    """The parts of a saved model (dense, cnn or mhsa) that the PyTorch module needs, validated. A file that is not a saved model (text, empty, truncated) is an ExportError."""
     try:
         return _read_archive(path)
     except (ExportError, FileNotFoundError):
@@ -240,7 +240,10 @@ def _arr(archive, key: str, shape: tuple) -> np.ndarray:
 
 # ---------------------------------------------------------------- CNN
 
-CNN_HEADS = {"multiclass": "softmax", "binary": "sigmoid"}       # anything else is the identity (CNNNetwork.apply_output_activation)
+SAVED_FORMAT = 2        # what ModelSerializer._save_cnn_or_mhsa writes; a newer layout is refused, not guessed
+# CNNNetwork.apply_output_activation compares task_type verbatim: "multiclass" is softmax, "binary" is sigmoid and anything else is the identity. Only the one
+# legitimate identity ("regression") is accepted here, so a value the engine would silently treat as raw outputs (a different case, a typo) is an export-time error.
+CNN_HEADS = {"multiclass": "softmax", "binary": "sigmoid", "regression": "identity"}
 CNN_OUTPUT_TEXT = {
     "softmax": "class probabilities, shape (N, n_classes)",
     "sigmoid": "probability of the positive class, shape (N, 1)",
@@ -248,12 +251,28 @@ CNN_OUTPUT_TEXT = {
 }
 
 
+def _check_saved_format(archive) -> None:
+    if "format" in archive and int(archive["format"]) > SAVED_FORMAT:
+        raise ExportError(f"the archive is format {int(archive['format'])}, newer than this exporter reads ({SAVED_FORMAT}): update the engine")
+
+
+def _provider_warning(archive) -> list[str]:
+    if "provider_standardised" in archive and bool(archive["provider_standardised"]):
+        return ["the training data was scaled with a mean/std that this archive does not carry (the data provider had them when the model was saved): the module expects inputs scaled the same way"]
+    return []
+
+
 def _read_cnn(archive) -> dict:
+    _check_saved_format(archive)
     try:
         layers = json.loads(str(archive["layers_json"]))
     except (KeyError, ValueError) as exc:
         raise ExportError(f"layers_json is missing or unreadable: {exc}") from exc
-    task = str(archive["task_type"]).strip().lower() if "task_type" in archive else "multiclass"
+    if "task_type" not in archive:
+        raise ExportError("task_type is missing from the archive: the output activation cannot be guessed")
+    task = str(archive["task_type"])
+    if task not in CNN_HEADS:
+        raise ExportError(f"task_type '{task}' is not one of {', '.join(sorted(CNN_HEADS))}: the engine would not apply softmax or sigmoid to it, so the output cannot be reproduced")
     convs = [layer for layer in layers if layer.get("type") in ("conv", "conv_block")]
     if not convs:
         raise ExportError("a cnn needs at least one conv layer")
@@ -286,9 +305,9 @@ def _read_cnn(archive) -> dict:
     if not dense_w:
         raise ExportError("a cnn needs a dense head")
     return {
-        "family": "cnn", "model_type": "cnn", "task_type": task, "head": CNN_HEADS.get(task, "identity"), "layers": layers,
+        "family": "cnn", "model_type": "cnn", "task_type": task, "head": CNN_HEADS[task], "layers": layers,
         "conv_w": conv_w, "conv_b": conv_b, "dense_w": dense_w, "dense_b": dense_b,
-        "warnings": ["inputs are used as given: no mean/std is stored for a cnn, so repeat any preprocessing (scaling, normalising) you did before training"],
+        "warnings": ["inputs are used as given: no mean/std is stored for a cnn, so repeat any preprocessing (scaling, normalising, the /255 an image loader may do) you did before training"] + _provider_warning(archive),
     }
 
 
@@ -390,6 +409,7 @@ LN_EPS = 1e-5     # mhsa_kernels.cpp kEps
 
 
 def _read_mhsa(archive) -> dict:
+    _check_saved_format(archive)
     need = ("d_model", "num_heads", "max_seq_len", "action_dim", "ffn_mult", "num_layers", "input_dim")
     missing = [k for k in need if k not in archive]
     if missing:
@@ -428,7 +448,7 @@ def _read_mhsa(archive) -> dict:
         "family": "mhsa", "model_type": "mhsa", "d_model": D, "num_heads": H, "max_seq_len": T, "action_dim": A, "ffn_hidden": ff, "num_layers": L,
         "input_dim": d_in, "action_mode": mode, "layers": layers, "act_w": act_w, "act_b": act_b, "pos": pos, "w_in": w_in, "b_in": b_in,
         "head": "tanh" if mode == "continuous" else "logits",
-        "warnings": ["inputs are used as given: no mean/std is stored for an mhsa model, so repeat any preprocessing you did before training"],
+        "warnings": ["inputs are used as given: no mean/std is stored for an mhsa model, so repeat any preprocessing you did before training"] + _provider_warning(archive),
     }
 
 
@@ -548,7 +568,7 @@ def _source_mhsa(spec: dict) -> str:
 def _info(spec: dict, source: str) -> dict:
     base = {"format_version": FORMAT_VERSION, "model_type": spec["model_type"], "dtype": "float32", "source": source, "warnings": spec["warnings"]}
     if spec["family"] == "cnn":
-        layers = [layer["type"] for layer in spec["layers"]]
+        layers = spec["layers"]      # the full description of each layer (kernel, stride, pad, pool), in forward order
         return {**base, "task_type": spec["task_type"], "layers": layers, "dense_sizes": [int(spec["dense_w"][0].shape[0])] + [int(w.shape[1]) for w in spec["dense_w"]],
                 "input": "images (N, C, H, W), float32, as the engine's loader gives them but without the width padding", "standardises_inputs": False,
                 "output": CNN_OUTPUT_TEXT[spec["head"]], "summary": f"cnn, {len(spec['conv_w'])} conv layers, dense {[int(w.shape[1]) for w in spec['dense_w']]}"}
