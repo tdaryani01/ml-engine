@@ -23,6 +23,7 @@ class MHSANetwork(TrainableModel):
     Python owns parameter storage and compiles the MHSA contract list.
     Forward/backward live in native ``mhsa_kernels``.
     """
+    model_kind = "mhsa"      # read by the serializer to choose the archive layout; renaming the class must not change it
 
     def __init__(
         self,

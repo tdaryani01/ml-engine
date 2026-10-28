@@ -669,3 +669,15 @@ def test_the_command_line_exports_and_a_bad_file_exits_2_with_a_message(tmp_path
     assert info["model_type"] == "multi_class" and info["layer_sizes"] == [N_IN, 6, 3]
     assert ex.main([str(tmp_path / "missing.npz"), str(tmp_path / "bad")]) == 2
     assert "export-pytorch:" in capsys.readouterr().err
+
+def test_the_serializer_goes_by_the_kind_a_network_declares_not_by_its_attributes():
+    from src.cnn_network import CNNNetwork
+    from src.mhsa_network import MHSANetwork
+
+    assert CNNNetwork.model_kind == "cnn" and MHSANetwork.model_kind == "mhsa"
+    # an object with none of the attributes the old guess looked for, renamed or reshaped, is still classified by what it declares
+    assert ModelSerializer._model_kind(types.SimpleNamespace(model_kind="cnn")) == "cnn"
+    assert ModelSerializer._model_kind(types.SimpleNamespace(model_kind="mhsa")) == "mhsa"
+    # and one that declares nothing falls back to the attribute test, so dense and older objects are unchanged
+    assert ModelSerializer._model_kind(types.SimpleNamespace(param_layers=[], layers=[])) == "cnn"
+    assert ModelSerializer._model_kind(types.SimpleNamespace(layer_sizes=[2, 3])) == "dense"

@@ -122,7 +122,10 @@ class ModelSerializer:
 
     @staticmethod
     def _model_kind(model) -> str:
-        """'cnn' (conv layers + dense head), 'mhsa' (stacked Pre-LN attention blocks) or 'dense'."""
+        """'cnn' (conv layers + dense head), 'mhsa' (stacked Pre-LN attention blocks) or 'dense'. The networks declare theirs as ``model_kind``; the attribute test is the fallback for objects that do not."""
+        declared = getattr(model, "model_kind", None)
+        if declared in ("cnn", "mhsa"):
+            return declared
         if hasattr(model, "param_layers") and hasattr(model, "layers"):
             return "cnn"
         if hasattr(model, "d_model") and hasattr(model, "num_heads"):

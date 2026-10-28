@@ -17,6 +17,7 @@ class CNNNetwork(TrainableModel):
     Automatically identifies and constructs fused ConvBlocks (Conv2D -> ReLU -> MaxPool2D)
     to minimize Python-to-C++ FFI dispatch transitions.
     """
+    model_kind = "cnn"       # read by the serializer to choose the archive layout; renaming the class must not change it
     def __init__(self, conv_configs: list, dense_sizes: list, optimizer_instance,
                  backend: EngineBackend = EngineBackend.NATIVE,
                  engine_ctx=None,
