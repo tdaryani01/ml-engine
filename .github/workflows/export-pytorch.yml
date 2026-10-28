@@ -1,0 +1,38 @@
+name: Export to PyTorch
+
+# Builds the native library (the MHSA comparisons and the overlapping-pool CNN case run against it) and runs the export tests with a CPU PyTorch.
+# Only when something the export reads or is compared against changes, so most pull requests do not pay for it.
+on:
+  pull_request:
+    paths: [src/export_pytorch.py, src/serializer.py, src/models.py, src/base_network.py, src/cnn_network.py, src/mhsa_network.py, src/spatial_layers.py, "src/native/**", utils/conv_dispatch.py,
+            testing/test_export_pytorch.py, testing/test_serializer.py, build_native.sh, .github/workflows/export-pytorch.yml]
+  push:
+    branches: [main]
+    paths: [src/export_pytorch.py, src/serializer.py, testing/test_export_pytorch.py, .github/workflows/export-pytorch.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install the engine's requirements and a CPU PyTorch
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libopenblas-dev
+          pip install "numpy>=1.26,<2" scipy numba pandas joblib pyyaml threadpoolctl pytest
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Build the native library (portable baseline)
+        run: MARCH=x86-64-v3 bash build_native.sh release
+      - name: Export tests (none may be skipped, the native cases are the point)
+        env:
+          ML_ENGINE_OPENBLAS_DLL: /usr/lib/x86_64-linux-gnu/libopenblas.so.0
+        run: |
+          set -o pipefail      # the default shell does not: without it a failing pytest would be hidden by tee
+          python -m pytest -q -rs testing/test_export_pytorch.py testing/test_serializer.py | tee pytest.log
+          if grep -q "^SKIPPED" pytest.log; then echo "::error::some export tests were skipped: the native kernels or OpenBLAS did not load"; exit 1; fi

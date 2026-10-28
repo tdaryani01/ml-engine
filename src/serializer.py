@@ -9,6 +9,10 @@ class ModelSerializer:
     @staticmethod
     def save_model(model, config, data_provider=None, file_path="deployed_model.npz"):
         """Serializes current trained parameters, normalization stats, and structural metadata to a compressed asset."""
+        kind = ModelSerializer._model_kind(model)
+        if kind != "dense":
+            return ModelSerializer._save_cnn_or_mhsa(model, kind, file_path, data_provider)
+
         
         if isinstance(config, dict):
             model_type_str = str(config["architecture"]["model_type"])
@@ -76,6 +80,11 @@ class ModelSerializer:
         if "ModelType." in raw_model_type:
             raw_model_type = raw_model_type.split("ModelType.")[-1]
         model_type_clean = raw_model_type.lower()
+        if model_type_clean in ("cnn", "mhsa"):
+            raise ValueError(
+                f"'{file_path}' holds a {model_type_clean} model saved for export (src/export_pytorch.py): "
+                "reloading it into the engine is not supported yet; train from the ledger checkpoints instead."
+            )
         
         use_bn = bool(archive["use_batch_norm"]) if "use_batch_norm" in archive else False
         bn_mom = float(archive["bn_momentum"]) if "bn_momentum" in archive else 0.9
@@ -110,3 +119,62 @@ class ModelSerializer:
             
         print(f"[Saver] Reconstituted {model_type_clean} model instance from {file_path} successfully.")
         return model
+
+    @staticmethod
+    def _model_kind(model) -> str:
+        """'cnn' (conv layers + dense head), 'mhsa' (stacked Pre-LN attention blocks) or 'dense'."""
+        if hasattr(model, "param_layers") and hasattr(model, "layers"):
+            return "cnn"
+        if hasattr(model, "d_model") and hasattr(model, "num_heads"):
+            return "mhsa"
+        return "dense"
+
+    @staticmethod
+    def _describe_cnn_layer(layer) -> dict:
+        """One entry of the CNN's layer list, in forward order; conv layers take their parameters from model.weights in order."""
+        name = type(layer).__name__
+        if isinstance(layer, str):
+            return {"type": layer}      # "relu"
+        if name == "ConvBlock":
+            return {"type": "conv_block", "in": int(layer.in_channels), "out": int(layer.out_channels), "kernel": [int(layer.k_h), int(layer.k_w)],
+                    "stride": int(layer.conv_stride), "pad": int(layer.conv_pad), "pool_size": int(layer.pool_size), "pool_stride": int(layer.pool_stride)}
+        if name == "Conv2D":
+            return {"type": "conv", "in": int(layer.in_channels), "out": int(layer.out_channels), "kernel": [int(layer.k_h), int(layer.k_w)],
+                    "stride": int(layer.stride), "pad": int(layer.pad)}
+        if name == "MaxPool2D":
+            return {"type": "pool", "pool_size": int(layer.pool_size), "stride": int(layer.stride)}
+        if name == "Flatten":
+            return {"type": "flatten"}
+        raise ValueError(f"cannot describe CNN layer {name}")
+
+    @staticmethod
+    def _save_cnn_or_mhsa(model, kind: str, file_path: str, data_provider=None) -> None:
+        """A CNN or MHSA model for export to PyTorch: parameters plus the structure that is not in the weights' shapes. Inputs are used as the loader gives them: the
+        provider's mean/std are not stored, but the archive records that the provider HAD a non-trivial scaling, so the export can say so."""
+        import json
+
+        payload = {"model_type": kind, "format": 2}
+        mean, std = getattr(data_provider, "mean", None), getattr(data_provider, "std", None)
+        if mean is not None and std is not None and not (np.all(np.asarray(mean) == 0) and np.all(np.asarray(std) == 1)):
+            payload["provider_standardised"] = True
+            print(f"[Saver] WARNING: the data provider scaled the {kind} inputs (mean/std); they are NOT stored in {file_path}, so the exported module expects inputs scaled the same way.")
+        if kind == "cnn":
+            payload["task_type"] = str(model.task_type)
+            payload["layers_json"] = json.dumps([ModelSerializer._describe_cnn_layer(layer) for layer in model.layers])
+        else:
+            for key in ("d_model", "num_heads", "max_seq_len", "action_dim", "ffn_mult", "num_layers", "input_dim"):
+                payload[key] = int(getattr(model, key))
+            payload["use_pos_encoding"] = bool(model.use_pos_encoding)
+            payload["action_mode"] = str(model.action_mode)
+            payload["action_temperature"] = float(model.action_temperature)
+            for li in range(model.num_layers):
+                payload[f"ln1_gamma_{li}"], payload[f"ln1_beta_{li}"] = model.ln1_gamma[li], model.ln1_beta[li]
+                payload[f"ln2_gamma_{li}"], payload[f"ln2_beta_{li}"] = model.ln2_gamma[li], model.ln2_beta[li]
+            if model.pos_embed is not None:
+                payload["pos_embed"] = model.pos_embed
+            if model.W_in is not None:
+                payload["W_in"], payload["b_in"] = model.W_in, model.b_in
+        for i, (w, b) in enumerate(zip(model.weights, model.biases)):
+            payload[f"w_{i}"], payload[f"b_{i}"] = w, b
+        np.savez_compressed(file_path, **payload)
+        print(f"[Saver] {kind} model saved for export to: {file_path}")
