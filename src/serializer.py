@@ -44,6 +44,11 @@ class ModelSerializer:
             if hasattr(data_provider, "std") and data_provider.std is not None:
                 payload["std"] = data_provider.std
 
+        # A regression model trains on standardised targets (RegressionNetwork.preprocess_targets): without this scaling a saved model cannot be read back in the target's units (src/export_pytorch.py).
+        for key in ("y_mean", "y_std"):
+            if getattr(model, key, None) is not None:
+                payload[key] = np.asarray(getattr(model, key))
+
         for i, (w, b) in enumerate(zip(model.weights, model.biases)):
             payload[f"w_{i}"] = w
             payload[f"b_{i}"] = b
@@ -88,6 +93,10 @@ class ModelSerializer:
             bn_momentum=bn_mom
         )
         
+        for key in ("y_mean", "y_std"):
+            if key in archive:
+                setattr(model, key, archive[key])
+
         for i in range(len(model.weights)):
             model.weights[i] = archive[f"w_{i}"]
             model.biases[i] = archive[f"b_{i}"]

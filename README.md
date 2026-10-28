@@ -109,6 +109,7 @@ Detailed documentation on project architecture and features can be found in the 
 * `docs/ledger-record-model.md` — Ledger record schema
 * `docs/contract-list-architecture.md` — Async native contract/dispatch architecture
 * `docs/phase-e-reference.md` — Phase E (ledger) reference
+* `docs/export-pytorch.md` — Export a trained dense model (binary, regression, multi-class) as a standalone PyTorch module
 
 ---
 
