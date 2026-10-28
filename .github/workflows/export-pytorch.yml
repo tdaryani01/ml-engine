@@ -1,14 +1,15 @@
 name: Export to PyTorch
 
 # Builds the native library (the MHSA comparisons and the overlapping-pool CNN case run against it) and runs the export tests with a CPU PyTorch.
-# Only when something the export reads or is compared against changes, so most pull requests do not pay for it.
+# The pull request and the push to main watch the same files. Only when something the export reads or is compared against changes, so most pull requests do not pay for it.
 on:
   pull_request:
-    paths: [src/export_pytorch.py, src/serializer.py, src/models.py, src/base_network.py, src/cnn_network.py, src/mhsa_network.py, src/spatial_layers.py, "src/native/**", utils/conv_dispatch.py,
+    paths: [src/export_pytorch.py, src/serializer.py, src/model_factory.py, src/models.py, src/base_network.py, src/cnn_network.py, src/mhsa_network.py, src/spatial_layers.py, "src/native/**", utils/conv_dispatch.py,
             testing/test_export_pytorch.py, testing/test_serializer.py, build_native.sh, .github/workflows/export-pytorch.yml]
   push:
     branches: [main]
-    paths: [src/export_pytorch.py, src/serializer.py, testing/test_export_pytorch.py, .github/workflows/export-pytorch.yml]
+    paths: [src/export_pytorch.py, src/serializer.py, src/model_factory.py, src/models.py, src/base_network.py, src/cnn_network.py, src/mhsa_network.py, src/spatial_layers.py, "src/native/**", utils/conv_dispatch.py,
+            testing/test_export_pytorch.py, testing/test_serializer.py, build_native.sh, .github/workflows/export-pytorch.yml]
 
 permissions:
   contents: read

@@ -30,7 +30,7 @@ with torch.no_grad():
 | `binary_classification` | `(N, n_features)` raw features, **columns in the training file's order** (a 1-D row also works) | the probability of the positive class, `(N, 1)` |
 | `multi_class` | the same | class probabilities, `(N, n_classes)`; column k is the label k the engine trained with |
 | `regression` | the same | values in the original units of the target (the module undoes the target standardisation) |
-| `cnn` | `(N, C, H, W)` images, **scaled the way you trained them** (the image loader divides by 255, the module does not) and **without the width padding** (a single `(C, H, W)` image also works) | class probabilities (`multiclass`), a probability (`binary`) or raw values (`regression`), by the model's `task_type` |
+| `cnn` | `(N, C, H, W)` images, **scaled the way you trained them** (the image loader divides by 255, the module does not) and **without the width padding** (a single `(C, H, W)` image also works; images of a different size than the model was trained on raise a `ValueError` that names the shape and the expected feature count) | class probabilities (`multiclass`), a probability (`binary`) or raw values (`regression`), by the model's `task_type` |
 | `mhsa` | `(N, T, input_dim)` sequences with `T <= max_seq_len` (a single `(T, input_dim)` sequence also works) | the action of the **last** position: `tanh`-bounded for `continuous`, raw logits for `discrete` |
 
 The dense modules standardise the features themselves with the training mean/std. **A cnn or mhsa module uses its input as given: no mean/std is stored for them**, so repeat any scaling you did before training (the export says so in `preprocess.json`).

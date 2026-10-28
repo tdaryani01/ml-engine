@@ -681,6 +681,11 @@ def test_the_serializer_goes_by_the_kind_a_network_declares_not_by_its_attribute
     # and one that declares nothing falls back to the attribute test, so dense and older objects are unchanged
     assert ModelSerializer._model_kind(types.SimpleNamespace(param_layers=[], layers=[])) == "cnn"
     assert ModelSerializer._model_kind(types.SimpleNamespace(layer_sizes=[2, 3])) == "dense"
+    # a declared kind is authoritative in both directions: "dense" overrules cnn-looking attributes, and a typo is an error rather than a silent guess
+    assert ModelSerializer._model_kind(types.SimpleNamespace(model_kind="dense", param_layers=[], layers=[])) == "dense"
+    for typo in ("CNN", "conv", ""):
+        with pytest.raises(ValueError, match="model_kind"):
+            ModelSerializer._model_kind(types.SimpleNamespace(model_kind=typo))
 
 def test_an_exported_cnn_given_images_of_the_wrong_size_says_so_instead_of_failing_in_a_matmul(tmp_path):
     layers = CNN_REFERENCE_CASES["block_then_conv"]
