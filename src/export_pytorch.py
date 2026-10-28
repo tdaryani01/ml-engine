@@ -1,15 +1,18 @@
 # src/export_pytorch.py
-"""Export a trained dense model (a ModelSerializer .npz: binary_classification, regression, multi_class) as a standalone PyTorch module.
+"""Export a trained model (a ModelSerializer .npz) as a standalone PyTorch module: the dense families (binary_classification, regression, multi_class), cnn and mhsa.
 
     python -m src.export_pytorch model.npz out_dir
 
 writes into out_dir:
     model.py         the network as plain torch code (no dependency on this project); ``load()`` returns it in eval mode
-    weights.pt       the trained parameters and the input/output scaling, as a torch state_dict (float32)
+    weights.pt       the trained parameters (and, for the dense families, the input/output scaling), as a torch state_dict (float32)
     preprocess.json  what the module expects and returns, and anything the export could not carry over
 
-The module takes RAW features (N, n_features), standardises them with the training mean/std, and returns the prediction in the units the
+Dense: the module takes RAW features (N, n_features), standardises them with the training mean/std, and returns the prediction in the units the
 task is about: a probability for binary_classification, class probabilities for multi_class, values in the original units for regression.
+CNN: images (N, C, H, W) as the engine's loader gives them, without the width padding; class probabilities (or a probability / values, by task).
+MHSA: sequences (N, T, input_dim) with T <= max_seq_len; the action of the last position (tanh-bounded, or raw logits for discrete).
+CNN and MHSA inputs are used as given: no mean/std is stored for them.
 The archive is read with numpy alone (no engine imports), and torch is needed only to write weights.pt.
 """
 from __future__ import annotations
@@ -68,8 +71,12 @@ def read_archive(path: str) -> dict:
 def _read_archive(path: str) -> dict:
     with np.load(path, allow_pickle=False) as archive:
         mtype = _model_type(archive)
+        if mtype == "cnn":
+            return _read_cnn(archive)
+        if mtype == "mhsa":
+            return _read_mhsa(archive)
         if mtype not in HEADS:
-            raise ExportError(f"'{mtype}' cannot be exported yet: only {', '.join(sorted(HEADS))} (the dense families)")
+            raise ExportError(f"'{mtype}' cannot be exported: only {', '.join(sorted(HEADS))} (the dense families), cnn and mhsa")
         sizes = [int(v) for v in np.asarray(archive["layer_sizes"]).reshape(-1)]
         if len(sizes) < 2:
             raise ExportError(f"layer_sizes {sizes} is not a network")
@@ -106,7 +113,7 @@ def _read_archive(path: str) -> dict:
                 y_mean, y_std = None, None
                 warnings.append("the archive holds no target mean/std (saved before they were stored): the module returns STANDARDISED predictions; multiply by the training std and add the training mean of the target")
         return {
-            "model_type": mtype, "head": HEADS[mtype], "sizes": sizes, "use_bn": use_bn,
+            "family": "dense", "model_type": mtype, "head": HEADS[mtype], "sizes": sizes, "use_bn": use_bn,
             "bn_momentum": float(archive["bn_momentum"]) if "bn_momentum" in archive else 0.9,
             "weights": weights, "biases": biases, "bn": bn, "x_mean": x_mean, "x_std": x_std, "y_mean": y_mean, "y_std": y_std, "warnings": warnings,
         }
@@ -114,6 +121,10 @@ def _read_archive(path: str) -> dict:
 
 def build_state(spec: dict) -> dict:
     """The module's state_dict as float64 numpy arrays (export() writes them as float32 tensors)."""
+    if spec["family"] == "cnn":
+        return _state_cnn(spec)
+    if spec["family"] == "mhsa":
+        return _state_mhsa(spec)
     s: dict = {}
     for i, (w, b) in enumerate(zip(spec["weights"], spec["biases"])):
         s[f"linears.{i}.weight"] = np.ascontiguousarray(w.T)      # engine: (in, out); torch Linear: (out, in)
@@ -191,6 +202,10 @@ _HEAD_CODE = {
 
 
 def generate_source(spec: dict) -> str:
+    if spec["family"] == "cnn":
+        return _source_cnn(spec)
+    if spec["family"] == "mhsa":
+        return _source_mhsa(spec)
     head = spec["head"]
     y_buffers, head_code = "", _HEAD_CODE.get(head, "        return x")
     if head == "identity" and spec["y_mean"] is not None:
@@ -208,8 +223,347 @@ def generate_source(spec: dict) -> str:
     return text
 
 
+def _fill(template: str, tokens: dict) -> str:
+    for token, value in tokens.items():
+        template = template.replace(token, value)
+    return template
+
+
+def _arr(archive, key: str, shape: tuple) -> np.ndarray:
+    if key not in archive:
+        raise ExportError(f"{key} is missing from the archive")
+    a = np.asarray(archive[key], dtype=np.float64)
+    if a.shape != tuple(shape):
+        raise ExportError(f"{key} has shape {a.shape}, the model needs {tuple(shape)}")
+    return a
+
+
+# ---------------------------------------------------------------- CNN
+
+CNN_HEADS = {"multiclass": "softmax", "binary": "sigmoid"}       # anything else is the identity (CNNNetwork.apply_output_activation)
+CNN_OUTPUT_TEXT = {
+    "softmax": "class probabilities, shape (N, n_classes)",
+    "sigmoid": "probability of the positive class, shape (N, 1)",
+    "identity": "raw output values, shape (N, n_outputs)",
+}
+
+
+def _read_cnn(archive) -> dict:
+    try:
+        layers = json.loads(str(archive["layers_json"]))
+    except (KeyError, ValueError) as exc:
+        raise ExportError(f"layers_json is missing or unreadable: {exc}") from exc
+    task = str(archive["task_type"]).strip().lower() if "task_type" in archive else "multiclass"
+    convs = [layer for layer in layers if layer.get("type") in ("conv", "conv_block")]
+    if not convs:
+        raise ExportError("a cnn needs at least one conv layer")
+    if not any(layer.get("type") == "flatten" for layer in layers):
+        raise ExportError("a cnn needs a flatten layer between the conv layers and the dense head")
+    conv_w, conv_b = [], []
+    channels = convs[0]["in"]
+    for i, layer in enumerate(convs):
+        if layer["in"] != channels:
+            raise ExportError(f"conv layer {i} takes {layer['in']} channels but the layer before it gives {channels}")
+        conv_w.append(_arr(archive, f"w_{i}", (layer["out"], layer["in"], layer["kernel"][0], layer["kernel"][1])))
+        conv_b.append(_flat(archive, f"b_{i}", layer["out"]))
+        if conv_b[-1] is None:
+            raise ExportError(f"b_{i} is missing from the archive")
+        channels = layer["out"]
+    dense_w, dense_b = [], []
+    i = len(convs)
+    while f"w_{i}" in archive:
+        w = np.asarray(archive[f"w_{i}"], dtype=np.float64)
+        if w.ndim != 2:
+            raise ExportError(f"w_{i} should be a dense matrix, it has shape {w.shape}")
+        if dense_w and w.shape[0] != dense_w[-1].shape[1]:
+            raise ExportError(f"dense layer w_{i} takes {w.shape[0]} inputs but the layer before it gives {dense_w[-1].shape[1]}")
+        b = _flat(archive, f"b_{i}", w.shape[1])
+        if b is None:
+            raise ExportError(f"b_{i} is missing from the archive")
+        dense_w.append(w)
+        dense_b.append(b)
+        i += 1
+    if not dense_w:
+        raise ExportError("a cnn needs a dense head")
+    return {
+        "family": "cnn", "model_type": "cnn", "task_type": task, "head": CNN_HEADS.get(task, "identity"), "layers": layers,
+        "conv_w": conv_w, "conv_b": conv_b, "dense_w": dense_w, "dense_b": dense_b,
+        "warnings": ["inputs are used as given: no mean/std is stored for a cnn, so repeat any preprocessing (scaling, normalising) you did before training"],
+    }
+
+
+def _state_cnn(spec: dict) -> dict:
+    s: dict = {}
+    for i, (w, b) in enumerate(zip(spec["conv_w"], spec["conv_b"])):
+        s[f"convs.{i}.weight"] = w                              # engine and torch Conv2d agree: (out, in, kh, kw)
+        s[f"convs.{i}.bias"] = b
+    for i, (w, b) in enumerate(zip(spec["dense_w"], spec["dense_b"])):
+        s[f"denses.{i}.weight"] = np.ascontiguousarray(w.T)     # engine: (in, out); torch Linear: (out, in)
+        s[f"denses.{i}.bias"] = b
+    return s
+
+
+_CNN_SOURCE = '''\
+"""A trained Anascope cnn model as a plain PyTorch module (no Anascope code needed).
+
+    from model import load
+    net = load()                      # reads weights.pt next to this file; eval mode
+    with torch.no_grad():
+        y = net(torch.tensor(images)) # images: (N, C, H, W) as the engine's loader gives them, WITHOUT the width padding -> @OUTPUT@
+
+No mean/std is stored for a cnn: pass the images the way the model was trained on them.
+"""
+import os
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+CONVS = @CONVS@          # (in, out, kernel_h, kernel_w, stride, pad), in forward order
+DENSES = @DENSES@        # (in, out)
+STEPS = @STEPS@          # the layer list: ("conv_block", conv, pool_size, pool_stride) is conv -> relu -> max-pool
+
+
+class AnascopeModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.convs = nn.ModuleList([nn.Conv2d(i, o, (kh, kw), stride=s, padding=p) for i, o, kh, kw, s, p in CONVS])
+        self.denses = nn.ModuleList([nn.Linear(i, o) for i, o in DENSES])
+
+    def forward(self, x):
+        if x.ndim == 3:                       # one image (C, H, W)
+            x = x.unsqueeze(0)
+        x = x.to(self.convs[0].weight.dtype)  # numpy / pandas hand over float64
+        for step in STEPS:
+            kind = step[0]
+            if kind == "conv_block":
+                x = F.max_pool2d(F.relu(self.convs[step[1]](x)), step[2], step[3])
+            elif kind == "conv":
+                x = self.convs[step[1]](x)
+            elif kind == "pool":
+                x = F.max_pool2d(x, step[1], step[2])
+            elif kind == "relu":
+                x = F.relu(x)
+            elif kind == "flatten":
+                x = torch.flatten(x, 1)
+        last = len(self.denses) - 1
+        for i, dense in enumerate(self.denses):
+            x = dense(x)
+            if i != last:
+                x = F.relu(x)
+@HEAD@
+
+
+def load(weights_path=None, device="cpu"):
+    weights_path = weights_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.pt")
+    model = AnascopeModel()
+    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+    return model.to(device).eval()
+'''
+
+
+def _source_cnn(spec: dict) -> str:
+    steps, ci = [], 0
+    for layer in spec["layers"]:
+        kind = layer["type"]
+        if kind == "conv_block":
+            steps.append(("conv_block", ci, layer["pool_size"], layer["pool_stride"]))
+            ci += 1
+        elif kind == "conv":
+            steps.append(("conv", ci))
+            ci += 1
+        elif kind == "pool":
+            steps.append(("pool", layer["pool_size"], layer["stride"]))
+        elif kind in ("relu", "flatten"):
+            steps.append((kind,))
+        else:
+            raise ExportError(f"unknown cnn layer type '{kind}'")
+    convs = [(c["in"], c["out"], c["kernel"][0], c["kernel"][1], c["stride"], c["pad"]) for c in spec["layers"] if c["type"] in ("conv", "conv_block")]
+    denses = [(int(w.shape[0]), int(w.shape[1])) for w in spec["dense_w"]]
+    head_code = _HEAD_CODE.get(spec["head"], "        return x")
+    return _fill(_CNN_SOURCE, {"@OUTPUT@": CNN_OUTPUT_TEXT[spec["head"]], "@CONVS@": repr(convs), "@DENSES@": repr(denses), "@STEPS@": repr(steps), "@HEAD@": head_code})
+
+
+# ---------------------------------------------------------------- MHSA
+
+LN_EPS = 1e-5     # mhsa_kernels.cpp kEps
+
+
+def _read_mhsa(archive) -> dict:
+    need = ("d_model", "num_heads", "max_seq_len", "action_dim", "ffn_mult", "num_layers", "input_dim")
+    missing = [k for k in need if k not in archive]
+    if missing:
+        raise ExportError(f"{', '.join(missing)} missing from the archive")
+    D, H, T, A, mult, L, d_in = (int(archive[k]) for k in need)
+    if D % H:
+        raise ExportError(f"d_model {D} is not divisible by num_heads {H}")
+    mode = str(archive["action_mode"]).strip().lower() if "action_mode" in archive else "continuous"
+    if mode not in ("continuous", "discrete"):
+        raise ExportError(f"action_mode '{mode}' is not continuous or discrete")
+    ff = D * mult
+    use_pos = bool(archive["use_pos_encoding"]) if "use_pos_encoding" in archive else False
+    layers = []
+    for li in range(L):
+        k = 4 * li
+        layers.append({
+            "ln1_g": _flat(archive, f"ln1_gamma_{li}", D), "ln1_b": _flat(archive, f"ln1_beta_{li}", D),
+            "ln2_g": _flat(archive, f"ln2_gamma_{li}", D), "ln2_b": _flat(archive, f"ln2_beta_{li}", D),
+            "qkv_w": _arr(archive, f"w_{k}", (D, 3 * D)), "qkv_b": _arr(archive, f"b_{k}", (1, 3 * D)).reshape(-1),
+            "o_w": _arr(archive, f"w_{k + 1}", (D, D)), "o_b": _arr(archive, f"b_{k + 1}", (1, D)).reshape(-1),
+            "ff1_w": _arr(archive, f"w_{k + 2}", (D, ff)), "ff1_b": _arr(archive, f"b_{k + 2}", (1, ff)).reshape(-1),
+            "ff2_w": _arr(archive, f"w_{k + 3}", (ff, D)), "ff2_b": _arr(archive, f"b_{k + 3}", (1, D)).reshape(-1),
+        })
+        for name in ("ln1_g", "ln1_b", "ln2_g", "ln2_b"):
+            if layers[-1][name] is None:
+                raise ExportError(f"layer {li}: a layer-norm array is missing from the archive")
+    act_w, act_b = _arr(archive, f"w_{4 * L}", (D, A)), _arr(archive, f"b_{4 * L}", (1, A)).reshape(-1)
+    pos = _arr(archive, "pos_embed", (T, D)) if use_pos else None
+    if use_pos and pos is None:
+        raise ExportError("pos_embed is missing from the archive")
+    w_in = _arr(archive, "W_in", (d_in, D)) if "W_in" in archive else None
+    b_in = _arr(archive, "b_in", (1, D)).reshape(-1) if w_in is not None else None
+    if w_in is None and d_in != D:
+        raise ExportError(f"input_dim {d_in} differs from d_model {D} but the archive has no input projection (W_in)")
+    return {
+        "family": "mhsa", "model_type": "mhsa", "d_model": D, "num_heads": H, "max_seq_len": T, "action_dim": A, "ffn_hidden": ff, "num_layers": L,
+        "input_dim": d_in, "action_mode": mode, "layers": layers, "act_w": act_w, "act_b": act_b, "pos": pos, "w_in": w_in, "b_in": b_in,
+        "head": "tanh" if mode == "continuous" else "logits",
+        "warnings": ["inputs are used as given: no mean/std is stored for an mhsa model, so repeat any preprocessing you did before training"],
+    }
+
+
+def _state_mhsa(spec: dict) -> dict:
+    s: dict = {}
+    if spec["w_in"] is not None:
+        s["in_proj.weight"], s["in_proj.bias"] = np.ascontiguousarray(spec["w_in"].T), spec["b_in"]
+    if spec["pos"] is not None:
+        s["pos_embed"] = spec["pos"]
+    for li, layer in enumerate(spec["layers"]):
+        p = f"blocks.{li}."
+        s[p + "ln1.weight"], s[p + "ln1.bias"] = layer["ln1_g"], layer["ln1_b"]
+        s[p + "qkv.weight"], s[p + "qkv.bias"] = np.ascontiguousarray(layer["qkv_w"].T), layer["qkv_b"]
+        s[p + "attn_out.weight"], s[p + "attn_out.bias"] = np.ascontiguousarray(layer["o_w"].T), layer["o_b"]
+        s[p + "ln2.weight"], s[p + "ln2.bias"] = layer["ln2_g"], layer["ln2_b"]
+        s[p + "ff1.weight"], s[p + "ff1.bias"] = np.ascontiguousarray(layer["ff1_w"].T), layer["ff1_b"]
+        s[p + "ff2.weight"], s[p + "ff2.bias"] = np.ascontiguousarray(layer["ff2_w"].T), layer["ff2_b"]
+    s["head.weight"], s["head.bias"] = np.ascontiguousarray(spec["act_w"].T), spec["act_b"]
+    return s
+
+
+_MHSA_SOURCE = '''\
+"""A trained Anascope mhsa model as a plain PyTorch module (no Anascope code needed).
+
+    from model import load
+    net = load()                      # reads weights.pt next to this file; eval mode
+    with torch.no_grad():
+        a = net(torch.tensor(seq))    # seq: (N, T, @D_IN@) with T <= @MAX_T@ -> (N, @A@): @OUTPUT@
+
+The action is read from the LAST position of the sequence. No mean/std is stored: pass the sequences the way the model was trained on them.
+"""
+import math
+import os
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+D_MODEL = @D@
+NUM_HEADS = @H@
+FFN_HIDDEN = @FF@
+NUM_LAYERS = @L@
+INPUT_DIM = @D_IN@
+ACTION_DIM = @A@
+MAX_SEQ_LEN = @MAX_T@
+USE_INPUT_PROJ = @USE_PROJ@
+USE_POS_ENCODING = @USE_POS@
+LN_EPS = @LN_EPS@
+
+
+class Block(nn.Module):
+    """Pre-LN: x = x + attention(ln1(x)); x = x + ffn(ln2(x)); causal attention, GELU (tanh form)."""
+
+    def __init__(self):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(D_MODEL, eps=LN_EPS)
+        self.qkv = nn.Linear(D_MODEL, 3 * D_MODEL)
+        self.attn_out = nn.Linear(D_MODEL, D_MODEL)
+        self.ln2 = nn.LayerNorm(D_MODEL, eps=LN_EPS)
+        self.ff1 = nn.Linear(D_MODEL, FFN_HIDDEN)
+        self.ff2 = nn.Linear(FFN_HIDDEN, D_MODEL)
+
+    def forward(self, x):
+        b, t, d = x.shape
+        q, k, v = self.qkv(self.ln1(x)).split(d, dim=-1)
+        q, k, v = (z.reshape(b, t, NUM_HEADS, d // NUM_HEADS).transpose(1, 2) for z in (q, k, v))
+        o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        x = x + self.attn_out(o.transpose(1, 2).reshape(b, t, d))
+        return x + self.ff2(F.gelu(self.ff1(self.ln2(x)), approximate="tanh"))
+
+
+class AnascopeModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        if USE_INPUT_PROJ:
+            self.in_proj = nn.Linear(INPUT_DIM, D_MODEL)
+        if USE_POS_ENCODING:
+            self.register_buffer("pos_embed", torch.zeros(MAX_SEQ_LEN, D_MODEL))
+        self.blocks = nn.ModuleList([Block() for _ in range(NUM_LAYERS)])
+        self.head = nn.Linear(D_MODEL, ACTION_DIM)
+
+    def forward(self, x):
+        if x.ndim == 2:                       # one sequence (T, input_dim)
+            x = x.unsqueeze(0)
+        x = x.to(self.head.weight.dtype)      # numpy / pandas hand over float64
+        if USE_INPUT_PROJ:
+            x = self.in_proj(x)
+        if USE_POS_ENCODING:
+            if x.shape[1] > MAX_SEQ_LEN:
+                raise ValueError(f"sequence length {x.shape[1]} exceeds max_seq_len {MAX_SEQ_LEN} this model was trained with")
+            x = x + self.pos_embed[: x.shape[1]]
+        for block in self.blocks:
+            x = block(x)
+        a = self.head(x[:, -1])
+@HEAD@
+
+
+def load(weights_path=None, device="cpu"):
+    weights_path = weights_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.pt")
+    model = AnascopeModel()
+    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+    return model.to(device).eval()
+'''
+
+
+def _source_mhsa(spec: dict) -> str:
+    head_code = "        return torch.tanh(a)" if spec["head"] == "tanh" else "        return a"
+    output = "actions in (-1, 1) (tanh)" if spec["head"] == "tanh" else "raw logits (apply softmax for probabilities)"
+    return _fill(_MHSA_SOURCE, {
+        "@D@": str(spec["d_model"]), "@H@": str(spec["num_heads"]), "@FF@": str(spec["ffn_hidden"]), "@L@": str(spec["num_layers"]),
+        "@D_IN@": str(spec["input_dim"]), "@A@": str(spec["action_dim"]), "@MAX_T@": str(spec["max_seq_len"]),
+        "@USE_PROJ@": repr(spec["w_in"] is not None), "@USE_POS@": repr(spec["pos"] is not None), "@LN_EPS@": repr(LN_EPS),
+        "@OUTPUT@": output, "@HEAD@": head_code,
+    })
+
+
+def _info(spec: dict, source: str) -> dict:
+    base = {"format_version": FORMAT_VERSION, "model_type": spec["model_type"], "dtype": "float32", "source": source, "warnings": spec["warnings"]}
+    if spec["family"] == "cnn":
+        layers = [layer["type"] for layer in spec["layers"]]
+        return {**base, "task_type": spec["task_type"], "layers": layers, "dense_sizes": [int(spec["dense_w"][0].shape[0])] + [int(w.shape[1]) for w in spec["dense_w"]],
+                "input": "images (N, C, H, W), float32, as the engine's loader gives them but without the width padding", "standardises_inputs": False,
+                "output": CNN_OUTPUT_TEXT[spec["head"]], "summary": f"cnn, {len(spec['conv_w'])} conv layers, dense {[int(w.shape[1]) for w in spec['dense_w']]}"}
+    if spec["family"] == "mhsa":
+        return {**base, "d_model": spec["d_model"], "num_heads": spec["num_heads"], "num_layers": spec["num_layers"], "max_seq_len": spec["max_seq_len"],
+                "input": f"sequences (N, T, {spec['input_dim']}), float32, T <= {spec['max_seq_len']}", "standardises_inputs": False,
+                "output": ("actions in (-1, 1) (tanh)" if spec["head"] == "tanh" else "raw logits") + f", shape (N, {spec['action_dim']}), from the last position",
+                "summary": f"mhsa, {spec['num_layers']} layers, d_model {spec['d_model']}, {spec['num_heads']} heads"}
+    return {**base, "layer_sizes": spec["sizes"], "use_batch_norm": spec["use_bn"], "input": f"raw features, shape (N, {spec['sizes'][0]}), float32", "standardises_inputs": spec["x_mean"] is not None,
+            "output": OUTPUT_TEXT[spec["head"]] + ("" if spec["head"] != "identity" or spec["y_mean"] is not None else " (STANDARDISED: the target scaling was not stored)"),
+            "summary": f"{spec['model_type']} {spec['sizes']}"}
+
+
 def export(npz_path: str, out_dir: str) -> dict:
-    """Write model.py, weights.pt and preprocess.json for the saved dense model; returns what preprocess.json says."""
+    """Write model.py, weights.pt and preprocess.json for the saved model; returns what preprocess.json says."""
     try:
         import torch
     except ImportError as exc:
@@ -220,12 +574,7 @@ def export(npz_path: str, out_dir: str) -> dict:
     torch.save(state, os.path.join(out_dir, "weights.pt"))
     with open(os.path.join(out_dir, "model.py"), "w", encoding="utf-8", newline="\n") as f:
         f.write(generate_source(spec))
-    info = {
-        "format_version": FORMAT_VERSION, "model_type": spec["model_type"], "layer_sizes": spec["sizes"], "use_batch_norm": spec["use_bn"],
-        "input": f"raw features, shape (N, {spec['sizes'][0]}), float32", "standardises_inputs": spec["x_mean"] is not None,
-        "output": OUTPUT_TEXT[spec["head"]] + ("" if spec["head"] != "identity" or spec["y_mean"] is not None else " (STANDARDISED: the target scaling was not stored)"),
-        "dtype": "float32", "source": os.path.basename(npz_path), "warnings": spec["warnings"],
-    }
+    info = _info(spec, os.path.basename(npz_path))
     with open(os.path.join(out_dir, "preprocess.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(info, f, indent=2)
         f.write("\n")
@@ -233,7 +582,7 @@ def export(npz_path: str, out_dir: str) -> dict:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Export a trained dense Anascope model (.npz) as a PyTorch module.")
+    ap = argparse.ArgumentParser(description="Export a trained Anascope model (.npz: dense, cnn or mhsa) as a PyTorch module.")
     ap.add_argument("npz")
     ap.add_argument("out_dir")
     a = ap.parse_args(argv)
@@ -244,7 +593,7 @@ def main(argv=None) -> int:
         return 2
     for w in info["warnings"]:
         print(f"export-pytorch: WARNING: {w}", file=sys.stderr)
-    print(f"export-pytorch: {info['model_type']} {info['layer_sizes']} -> {a.out_dir} (model.py, weights.pt, preprocess.json)")
+    print(f"export-pytorch: {info['summary']} -> {a.out_dir} (model.py, weights.pt, preprocess.json)")
     return 0
 
 
