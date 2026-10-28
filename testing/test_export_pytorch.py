@@ -681,3 +681,15 @@ def test_the_serializer_goes_by_the_kind_a_network_declares_not_by_its_attribute
     # and one that declares nothing falls back to the attribute test, so dense and older objects are unchanged
     assert ModelSerializer._model_kind(types.SimpleNamespace(param_layers=[], layers=[])) == "cnn"
     assert ModelSerializer._model_kind(types.SimpleNamespace(layer_sizes=[2, 3])) == "dense"
+
+def test_an_exported_cnn_given_images_of_the_wrong_size_says_so_instead_of_failing_in_a_matmul(tmp_path):
+    layers = CNN_REFERENCE_CASES["block_then_conv"]
+    path = str(tmp_path / "c.npz")
+    _synthetic_cnn(path, layers, task="multiclass", out=4)                       # the head is sized for 12 x 10 images
+    spec = ex.read_archive(path)
+    net = _module_from_source(tmp_path, ex.generate_source(spec)).AnascopeModel().double().eval()
+    net.load_state_dict({k: torch.from_numpy(np.asarray(v)) for k, v in ex.build_state(spec).items()})
+    with torch.no_grad():
+        net(torch.zeros(2, 2, 12, 10, dtype=torch.float64))                     # the trained size still works
+        with pytest.raises(ValueError, match=r"\(2, 12, 14\).*features.*trained on"):
+            net(torch.zeros(2, 2, 12, 14, dtype=torch.float64))
