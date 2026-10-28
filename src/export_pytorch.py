@@ -18,6 +18,8 @@ import argparse
 import json
 import os
 import sys
+import zipfile
+import zlib
 
 import numpy as np
 
@@ -54,7 +56,16 @@ def _flat(archive, key: str, n: int):
 
 
 def read_archive(path: str) -> dict:
-    """The parts of a saved dense model that the PyTorch module needs, validated."""
+    """The parts of a saved dense model that the PyTorch module needs, validated. A file that is not a saved model (text, empty, truncated) is an ExportError."""
+    try:
+        return _read_archive(path)
+    except (ExportError, FileNotFoundError):
+        raise
+    except (zipfile.BadZipFile, EOFError, zlib.error, KeyError, ValueError) as exc:
+        raise ExportError(f"{path} is not a readable saved model (.npz): {type(exc).__name__}: {exc}") from exc
+
+
+def _read_archive(path: str) -> dict:
     with np.load(path, allow_pickle=False) as archive:
         mtype = _model_type(archive)
         if mtype not in HEADS:
@@ -126,9 +137,10 @@ _SOURCE = '''\
 
     from model import load
     net = load()                      # reads weights.pt next to this file; eval mode
-    y = net(torch.tensor(x_raw))      # x_raw: (N, @N_IN@) float32 raw features -> @OUTPUT@
+    with torch.no_grad():
+        y = net(torch.tensor(x_raw))  # x_raw: (N, @N_IN@) raw features, columns in the training file's order -> @OUTPUT@
 
-Inputs are standardised inside the module with the training mean/std (buffers x_mean, x_std).
+Inputs (float32 or float64, or a single 1-D row) are standardised inside the module with the training mean/std (buffers x_mean, x_std).
 """
 import os
 
@@ -150,6 +162,9 @@ class AnascopeModel(nn.Module):
         self.register_buffer("x_std", torch.ones(SIZES[0]))
 @Y_BUFFERS@
     def forward(self, x):
+        if x.ndim == 1:                       # one row, as model.predict accepts
+            x = x.reshape(1, -1)
+        x = x.to(self.x_mean.dtype)           # numpy / pandas hand over float64
         x = (x - self.x_mean) / self.x_std
         last = len(self.linears) - 1
         for i, linear in enumerate(self.linears):

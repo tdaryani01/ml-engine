@@ -160,6 +160,66 @@ def test_an_archive_with_missing_batch_norm_arrays_is_refused_not_guessed(tmp_pa
         ex.read_archive(path)
 
 
+def test_the_exported_module_takes_what_numpy_and_pandas_hand_over_and_a_single_row(tmp_path):
+    model = _trained_like("multi_class", True, (N_IN, 6, 3))
+    path, mean, std = _save(tmp_path, model, "multi_class", True)
+    ex.export(path, str(tmp_path / "o"))
+    net = _module(str(tmp_path / "o")).load()
+    x = np.random.default_rng(3).normal(size=(6, N_IN))          # float64, as numpy makes it
+    want = _reference(model, x, mean, std)
+    with torch.no_grad():
+        np.testing.assert_allclose(net(torch.from_numpy(x)).numpy(), want, rtol=2e-4, atol=2e-5)
+        np.testing.assert_allclose(net(torch.from_numpy(x[0])).numpy(), want[:1], rtol=2e-4, atol=2e-5)      # 1-D row, as model.predict accepts
+
+
+def test_the_written_files_say_what_they_hold(tmp_path):
+    model = _trained_like("regression", True, (N_IN, 6, 2))
+    model.y_mean, model.y_std = np.array([1.0, 2.0]), np.array([3.0, 4.0])
+    path, _, _ = _save(tmp_path, model, "regression", True)
+    info = ex.export(path, str(tmp_path / "o"))
+    state = torch.load(str(tmp_path / "o/weights.pt"), weights_only=True)
+    assert info["dtype"] == "float32"
+    assert {v.dtype for k, v in state.items() if "num_batches_tracked" not in k} == {torch.float32}
+    assert json.loads((tmp_path / "o/preprocess.json").read_text()) == info
+    assert {"y_mean", "y_std", "x_mean", "x_std"} <= set(state)
+
+
+@pytest.mark.parametrize("make", ["text", "empty", "truncated"])
+def test_a_file_that_is_not_a_saved_model_exits_2_with_a_message_not_a_traceback(tmp_path, capsys, make):
+    good, _, _ = _save(tmp_path, _trained_like("binary_classification", True, (N_IN, 6, 1)), "binary_classification", True)
+    bad = tmp_path / "bad.npz"
+    if make == "text":
+        bad.write_text("not a model\n")
+    elif make == "empty":
+        bad.write_bytes(b"")
+    else:
+        bad.write_bytes(open(good, "rb").read()[:200])
+    assert ex.main([str(bad), str(tmp_path / "o")]) == 2
+    assert "export-pytorch:" in capsys.readouterr().err
+
+
+def test_a_model_trained_a_few_steps_with_the_engine_exports_and_agrees(tmp_path):
+    """Train, save and export in one go, with the target scaling set by the engine's own preprocess_targets."""
+    rng = np.random.default_rng(11)
+    x = rng.normal(2.0, 3.0, (300, N_IN))
+    y = (x @ rng.normal(size=(N_IN, 1)) * 5.0 + 40.0).reshape(-1, 1)
+    mean, std = x.mean(axis=0), x.std(axis=0) + 1e-24
+    xs = (x - mean) / std
+    model = ModelFactory.create_model(model_type="regression", layer_sizes=(N_IN, 8, 1), lr=0.01, optimizer="adam", lam_l1=0.0, lam_l2=0.0, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9)
+    y_train, _, _ = model.preprocess_targets(y, y[:20])
+    for _ in range(40):
+        model.backward(xs, y_train, 0.01)
+    path = str(tmp_path / "trained.npz")
+    ModelSerializer.save_model(model, _config("regression", True), data_provider=types.SimpleNamespace(mean=mean, std=std), file_path=path)
+    ex.export(path, str(tmp_path / "o"))
+    net = _module(str(tmp_path / "o")).load()
+    want = model.predict(xs) * model.y_std + model.y_mean
+    with torch.no_grad():
+        got = net(torch.from_numpy(x.astype(np.float32))).numpy()
+    np.testing.assert_allclose(got, want, rtol=2e-4, atol=2e-3)
+    assert abs(float(got.mean()) - float(y.mean())) < 0.5 * float(y.std())      # the output is in the target's units, not standardised
+
+
 def test_the_command_line_exports_and_a_bad_file_exits_2_with_a_message(tmp_path, capsys):
     model = _trained_like("multi_class", True, (N_IN, 6, 3))
     path, _, _ = _save(tmp_path, model, "multi_class", True)

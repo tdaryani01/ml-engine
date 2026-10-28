@@ -3,7 +3,7 @@
 Dense models (`binary_classification`, `regression`, `multi_class`) saved by `ModelSerializer` can be exported as a standalone PyTorch module. CNN and MHSA are not supported yet and are refused by name.
 
 ```
-pip install torch                       # only to write weights.pt
+pip install torch                       # to write weights.pt, and to use the exported module
 python -m src.export_pytorch model.npz out_dir
 ```
 
@@ -19,10 +19,11 @@ python -m src.export_pytorch model.npz out_dir
 import torch
 from model import load            # run from out_dir, or put it on the path
 net = load()
-y = net(torch.tensor(x_raw))      # x_raw: (N, n_features) float32, RAW features
+with torch.no_grad():
+    y = net(torch.tensor(x_raw))  # x_raw: (N, n_features), RAW features
 ```
 
-The module standardises the features itself with the training mean/std, and returns:
+`x_raw` may be float32 or float64 (numpy and pandas give float64), or a single 1-D row. **The columns must be in the same order as the training file's features**: the module has no column names. The module standardises the features itself with the training mean/std, and returns:
 
 - `binary_classification`: the probability of the positive class, `(N, 1)`
 - `multi_class`: class probabilities, `(N, n_classes)`; column k is the label k the engine trained with
