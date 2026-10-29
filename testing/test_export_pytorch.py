@@ -669,3 +669,32 @@ def test_the_command_line_exports_and_a_bad_file_exits_2_with_a_message(tmp_path
     assert info["model_type"] == "multi_class" and info["layer_sizes"] == [N_IN, 6, 3]
     assert ex.main([str(tmp_path / "missing.npz"), str(tmp_path / "bad")]) == 2
     assert "export-pytorch:" in capsys.readouterr().err
+
+def test_the_serializer_goes_by_the_kind_a_network_declares_not_by_its_attributes():
+    from src.cnn_network import CNNNetwork
+    from src.mhsa_network import MHSANetwork
+
+    assert CNNNetwork.model_kind == "cnn" and MHSANetwork.model_kind == "mhsa"
+    # an object with none of the attributes the old guess looked for, renamed or reshaped, is still classified by what it declares
+    assert ModelSerializer._model_kind(types.SimpleNamespace(model_kind="cnn")) == "cnn"
+    assert ModelSerializer._model_kind(types.SimpleNamespace(model_kind="mhsa")) == "mhsa"
+    # and one that declares nothing falls back to the attribute test, so dense and older objects are unchanged
+    assert ModelSerializer._model_kind(types.SimpleNamespace(param_layers=[], layers=[])) == "cnn"
+    assert ModelSerializer._model_kind(types.SimpleNamespace(layer_sizes=[2, 3])) == "dense"
+    # a declared kind is authoritative in both directions: "dense" overrules cnn-looking attributes, and a typo is an error rather than a silent guess
+    assert ModelSerializer._model_kind(types.SimpleNamespace(model_kind="dense", param_layers=[], layers=[])) == "dense"
+    for typo in ("CNN", "conv", ""):
+        with pytest.raises(ValueError, match="model_kind"):
+            ModelSerializer._model_kind(types.SimpleNamespace(model_kind=typo))
+
+def test_an_exported_cnn_given_images_of_the_wrong_size_says_so_instead_of_failing_in_a_matmul(tmp_path):
+    layers = CNN_REFERENCE_CASES["block_then_conv"]
+    path = str(tmp_path / "c.npz")
+    _synthetic_cnn(path, layers, task="multiclass", out=4)                       # the head is sized for 12 x 10 images
+    spec = ex.read_archive(path)
+    net = _module_from_source(tmp_path, ex.generate_source(spec)).AnascopeModel().double().eval()
+    net.load_state_dict({k: torch.from_numpy(np.asarray(v)) for k, v in ex.build_state(spec).items()})
+    with torch.no_grad():
+        net(torch.zeros(2, 2, 12, 10, dtype=torch.float64))                     # the trained size still works
+        with pytest.raises(ValueError, match=r"\(2, 12, 14\).*features.*trained on"):
+            net(torch.zeros(2, 2, 12, 14, dtype=torch.float64))

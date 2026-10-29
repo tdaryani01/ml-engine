@@ -353,6 +353,7 @@ class AnascopeModel(nn.Module):
         if x.ndim == 3:                       # one image (C, H, W)
             x = x.unsqueeze(0)
         x = x.to(self.convs[0].weight.dtype)  # numpy / pandas hand over float64
+        image_shape = tuple(x.shape[1:])
         for step in STEPS:
             kind = step[0]
             if kind == "conv_block":
@@ -365,6 +366,9 @@ class AnascopeModel(nn.Module):
                 x = F.relu(x)
             elif kind == "flatten":
                 x = torch.flatten(x, 1)
+                if x.shape[1] != DENSES[0][0]:
+                    raise ValueError(f"images of shape {image_shape} give {x.shape[1]} features after the conv layers, but the dense head was trained on {DENSES[0][0]}: "
+                                     "use images of the size the model was trained on (without the width padding)")
         last = len(self.denses) - 1
         for i, dense in enumerate(self.denses):
             x = dense(x)
