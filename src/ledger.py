@@ -733,6 +733,8 @@ class TrainingLedger:
             version=parent_version,
         )
         child._best_val_loss = self._best_val_loss
+        child.run_config = self.run_config          # a forked branch's checkpoints carry the config and keep getting an export archive
+        child.export_sidecar = self.export_sidecar
         return child
 
     def scan_branch(self, doc_type: str | None = None) -> Iterator[LedgerDocument]:

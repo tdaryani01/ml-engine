@@ -71,6 +71,24 @@ def test_a_fit_without_a_run_config_writes_no_archive_and_does_not_fail(tmp_path
 
 
 def test_an_archive_that_cannot_be_written_never_fails_the_fit(tmp_path):
-    bad = {"architecture": {"model_type": "binary_classification"}, "optimization": {}}     # save_model needs more than this: it raises
+    bad = {"architecture": {}, "optimization": {}}                                             # no model_type: save_model raises
     _, _, docs = _fit(tmp_path, bad)
     assert docs and not list((tmp_path / "ledger" / "checkpoints").glob("*.export.npz"))
+
+def test_a_run_config_that_leaves_out_batch_norm_and_optimizer_settings_still_gets_archives(tmp_path):
+    sparse = {"architecture": {"model_type": "binary_classification"}, "optimization": {"seed": 4}}
+    _, _, docs = _fit(tmp_path, sparse)
+    assert docs and all((tmp_path / "ledger" / "checkpoints" / f"main_v{d.body['version']}.export.npz").is_file() for d in docs)
+    info = ex.export(str(tmp_path / "ledger" / "checkpoints" / f"main_v{docs[-1].body['version']}.export.npz"), str(tmp_path / "out"))
+    assert info["warnings"] == [] and info["model_type"] == "binary_classification"
+
+
+def test_a_forked_branch_keeps_writing_archives(tmp_path):
+    ctl, _, docs = _fit(tmp_path, RUN_CONFIG)
+    from src.ledger import TrainingLedger
+    store = FileLedgerStore(str(tmp_path / "ledger2"))
+    ledger = TrainingLedger(store=store, branch_id="main", run_config=RUN_CONFIG, export_sidecar=ctl._export_archive_writer(RUN_CONFIG))
+    child = ledger.fork_branch("exp1", 0, "try something")
+    assert child.run_config == RUN_CONFIG and child.export_sidecar is ledger.export_sidecar
+    child.push_checkpoint(ctl.model, version=3, val_loss=0.5)
+    assert (tmp_path / "ledger2" / "checkpoints" / "exp1_v3.export.npz").is_file()

@@ -52,6 +52,7 @@ The tests (`testing/test_export_pytorch.py`) compare each module with the engine
 A checkpoint holds the weights and the run config but not what the model needs to be used on raw data: the input scaling, the target scaling of a regression model and the batch-norm running statistics. So when a fit runs with the ledger on and a run config, the engine also writes the archive this exporter reads beside every checkpoint it stores: `ledger/checkpoints/main_v<version>.export.npz` next to `main_v<version>.bin`. Export that file with `python -m src.export_pytorch <file> <out dir>`.
 
 The archive is written by `TrainingLedger.export_sidecar` (set by `ModelController.fit`); a failure to write it is logged and never fails the fit. Checkpoints written before this existed have no archive and cannot be exported.
+
 ## Warnings
 
 - **Dense, no input mean/std in the archive** (saved without a data provider): the module expects features that are already standardised.
