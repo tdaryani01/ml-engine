@@ -373,6 +373,8 @@ class TrainingLedger:
     _best_val_loss: float = field(default=float("inf"), repr=False)
     # The run config this ledger's checkpoints belong to (set once by the controller); stored in every checkpoint.
     run_config: dict[str, Any] | None = field(default=None, repr=False)
+    # Called as export_sidecar(model, path) after each checkpoint is stored, to write the archive src/export_pytorch.py reads beside it (the checkpoint itself has no input scaling or batch-norm statistics). A failure here never fails a fit.
+    export_sidecar: Any = field(default=None, repr=False)
 
     def _envelope(
         self,
@@ -573,7 +575,17 @@ class TrainingLedger:
         )
         lsn = self.push(doc)
         self.store.put_checkpoint(doc)
+        self._write_export_sidecar(model, version)
         return lsn
+
+    def _write_export_sidecar(self, model: Any, version: int) -> None:
+        path_for = getattr(self.store, "_checkpoint_path", None)
+        if self.export_sidecar is None or path_for is None:
+            return
+        try:
+            self.export_sidecar(model, str(Path(path_for(self.branch_id, version)).with_suffix(".export.npz")))
+        except Exception as exc:  # noqa: BLE001 - the export archive is a convenience; the checkpoint is already stored
+            _log.warning("export archive for version %s not written: %s", version, exc)
 
     def push_checkpoint_state(
         self,
@@ -721,6 +733,8 @@ class TrainingLedger:
             version=parent_version,
         )
         child._best_val_loss = self._best_val_loss
+        child.run_config = self.run_config          # a forked branch's checkpoints carry the config and keep getting an export archive
+        child.export_sidecar = self.export_sidecar
         return child
 
     def scan_branch(self, doc_type: str | None = None) -> Iterator[LedgerDocument]:

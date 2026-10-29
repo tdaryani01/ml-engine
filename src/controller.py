@@ -1,4 +1,6 @@
 # src/controller.py
+import contextlib
+import io
 import os
 import logging
 from typing import Optional, Tuple, List, Dict, Any
@@ -273,6 +275,8 @@ class ModelController:
             )
             if ledger_on:
                 engine.ledger.run_config = getattr(ls, "run_config", None)
+                if engine.ledger.run_config:
+                    engine.ledger.export_sidecar = self._export_archive_writer(engine.ledger.run_config)
                 logging.info(
                     "[Model Controller] Training ledger enabled: %s backend=%s instance_id=%s",
                     ledger_dir,
@@ -333,6 +337,18 @@ class ModelController:
         )
         self.steps_completed = session.steps_completed
         return self.train_history, self.val_history
+
+    def _export_archive_writer(self, run_config: dict):
+        """The ledger's export_sidecar: save the model, with this controller's input scaling, as the archive src/export_pytorch.py reads."""
+        def write(model, path: str) -> None:
+            arch, opt = dict(run_config.get("architecture") or {}), dict(run_config.get("optimization") or {})
+            arch.setdefault("use_batch_norm", bool(getattr(model, "gammas", None)))        # a run config that leaves these out still trained with something
+            arch.setdefault("bn_momentum", float(getattr(model, "bn_momentum", 0.9)))
+            opt.setdefault("optimizer", "adam")
+            opt.setdefault("learning_rate", float(self.initial_lr))
+            with contextlib.redirect_stdout(io.StringIO()):     # the saver prints a line per file
+                ModelSerializer.save_model(model, {**run_config, "architecture": arch, "optimization": opt}, data_provider=self.data_provider, file_path=path)
+        return write
 
     def serialize_current_state(self, target_asset_path: str, serialized_config_dict: dict) -> None:
         """Writes active weights and hyperparameter state out to disk."""
