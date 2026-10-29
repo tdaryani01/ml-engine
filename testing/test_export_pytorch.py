@@ -698,3 +698,40 @@ def test_an_exported_cnn_given_images_of_the_wrong_size_says_so_instead_of_faili
         net(torch.zeros(2, 2, 12, 10, dtype=torch.float64))                     # the trained size still works
         with pytest.raises(ValueError, match=r"\(2, 12, 14\).*features.*trained on"):
             net(torch.zeros(2, 2, 12, 14, dtype=torch.float64))
+
+def _export_without_torch(monkeypatch, npz, out):
+    """export() as it runs on a computer with no PyTorch (the Desktop): `import torch` inside it fails."""
+    monkeypatch.setitem(sys.modules, "torch", None)
+    info = ex.export(npz, str(out))
+    monkeypatch.undo()
+    return info
+
+
+def test_without_torch_the_weights_are_written_as_npz_and_load_gives_the_same_model(tmp_path, monkeypatch):
+    model = _trained_like("binary_classification", True, (N_IN, 8, 6, 1))
+    path, mean, std = _save(tmp_path, model, "binary_classification", True)
+    x = np.random.default_rng(7).normal(0.5, 2.0, (40, N_IN)).astype(np.float32)
+
+    with_torch = tmp_path / "with_torch"
+    ex.export(path, str(with_torch))
+    assert sorted(os.listdir(with_torch)) == ["model.py", "preprocess.json", "weights.pt"]
+
+    without = tmp_path / "without_torch"
+    info = _export_without_torch(monkeypatch, path, without)
+    assert sorted(os.listdir(without)) == ["model.py", "preprocess.json", "weights.npz"] and info["weights_file"] == "weights.npz"
+    assert json.load(open(without / "preprocess.json"))["weights_file"] == "weights.npz"
+
+    a = _module(str(with_torch)).load(str(with_torch / "weights.pt"))(torch.from_numpy(x)).detach().numpy()
+    b = _module(str(without)).load()(torch.from_numpy(x)).detach().numpy()          # no path given: load() finds weights.npz beside model.py
+    np.testing.assert_array_equal(a, b)
+
+
+def test_a_cnn_exported_without_torch_loads_from_npz_too(tmp_path, monkeypatch):
+    layers = CNN_REFERENCE_CASES["block_then_conv"]
+    path = str(tmp_path / "c.npz")
+    arrays = _synthetic_cnn(path, layers, task="multiclass", out=4)
+    x = np.random.default_rng(4).uniform(0, 1, (5, 2, 12, 10))
+    out = tmp_path / "out"
+    _export_without_torch(monkeypatch, path, out)
+    got = _module(str(out)).load()(torch.from_numpy(x)).detach().numpy()
+    np.testing.assert_allclose(got, _np_cnn(x, layers, arrays, "multiclass"), rtol=2e-4, atol=2e-5)
