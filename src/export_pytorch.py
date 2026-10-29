@@ -13,7 +13,7 @@ task is about: a probability for binary_classification, class probabilities for 
 CNN: images (N, C, H, W) as the engine's loader gives them, without the width padding; class probabilities (or a probability / values, by task).
 MHSA: sequences (N, T, input_dim) with T <= max_seq_len; the action of the last position (tanh-bounded, or raw logits for discrete).
 CNN and MHSA inputs are used as given: no mean/std is stored for them.
-The archive is read with numpy alone (no engine imports), and torch is needed only to write weights.pt.
+The archive is read with numpy alone (no engine imports). torch writes weights.pt; where torch is not installed (the Desktop) the same state_dict is written as weights.npz, and the generated load() reads either.
 """
 from __future__ import annotations
 
@@ -189,9 +189,18 @@ class AnascopeModel(nn.Module):
 
 
 def load(weights_path=None, device="cpu"):
-    weights_path = weights_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.pt")
+    here = os.path.dirname(os.path.abspath(__file__))
+    weights_path = weights_path or next((p for p in (os.path.join(here, "weights.pt"), os.path.join(here, "weights.npz")) if os.path.exists(p)), None)
+    if weights_path is None:
+        raise FileNotFoundError(f"no weights.pt or weights.npz beside {here}")
     model = AnascopeModel()
-    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+    if str(weights_path).endswith(".npz"):      # written instead of weights.pt where torch was not installed to export
+        import numpy as np
+        with np.load(weights_path) as z:
+            state = {k: torch.from_numpy(z[k]) for k in z.files}
+    else:
+        state = torch.load(weights_path, map_location=device, weights_only=True)
+    model.load_state_dict(state)
     return model.to(device).eval()
 '''
 
@@ -378,9 +387,18 @@ class AnascopeModel(nn.Module):
 
 
 def load(weights_path=None, device="cpu"):
-    weights_path = weights_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.pt")
+    here = os.path.dirname(os.path.abspath(__file__))
+    weights_path = weights_path or next((p for p in (os.path.join(here, "weights.pt"), os.path.join(here, "weights.npz")) if os.path.exists(p)), None)
+    if weights_path is None:
+        raise FileNotFoundError(f"no weights.pt or weights.npz beside {here}")
     model = AnascopeModel()
-    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+    if str(weights_path).endswith(".npz"):      # written instead of weights.pt where torch was not installed to export
+        import numpy as np
+        with np.load(weights_path) as z:
+            state = {k: torch.from_numpy(z[k]) for k in z.files}
+    else:
+        state = torch.load(weights_path, map_location=device, weights_only=True)
+    model.load_state_dict(state)
     return model.to(device).eval()
 '''
 
@@ -551,9 +569,18 @@ class AnascopeModel(nn.Module):
 
 
 def load(weights_path=None, device="cpu"):
-    weights_path = weights_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights.pt")
+    here = os.path.dirname(os.path.abspath(__file__))
+    weights_path = weights_path or next((p for p in (os.path.join(here, "weights.pt"), os.path.join(here, "weights.npz")) if os.path.exists(p)), None)
+    if weights_path is None:
+        raise FileNotFoundError(f"no weights.pt or weights.npz beside {here}")
     model = AnascopeModel()
-    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+    if str(weights_path).endswith(".npz"):      # written instead of weights.pt where torch was not installed to export
+        import numpy as np
+        with np.load(weights_path) as z:
+            state = {k: torch.from_numpy(z[k]) for k in z.files}
+    else:
+        state = torch.load(weights_path, map_location=device, weights_only=True)
+    model.load_state_dict(state)
     return model.to(device).eval()
 '''
 
@@ -587,18 +614,26 @@ def _info(spec: dict, source: str) -> dict:
 
 
 def export(npz_path: str, out_dir: str) -> dict:
-    """Write model.py, weights.pt and preprocess.json for the saved model; returns what preprocess.json says."""
-    try:
-        import torch
-    except ImportError as exc:
-        raise ExportError("PyTorch is needed to write weights.pt: pip install torch") from exc
+    """Write model.py, the weights and preprocess.json for the saved model; returns what preprocess.json says.
+    The weights are weights.pt when torch is installed here and weights.npz (the same float32 state_dict, as arrays) when it is not: the generated load() reads either."""
     spec = read_archive(npz_path)
     os.makedirs(out_dir, exist_ok=True)
-    state = {k: torch.from_numpy(v.astype(np.int64 if v.dtype == np.int64 else np.float32)) for k, v in build_state(spec).items()}
-    torch.save(state, os.path.join(out_dir, "weights.pt"))
+    state = {k: v.astype(np.int64 if v.dtype == np.int64 else np.float32) for k, v in build_state(spec).items()}
+    try:
+        import torch
+    except ImportError:
+        weights_file = "weights.npz"
+        np.savez(os.path.join(out_dir, weights_file), **state)
+    else:
+        weights_file = "weights.pt"
+        torch.save({k: torch.from_numpy(v) for k, v in state.items()}, os.path.join(out_dir, weights_file))
+    stale = os.path.join(out_dir, "weights.pt" if weights_file == "weights.npz" else "weights.npz")      # from an earlier export here: load() would prefer it
+    if os.path.exists(stale):
+        os.remove(stale)
     with open(os.path.join(out_dir, "model.py"), "w", encoding="utf-8", newline="\n") as f:
         f.write(generate_source(spec))
     info = _info(spec, os.path.basename(npz_path))
+    info["weights_file"] = weights_file
     with open(os.path.join(out_dir, "preprocess.json"), "w", encoding="utf-8", newline="\n") as f:
         json.dump(info, f, indent=2)
         f.write("\n")
@@ -617,7 +652,7 @@ def main(argv=None) -> int:
         return 2
     for w in info["warnings"]:
         print(f"export-pytorch: WARNING: {w}", file=sys.stderr)
-    print(f"export-pytorch: {info['summary']} -> {a.out_dir} (model.py, weights.pt, preprocess.json)")
+    print(f"export-pytorch: {info['summary']} -> {a.out_dir} (model.py, {info['weights_file']}, preprocess.json)")
     return 0
 
 

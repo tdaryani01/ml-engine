@@ -3,7 +3,7 @@
 A model saved by `ModelSerializer.save_model` can be exported as a standalone PyTorch module: the dense families (`binary_classification`, `regression`, `multi_class`), `cnn` and `mhsa`.
 
 ```
-pip install torch                       # to write weights.pt, and to use the exported module
+pip install torch                       # to use the exported module (and to write weights.pt; without torch the weights are written as weights.npz)
 python -m src.export_pytorch model.npz out_dir
 ```
 
@@ -12,7 +12,7 @@ python -m src.export_pytorch model.npz out_dir
 | File | What it is |
 |---|---|
 | `model.py` | The network as plain torch code. It does not import anything from this project. `load()` returns it in eval mode. |
-| `weights.pt` | A torch `state_dict` (float32): the weights and, for the dense families, the input/output scaling. |
+| `weights.pt` | A torch `state_dict` (float32): the weights and, for the dense families, the input/output scaling. Where torch is not installed to export (the Anascope Desktop) the same state_dict is written as `weights.npz` instead, and `load()` reads whichever is beside `model.py`. `preprocess.json` names the file (`weights_file`). |
 | `preprocess.json` | What the module takes and returns, and any warning (below). |
 
 ```python
