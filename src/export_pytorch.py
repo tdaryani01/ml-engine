@@ -190,7 +190,9 @@ class AnascopeModel(nn.Module):
 
 def load(weights_path=None, device="cpu"):
     here = os.path.dirname(os.path.abspath(__file__))
-    weights_path = weights_path or next(p for p in (os.path.join(here, "weights.pt"), os.path.join(here, "weights.npz")) if os.path.exists(p))
+    weights_path = weights_path or next((p for p in (os.path.join(here, "weights.pt"), os.path.join(here, "weights.npz")) if os.path.exists(p)), None)
+    if weights_path is None:
+        raise FileNotFoundError(f"no weights.pt or weights.npz beside {here}")
     model = AnascopeModel()
     if str(weights_path).endswith(".npz"):      # written instead of weights.pt where torch was not installed to export
         import numpy as np
@@ -386,7 +388,9 @@ class AnascopeModel(nn.Module):
 
 def load(weights_path=None, device="cpu"):
     here = os.path.dirname(os.path.abspath(__file__))
-    weights_path = weights_path or next(p for p in (os.path.join(here, "weights.pt"), os.path.join(here, "weights.npz")) if os.path.exists(p))
+    weights_path = weights_path or next((p for p in (os.path.join(here, "weights.pt"), os.path.join(here, "weights.npz")) if os.path.exists(p)), None)
+    if weights_path is None:
+        raise FileNotFoundError(f"no weights.pt or weights.npz beside {here}")
     model = AnascopeModel()
     if str(weights_path).endswith(".npz"):      # written instead of weights.pt where torch was not installed to export
         import numpy as np
@@ -566,7 +570,9 @@ class AnascopeModel(nn.Module):
 
 def load(weights_path=None, device="cpu"):
     here = os.path.dirname(os.path.abspath(__file__))
-    weights_path = weights_path or next(p for p in (os.path.join(here, "weights.pt"), os.path.join(here, "weights.npz")) if os.path.exists(p))
+    weights_path = weights_path or next((p for p in (os.path.join(here, "weights.pt"), os.path.join(here, "weights.npz")) if os.path.exists(p)), None)
+    if weights_path is None:
+        raise FileNotFoundError(f"no weights.pt or weights.npz beside {here}")
     model = AnascopeModel()
     if str(weights_path).endswith(".npz"):      # written instead of weights.pt where torch was not installed to export
         import numpy as np
@@ -621,6 +627,9 @@ def export(npz_path: str, out_dir: str) -> dict:
     else:
         weights_file = "weights.pt"
         torch.save({k: torch.from_numpy(v) for k, v in state.items()}, os.path.join(out_dir, weights_file))
+    stale = os.path.join(out_dir, "weights.pt" if weights_file == "weights.npz" else "weights.npz")      # from an earlier export here: load() would prefer it
+    if os.path.exists(stale):
+        os.remove(stale)
     with open(os.path.join(out_dir, "model.py"), "w", encoding="utf-8", newline="\n") as f:
         f.write(generate_source(spec))
     info = _info(spec, os.path.basename(npz_path))
