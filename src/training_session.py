@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from config.constants import DataKeys, ModelType
+from src import step_loss_stats as _step_loss_stats
 
 # The losses a fit reports (train per step, validation per epoch) are the raw cost; the L2 term is not added (a caller reading an older engine finds this name missing and must
 # take the reported losses as penalised, ml-engine#52).
@@ -604,6 +605,7 @@ class TrainingSession:
                 on_submitted=_on_submitted,
             )
             self.steps_completed = 0
+            _step_loss_stats.observe_epoch(batch_losses)      # the zigzag of the per-step losses (src/step_loss_stats.py); reads only
             return float(np.mean(batch_losses)) if batch_losses else 0.0, forensic_data
 
         while True:
@@ -632,6 +634,7 @@ class TrainingSession:
                 self.steps_completed = 0
                 break
 
+        _step_loss_stats.observe_epoch(batch_losses)
         return float(np.mean(batch_losses)) if batch_losses else 0.0, forensic_data
 
     def _forensic_batch_zero(
