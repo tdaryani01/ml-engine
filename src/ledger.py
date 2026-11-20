@@ -462,7 +462,9 @@ class TrainingLedger:
             body["n_train"] = int(n_train)
         from src import grad_stats      # the gradient statistics of the steps since the last boundary ride the same channel, for every family and caller
 
-        drained = grad_stats.drain()
+        from src import step_loss_stats      # the zigzag of the per-step training losses rides the same channel (src/step_loss_stats.py)
+
+        drained = {**grad_stats.drain(), **step_loss_stats.drain()}
         if drained:
             extra_metrics = {**(extra_metrics or {}), **drained}
         if extra_metrics:
