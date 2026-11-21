@@ -40,9 +40,17 @@ class InMemoryDataProvider(BaseDataProvider):
         if self.normalize_features and self.X_train.ndim == 2:
             self.mean = np.mean(self.X_train, axis=0)
             self.std = np.std(self.X_train, axis=0) + 1e-24
+            # Data design §9 row 21, engine half (03ec5b3): a column the output mask calls one-hot is not scaled (mean 0, std 1 = identity).
+            mask = getattr(self.loader, "output_mask", None) or []
+            if mask and len(mask) != self.mean.size:
+                raise ValueError(f"[In-Memory Provider] the output mask has {len(mask)} columns, the training part has {self.mean.size}")
+            self.exempt = np.array([c.get("kind") == "onehot" for c in mask], dtype=bool) if mask else np.zeros(self.mean.shape, dtype=bool)
+            self.mean = np.where(self.exempt, 0.0, self.mean)
+            self.std = np.where(self.exempt, 1.0, self.std)
         else:
             self.mean = np.zeros(self.X_train.shape[1:], dtype=np.float32)
             self.std = np.ones(self.X_train.shape[1:], dtype=np.float32)
+            self.exempt = np.zeros(self.mean.shape, dtype=bool)
 
         self.n_samples = self.X_train.shape[0]
         self.num_batches = int(np.ceil(self.n_samples / self.batch_size))
