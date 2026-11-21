@@ -171,6 +171,14 @@ class ModelController:
             if key in stored and key in now and stored[key] != now[key]:
                 raise ValueError(f"checkpoint {path} was trained under {key}={stored[key]!r}, this run has {key}={now[key]!r}: refusing to restore")
         restore_model_checkpoint(self.model, body)
+        # A stop-state checkpoint (data design §9 row 15) continues the run it stopped: the next fit keeps the optimizer and the epoch clock.
+        # Any other checkpoint restores weights only, and the optimizer restarts, as before.
+        cont = body.get("continuation")
+        if cont:
+            from src.ledger import best_from_state
+
+            cont = {**cont, "best": best_from_state(body.get("state") or {})}
+        self.model.continuation = cont or None
         logging.info("[Model Controller] Restored weights from checkpoint document %s", path)
         return int(getattr(doc, "version", 0) or 0)
 

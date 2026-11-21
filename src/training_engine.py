@@ -1682,11 +1682,17 @@ class TrainingEngine:
             sess.session_id,
         )
         if self.ledger.version == 0:
+            cont = getattr(sess, "_fit_continuation", None)
             with self._ledger_lock:
+                # A continued run keeps the best of the whole run: its version 0 holds the best weights of the run it continues, so a
+                # restore of the best (an early stop, the run end) finds them in this ledger.
                 self.ledger.push_checkpoint(
                     sess.model,
                     version=0,
+                    val_loss=None if cont is None else cont["best_val_loss"],
+                    is_local_best=cont is not None,
                     model_instance_id=self._ledger_model_instance_id(sess),
+                    extra=None if cont is None else {k: v for k, v in cont["best"].items() if v is not None},
                 )
         if self.config.contract_list_enabled and hasattr(sess.model, "enable_contract_list"):
             sess.model.enable_contract_list(
@@ -1825,6 +1831,24 @@ class TrainingEngine:
             epoch,
             version,
         )
+        return version
+
+    def save_stop_state(self, epoch: int, es_state: dict) -> int:
+        """Data design §9 row 15 (03ec5b3): the state the run stops in (weights, optimizer) as one extra checkpoint, before the best weights
+        are restored, so a run can be continued from where it stopped. The best checkpoint's weights ride in the marker, so a continued run
+        returns the best over the whole run. Written only in the separate-streams mode."""
+        sess = self._require_session()
+        from src.ledger import best_to_state
+
+        best_doc = self.ledger.store.get_checkpoint(self.ledger.branch_id, int(es_state["best_version"]))
+        best = {k: best_doc.body.get(k) for k in ("weights", "biases", "gammas", "betas")}
+        version = self.ledger.version
+        marker = {"epoch": int(epoch) + 1, "best_val_loss": float(es_state["best_val_loss"]), "best_epoch": int(es_state["best_epoch"])}
+        with self._ledger_lock:
+            self.ledger.push_checkpoint(sess.model, version=version, val_loss=None, is_local_best=False,
+                                        model_instance_id=self._ledger_model_instance_id(sess),
+                                        extra={"continuation": marker, "state": best_to_state(best)})
+        logging.info("[Early Stopping] Stop state of epoch %d saved as ledger checkpoint version=%d", epoch, version)
         return version
 
     def on_early_stopping_triggered(self, epoch: int, best_epoch: int, best_version: int) -> None:

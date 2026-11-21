@@ -21,6 +21,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from utils.seeding import separate_streams
+
 from config.constants import DataKeys, ModelType
 from src import step_loss_stats as _step_loss_stats
 
@@ -139,6 +141,7 @@ class TrainingSession:
         # Fit contract: why the fit ended ("es_trip" | "success"); read by the engine's run.end.
         self._fit_stop_reason: str | None = None
         self._fit_epochs_done: int = 0
+        self._fit_continuation: Dict[str, Any] | None = None
         self._fit_is_classification = False
         self._fit_X_val = None
         self._fit_y_val = None
@@ -391,7 +394,7 @@ class TrainingSession:
             "max_epochs": max_epochs,
         }
         self._fit_done = False
-        self._fit_epoch = 0
+        self._fit_epoch = self._fit_epoch_start = 0
         self._fit_is_classification = model_type in (
             ModelType.BINARY_CLASSIFICATION,
             ModelType.MULTI_CLASS,
@@ -416,7 +419,8 @@ class TrainingSession:
             self._fit_ready = True
             return
         self._set_train_batch_caps(model_type)
-        if hasattr(self.model.optimizer, "_setup_done"):
+        self._fit_continuation = getattr(self.model, "continuation", None)
+        if self._fit_continuation is None and hasattr(self.model.optimizer, "_setup_done"):
             self.model.optimizer._setup_done = False
             self.model.optimizer.t = 0
             logging.info(
@@ -432,6 +436,12 @@ class TrainingSession:
             "biases": None,
             "best_version": None,
         }
+        cont = self._fit_continuation
+        if cont is not None:      # a run continued from a stop state: the epoch clock, and the best so far (held as version 0 of this ledger)
+            self._fit_epoch = self._fit_epoch_start = int(cont["epoch"])
+            self.data_provider.epoch_offset = int(cont["epoch"])
+            self._fit_es_state.update(best_val_loss=float(cont["best_val_loss"]), best_epoch=int(cont["best_epoch"]), best_version=0,
+                                      weights=cont["best"]["weights"], biases=cont["best"]["biases"])
         if self.engine is not None:
             self.engine.on_fit_start(self)
         self._fit_ready = True
@@ -496,7 +506,7 @@ class TrainingSession:
                 self.finish_fit()
                 return False
         max_epochs = kw.get("max_epochs")
-        if max_epochs is not None and epoch + 1 >= max_epochs:
+        if max_epochs is not None and epoch + 1 - self._fit_epoch_start >= max_epochs:      # a budget of epochs, counted from where this run began
             self.finish_fit()
             return False
         self._fit_epoch = epoch + 1
@@ -743,6 +753,8 @@ class TrainingSession:
 
         es_state["patience_counter"] += 1
         if es_state["patience_counter"] >= patience:
+            if self.engine is not None and es_state.get("best_version") is not None and separate_streams():
+                self.engine.save_stop_state(epoch, es_state)      # before the best weights are put back
             if self.engine is not None and es_state.get("best_version") is not None:
                 self.engine.on_early_stopping_triggered(
                     epoch,
