@@ -148,6 +148,9 @@ class ModelController:
             ident["split_seed"] = int(loader.random_state)
         if getattr(loader, "lists_hash", None):
             ident["lists_hash"] = str(loader.lists_hash)
+        for key in ("n_discarded", "n_unused", "n_train", "n_validation"):      # the parts, for the result line: what the cut left out, and the sizes of a lists run
+            if isinstance(getattr(loader, key, None), int):
+                ident[key] = int(getattr(loader, key))
         return ident
 
     def restore_from_checkpoint_doc(self, path: str) -> int:

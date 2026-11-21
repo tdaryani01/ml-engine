@@ -66,6 +66,11 @@ class BaseDataLoader(ABC):
                 train_split=cfg.ingestion.splits.train,
             )
 
+        if getattr(cfg.ingestion.splits, "lists_path", None):
+            from src.data.lists_loader import ListsCSVLoader
+
+            return ListsCSVLoader(cfg.ingestion.data_file_path, cfg.ingestion.splits.lists_path, cfg.architecture.model_type, cfg.architecture.num_classes)
+
         return TabularCSVLoader(
             data_file_path=cfg.ingestion.data_file_path,
             feature_names=cfg.ingestion.feature_names,

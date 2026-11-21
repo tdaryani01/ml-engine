@@ -18,6 +18,8 @@ class SplitConfig:
     train: float
     val: float
     seed: int = 42
+    # Data design A1b: a lists file (row positions per part, encoded matrix, output mask); with it the engine cuts nothing.
+    lists_path: str | None = None
 
 @dataclass(frozen=True)
 class IngestionConfig:
