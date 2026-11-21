@@ -144,3 +144,13 @@ def test_an_epoch_of_one_step_still_carries_the_agreement_key() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         docs, _, _ = _fit(tmp, mt, nf, nout, 0.0, False, seed, recordings=True, batch_size=10_000)      # the whole training part in one batch: one step, no pair
     assert docs and all(d.body["extra_metrics"]["rec_steps"] == 1 and d.body["extra_metrics"]["rec_grad_agreement"] == 0.0 for d in docs)
+
+
+def test_the_dead_unit_sample_is_every_kth_row_and_spans_a_sorted_part() -> None:
+    from src import recordings
+
+    rows = np.arange(5000)                                   # a part sorted by time: row i is the i-th oldest
+    got = rows[recordings.dead_sample(len(rows))]
+    assert len(got) <= recordings.DEAD_SAMPLE and got[0] == 0 and got[-1] >= 5000 - 5 and np.all(np.diff(got) == 5)      # k = ceil(5000 / 1024) = 5: the whole file, not its first block
+    part = np.arange(300)
+    assert np.array_equal(part[recordings.dead_sample(300)], part)      # a part under the cap is taken whole

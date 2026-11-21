@@ -432,8 +432,8 @@ class TrainingSession:
         self._rec_dead_start = None
         if getattr(self.model, "recordings", False):      # the dead-unit shares of the weights this fit starts from, on the fixed sample (src/recordings.py)
             try:
-                n = recordings.DEAD_SAMPLE
-                self._rec_dead_start = self.model.recording_pass(self.data_provider.normalize(self.data_provider.X_train[:n]), self.data_provider.y_train_processed[:n])[1]
+                pick = recordings.dead_sample(len(self.data_provider.X_train))
+                self._rec_dead_start = self.model.recording_pass(self.data_provider.normalize(self.data_provider.X_train[pick]), self.data_provider.y_train_processed[pick])[1]
             except Exception:  # noqa: BLE001
                 logging.exception("[TrainingSession] recordings: the starting dead-unit shares failed")
         self._fit_es_state = {
@@ -669,8 +669,8 @@ class TrainingSession:
             vals.update(recordings.row_loss_stats(rows, "train"))
             rows, _ = self.model.recording_pass(self.data_provider.normalize(self._fit_X_val), self._fit_y_val)
             vals.update(recordings.row_loss_stats(rows, "val"))
-            sample = self.data_provider.normalize(X_tr[: recordings.DEAD_SAMPLE])
-            _, dead = self.model.recording_pass(sample, y_tr[: recordings.DEAD_SAMPLE])
+            pick = recordings.dead_sample(len(X_tr))
+            _, dead = self.model.recording_pass(self.data_provider.normalize(X_tr[pick]), y_tr[pick])
             vals.update(recordings.dead_stats(dead, getattr(self, "_rec_dead_start", None)))
             recordings.stage(vals)
         except Exception:  # noqa: BLE001

@@ -5,7 +5,7 @@ Per epoch, in the step document's ``extra_metrics``:
   rec_loss_p10/p50/p90_<part>, rec_loss_over3med_<part>    percentiles of the per-row loss and the share of rows above 3 x the median, <part> = train, val
                                                            (one evaluation pass at the end of the epoch with dropout off, the weights the epoch ended with)
   rec_dead_l<i>, rec_dead_l<i>_start                       per hidden layer, the share of units whose pre-activation is not above 0 for every row of a fixed sample
-                                                           (the first DEAD_SAMPLE training rows, in order), at the end of the epoch and at the start (the initial weights)
+                                                           (every k-th training row, k = ceil(rows / DEAD_SAMPLE), from row 0: at most DEAD_SAMPLE rows over the whole part), at the end of the epoch and at the start (the initial weights)
   rec_grad_agreement                                       mean over the epoch's consecutive pairs of steps of the cosine of the two batch gradients (weights and biases);
                                                            0.0 on an epoch with no pair (fewer than two steps, or a zero gradient), so the key is on every epoch: read it with rec_steps
   rec_clip_fires, rec_steps                                steps whose gradient norm exceeded the clipping norm, and the steps taken
@@ -30,6 +30,11 @@ class StepState:
         self.pairs = 0
         self.fires = 0
         self.steps = 0
+
+
+def dead_sample(n_rows: int) -> slice:
+    """Every k-th training row from row 0, k = ceil(n_rows / DEAD_SAMPLE): at most DEAD_SAMPLE rows spread over the whole part, the same rows every epoch and every run on the same rows."""
+    return slice(0, None, max(1, -(-int(n_rows) // DEAD_SAMPLE)))
 
 
 def reset_epoch(model) -> None:
