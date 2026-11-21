@@ -246,6 +246,10 @@ class OptimizationConfig:
     num_threads: int
     # Fit contract: seeds numpy's global RNG once at run start (None = unseeded, as before).
     seed: int | None = None
+    # Data design A4: separate streams for the plain network's starting weights and its batch order (shuffle and dropout).
+    # Neither set = the one global stream seeded by ``seed``; one not set falls back to ``seed``.
+    init_seed: int | None = None
+    batch_seed: int | None = None
 
 
 @dataclass(frozen=True)
