@@ -485,7 +485,9 @@ class TrainingLedger:
 
         from src import clip_stats      # the clipped-cell counts of a provider with the clip on: only the first document after it was built gets them
 
-        drained = {**grad_stats.drain(), **step_loss_stats.drain(), **clip_stats.drain()}
+        from src import recordings      # the pilots' per-epoch recordings (src/recordings.py): nothing unless the run sets them
+
+        drained = {**grad_stats.drain(), **step_loss_stats.drain(), **clip_stats.drain(), **recordings.drain()}
         if drained:
             extra_metrics = {**(extra_metrics or {}), **drained}
         if extra_metrics:

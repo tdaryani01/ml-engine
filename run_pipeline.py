@@ -191,6 +191,7 @@ def _build_provider_and_controller(cfg: PipelineConfig):
         backend=cfg.architecture.backend,
         contract_list_enabled=bool(getattr(cfg.ledger, "contract_list_enabled", False)),
         init_scale=float(getattr(cfg.optimization, "init_scale", 1.0)),
+        recordings=bool(getattr(cfg.optimization, "recordings", False)),
     )
 
     if cfg.persistence.load_saved_model:
