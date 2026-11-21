@@ -73,4 +73,5 @@ class BaseDataLoader(ABC):
             val_split=cfg.ingestion.splits.val,
             model_type=cfg.architecture.model_type,
             num_classes=cfg.architecture.num_classes,
+            random_state=int(getattr(cfg.ingestion.splits, "seed", 42)),      # the split seed (data design A1); 42 when the config gives none
         )
