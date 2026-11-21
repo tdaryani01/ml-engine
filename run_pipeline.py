@@ -156,7 +156,7 @@ def _build_provider_and_controller(cfg: PipelineConfig):
         else:
             input_dim = (
                 len(cfg.ingestion.feature_names)
-                if isinstance(cfg.ingestion.feature_names, list)
+                if isinstance(cfg.ingestion.feature_names, list) and not getattr(loader, "lists_hash", None)
                 else data_provider.splits[DataKeys.X_TRAIN].shape[1]
             )
 

@@ -80,6 +80,7 @@ class TabularCSVLoader(BaseDataLoader):
         self.model_type = model_type
         self.num_classes = num_classes
         self.random_state = random_state
+        self.n_discarded: int | None = None      # rows the cut leaves in neither part; known after load_splits
 
     def load_splits(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         df = pd.read_csv(self.data_file_path)
@@ -131,6 +132,7 @@ class TabularCSVLoader(BaseDataLoader):
                 raise ValueError(f"[Tabular Loader] Data leakage detected across seed groups: {leakage}")
 
             X_train, y_train = X[train_idx], y_raw[train_idx]
+            self.n_discarded = len(df) - len(train_idx) - len(val_idx)
             X_val, y_val = X[val_idx], y_raw[val_idx]
         else:
             logger.info("[Tabular Loader] Performing standard train/validation split...")
@@ -140,6 +142,7 @@ class TabularCSVLoader(BaseDataLoader):
             X_val, _, y_val, _ = numpy_train_test_split(
                 X_temp, y_temp, train_size=val_ratio, random_state=self.random_state
             )
+            self.n_discarded = len(X) - len(X_train) - len(X_val)      # the rest of the 70/15 cut: left out, kept so (data design §9 row 1, ruling 2)
 
         # 4. Target Formatting
         y_train_formatted = self._format_targets(y_train)

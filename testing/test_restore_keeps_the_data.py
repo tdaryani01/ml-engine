@@ -104,9 +104,9 @@ def test_a_checkpoint_written_without_knobs_still_restores_under_any_seed() -> N
         _fit(b, 8, epochs=1, restore=ckpt)
 
 
-def test_the_knobs_of_a_default_run_gain_the_split_seed_and_nothing_else() -> None:
+def test_the_knobs_of_a_default_run_gain_the_split_seed_and_the_discarded_count_and_nothing_else() -> None:
     with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
         _, store = _fit(a, 42, epochs=2, run_config=CONFIG)
         _, doc = _mid_run_checkpoint(store, b)
         assert set(doc.body["knobs"]) == {"learning_rate", "seed", "batch_size", "epochs_full_dataset", "optimizer", "early_stopping_enabled",
-                                          "patience", "min_delta", "checkpoint_every", "split_seed"}
+                                          "patience", "min_delta", "checkpoint_every", "split_seed", "n_discarded"}
