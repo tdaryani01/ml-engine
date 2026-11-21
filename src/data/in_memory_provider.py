@@ -90,7 +90,8 @@ class InMemoryDataProvider(BaseDataProvider):
                 beyond = (np.abs((X - self.mean) / self.std) > self.clip_sd) & ~self.exempt
                 counts[f"clip_cells_{part}"] = int(beyond.sum())
                 counts[f"clip_rows_multi_{part}"] = int((beyond.sum(axis=1) >= 2).sum())
-        clip_stats.set_counts(counts)
+        if counts:      # a provider without the clip (a second build in the process) must not erase the counts of the one that has it
+            clip_stats.set_counts(counts)
 
     def reset_epoch(self) -> None:
         if self._batch_idx > 0:

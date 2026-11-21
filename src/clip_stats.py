@@ -12,7 +12,7 @@ _counts: dict[str, float] = {}
 
 
 def set_counts(counts: dict[str, float]) -> None:
-    """Replace what the next ``drain`` returns (an empty dict clears it: a provider without the clip leaves nothing behind)."""
+    """Replace what the next ``drain`` returns. Called only by a provider with the clip on; a provider without it does not call (it must not erase another's counts)."""
     with _lock:
         _counts.clear()
         _counts.update({str(k): float(v) for k, v in counts.items()})

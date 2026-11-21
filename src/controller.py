@@ -12,6 +12,7 @@ from src.schedulers import StepDecay, ExponentialDecay
 from src.training_session import TrainingSession
 from config.constants import ModelType, LRHierarchy, EngineBackend
 from config.schema import LedgerSettings
+from utils.seeding import separate_streams
 
 
 class ModelController:
@@ -151,6 +152,9 @@ class ModelController:
         for key in ("n_discarded", "n_unused", "n_train", "n_validation"):      # the parts, for the result line: what the cut left out, and the sizes of a lists run
             if isinstance(getattr(loader, key, None), int):
                 ident[key] = int(getattr(loader, key))
+        shares = getattr(loader, "class_shares", None)
+        if shares:      # fraction mode only: the class shares of each part, for the result line
+            ident["class_shares_train"], ident["class_shares_validation"] = list(shares["train"]), list(shares["validation"])
         return ident
 
     def restore_from_checkpoint_doc(self, path: str) -> int:
@@ -177,6 +181,8 @@ class ModelController:
         # A stop-state checkpoint (data design §9 row 15) continues the run it stopped: the next fit keeps the optimizer and the epoch clock.
         # Any other checkpoint restores weights only, and the optimizer restarts, as before.
         cont = body.get("continuation")
+        if cont and not separate_streams():      # data design §9 row 20: a read never mixes the two modes
+            raise ValueError(f"checkpoint {path} is a stop-state checkpoint (resume after the stop), which needs the separate-streams mode (an init seed or a batch seed); refusing to restore it under the single stream")
         if cont:
             from src.ledger import best_from_state
 

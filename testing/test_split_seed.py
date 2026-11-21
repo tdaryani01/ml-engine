@@ -87,3 +87,16 @@ def test_a_spec_without_a_pipeline_also_carries_the_split_seed(tmp_path) -> None
     mk = lambda **kw: build_pipeline_payload(SupervisedFitSpec(model_type="binary_classification", data_path=plate, feature_names=tuple(FEATURES), **kw), work_dir=tmp_path / "w")      # noqa: E731
     assert "seed" not in mk()["ingestion"]["splits"]
     assert mk(split_seed=3)["ingestion"]["splits"]["seed"] == 3
+
+
+def test_fraction_mode_reports_the_class_shares_of_each_part_and_a_regression_run_reports_none(tmp_path) -> None:
+    from config.constants import ModelType
+
+    csv = _plate(tmp_path)
+    loader = TabularCSVLoader(csv, FEATURES, 0.7, 0.15, ModelType.BINARY_CLASSIFICATION, 1)
+    loader.load_splits()
+    sh = loader.class_shares
+    assert set(sh) == {"train", "validation"} and all(abs(sum(v) - 1.0) < 1e-9 for v in sh.values())
+    reg = TabularCSVLoader(csv, FEATURES, 0.7, 0.15, ModelType.REGRESSION, 1)
+    reg.load_splits()
+    assert reg.class_shares is None

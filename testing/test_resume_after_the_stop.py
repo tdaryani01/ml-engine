@@ -101,3 +101,13 @@ def test_a_resumed_run_that_improves_returns_its_own_best() -> None:
         _, resumed = _fit(b, epochs=6, es=True, min_delta=1e-9, patience=50, restore=_stop_state(docs, a))
         end = [d for d in resumed if d.doc_type == RUN_END][0].body
     assert end["best_val_loss"] < before["best_val_loss"] and end["best_epoch"] >= 3      # epochs of the resumed run count from the stop
+
+
+def test_a_stop_state_checkpoint_is_refused_in_the_legacy_mode() -> None:
+    import pytest
+
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        _, docs = _stopped_run(a)
+        path = _stop_state(docs, a)
+        with pytest.raises(ValueError, match="separate-streams"):
+            _fit(b, epochs=4, es=False, restore=path, modes=False)      # one stream: the resumed order would not continue the old one
