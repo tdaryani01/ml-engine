@@ -61,6 +61,7 @@ class SupervisedFitSpec:
     backend: str = "numpy"
     num_threads: int = 2
     seed: int | None = None  # seeds ME's RNG once per run: same seed, same fit
+    split_seed: int | None = None  # seeds the train/validation cut of a table; None = the loader's 42, as every run so far
     mhsa: dict[str, Any] = field(default_factory=dict)  # mhsa model geometry
     cnn: dict[str, Any] = field(default_factory=dict)  # cnn model geometry
     model_id: str = "ee-fit"
@@ -135,6 +136,8 @@ def _from_pipeline(spec: SupervisedFitSpec, *, work_dir: Path, restore: Path | N
     ing["source_mode"] = "csv"
     ing["data_file_path"] = str(spec.data_path)
     ing.setdefault("splits", {"train": spec.train_split, "val": spec.val_split})
+    if spec.split_seed is not None:
+        ing["splits"] = {**ing["splits"], "seed": int(spec.split_seed)}
     for k, v in (("drain_on_empty", False), ("val_queue_name", ""), ("amqp_url", ""), ("queue_name", "")):
         ing.setdefault(k, v)
     names = ing.get("feature_names")
@@ -209,7 +212,7 @@ def build_pipeline_payload(
         "source_mode": "csv",
         "data_file_path": str(spec.data_path),
         "feature_names": list(spec.feature_names) if spec.feature_names else "auto",
-        "splits": {"train": float(spec.train_split), "val": float(spec.val_split)},
+        "splits": {"train": float(spec.train_split), "val": float(spec.val_split), **({"seed": int(spec.split_seed)} if spec.split_seed is not None else {})},
         "drain_on_empty": False,
         "val_queue_name": "",
         "amqp_url": "",

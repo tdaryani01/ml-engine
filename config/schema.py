@@ -14,9 +14,10 @@ class MetaConfig:
 
 @dataclass(frozen=True)
 class SplitConfig:
-    """Defines dataset split ratios for training and validation."""
+    """Defines dataset split ratios for training and validation, and the seed that cuts them (42 = every run so far)."""
     train: float
     val: float
+    seed: int = 42
 
 @dataclass(frozen=True)
 class IngestionConfig:
