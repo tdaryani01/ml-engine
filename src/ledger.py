@@ -111,6 +111,7 @@ class LedgerConfig:
     keep_last_k_checkpoints: int = 20
     contract_list_enabled: bool = False  # Phase F: off until grad/benchmark parity
     native_async_submit: bool = False  # Independent of ledger I/O; see config.yaml ledger
+    thin_steps: bool = False  # step documents without gradient arrays (config.schema.LedgerSettings.thin_steps)
     store_backend: str = "file_streaming"  # file_streaming | file_sync | noop | cache | queue | redis
     flush_stall_threshold: int = 64
 
@@ -129,6 +130,16 @@ from src.ledger_wire import (
 def train_step_result_to_body(result: TrainStepResult) -> dict[str, Any]:
     """In-memory step.result body — raw arrays, no wire encoding."""
     return {"_result": result}
+
+
+class ThinStepError(RuntimeError):
+    """A step document written under ``ledger.thin_steps`` carries no gradients; replaying it would apply nothing and leave wrong weights."""
+
+
+def _replayable(result: TrainStepResult) -> TrainStepResult:
+    if not result.grad_weights:
+        raise ThinStepError(f"step {result.step_id} has no gradient arrays (written with ledger.thin_steps): the journal cannot be replayed; restore from a checkpoint instead")
+    return result
 
 
 def train_step_result_from_body(body: dict[str, Any]) -> TrainStepResult:
@@ -547,8 +558,11 @@ class TrainingLedger:
         verdict: str = VERDICT_HEALTHY,
         scheduler_epoch: int = 0,
         model_instance_id: str | None = None,
+        thin: bool = False,
     ) -> int:
-        """One journal record per batch (command + result + consolidated + metrics)."""
+        """One journal record per batch (command + result + consolidated + metrics). ``thin``: the result keeps step id, loss and sample count and no gradient arrays."""
+        if thin:
+            result = TrainStepResult(step_id=result.step_id, loss=result.loss, grad_weights=[], grad_biases=[], m_samples=result.m_samples, weights_applied=result.weights_applied)
         command = {
             "step_id": step_id,
             "base_version": base_version,
@@ -728,7 +742,7 @@ class TrainingLedger:
             if ver <= from_version or ver > to_version:
                 continue
             lr = float(doc.body.get("command", {}).get("lr", default_lr))
-            session.apply_step(result, lr)
+            session.apply_step(_replayable(result), lr)
 
     def fork_branch(self, new_branch_id: str, parent_version: int, reason: str, settings_delta: dict[str, Any] | None = None) -> TrainingLedger:
         parent_lsn = self.store.head_lsn()
@@ -791,7 +805,7 @@ class TrainingLedger:
                 if result.step_id <= from_version or result.step_id > to_version:
                     continue
                 lr = float(doc.body["command"]["lr"])
-                session.apply_step(result, lr)
+                session.apply_step(_replayable(result), lr)
             return
 
         lr_by_step: dict[int, float] = {}
