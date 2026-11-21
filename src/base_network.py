@@ -3,6 +3,7 @@ from abc import abstractmethod
 import logging
 import numpy as np
 
+from src import recordings
 from src.trainable_model import TrainableModel
 from utils.seeding import batch_rng, init_rng
 
@@ -11,7 +12,7 @@ class BaseNeuralNetwork(TrainableModel):
     Dense MLP trainable model (NumPy). Shares TrainableModel with CNN for
     session/engine/contract attachment; subclasses supply task heads.
     """
-    def __init__(self, layer_sizes, optimizer_instance, lam_l1=0.01, lam_l2=0.01, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9, max_norm=5.0, init_scale=1.0, **kwargs) -> None:
+    def __init__(self, layer_sizes, optimizer_instance, lam_l1=0.01, lam_l2=0.01, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9, max_norm=5.0, init_scale=1.0, recordings=False, **kwargs) -> None:
         super().__init__(
             optimizer_instance,
             lam_l1=lam_l1,
@@ -25,6 +26,8 @@ class BaseNeuralNetwork(TrainableModel):
         self.bn_momentum = bn_momentum
         self.eps = 1e-5
         
+        self.recordings = bool(recordings)      # data design B7: the per-step part lives in src/recordings.py, off unless set
+        self._rec_steps = None
         self.weights = []
         self.biases = []
         
@@ -48,6 +51,18 @@ class BaseNeuralNetwork(TrainableModel):
                 self.betas.append(init_rng().uniform(-0.1, 0.1, size=(1, output_dim)))
                 self.running_means.append(np.zeros((1, output_dim)))
                 self.running_vars.append(np.ones((1, output_dim)))
+
+    def row_costs(self, output, y):
+        """The cost of each row, shaped (rows,): its mean is ``calculate_raw_cost`` (data design B7). A subclass that records implements it."""
+        raise NotImplementedError
+
+    def recording_pass(self, X, y):
+        """One forward pass in the evaluation mode (no dropout, the running batch-norm numbers, nothing written to the model's state but the activation caches the next
+        forward overwrites): the cost of each row, and for each hidden layer the share of units whose pre-activation (after batch norm when it is on) is not above 0
+        for every row of X (the leaky ReLU never outputs exactly 0, so 'dead' is read on the pre-activation)."""
+        out = self.predict(X)
+        pre = self.z_bns if self.use_batch_norm else self.zs[:-1]
+        return self.row_costs(out, y), [float(np.mean(np.all(z <= 0.0, axis=0))) for z in pre]
 
     def preprocess_targets(self, y_train, y_val, y_test=None):
         """Hook for target preprocessing subclasses."""
@@ -233,6 +248,8 @@ class BaseNeuralNetwork(TrainableModel):
         total_norm = np.sqrt(sum(np.sum(gw**2) for gw in grad_weights))
 
         if total_norm > self.max_norm:
+            if self.recordings:
+                recordings.step_clipped(self)
             scaling_factor = self.max_norm / (total_norm + 1e-15)
             logging.debug(f"[Backward Stability] Exploding gradient threat detected! Total Norm: {total_norm:.4f} | Scaling down by factor: {scaling_factor:.4f}")
             for i in range(num_layers):
@@ -243,6 +260,8 @@ class BaseNeuralNetwork(TrainableModel):
         loss = self.calculate_raw_cost(output, y)      # the reported step loss is the raw cost (ml-engine#52)
         gg = grad_gammas if self.use_batch_norm else None
         gbb = grad_betas if self.use_batch_norm else None
+        if self.recordings:      # the direction of this step's gradient against the last one's (src/recordings.py); reads only
+            recordings.step_gradient(self, grad_weights, grad_biases)
         return loss, grad_weights, grad_biases, m, gg, gbb
 
     def _apply_grads(

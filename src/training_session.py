@@ -24,6 +24,7 @@ import numpy as np
 from utils.seeding import separate_streams
 
 from config.constants import DataKeys, ModelType
+from src import recordings
 from src import step_loss_stats as _step_loss_stats
 
 # The losses a fit reports (train per step, validation per epoch) are the raw cost; the L2 term is not added (a caller reading an older engine finds this name missing and must
@@ -428,6 +429,13 @@ class TrainingSession:
             )
         self._fit_stop_reason = None
         self._fit_epochs_done = 0
+        self._rec_dead_start = None
+        if getattr(self.model, "recordings", False):      # the dead-unit shares of the weights this fit starts from, on the fixed sample (src/recordings.py)
+            try:
+                pick = recordings.dead_sample(len(self.data_provider.X_train))
+                self._rec_dead_start = self.model.recording_pass(self.data_provider.normalize(self.data_provider.X_train[pick]), self.data_provider.y_train_processed[pick])[1]
+            except Exception:  # noqa: BLE001
+                logging.exception("[TrainingSession] recordings: the starting dead-unit shares failed")
         self._fit_es_state = {
             "best_val_loss": float("inf"),
             "best_epoch": 0,
@@ -478,6 +486,8 @@ class TrainingSession:
         current_val_raw_cost = self.model.calculate_raw_cost(val_preds, y_val_target)
         current_val_loss = current_val_raw_cost
         self.val_history.append(current_val_loss)
+        if getattr(self.model, "recordings", False):
+            self._record_epoch()
         if self.engine is not None and hasattr(self.engine, "on_epoch_end"):
             self.engine.on_epoch_end(self, epoch, float(epoch_train_loss), float(current_val_loss))
 
@@ -575,6 +585,8 @@ class TrainingSession:
         is_classification: bool,
     ) -> Tuple[float, Dict[str, Any]]:
         self.data_provider.reset_epoch()
+        if getattr(self.model, "recordings", False):
+            recordings.reset_epoch(self.model)
         batch_losses: List[float] = []
         batch_idx = 0
         forensic_data: Dict[str, Any] = {}
@@ -646,6 +658,23 @@ class TrainingSession:
 
         _step_loss_stats.observe_epoch(batch_losses)
         return float(np.mean(batch_losses)) if batch_losses else 0.0, forensic_data
+
+    def _record_epoch(self) -> None:
+        """The pilots' recordings for the epoch just finished (src/recordings.py): one evaluation pass over the training part and one over the validation part, dropout off.
+        Reads the weights, draws nothing from any stream, and never raises into the run."""
+        try:
+            vals = dict(recordings.step_stats(self.model))
+            X_tr, y_tr = self.data_provider.X_train, self.data_provider.y_train_processed
+            rows, _ = self.model.recording_pass(self.data_provider.normalize(X_tr), y_tr)
+            vals.update(recordings.row_loss_stats(rows, "train"))
+            rows, _ = self.model.recording_pass(self.data_provider.normalize(self._fit_X_val), self._fit_y_val)
+            vals.update(recordings.row_loss_stats(rows, "val"))
+            pick = recordings.dead_sample(len(X_tr))
+            _, dead = self.model.recording_pass(self.data_provider.normalize(X_tr[pick]), y_tr[pick])
+            vals.update(recordings.dead_stats(dead, getattr(self, "_rec_dead_start", None)))
+            recordings.stage(vals)
+        except Exception:  # noqa: BLE001
+            logging.exception("[TrainingSession] recordings failed; the run goes on without them")
 
     def _forensic_batch_zero(
         self, y_b: np.ndarray, is_classification: bool

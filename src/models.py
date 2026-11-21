@@ -31,6 +31,11 @@ class BinaryClassificationNetwork(BaseNeuralNetwork):
             logging.info(f"[MODEL PASS] Error Delta Array Bounds -> Max: {np.max(output - y):.4f} | Min: {np.min(output - y):.4f} | Mean: {np.mean(output - y):.4f}")
         return output - y
 
+    def row_costs(self, output, y):
+        output = np.clip(output, 1e-15, 1.0 - 1e-15)
+        y = np.asarray(y).reshape(output.shape)
+        return -np.sum(y * np.log(output) + (1.0 - y) * np.log(1.0 - output), axis=1)
+
     def calculate_raw_cost(self, output, y):
         """Calculates binary cross-entropy loss with numerical stability clips."""
         m = y.shape[0]
@@ -75,6 +80,9 @@ class RegressionNetwork(BaseNeuralNetwork):
         """Computes the output error delta for regression."""
         return output - y
 
+    def row_costs(self, output, y):
+        return np.sum((output - np.asarray(y).reshape(output.shape)) ** 2, axis=1) / 2
+
     def calculate_raw_cost(self, output, y):
         """Calculates Mean Squared Error (MSE) cost."""
         m = y.shape[0]
@@ -109,6 +117,9 @@ class MultiClassNetwork(BaseNeuralNetwork):
     def compute_output_delta(self, output, y):
         """Computes output error delta for multi-class softmax predictions."""
         return output - y
+
+    def row_costs(self, output, y):
+        return -np.sum(np.asarray(y) * np.log(np.clip(output, 1e-15, 1.0 - 1e-15)), axis=1)
 
     def calculate_raw_cost(self, output, y):
         """Calculates categorical cross-entropy loss with stability clipping."""

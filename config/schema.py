@@ -256,6 +256,8 @@ class OptimizationConfig:
     batch_seed: int | None = None
     # Scale multiplied into the plain network's Glorot starting weights (1.0 = as drawn, every run so far).
     init_scale: float = 1.0
+    # Data design B7: per-epoch recordings for the pilots (row-loss percentiles, dead units, gradient agreement, clip fires) in the step document's extra_metrics. Off = nothing recorded.
+    recordings: bool = False
 
 
 @dataclass(frozen=True)

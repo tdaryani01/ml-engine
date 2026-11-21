@@ -71,6 +71,7 @@ class SupervisedFitSpec:
     init_seed: int | None = None
     batch_seed: int | None = None
     init_scale: float | None = None  # multiplied into the plain network's starting weights; None = 1.0, as drawn
+    recordings: bool | None = None  # data design B7: per-epoch recordings for the pilots; None = off
     mhsa: dict[str, Any] = field(default_factory=dict)  # mhsa model geometry
     cnn: dict[str, Any] = field(default_factory=dict)  # cnn model geometry
     model_id: str = "ee-fit"
@@ -184,6 +185,8 @@ def _from_pipeline(spec: SupervisedFitSpec, *, work_dir: Path, restore: Path | N
         opt["batch_seed"] = int(spec.batch_seed)
     if spec.init_scale is not None:
         opt["init_scale"] = float(spec.init_scale)
+    if spec.recordings is not None:
+        opt["recordings"] = bool(spec.recordings)
     if int(spec.stretch_index) > 1:  # Autopilot: stretch N shuffles with seed + N - 1, so a retry is a new run
         opt["seed"] = int(opt.get("seed") or 0) + int(spec.stretch_index) - 1
         if opt.get("batch_seed") is not None:  # the batch stream moves too; the init stream does not (a restore overwrites the weights)
@@ -283,6 +286,7 @@ def build_pipeline_payload(
             **({"init_seed": int(spec.init_seed)} if spec.init_seed is not None else {}),
             **({"batch_seed": int(spec.batch_seed)} if spec.batch_seed is not None else {}),
             **({"init_scale": float(spec.init_scale)} if spec.init_scale is not None else {}),
+            **({"recordings": bool(spec.recordings)} if spec.recordings is not None else {}),
         },
         "regularization": {"lam_l1": float(spec.lam_l1), "lam_l2": float(spec.lam_l2), "sparsity_tolerance": 1e-5},
         "transformations": {"fourier_expansion": {"enabled": False, "num_frequencies": 4}},

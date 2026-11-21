@@ -69,6 +69,7 @@ class ModelController:
         backend: EngineBackend = EngineBackend.NATIVE,
         contract_list_enabled: bool = False,
         init_scale: float = 1.0,
+        recordings: bool = False,
     ) -> None:
         """
         Builds and initializes network topology. 
@@ -106,6 +107,10 @@ class ModelController:
             if model_type not in (ModelType.BINARY_CLASSIFICATION, ModelType.MULTI_CLASS, ModelType.REGRESSION):
                 raise ValueError(f"[Model Controller] init_scale is for the plain network only, not {model_type.name}")
             extra["init_scale"] = float(init_scale)
+        if recordings:      # the per-epoch recordings of the pilots (src/recordings.py): the plain network only
+            if model_type not in (ModelType.BINARY_CLASSIFICATION, ModelType.MULTI_CLASS, ModelType.REGRESSION):
+                raise ValueError(f"[Model Controller] recordings are for the plain network only, not {model_type.name}")
+            extra["recordings"] = True
         self.model = ModelFactory.create_model(
             model_type=type_str,
             layer_sizes=resolved_topology,
