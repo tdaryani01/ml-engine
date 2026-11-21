@@ -67,6 +67,7 @@ class ModelController:
         mhsa_config: Optional[Dict[str, Any]] = None,
         backend: EngineBackend = EngineBackend.NATIVE,
         contract_list_enabled: bool = False,
+        init_scale: float = 1.0,
     ) -> None:
         """
         Builds and initializes network topology. 
@@ -99,6 +100,11 @@ class ModelController:
 
         type_str = model_type.name.lower() if hasattr(model_type, "name") else str(model_type).lower()
 
+        extra: Dict[str, Any] = {}
+        if float(init_scale) != 1.0:      # the scale of the starting weights: the plain network only
+            if model_type not in (ModelType.BINARY_CLASSIFICATION, ModelType.MULTI_CLASS, ModelType.REGRESSION):
+                raise ValueError(f"[Model Controller] init_scale is for the plain network only, not {model_type.name}")
+            extra["init_scale"] = float(init_scale)
         self.model = ModelFactory.create_model(
             model_type=type_str,
             layer_sizes=resolved_topology,
@@ -114,6 +120,7 @@ class ModelController:
             cnn_config=cnn_config,
             mhsa_config=mhsa_config,
             contract_list_enabled=contract_list_enabled,
+            **extra,
         )
 
         # FORENSIC HOOK: INIT TRACE

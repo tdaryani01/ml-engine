@@ -250,6 +250,8 @@ class OptimizationConfig:
     # Neither set = the one global stream seeded by ``seed``; one not set falls back to ``seed``.
     init_seed: int | None = None
     batch_seed: int | None = None
+    # Scale multiplied into the plain network's Glorot starting weights (1.0 = as drawn, every run so far).
+    init_scale: float = 1.0
 
 
 @dataclass(frozen=True)

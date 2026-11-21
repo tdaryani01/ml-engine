@@ -11,7 +11,7 @@ class BaseNeuralNetwork(TrainableModel):
     Dense MLP trainable model (NumPy). Shares TrainableModel with CNN for
     session/engine/contract attachment; subclasses supply task heads.
     """
-    def __init__(self, layer_sizes, optimizer_instance, lam_l1=0.01, lam_l2=0.01, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9, max_norm=5.0, **kwargs) -> None:
+    def __init__(self, layer_sizes, optimizer_instance, lam_l1=0.01, lam_l2=0.01, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9, max_norm=5.0, init_scale=1.0, **kwargs) -> None:
         super().__init__(
             optimizer_instance,
             lam_l1=lam_l1,
@@ -38,7 +38,8 @@ class BaseNeuralNetwork(TrainableModel):
         for i in range(len(layer_sizes) - 1):
             input_dim, output_dim = layer_sizes[i], layer_sizes[i+1]
             limit = np.sqrt(6.0 / (input_dim + output_dim))
-            self.weights.append(init_rng().uniform(-limit, limit, (input_dim, output_dim)))
+            w = init_rng().uniform(-limit, limit, (input_dim, output_dim))
+            self.weights.append(w if init_scale == 1.0 else w * float(init_scale))      # the scale of the starting weights (1.0 = Glorot as drawn, every run so far)
             self.biases.append(np.zeros((1, output_dim)))
             
             # Initialize batch normalization parameters for hidden layers

@@ -189,6 +189,7 @@ def _build_provider_and_controller(cfg: PipelineConfig):
         mhsa_config=mhsa_cfg if is_mhsa else None,
         backend=cfg.architecture.backend,
         contract_list_enabled=bool(getattr(cfg.ledger, "contract_list_enabled", False)),
+        init_scale=float(getattr(cfg.optimization, "init_scale", 1.0)),
     )
 
     if cfg.persistence.load_saved_model:
