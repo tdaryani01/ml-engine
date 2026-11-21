@@ -67,6 +67,7 @@ class ModelController:
         mhsa_config: Optional[Dict[str, Any]] = None,
         backend: EngineBackend = EngineBackend.NATIVE,
         contract_list_enabled: bool = False,
+        init_scale: float = 1.0,
     ) -> None:
         """
         Builds and initializes network topology. 
@@ -99,6 +100,11 @@ class ModelController:
 
         type_str = model_type.name.lower() if hasattr(model_type, "name") else str(model_type).lower()
 
+        extra: Dict[str, Any] = {}
+        if float(init_scale) != 1.0:      # the scale of the starting weights: the plain network only
+            if model_type not in (ModelType.BINARY_CLASSIFICATION, ModelType.MULTI_CLASS, ModelType.REGRESSION):
+                raise ValueError(f"[Model Controller] init_scale is for the plain network only, not {model_type.name}")
+            extra["init_scale"] = float(init_scale)
         self.model = ModelFactory.create_model(
             model_type=type_str,
             layer_sizes=resolved_topology,
@@ -114,6 +120,7 @@ class ModelController:
             cnn_config=cnn_config,
             mhsa_config=mhsa_config,
             contract_list_enabled=contract_list_enabled,
+            **extra,
         )
 
         # FORENSIC HOOK: INIT TRACE
@@ -167,6 +174,14 @@ class ModelController:
             if key in stored and key in now and stored[key] != now[key]:
                 raise ValueError(f"checkpoint {path} was trained under {key}={stored[key]!r}, this run has {key}={now[key]!r}: refusing to restore")
         restore_model_checkpoint(self.model, body)
+        # A stop-state checkpoint (data design §9 row 15) continues the run it stopped: the next fit keeps the optimizer and the epoch clock.
+        # Any other checkpoint restores weights only, and the optimizer restarts, as before.
+        cont = body.get("continuation")
+        if cont:
+            from src.ledger import best_from_state
+
+            cont = {**cont, "best": best_from_state(body.get("state") or {})}
+        self.model.continuation = cont or None
         logging.info("[Model Controller] Restored weights from checkpoint document %s", path)
         return int(getattr(doc, "version", 0) or 0)
 

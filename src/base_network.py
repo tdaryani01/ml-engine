@@ -4,13 +4,14 @@ import logging
 import numpy as np
 
 from src.trainable_model import TrainableModel
+from utils.seeding import batch_rng, init_rng
 
 class BaseNeuralNetwork(TrainableModel):
     """
     Dense MLP trainable model (NumPy). Shares TrainableModel with CNN for
     session/engine/contract attachment; subclasses supply task heads.
     """
-    def __init__(self, layer_sizes, optimizer_instance, lam_l1=0.01, lam_l2=0.01, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9, max_norm=5.0, **kwargs) -> None:
+    def __init__(self, layer_sizes, optimizer_instance, lam_l1=0.01, lam_l2=0.01, p_dropout=0.0, use_batch_norm=True, bn_momentum=0.9, max_norm=5.0, init_scale=1.0, **kwargs) -> None:
         super().__init__(
             optimizer_instance,
             lam_l1=lam_l1,
@@ -37,13 +38,14 @@ class BaseNeuralNetwork(TrainableModel):
         for i in range(len(layer_sizes) - 1):
             input_dim, output_dim = layer_sizes[i], layer_sizes[i+1]
             limit = np.sqrt(6.0 / (input_dim + output_dim))
-            self.weights.append(np.random.uniform(-limit, limit, (input_dim, output_dim)))
+            w = init_rng().uniform(-limit, limit, (input_dim, output_dim))
+            self.weights.append(w if init_scale == 1.0 else w * float(init_scale))      # the scale of the starting weights (1.0 = Glorot as drawn, every run so far)
             self.biases.append(np.zeros((1, output_dim)))
             
             # Initialize batch normalization parameters for hidden layers
             if self.use_batch_norm and (i < len(layer_sizes) - 2):
-                self.gammas.append(np.random.uniform(0.8, 1.2, size=(1, output_dim)))
-                self.betas.append(np.random.uniform(-0.1, 0.1, size=(1, output_dim)))
+                self.gammas.append(init_rng().uniform(0.8, 1.2, size=(1, output_dim)))
+                self.betas.append(init_rng().uniform(-0.1, 0.1, size=(1, output_dim)))
                 self.running_means.append(np.zeros((1, output_dim)))
                 self.running_vars.append(np.ones((1, output_dim)))
 
@@ -146,7 +148,7 @@ class BaseNeuralNetwork(TrainableModel):
             
             # Apply inverted dropout during training
             if training and self.p_dropout > 0.0:
-                mask = (np.random.rand(*current_act.shape) >= self.p_dropout) / (1.0 - self.p_dropout)
+                mask = (batch_rng().rand(*current_act.shape) >= self.p_dropout) / (1.0 - self.p_dropout)
                 current_act = current_act * mask
                 self.masks.append(mask)
             else:
