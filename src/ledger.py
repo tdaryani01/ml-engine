@@ -132,6 +132,16 @@ def train_step_result_to_body(result: TrainStepResult) -> dict[str, Any]:
     return {"_result": result}
 
 
+class ThinStepError(RuntimeError):
+    """A step document written under ``ledger.thin_steps`` carries no gradients; replaying it would apply nothing and leave wrong weights."""
+
+
+def _replayable(result: TrainStepResult) -> TrainStepResult:
+    if not result.grad_weights:
+        raise ThinStepError(f"step {result.step_id} has no gradient arrays (written with ledger.thin_steps): the journal cannot be replayed; restore from a checkpoint instead")
+    return result
+
+
 def train_step_result_from_body(body: dict[str, Any]) -> TrainStepResult:
     if "_result" in body:
         return body["_result"]
@@ -732,7 +742,7 @@ class TrainingLedger:
             if ver <= from_version or ver > to_version:
                 continue
             lr = float(doc.body.get("command", {}).get("lr", default_lr))
-            session.apply_step(result, lr)
+            session.apply_step(_replayable(result), lr)
 
     def fork_branch(self, new_branch_id: str, parent_version: int, reason: str, settings_delta: dict[str, Any] | None = None) -> TrainingLedger:
         parent_lsn = self.store.head_lsn()
@@ -795,7 +805,7 @@ class TrainingLedger:
                 if result.step_id <= from_version or result.step_id > to_version:
                     continue
                 lr = float(doc.body["command"]["lr"])
-                session.apply_step(result, lr)
+                session.apply_step(_replayable(result), lr)
             return
 
         lr_by_step: dict[int, float] = {}

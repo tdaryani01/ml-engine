@@ -17,13 +17,28 @@ from src.ledger_wire import iter_framed_records
 from testing.test_launcher import _spec
 
 
+def _feed(h, v) -> None:
+    """Every number of the optimizer state (step count and moment buffers), arrays by their bytes."""
+    if isinstance(v, dict):
+        for k in sorted(v, key=str):
+            h.update(str(k).encode())
+            _feed(h, v[k])
+    elif isinstance(v, (list, tuple)):
+        for x in v:
+            _feed(h, x)
+    elif isinstance(v, np.ndarray):
+        h.update(np.ascontiguousarray(v).tobytes())
+    else:
+        h.update(repr(v).encode())
+
+
 def _weights_digest(ckpt: bytes) -> str:
     body = document_from_bytes(ckpt).body
     h = hashlib.sha256()
     for k in ("weights", "biases", "gammas", "betas"):
         for a in body.get(k) or []:
             h.update(np.ascontiguousarray(a).tobytes())
-    h.update(repr(sorted((k, repr(v)) for k, v in (body.get("optimizer") or {}).items() if k in ("t",))).encode())
+    _feed(h, body.get("optimizer") or {})
     return h.hexdigest()
 
 
@@ -59,3 +74,29 @@ def test_a_harness_run_reads_the_same_with_thin_steps_on_and_the_journal_is_smal
         assert a.body["_result"].loss == b.body["_result"].loss and a.body["_result"].m_samples == b.body["_result"].m_samples
         assert a.body["_result"].grad_weights and not b.body["_result"].grad_weights
     assert len(j_on) < len(j_off)
+
+
+def test_a_thin_journal_cannot_be_replayed_and_a_full_one_still_can(tmp_path) -> None:
+    import pytest
+
+    from src.ledger import FileLedgerStore, ThinStepError, TrainingLedger
+
+    class _Session:
+        def __init__(self) -> None:
+            self.applied = 0
+
+        def apply_step(self, result, lr) -> None:
+            self.applied += 1
+
+    for name, thin in (("full", None), ("thin", True)):
+        _run(tmp_path, name, **({"thin_steps": True} if thin else {}))
+    sessions = {}
+    for name in ("full", "thin"):
+        led = TrainingLedger(store=FileLedgerStore(str(tmp_path / name / "out" / "ledger")), branch_id="main", model_instance_id="t", architecture_id="x", version=0)
+        sessions[name] = (led, _Session())
+    led, s = sessions["full"]
+    led.replay_apply_from_version(s, 0, 10**9, 0.01)
+    assert s.applied > 0
+    led, s = sessions["thin"]
+    with pytest.raises(ThinStepError):
+        led.replay_apply_from_version(s, 0, 10**9, 0.01)
