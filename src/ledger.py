@@ -270,6 +270,23 @@ def capture_model_checkpoint(model: Any, version: int, val_loss: float | None = 
     return body
 
 
+_BEST_KINDS = (("weights", "best_w"), ("biases", "best_b"), ("gammas", "best_g"), ("betas", "best_beta"))
+
+
+def best_to_state(best: dict[str, Any]) -> dict[str, Any]:
+    """The best weights of a stopped run as the named arrays a checkpoint body already carries (``state``); None kinds are left out."""
+    return {f"{prefix}{i}": np.copy(a) for kind, prefix in _BEST_KINDS for i, a in enumerate(best.get(kind) or [])}
+
+
+def best_from_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Inverse of ``best_to_state``: lists of arrays per kind, None where the run had none."""
+    out: dict[str, Any] = {}
+    for kind, prefix in _BEST_KINDS:
+        found = [state[f"{prefix}{i}"] for i in range(len(state)) if f"{prefix}{i}" in state]
+        out[kind] = found or None
+    return out
+
+
 def restore_model_checkpoint(model: Any, body: dict[str, Any]) -> None:
     """Hydrate model weights and Adam state from a checkpoint body."""
     weights = body["weights"] or []
@@ -560,9 +577,13 @@ class TrainingLedger:
         val_loss: float | None = None,
         is_local_best: bool = False,
         model_instance_id: str | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> int:
+        """``extra`` keys are written into the body after the model's capture: the stop-state marker ``continuation``, or, for the best weights a
+        continued run starts its ledger with, the ``weights`` themselves (then no export archive is written, it would show the other weights)."""
         body = capture_model_checkpoint(model, version, val_loss=val_loss)
         body["is_local_best"] = is_local_best
+        body.update(extra or {})
         if self.run_config:
             from src.checkpoint_knobs import knobs_from_config
 
@@ -577,7 +598,8 @@ class TrainingLedger:
         )
         lsn = self.push(doc)
         self.store.put_checkpoint(doc)
-        self._write_export_sidecar(model, version)
+        if "weights" not in (extra or {}):
+            self._write_export_sidecar(model, version)
         return lsn
 
     def _write_export_sidecar(self, model: Any, version: int) -> None:

@@ -359,7 +359,7 @@ def pack_checkpoint_body(body: dict[str, Any]) -> bytes:
         ]
     )
     # The run config and its knobs travel with the model state, so Live and restore find them in the checkpoint.
-    extra = {k: body[k] for k in ("config", "knobs") if isinstance(body.get(k), dict)}
+    extra = {k: body[k] for k in ("config", "knobs", "continuation") if isinstance(body.get(k), dict)}
     blob = json.dumps(extra, separators=(",", ":"), default=str).encode("utf-8") if extra else b""
     parts.append(struct.pack("<I", len(blob)))
     parts.append(blob)
