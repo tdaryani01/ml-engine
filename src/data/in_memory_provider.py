@@ -5,6 +5,7 @@ import numpy as np
 from src.data.base_provider import BaseDataProvider
 from src.data.base_loader import BaseDataLoader
 from config.constants import DataKeys
+from utils.seeding import batch_rng
 
 
 class InMemoryDataProvider(BaseDataProvider):
@@ -71,7 +72,7 @@ class InMemoryDataProvider(BaseDataProvider):
             self._has_more = False
             return
 
-        np.random.shuffle(self.indices)
+        batch_rng().shuffle(self.indices)
         self._batch_idx = 0
         self._has_more = True
 
