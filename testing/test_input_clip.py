@@ -71,6 +71,7 @@ def test_the_clip_uses_the_training_numbers_for_validation() -> None:
 
 def test_without_the_switch_nothing_is_clipped_and_nothing_is_counted() -> None:
     with tempfile.TemporaryDirectory() as tmp:
+        clip_stats.drain()      # the accumulator is the process's: start from nothing
         p = _provider(_plate(tmp))
         np.testing.assert_array_equal(p.normalize(p.X_train), (p.X_train - p.mean) / p.std)
         assert clip_stats.drain() == {}
@@ -102,3 +103,13 @@ def test_the_switch_reaches_the_payload_and_the_config_only_when_set(tmp_path) -
     assert "input_clip_sd" not in plain["ingestion"] and parse_tm_production_config(plain, profile="pipeline").ingestion.input_clip_sd is None
     on = build_pipeline_payload(_spec(tmp_path, clip_sd=5.0), work_dir=tmp_path / "w")
     assert parse_tm_production_config(on, profile="pipeline").ingestion.input_clip_sd == 5.0
+
+
+def test_a_provider_without_the_clip_built_after_one_with_it_leaves_its_counts_alone() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        csv = _plate(tmp)
+        clip_stats.drain()
+        _provider(csv, clip_sd=5.0)
+        _provider(csv)                      # a second build in the process, clip off
+        counts = clip_stats.drain()
+    assert counts.get("clip_cells_train", 0) + counts.get("clip_cells_val", 0) >= 3

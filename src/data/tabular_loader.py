@@ -81,6 +81,7 @@ class TabularCSVLoader(BaseDataLoader):
         self.num_classes = num_classes
         self.random_state = random_state
         self.n_discarded: int | None = None      # rows the cut leaves in neither part; known after load_splits
+        self.class_shares: dict[str, list[float]] | None = None      # fraction mode, classification: the class shares of each part, reported not asserted (backlog A1, amended 2026-11-20)
 
     def load_splits(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         df = pd.read_csv(self.data_file_path)
@@ -144,11 +145,20 @@ class TabularCSVLoader(BaseDataLoader):
             )
             self.n_discarded = len(X) - len(X_train) - len(X_val)      # the rest of the 70/15 cut: left out, kept so (data design §9 row 1, ruling 2)
 
+        self._report_class_shares(y_train, y_val)
+
         # 4. Target Formatting
         y_train_formatted = self._format_targets(y_train)
         y_val_formatted = self._format_targets(y_val)
 
         return X_train, y_train_formatted, X_val, y_val_formatted
+
+    def _report_class_shares(self, y_train: np.ndarray, y_val: np.ndarray) -> None:
+        """The share of each class in the train and validation parts of a fraction-mode cut (the build owns the shares of a lists run, which never reaches here)."""
+        if self.model_type not in (ModelType.BINARY_CLASSIFICATION, ModelType.MULTI_CLASS):
+            return
+        k = 2 if self.model_type == ModelType.BINARY_CLASSIFICATION else int(self.num_classes)
+        self.class_shares = {part: [float(c) / max(len(y), 1) for c in np.bincount(np.asarray(y).ravel().astype(int), minlength=k)[:k]] for part, y in (("train", y_train), ("validation", y_val))}
 
     def _format_targets(self, y: np.ndarray) -> np.ndarray:
         """Transforms targets based on the specific network task type."""
