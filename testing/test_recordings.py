@@ -28,7 +28,7 @@ CASES = [("binary", ModelType.BINARY_CLASSIFICATION, 2, 1, 0.0, False, 3),
          ("multiclass", ModelType.MULTI_CLASS, 3, 3, 0.1, True, 7)]
 
 
-def _fit(tmp: str, mt, nf, nout, pdrop, bn, seed, *, recordings: bool, lr: float = 0.05, epochs: int = 4):
+def _fit(tmp: str, mt, nf, nout, pdrop, bn, seed, *, recordings: bool, lr: float = 0.05, epochs: int = 4, max_norm: float = 5.0, batch_size: int = 16):
     r = np.random.default_rng(100 + seed)
     X = r.normal(size=(300, nf))
     s = X.sum(1)
@@ -37,10 +37,10 @@ def _fit(tmp: str, mt, nf, nout, pdrop, bn, seed, *, recordings: bool, lr: float
     feats = [f"f{i}" for i in range(nf)]
     pd.DataFrame({**{f: X[:, i] for i, f in enumerate(feats)}, "target": y}).to_csv(csv, index=False)
     seed_everything(seed)
-    prov = InMemoryDataProvider(loader=TabularCSVLoader(csv, feats, 0.7, 0.15, mt, nout), batch_size=16, epochs=epochs, normalize_features=True)
+    prov = InMemoryDataProvider(loader=TabularCSVLoader(csv, feats, 0.7, 0.15, mt, nout), batch_size=batch_size, epochs=epochs, normalize_features=True)
     ctl = ModelController(data_provider=prov, learning_rate=lr)
     ctl.initialize_network_from_dimensions(input_dim=nf, output_dim=nout, model_type=mt, hidden_layers=[8, 4], optimizer_name="adam", backend=EngineBackend.NUMPY,
-                                           p_dropout=pdrop, use_batch_norm=bn, recordings=recordings)
+                                           p_dropout=pdrop, use_batch_norm=bn, recordings=recordings, max_norm=max_norm)
     ctl.fit(steps=prov.recomment_steps(), source_mode=None, model_type=mt, early_stopping_enabled=False, patience=3, min_delta=1e-3,
             ledger_settings=LedgerSettings(enabled=True, path="ledger", checkpoint_every_steps=25), output_dir=tmp, training_manager=None, model_id="b7")
     docs = [d for d in FileLedgerStore(os.path.join(tmp, "ledger")).scan(1) if d.doc_type == STEP_METRICS]
@@ -126,3 +126,21 @@ def test_the_switch_reaches_the_payload_only_when_set_and_the_cnn_refuses_it(tmp
     with pytest.raises(ValueError, match="plain network only"):
         ctl.initialize_network_from_dimensions(input_dim=16, output_dim=2, model_type=ModelType.CNN, hidden_layers=[4], optimizer_name="adam", backend=EngineBackend.NUMPY,
                                                cnn_config={"input_shape": [1, 4, 4], "spatial_pipeline": [], "dense_head": []}, recordings=True)
+
+
+def test_the_clip_count_is_recounted_it_never_exceeds_the_steps_and_follows_the_norm() -> None:
+    name, mt, nf, nout, pdrop, bn, seed = CASES[0]
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b, tempfile.TemporaryDirectory() as c:
+        free, _, _ = _fit(a, mt, nf, nout, 0.0, False, seed, recordings=True, max_norm=1e9)      # a clipping norm nothing reaches: no fires
+        always, _, _ = _fit(b, mt, nf, nout, 0.0, False, seed, recordings=True, max_norm=1e-9)      # one nothing stays under: every step fires
+        normal, _, _ = _fit(c, mt, nf, nout, 0.0, False, seed, recordings=True)
+    assert all(d.body["extra_metrics"]["rec_clip_fires"] == 0 for d in free)
+    assert all(d.body["extra_metrics"]["rec_clip_fires"] == d.body["extra_metrics"]["rec_steps"] > 0 for d in always)
+    assert all(0 <= d.body["extra_metrics"]["rec_clip_fires"] <= d.body["extra_metrics"]["rec_steps"] for d in normal)
+
+
+def test_an_epoch_of_one_step_still_carries_the_agreement_key() -> None:
+    name, mt, nf, nout, pdrop, bn, seed = CASES[0]
+    with tempfile.TemporaryDirectory() as tmp:
+        docs, _, _ = _fit(tmp, mt, nf, nout, 0.0, False, seed, recordings=True, batch_size=10_000)      # the whole training part in one batch: one step, no pair
+    assert docs and all(d.body["extra_metrics"]["rec_steps"] == 1 and d.body["extra_metrics"]["rec_grad_agreement"] == 0.0 for d in docs)

@@ -6,7 +6,8 @@ Per epoch, in the step document's ``extra_metrics``:
                                                            (one evaluation pass at the end of the epoch with dropout off, the weights the epoch ended with)
   rec_dead_l<i>, rec_dead_l<i>_start                       per hidden layer, the share of units whose pre-activation is not above 0 for every row of a fixed sample
                                                            (the first DEAD_SAMPLE training rows, in order), at the end of the epoch and at the start (the initial weights)
-  rec_grad_agreement                                       mean over the epoch's consecutive pairs of steps of the cosine of the two batch gradients (weights and biases)
+  rec_grad_agreement                                       mean over the epoch's consecutive pairs of steps of the cosine of the two batch gradients (weights and biases);
+                                                           0.0 on an epoch with no pair (fewer than two steps, or a zero gradient), so the key is on every epoch: read it with rec_steps
   rec_clip_fires, rec_steps                                steps whose gradient norm exceeded the clipping norm, and the steps taken
 The per-step part keeps its state on the model, not in a module, and only reads the gradient the step computed."""
 from __future__ import annotations
@@ -73,9 +74,7 @@ def step_stats(model) -> dict[str, float]:
     st = model._rec_steps
     if st is None:
         return {}
-    out = {"rec_clip_fires": float(st.fires), "rec_steps": float(st.steps)}
-    if st.pairs:
-        out["rec_grad_agreement"] = st.cos_sum / st.pairs
+    out = {"rec_clip_fires": float(st.fires), "rec_steps": float(st.steps), "rec_grad_agreement": st.cos_sum / st.pairs if st.pairs else 0.0}      # 0.0 when no pair of steps exists (fewer than two steps): read it with rec_steps
     return out
 
 
