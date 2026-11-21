@@ -12,6 +12,7 @@ import random
 import numpy as np
 
 _streams: dict[str, np.random.RandomState | None] = {"init": None, "batch": None}
+_batch_base: list[int | None] = [None]      # the batch seed of the separate-streams mode; None in the legacy mode
 
 
 def seed_everything(seed: int | None, init_seed: int | None = None, batch_seed: int | None = None) -> None:
@@ -19,7 +20,9 @@ def seed_everything(seed: int | None, init_seed: int | None = None, batch_seed: 
     from ``RandomState(init_seed)`` and its shuffle and dropout draws from ``RandomState(batch_seed)``; the one not given
     falls back to ``seed`` (None = unseeded). Neither given = the global stream for both (the legacy path)."""
     _streams["init"] = _streams["batch"] = None
+    _batch_base[0] = None
     if init_seed is not None or batch_seed is not None:
+        _batch_base[0] = int(batch_seed) if batch_seed is not None else (int(seed) if seed is not None else None)
         pick = lambda s: np.random.RandomState(int(s) if s is not None else (int(seed) if seed is not None else None))  # noqa: E731
         _streams["init"], _streams["batch"] = pick(init_seed), pick(batch_seed)
     if seed is None:
@@ -36,3 +39,16 @@ def init_rng():
 def batch_rng():
     """The stream the plain network's batch order and dropout masks are drawn from (numpy's global RNG unless one is set)."""
     return np.random if _streams["batch"] is None else _streams["batch"]
+
+
+def separate_streams() -> bool:
+    """True in the separate-streams mode (an init seed or a batch seed was given), where each epoch's batch order is derived, not run on."""
+    return _streams["batch"] is not None
+
+
+def batch_epoch(epoch: int) -> None:
+    """Data design §9 row 20 (03ec5b3): in the separate-streams mode the batch stream of epoch ``epoch`` is ``RandomState([batch seed, epoch])``,
+    so the shuffle and the dropout masks of an epoch depend on the batch seed and the epoch only and no position needs storing. A no-op in the
+    legacy mode, and when the mode has no batch seed to derive from (unseeded)."""
+    if _batch_base[0] is not None:
+        _streams["batch"] = np.random.RandomState(np.array([_batch_base[0], int(epoch)], dtype=np.int64))

@@ -5,7 +5,7 @@ import numpy as np
 from src.data.base_provider import BaseDataProvider
 from src.data.base_loader import BaseDataLoader
 from config.constants import DataKeys
-from utils.seeding import batch_rng
+from utils.seeding import batch_epoch, batch_rng, separate_streams
 
 
 class InMemoryDataProvider(BaseDataProvider):
@@ -26,6 +26,7 @@ class InMemoryDataProvider(BaseDataProvider):
         self.epochs = epochs
         self.normalize_features = normalize_features
         self._epochs_completed = 0
+        self.epoch_offset = 0      # the epoch a continued run starts at; the per-epoch batch order of the separate-streams mode depends on it
         self._batch_idx = 0
         self._has_more = True
 
@@ -72,6 +73,9 @@ class InMemoryDataProvider(BaseDataProvider):
             self._has_more = False
             return
 
+        if separate_streams():      # data design §9 row 20: this epoch's order, and its dropout masks, from (batch seed, epoch) alone
+            batch_epoch(self.epoch_offset + self._epochs_completed)
+            self.indices = np.arange(self.n_samples)
         batch_rng().shuffle(self.indices)
         self._batch_idx = 0
         self._has_more = True
