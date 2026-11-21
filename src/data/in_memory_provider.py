@@ -18,12 +18,14 @@ class InMemoryDataProvider(BaseDataProvider):
         loader: BaseDataLoader,
         batch_size: int = 32,
         epochs: int = 300,
-        normalize_features: bool = True
+        normalize_features: bool = True,
+        clip_sd: float | None = None,
     ):
         self.loader = loader
         self.batch_size = batch_size
         self.epochs = epochs
         self.normalize_features = normalize_features
+        self.clip_sd = None if clip_sd is None else float(clip_sd)      # data design §9 row 2: off unless the caller sets it
         self._epochs_completed = 0
         self._batch_idx = 0
         self._has_more = True
@@ -52,6 +54,8 @@ class InMemoryDataProvider(BaseDataProvider):
             self.std = np.ones(self.X_train.shape[1:], dtype=np.float32)
             self.exempt = np.zeros(self.mean.shape, dtype=bool)
 
+        self._count_clipped()
+
         self.n_samples = self.X_train.shape[0]
         self.num_batches = int(np.ceil(self.n_samples / self.batch_size))
         self.indices = np.arange(self.n_samples)
@@ -68,8 +72,23 @@ class InMemoryDataProvider(BaseDataProvider):
     def normalize(self, data_matrix: np.ndarray) -> np.ndarray:
         """Applies z-score normalization if enabled and dimensionality is 2D tabular."""
         if self.normalize_features and data_matrix.ndim == 2:
-            return (data_matrix - self.mean) / self.std
+            z = (data_matrix - self.mean) / self.std
+            if self.clip_sd is not None:      # standardise with the training part's numbers, clip, nothing after it (exempt columns are left alone)
+                z = np.where(self.exempt, z, np.clip(z, -self.clip_sd, self.clip_sd))
+            return z
         return data_matrix
+
+    def _count_clipped(self) -> None:
+        """The cells and rows the clip cuts, per part, for the first step document (``src/clip_stats.py``); nothing when the clip is off."""
+        from src import clip_stats
+
+        counts: dict[str, float] = {}
+        if self.clip_sd is not None and self.normalize_features and self.X_train.ndim == 2:
+            for part, X in (("train", self.X_train), ("val", self.X_val)):
+                beyond = (np.abs((X - self.mean) / self.std) > self.clip_sd) & ~self.exempt
+                counts[f"clip_cells_{part}"] = int(beyond.sum())
+                counts[f"clip_rows_multi_{part}"] = int((beyond.sum(axis=1) >= 2).sum())
+        clip_stats.set_counts(counts)
 
     def reset_epoch(self) -> None:
         if self._batch_idx > 0:

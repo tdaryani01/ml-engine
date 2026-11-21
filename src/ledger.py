@@ -466,7 +466,9 @@ class TrainingLedger:
 
         from src import step_loss_stats      # the zigzag of the per-step training losses rides the same channel (src/step_loss_stats.py)
 
-        drained = {**grad_stats.drain(), **step_loss_stats.drain()}
+        from src import clip_stats      # the clipped-cell counts of a provider with the clip on: only the first document after it was built gets them
+
+        drained = {**grad_stats.drain(), **step_loss_stats.drain(), **clip_stats.drain()}
         if drained:
             extra_metrics = {**(extra_metrics or {}), **drained}
         if extra_metrics:

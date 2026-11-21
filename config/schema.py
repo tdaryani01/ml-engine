@@ -32,6 +32,8 @@ class IngestionConfig:
     val_queue_name: str
     amqp_url: Optional[str] = None
     queue_name: Optional[str] = None
+    # Data design A2: standardise with the training part's numbers, then clip at this many sd (None = no clip; the caller sets it).
+    input_clip_sd: Optional[float] = None
 
 @dataclass(frozen=True)
 class CNNConfig:

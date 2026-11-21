@@ -63,6 +63,8 @@ class SupervisedFitSpec:
     seed: int | None = None  # seeds ME's RNG once per run: same seed, same fit
     # Data design A1b: a lists file (row positions per part, the encoded matrix, the output mask); with it the engine cuts nothing and split_seed is the file's.
     lists_path: str | None = None
+    # Data design A2: clip the standardised inputs at this many sd; None = no clip (the harness sets it for its runs).
+    clip_sd: float | None = None
     split_seed: int | None = None  # seeds the train/validation cut of a table; None = the loader's 42, as every run so far
     mhsa: dict[str, Any] = field(default_factory=dict)  # mhsa model geometry
     cnn: dict[str, Any] = field(default_factory=dict)  # cnn model geometry
@@ -140,6 +142,8 @@ def _from_pipeline(spec: SupervisedFitSpec, *, work_dir: Path, restore: Path | N
     ing.setdefault("splits", {"train": spec.train_split, "val": spec.val_split})
     if spec.split_seed is not None:
         ing["splits"] = {**ing["splits"], "seed": int(spec.split_seed)}
+    if spec.clip_sd is not None:
+        ing["input_clip_sd"] = float(spec.clip_sd)
     if spec.lists_path is not None:
         ing["splits"] = {**ing["splits"], "lists_path": str(spec.lists_path)}
     for k, v in (("drain_on_empty", False), ("val_queue_name", ""), ("amqp_url", ""), ("queue_name", "")):
@@ -218,6 +222,7 @@ def build_pipeline_payload(
         "feature_names": list(spec.feature_names) if spec.feature_names else "auto",
         "splits": {"train": float(spec.train_split), "val": float(spec.val_split), **({"seed": int(spec.split_seed)} if spec.split_seed is not None else {}),
                    **({"lists_path": str(spec.lists_path)} if spec.lists_path is not None else {})},
+        **({"input_clip_sd": float(spec.clip_sd)} if spec.clip_sd is not None else {}),
         "drain_on_empty": False,
         "val_queue_name": "",
         "amqp_url": "",
