@@ -21,7 +21,7 @@ from src.controller import ModelController
 from src.data.in_memory_provider import InMemoryDataProvider
 from src.data.tabular_loader import TabularCSVLoader
 from src.ledger import CHECKPOINT, STEP_METRICS, FileLedgerStore
-from utils.seeding import batch_rng, init_rng, seed_everything
+from utils.seeding import batch_epoch, batch_rng, init_rng, seed_everything
 
 
 def _fit(tmp: str, seed, init_seed=None, batch_seed=None, p_dropout=0.0):
@@ -126,3 +126,58 @@ def test_the_options_reach_the_payload_the_config_and_the_knobs_only_when_set(tm
     assert knobs["init_seed"] == 4 and knobs["batch_seed"] == 6
     later = build_pipeline_payload(_spec(tmp_path, init_seed=4, batch_seed=6, stretch_index=3), work_dir=tmp_path / "w")
     assert later["optimization"]["init_seed"] == 4 and later["optimization"]["batch_seed"] == 8      # a retry shuffles anew from the same init stream
+
+
+def _provider(tmp: str, epochs: int = 6):
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(200, 2))
+    csv = os.path.join(tmp, "p.csv")
+    pd.DataFrame({"f1": X[:, 0], "f2": X[:, 1], "target": (X[:, 0] > 0).astype(int)}).to_csv(csv, index=False)
+    loader = TabularCSVLoader(csv, ["f1", "f2"], 0.7, 0.15, ModelType.BINARY_CLASSIFICATION, 1)
+    return InMemoryDataProvider(loader=loader, batch_size=16, epochs=epochs, normalize_features=True)
+
+
+def _orders(provider, n: int):
+    out = []
+    for _ in range(n):
+        out.append(provider.indices.copy())
+        provider.next_batch()      # a batch drawn, so the next reset_epoch counts an epoch as done
+        provider.reset_epoch()
+    return out
+
+
+def test_in_the_separate_streams_mode_an_epochs_order_depends_on_the_batch_seed_and_the_epoch_only(tmp_path) -> None:
+    seed_everything(1, init_seed=2, batch_seed=3)
+    full = _orders(_provider(str(tmp_path)), 4)
+    assert len({tuple(o) for o in full}) == 4                      # four epochs, four orders
+    seed_everything(99, init_seed=5, batch_seed=3)                 # another seed and init seed, the same batch seed
+    later = _provider(str(tmp_path))
+    later.epoch_offset = 2
+    seed_everything(99, init_seed=5, batch_seed=3)
+    later = _provider(str(tmp_path))
+    later.epoch_offset = 2
+    later.reset_epoch()
+    assert np.array_equal(later.indices, full[2])                  # a run continued at epoch 2 shuffles epoch 2 as the full run did
+    seed_everything(1, init_seed=2, batch_seed=4)
+    assert not np.array_equal(_orders(_provider(str(tmp_path)), 3)[2], full[2])
+
+
+def test_the_legacy_mode_still_runs_one_stream_on_through_the_epochs(tmp_path) -> None:
+    seed_everything(1)
+    a = _orders(_provider(str(tmp_path)), 3)
+    seed_everything(1)
+    p = _provider(str(tmp_path))
+    p.epoch_offset = 2                                              # the offset does nothing without the mode
+    b = _orders(p, 3)
+    assert all(np.array_equal(x, y) for x, y in zip(a, b))
+
+
+def test_dropout_masks_of_an_epoch_depend_on_the_batch_seed_and_the_epoch_only() -> None:
+    seed_everything(1, init_seed=2, batch_seed=3)
+    batch_epoch(4)
+    a = batch_rng().rand(6)
+    seed_everything(7, init_seed=8, batch_seed=3)
+    batch_epoch(4)
+    np.testing.assert_array_equal(a, batch_rng().rand(6))
+    batch_epoch(5)
+    assert not np.array_equal(a, batch_rng().rand(6))
