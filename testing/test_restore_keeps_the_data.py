@@ -35,7 +35,7 @@ def _h(*arrays) -> str:
     return h.hexdigest()[:16]
 
 
-def _fit(tmp: str, split_seed: int, *, epochs: int, restore: str | None = None):
+def _fit(tmp: str, split_seed: int, *, epochs: int, restore: str | None = None, run_config: dict | None = None):
     """One plain-network fit on a fixed plate; returns the provider (rows, scaling) and the ledger store."""
     rng = np.random.default_rng(0)
     X = rng.normal(size=(400, 2))
@@ -48,7 +48,7 @@ def _fit(tmp: str, split_seed: int, *, epochs: int, restore: str | None = None):
     ctl.initialize_network_from_dimensions(input_dim=2, output_dim=1, model_type=ModelType.BINARY_CLASSIFICATION, hidden_layers=[8],
                                            optimizer_name="adam", backend=EngineBackend.NUMPY)
     ctl.fit(steps=provider.recomment_steps(), source_mode=None, model_type=ModelType.BINARY_CLASSIFICATION, early_stopping_enabled=False,
-            patience=3, min_delta=1e-3, ledger_settings=LedgerSettings(enabled=True, path="ledger", checkpoint_every_steps=25, restore_checkpoint_path=restore),
+            patience=3, min_delta=1e-3, ledger_settings=LedgerSettings(enabled=True, path="ledger", checkpoint_every_steps=25, restore_checkpoint_path=restore, run_config=run_config),
             output_dir=tmp, training_manager=None, model_id="a3")
     return provider, FileLedgerStore(os.path.join(tmp, "ledger"))
 
@@ -79,11 +79,34 @@ def test_a_restore_under_the_split_seed_of_the_checkpoint_gives_the_same_rows_an
     assert len({s["train"] for s in seen}) == 3 and len({s["scaling"] for s in seen}) == 3      # the three seeds cut three different ways
 
 
-def test_today_a_restore_under_another_split_seed_is_not_noticed() -> None:
+CONFIG = {"optimization": {"seed": 1}}      # a stored run always has a run config; only then do its checkpoints carry knobs
+
+
+def test_the_checkpoint_knobs_carry_the_split_seed_and_a_restore_under_another_one_is_refused() -> None:
+    import pytest
+
     with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
-        before_provider, store = _fit(a, 7, epochs=3)
+        _, store = _fit(a, 7, epochs=3, run_config=CONFIG)
         ckpt, doc = _mid_run_checkpoint(store, b)
-        assert not any(k in doc.body for k in ("mean", "std", "rows", "indices", "split_seed")) and "split_seed" not in (doc.body.get("knobs") or {})
-        after_provider, _ = _fit(b, 8, epochs=1, restore=ckpt)      # no error: the weights load into rows and scaling the checkpoint was not trained on
-        assert _data_hashes(after_provider)["train"] != _data_hashes(before_provider)["train"]
-        assert _data_hashes(after_provider)["scaling"] != _data_hashes(before_provider)["scaling"]
+        assert doc.body["knobs"]["split_seed"] == 7
+        assert not any(k in doc.body for k in ("mean", "std", "rows", "indices"))
+        with pytest.raises(ValueError, match="split_seed=7.*split_seed=8"):
+            _fit(b, 8, epochs=1, restore=ckpt, run_config=CONFIG)
+        again, _ = _fit(b, 7, epochs=1, restore=ckpt, run_config=CONFIG)      # the seed it was trained under still restores
+        assert again.mean is not None
+
+
+def test_a_checkpoint_written_without_knobs_still_restores_under_any_seed() -> None:
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        _, store = _fit(a, 7, epochs=3)                       # no run config: no knobs, as before
+        ckpt, doc = _mid_run_checkpoint(store, b)
+        assert "knobs" not in doc.body
+        _fit(b, 8, epochs=1, restore=ckpt)
+
+
+def test_the_knobs_of_a_default_run_gain_the_split_seed_and_nothing_else() -> None:
+    with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+        _, store = _fit(a, 42, epochs=2, run_config=CONFIG)
+        _, doc = _mid_run_checkpoint(store, b)
+        assert set(doc.body["knobs"]) == {"learning_rate", "seed", "batch_size", "epochs_full_dataset", "optimizer", "early_stopping_enabled",
+                                          "patience", "min_delta", "checkpoint_every", "split_seed"}

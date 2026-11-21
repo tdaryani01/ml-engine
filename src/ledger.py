@@ -373,6 +373,8 @@ class TrainingLedger:
     _best_val_loss: float = field(default=float("inf"), repr=False)
     # The run config this ledger's checkpoints belong to (set once by the controller); stored in every checkpoint.
     run_config: dict[str, Any] | None = field(default=None, repr=False)
+    # What the data under this run is (the split seed, later the hash of the row lists); written into every checkpoint's knobs beside the config, and checked when a fit restores one.
+    data_identity: dict[str, Any] | None = field(default=None, repr=False)
     # Called as export_sidecar(model, path) after each checkpoint is stored, to write the archive src/export_pytorch.py reads beside it (the checkpoint itself has no input scaling or batch-norm statistics). A failure here never fails a fit.
     export_sidecar: Any = field(default=None, repr=False)
 
@@ -567,7 +569,7 @@ class TrainingLedger:
             from src.checkpoint_knobs import knobs_from_config
 
             body["config"] = self.run_config
-            body["knobs"] = knobs_from_config(self.run_config)
+            body["knobs"] = {**knobs_from_config(self.run_config), **(self.data_identity or {})}
         doc = self._envelope(
             CHECKPOINT,
             body,
@@ -609,7 +611,7 @@ class TrainingLedger:
             from src.checkpoint_knobs import knobs_from_config
 
             body["config"] = self.run_config
-            body["knobs"] = knobs_from_config(self.run_config)
+            body["knobs"] = {**knobs_from_config(self.run_config), **(self.data_identity or {})}
         doc = self._envelope(CHECKPOINT, body, version=version, step_id=version, model_instance_id=model_instance_id)
         lsn = self.push(doc)
         self.store.put_checkpoint(doc)
@@ -737,6 +739,7 @@ class TrainingLedger:
         child._best_val_loss = self._best_val_loss
         child.run_config = self.run_config          # a forked branch's checkpoints carry the config and keep getting an export archive
         child.export_sidecar = self.export_sidecar
+        child.data_identity = self.data_identity
         return child
 
     def scan_branch(self, doc_type: str | None = None) -> Iterator[LedgerDocument]:
