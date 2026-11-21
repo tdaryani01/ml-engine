@@ -133,6 +133,16 @@ class ModelController:
             return True
         return False
 
+    def data_identity(self) -> dict[str, Any]:
+        """What the rows under this controller's provider are: the loader's split seed, and the hash of its row lists once it has them."""
+        loader = getattr(self.data_provider, "loader", None)
+        ident: dict[str, Any] = {}
+        if isinstance(getattr(loader, "random_state", None), int):
+            ident["split_seed"] = int(loader.random_state)
+        if getattr(loader, "lists_hash", None):
+            ident["lists_hash"] = str(loader.lists_hash)
+        return ident
+
     def restore_from_checkpoint_doc(self, path: str) -> int:
         """Fit contract: load weights from a ledger checkpoint document file. Returns its version."""
         from src.ledger import document_from_bytes, restore_model_checkpoint
@@ -147,6 +157,12 @@ class ModelController:
         body = getattr(doc, "body", None)
         if not isinstance(body, dict) or "weights" not in body:
             raise ValueError(f"checkpoint document has no weights: {path}")
+        # Data design §9 row 4 (03ec5b3): the weights were trained on one split; refuse to load them under another. A checkpoint written
+        # before the knobs carried the split seed says nothing, and is accepted.
+        stored, now = dict(body.get("knobs") or {}), self.data_identity()
+        for key in ("split_seed", "lists_hash"):
+            if key in stored and key in now and stored[key] != now[key]:
+                raise ValueError(f"checkpoint {path} was trained under {key}={stored[key]!r}, this run has {key}={now[key]!r}: refusing to restore")
         restore_model_checkpoint(self.model, body)
         logging.info("[Model Controller] Restored weights from checkpoint document %s", path)
         return int(getattr(doc, "version", 0) or 0)
@@ -275,6 +291,7 @@ class ModelController:
             )
             if ledger_on:
                 engine.ledger.run_config = getattr(ls, "run_config", None)
+                engine.ledger.data_identity = self.data_identity()
                 if engine.ledger.run_config:
                     engine.ledger.export_sidecar = self._export_archive_writer(engine.ledger.run_config)
                 logging.info(
