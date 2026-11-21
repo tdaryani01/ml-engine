@@ -245,6 +245,8 @@ class OptimizationConfig:
     num_threads: int
     # Fit contract: seeds numpy's global RNG once at run start (None = unseeded, as before).
     seed: int | None = None
+    # Scale multiplied into the plain network's Glorot starting weights (1.0 = as drawn, every run so far).
+    init_scale: float = 1.0
 
 
 @dataclass(frozen=True)
