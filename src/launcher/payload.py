@@ -72,6 +72,7 @@ class SupervisedFitSpec:
     batch_seed: int | None = None
     init_scale: float | None = None  # multiplied into the plain network's starting weights; None = 1.0, as drawn
     recordings: bool | None = None  # data design B7: per-epoch recordings for the pilots; None = off
+    thin_steps: bool | None = None  # journal without the per-step gradient arrays (config.schema.LedgerSettings.thin_steps); None = off
     mhsa: dict[str, Any] = field(default_factory=dict)  # mhsa model geometry
     cnn: dict[str, Any] = field(default_factory=dict)  # cnn model geometry
     model_id: str = "ee-fit"
@@ -202,6 +203,7 @@ def _from_pipeline(spec: SupervisedFitSpec, *, work_dir: Path, restore: Path | N
         "contract_list_enabled": arch.get("model_type") == "mhsa", "native_async_submit": False,  # the mhsa model trains only through its contract list
         # The checkpoint stores the config TM sent (not this adapted copy), so Live and restore hand TM back its own config.
         "run_config": copy.deepcopy(base),
+        **({"thin_steps": bool(spec.thin_steps)} if spec.thin_steps is not None else {}),
         **({"restore_checkpoint_path": str(restore)} if restore is not None else {}),
     }
     cfg["model_id"] = spec.model_id
@@ -253,6 +255,7 @@ def build_pipeline_payload(
         "checkpoint_on_local_best": True,
         "contract_list_enabled": spec.model_type == "mhsa",  # the mhsa model trains only through its contract list
         "native_async_submit": False,
+        **({"thin_steps": bool(spec.thin_steps)} if spec.thin_steps is not None else {}),
     }
     if restore_checkpoint_path is not None:
         ledger["restore_checkpoint_path"] = str(restore_checkpoint_path)

@@ -296,6 +296,9 @@ class LedgerSettings:
     # Independent of ledger I/O: native async submit for contract steps.
     # Keep false on Linux for strict OMP thread caps unless measured.
     native_async_submit: bool = False
+    # Data design 9 (harness needs): off = every step document carries its full gradient set (today). On = the step document keeps its numbers (step, loss, sample count, command, version, metrics) and
+    # drops the gradient arrays, so the journal grows by a few hundred bytes a step instead of one weight set. Checkpoints, epoch metrics and run.end are written as before; replaying steps from the journal needs the gradients.
+    thin_steps: bool = False
     # Pluggable persistence. Default = file_streaming (current SyncJournalWriter path).
     # noop = tests / Docker (engine+contract, no journal I/O). Future: cache, queue, redis.
     store_backend: str = "file_streaming"

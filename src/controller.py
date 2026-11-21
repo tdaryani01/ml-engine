@@ -279,6 +279,7 @@ class ModelController:
                     checkpoint_on_local_best=ls.checkpoint_on_local_best,
                     contract_list_enabled=ls.contract_list_enabled,
                     native_async_submit=ls.native_async_submit,
+                    thin_steps=bool(getattr(ls, "thin_steps", False)),
                     store_backend=ls.store_backend,
                 )
             else:

@@ -1604,6 +1604,7 @@ class TrainingEngine:
             val_loss=step.val_loss,
             verdict=verdict,
             model_instance_id=self._ledger_model_instance_id(session),
+            thin=bool(getattr(self.config, "thin_steps", False)),
         )
 
         if verdict == VERDICT_HEALTHY:

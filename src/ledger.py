@@ -111,6 +111,7 @@ class LedgerConfig:
     keep_last_k_checkpoints: int = 20
     contract_list_enabled: bool = False  # Phase F: off until grad/benchmark parity
     native_async_submit: bool = False  # Independent of ledger I/O; see config.yaml ledger
+    thin_steps: bool = False  # step documents without gradient arrays (config.schema.LedgerSettings.thin_steps)
     store_backend: str = "file_streaming"  # file_streaming | file_sync | noop | cache | queue | redis
     flush_stall_threshold: int = 64
 
@@ -547,8 +548,11 @@ class TrainingLedger:
         verdict: str = VERDICT_HEALTHY,
         scheduler_epoch: int = 0,
         model_instance_id: str | None = None,
+        thin: bool = False,
     ) -> int:
-        """One journal record per batch (command + result + consolidated + metrics)."""
+        """One journal record per batch (command + result + consolidated + metrics). ``thin``: the result keeps step id, loss and sample count and no gradient arrays."""
+        if thin:
+            result = TrainStepResult(step_id=result.step_id, loss=result.loss, grad_weights=[], grad_biases=[], m_samples=result.m_samples, weights_applied=result.weights_applied)
         command = {
             "step_id": step_id,
             "base_version": base_version,
