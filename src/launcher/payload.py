@@ -61,6 +61,10 @@ class SupervisedFitSpec:
     backend: str = "numpy"
     num_threads: int = 2
     seed: int | None = None  # seeds ME's RNG once per run: same seed, same fit
+    # Data design A4: the plain network's starting weights and its batch order (shuffle and dropout masks) from streams of their
+    # own. Neither set = one stream seeded by `seed`, as before; one not set falls back to `seed`.
+    init_seed: int | None = None
+    batch_seed: int | None = None
     init_scale: float | None = None  # multiplied into the plain network's starting weights; None = 1.0, as drawn
     mhsa: dict[str, Any] = field(default_factory=dict)  # mhsa model geometry
     cnn: dict[str, Any] = field(default_factory=dict)  # cnn model geometry
@@ -163,10 +167,16 @@ def _from_pipeline(spec: SupervisedFitSpec, *, work_dir: Path, restore: Path | N
         opt["patience"] = int(spec.patience)
     if spec.seed is not None:
         opt["seed"] = int(spec.seed)
+    if spec.init_seed is not None:
+        opt["init_seed"] = int(spec.init_seed)
+    if spec.batch_seed is not None:
+        opt["batch_seed"] = int(spec.batch_seed)
     if spec.init_scale is not None:
         opt["init_scale"] = float(spec.init_scale)
     if int(spec.stretch_index) > 1:  # Autopilot: stretch N shuffles with seed + N - 1, so a retry is a new run
         opt["seed"] = int(opt.get("seed") or 0) + int(spec.stretch_index) - 1
+        if opt.get("batch_seed") is not None:  # the batch stream moves too; the init stream does not (a restore overwrites the weights)
+            opt["batch_seed"] = int(opt["batch_seed"]) + int(spec.stretch_index) - 1
     cfg.setdefault("transformations", {"fourier_expansion": {"enabled": False, "num_frequencies": 4}})
     cfg["persistence"] = {"load_saved_model": False, "model_asset_path": "unused.npz"}
     cfg["diagnostics"] = {"enabled": False, "metric_to_plot": "loss", "save_raw_logs": False, "figure_width": 8,
@@ -257,6 +267,8 @@ def build_pipeline_payload(
             "gradient_clipping_max_norm": 5.0,
             "num_threads": int(spec.num_threads),
             **({"seed": int(spec.seed)} if spec.seed is not None else {}),
+            **({"init_seed": int(spec.init_seed)} if spec.init_seed is not None else {}),
+            **({"batch_seed": int(spec.batch_seed)} if spec.batch_seed is not None else {}),
             **({"init_scale": float(spec.init_scale)} if spec.init_scale is not None else {}),
         },
         "regularization": {"lam_l1": float(spec.lam_l1), "lam_l2": float(spec.lam_l2), "sparsity_tolerance": 1e-5},
