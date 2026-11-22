@@ -138,12 +138,15 @@ def _build_provider_and_controller(cfg: PipelineConfig):
     else:
         loader = BaseDataLoader.create_loader(cfg)
 
+        if getattr(cfg.ingestion, "scale_targets", False) and (is_cnn or is_mhsa):
+            raise ValueError("scale_targets is for the plain network only")
         data_provider = InMemoryDataProvider(
             loader=loader,
             batch_size=cfg.optimization.batch_size,
             epochs=cfg.optimization.epochs_full_dataset,
             normalize_features=(not is_cnn and not is_mhsa),
             clip_sd=getattr(cfg.ingestion, "input_clip_sd", None),
+            scale_targets=bool(getattr(cfg.ingestion, "scale_targets", False)),
         )
         steps = data_provider.recomment_steps()
 

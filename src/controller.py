@@ -157,6 +157,8 @@ class ModelController:
         for key in ("n_discarded", "n_unused", "n_train", "n_validation"):      # the parts, for the result line: what the cut left out, and the sizes of a lists run
             if isinstance(getattr(loader, key, None), int):
                 ident[key] = int(getattr(loader, key))
+        if getattr(self.data_provider, "y_mean", None) is not None:      # B15: the target was standardised with the training part's numbers: they travel with the checkpoint (written only when set)
+            ident["y_mean"], ident["y_std"] = np.asarray(self.data_provider.y_mean).ravel().tolist(), np.asarray(self.data_provider.y_std).ravel().tolist()
         shares = getattr(loader, "class_shares", None)
         if shares:      # fraction mode only: the class shares of each part, for the result line
             ident["class_shares_train"], ident["class_shares_validation"] = list(shares["train"]), list(shares["validation"])
@@ -182,6 +184,10 @@ class ModelController:
         for key in ("split_seed", "lists_hash"):
             if key in stored and key in now and stored[key] != now[key]:
                 raise ValueError(f"checkpoint {path} was trained under {key}={stored[key]!r}, this run has {key}={now[key]!r}: refusing to restore")
+        if "split_seed" in stored and ("y_mean" in stored) != ("y_mean" in now):      # B15: weights trained on scaled targets are in other units than a raw-target run's (and the other way round)
+            raise ValueError(f"checkpoint {path} was trained {'with' if 'y_mean' in stored else 'without'} scaled targets, this run is {'with' if 'y_mean' in now else 'without'}: refusing to restore")
+        if "y_mean" in stored and "y_mean" in now and (stored["y_mean"] != now["y_mean"] or stored["y_std"] != now["y_std"]):
+            raise ValueError(f"checkpoint {path} was trained with other target scaling numbers than this run has: refusing to restore")
         restore_model_checkpoint(self.model, body)
         # A stop-state checkpoint (data design §9 row 15) continues the run it stopped: the next fit keeps the optimizer and the epoch clock.
         # Any other checkpoint restores weights only, and the optimizer restarts, as before.
