@@ -70,6 +70,7 @@ class SupervisedFitSpec:
     # own. Neither set = one stream seeded by `seed`, as before; one not set falls back to `seed`.
     init_seed: int | None = None
     batch_seed: int | None = None
+    scale_targets: bool | None = None  # data design B15: a regression target standardised with the training part's mean and sd; None = off (raw targets)
     init_scale: float | None = None  # multiplied into the plain network's starting weights; None = 1.0, as drawn
     recordings: bool | None = None  # data design B7: per-epoch recordings for the pilots; None = off
     thin_steps: bool | None = None  # journal without the per-step gradient arrays (config.schema.LedgerSettings.thin_steps); None = off
@@ -151,6 +152,8 @@ def _from_pipeline(spec: SupervisedFitSpec, *, work_dir: Path, restore: Path | N
         ing["splits"] = {**ing["splits"], "seed": int(spec.split_seed)}
     if spec.clip_sd is not None:
         ing["input_clip_sd"] = float(spec.clip_sd)
+    if spec.scale_targets is not None:
+        ing["scale_targets"] = bool(spec.scale_targets)
     if spec.lists_path is not None:
         ing["splits"] = {**ing["splits"], "lists_path": str(spec.lists_path)}
     for k, v in (("drain_on_empty", False), ("val_queue_name", ""), ("amqp_url", ""), ("queue_name", "")):
@@ -241,6 +244,7 @@ def build_pipeline_payload(
         "splits": {"train": float(spec.train_split), "val": float(spec.val_split), **({"seed": int(spec.split_seed)} if spec.split_seed is not None else {}),
                    **({"lists_path": str(spec.lists_path)} if spec.lists_path is not None else {})},
         **({"input_clip_sd": float(spec.clip_sd)} if spec.clip_sd is not None else {}),
+        **({"scale_targets": bool(spec.scale_targets)} if spec.scale_targets is not None else {}),
         "drain_on_empty": False,
         "val_queue_name": "",
         "amqp_url": "",

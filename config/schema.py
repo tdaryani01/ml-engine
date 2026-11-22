@@ -34,6 +34,8 @@ class IngestionConfig:
     queue_name: Optional[str] = None
     # Data design A2: standardise with the training part's numbers, then clip at this many sd (None = no clip; the caller sets it).
     input_clip_sd: Optional[float] = None
+    # Data design B15: standardise a regression target with the training part's mean and sd (the split seed being run); the two numbers go into the checkpoint's knobs. Off = raw targets, as every run so far.
+    scale_targets: bool = False
 
 @dataclass(frozen=True)
 class CNNConfig:

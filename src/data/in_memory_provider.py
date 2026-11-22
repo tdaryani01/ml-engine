@@ -21,6 +21,7 @@ class InMemoryDataProvider(BaseDataProvider):
         epochs: int = 300,
         normalize_features: bool = True,
         clip_sd: float | None = None,
+        scale_targets: bool = False,
     ):
         self.loader = loader
         self.batch_size = batch_size
@@ -39,6 +40,19 @@ class InMemoryDataProvider(BaseDataProvider):
         self.y_train_processed = np.ascontiguousarray(y_train)
         self.X_val = np.ascontiguousarray(X_val)
         self.y_val_processed = np.ascontiguousarray(y_val)
+
+        # Data design B15: a regression target standardised with the training part's mean and sd (the numbers of the split seed being run), validation with the same numbers.
+        self.y_mean = self.y_std = None
+        if scale_targets:
+            from config.constants import ModelType
+
+            if getattr(self.loader, "model_type", None) != ModelType.REGRESSION:
+                raise ValueError("[In-Memory Provider] scale_targets is for a regression run only")
+            ty = np.asarray(y_train, dtype=np.float64)
+            self.y_mean = ty.mean(axis=0)
+            self.y_std = ty.std(axis=0) + 1e-24
+            self.y_train_processed = np.ascontiguousarray(((ty - self.y_mean) / self.y_std).astype(np.asarray(y_train).dtype))
+            self.y_val_processed = np.ascontiguousarray(((np.asarray(y_val, dtype=np.float64) - self.y_mean) / self.y_std).astype(np.asarray(y_val).dtype))
 
         # Setup feature normalization statistics
         if self.normalize_features and self.X_train.ndim == 2:
