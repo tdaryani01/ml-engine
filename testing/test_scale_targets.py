@@ -136,6 +136,30 @@ def test_the_numbers_travel_with_the_checkpoint_only_when_set_and_a_restore_acro
         assert ctl(False).restore_from_checkpoint_doc(off_path) > 0
 
 
+def test_an_old_checkpoint_with_no_knobs_is_not_restored_into_a_scaled_run(monkeypatch) -> None:
+    """Units are checked on the presence of y_mean, not on split_seed: a checkpoint from before the knobs carried the split seed is raw-unit weights."""
+    import src.ledger as C
+
+    with tempfile.TemporaryDirectory() as a:
+        csv = _csv(a, scale=40.0, shift=100.0)
+        _, ck = _run(a, csv, None)
+        path = os.path.join(a, "old.bin")
+        with open(path, "wb") as fh:
+            fh.write(ck)
+        real = C.document_from_bytes
+
+        def no_knobs(data):
+            d = real(data)
+            d.body.pop("knobs", None)
+            return d
+
+        monkeypatch.setattr(C, "document_from_bytes", no_knobs)
+        c = ModelController(data_provider=_provider(csv, True), learning_rate=0.05)
+        c.initialize_network_from_dimensions(input_dim=3, output_dim=1, model_type=ModelType.REGRESSION, hidden_layers=[6], optimizer_name="adam", backend=EngineBackend.NUMPY)
+        with pytest.raises(ValueError, match="scaled targets"):
+            c.restore_from_checkpoint_doc(path)
+
+
 def test_the_payload_key_is_written_only_when_set(tmp_path) -> None:
     assert "scale_targets" not in build_pipeline_payload(_spec(tmp_path), work_dir=tmp_path / "w")["ingestion"]
     assert build_pipeline_payload(_spec(tmp_path, scale_targets=True), work_dir=tmp_path / "w")["ingestion"]["scale_targets"] is True

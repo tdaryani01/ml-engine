@@ -184,7 +184,7 @@ class ModelController:
         for key in ("split_seed", "lists_hash"):
             if key in stored and key in now and stored[key] != now[key]:
                 raise ValueError(f"checkpoint {path} was trained under {key}={stored[key]!r}, this run has {key}={now[key]!r}: refusing to restore")
-        if "split_seed" in stored and ("y_mean" in stored) != ("y_mean" in now):      # B15: weights trained on scaled targets are in other units than a raw-target run's (and the other way round)
+        if ("y_mean" in stored) != ("y_mean" in now):      # B15: weights trained on scaled targets are in other units than a raw-target run's (and the other way round)
             raise ValueError(f"checkpoint {path} was trained {'with' if 'y_mean' in stored else 'without'} scaled targets, this run is {'with' if 'y_mean' in now else 'without'}: refusing to restore")
         if "y_mean" in stored and "y_mean" in now and (stored["y_mean"] != now["y_mean"] or stored["y_std"] != now["y_std"]):
             raise ValueError(f"checkpoint {path} was trained with other target scaling numbers than this run has: refusing to restore")
