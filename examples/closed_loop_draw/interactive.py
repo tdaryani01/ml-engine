@@ -685,7 +685,7 @@ class DrawInteractiveApp:
             unit = None
             if self.brain_args.get("null_result"):
                 unit = json.loads(Path(self.brain_args["null_result"]).read_text())["noise_unit"]["unit"]
-            self.brain_demo = draw_window.BrainDemo(os.path.join(root, "maze"), self.cfg, self.brain_args["state_dir"], unit, STOCK_COMMAND_IDS, self._brain_make_session, self._brain_log)
+            self.brain_demo = draw_window.BrainDemo(os.path.join(root, "maze"), self.cfg, self.brain_args["state_dir"], unit, STOCK_COMMAND_IDS, self._brain_make_session, self._brain_log, bars_path=self.brain_args.get("bars_file"))
         return self.brain_demo
 
     def brain_round(self) -> None:
@@ -777,13 +777,14 @@ def main() -> int:
     ap.add_argument("--brain", choices=("c4",), default=None, help="steer runs with the current brain (the C4 walker of the Training Manager's maze) and sleep between sweeps")
     ap.add_argument("--tm-root", default=os.environ.get("TM_HARNESS_ROOT"), help="training-manager/brain_rl_data_engine (or env TM_HARNESS_ROOT)")
     ap.add_argument("--brain-dir", default=os.path.expanduser("~/.draw_brain"), help="where the arm keeps its ledger, memory rows and log (the sleep survives closing the window)")
+    ap.add_argument("--bars-file", default=None, help="the draw bars (draw_bars.json); without it the bank bars are used and the log says so")
     ap.add_argument("--null-result", default=None, help="the unsteered-null result JSON (its noise unit); without it the runs are shown but nothing is judged")
     a = ap.parse_args()
     brain = None
     if a.brain:
         if not a.tm_root:
             raise SystemExit("--brain c4 needs --tm-root (training-manager/brain_rl_data_engine) or TM_HARNESS_ROOT")
-        brain = {"tm_root": a.tm_root, "state_dir": a.brain_dir, "null_result": a.null_result}
+        brain = {"tm_root": a.tm_root, "state_dir": a.brain_dir, "null_result": a.null_result, "bars_file": a.bars_file}
     cfg = Path(a.config)
     print(f"[interactive] config={cfg}")
     print("[interactive] commands:", ", ".join(COMMANDS[i] for i in sorted(COMMANDS)))
