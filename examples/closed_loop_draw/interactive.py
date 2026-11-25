@@ -10,6 +10,9 @@ Usage (repo root, needs a display):
 """
 from __future__ import annotations
 
+import argparse
+import copy
+import json
 import os
 import sys
 import time
@@ -49,9 +52,16 @@ def _rollout_frames(app, ids):
     return app.trainer.rollout_eval(goal=DrawGoal.render(ids)).extras["frames"]
 
 
+class _BrainStopped(Exception):
+    pass
+
+
 class DrawInteractiveApp:
-    def __init__(self, cfg_path: Path) -> None:
+    def __init__(self, cfg_path: Path, brain: dict | None = None) -> None:
         bootstrap_im2col_gemm_runtime()
+        self.cfg_path = Path(cfg_path)
+        self.brain_args = brain
+        self.brain_demo = None
         self.cfg = load_config(cfg_path)
         cl = self.cfg["closed_loop"]
         C, H, W = (int(x) for x in cl["canvas"])
@@ -113,6 +123,12 @@ class DrawInteractiveApp:
         )
         self.btn_warm = ttk.Button(top, text="Warmup", command=lambda: self._run_action(self.warmup))
         self.btn_stop = ttk.Button(top, text="Stop", command=self._request_stop)
+        self.btn_brain = self.btn_sweep = None
+        if self.brain_args:      # --brain c4: the current brain steers a run, shows its guess, the try and the result, and sleeps after each sweep of the five shapes
+            self.btn_brain = ttk.Button(top, text="Brain round", command=lambda: self._run_action(self.brain_round, label="brain round"))
+            self.btn_sweep = ttk.Button(top, text="Brain sweep (5)", command=lambda: self._run_action(self.brain_sweep, label="brain sweep"))
+            self.btn_brain.pack(side=tk.LEFT, padx=(14, 2))
+            self.btn_sweep.pack(side=tk.LEFT, padx=2)
         self.btn_draw.pack(side=tk.LEFT, padx=4)
         self.btn_train.pack(side=tk.LEFT, padx=2)
         self.btn_warm.pack(side=tk.LEFT, padx=2)
@@ -160,6 +176,10 @@ class DrawInteractiveApp:
 
         self.progress = ttk.Progressbar(self.root, mode="determinate", maximum=100)
         self.progress.pack(fill=tk.X, padx=8, pady=(0, 4))
+        self.log_box = None
+        if self.brain_args:
+            self.log_box = tk.Text(self.root, height=9, wrap="word", state="disabled")
+            self.log_box.pack(fill=tk.X, padx=8, pady=(0, 4))
 
         body = ttk.Frame(self.root, padding=8)
         body.pack(fill=tk.BOTH, expand=True)
@@ -296,8 +316,9 @@ class DrawInteractiveApp:
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
-        for b in (self.btn_draw, self.btn_train, self.btn_warm):
-            b.configure(state=state)
+        for b in (self.btn_draw, self.btn_train, self.btn_warm, self.btn_brain, self.btn_sweep):
+            if b is not None:
+                b.configure(state=state)
         self.entry.configure(state=state)
         # Stop stays enabled while busy so the user can abort auto-train.
         self.btn_stop.configure(state=tk.NORMAL if busy else tk.DISABLED)
@@ -623,6 +644,66 @@ class DrawInteractiveApp:
             f"{tag}  — Draw anytime"
         )
 
+    # -- the current brain (maze design points 4c, 7, 8, 9, 9a, 11): rounds steered by the C4 walker, the sleep between sweeps ---------------------------------------------
+    def _brain_log(self, line: str) -> None:
+        print(line, flush=True)
+        if self.log_box is not None:
+            self.log_box.configure(state="normal")
+            self.log_box.insert("end", line + "\n")
+            self.log_box.see("end")
+            self.log_box.configure(state="disabled")
+        self.status_var.set(line[:200])
+        self._pump()
+
+    def _brain_make_session(self, shape: int, seed: int, val_shape: int):
+        from examples.closed_loop_draw.session import DrawSession
+
+        s = DrawSession(copy.deepcopy(self.cfg), seed=seed, train_command=shape, val_command=val_shape)
+        self._brain_calls = 0
+        self._show_target(s.target())
+
+        def tick(kind: str) -> None:
+            self._brain_calls += 1
+            if self._stop_requested:
+                raise _BrainStopped()
+            if kind == "train" and self._brain_calls % 10 == 0:
+                self._show_canvas(s.canvas())
+            self._pump()
+
+        s.tick = tick
+        return s
+
+    def _brain_demo(self):
+        if self.brain_demo is None:
+            root = self.brain_args["tm_root"]
+            for sub in ("maze", "walker_tree", "src"):
+                p = os.path.join(root, sub)
+                if p not in sys.path:
+                    sys.path.insert(0, p)
+            import draw_window
+
+            unit = None
+            if self.brain_args.get("null_result"):
+                unit = json.loads(Path(self.brain_args["null_result"]).read_text())["noise_unit"]["unit"]
+            self.brain_demo = draw_window.BrainDemo(os.path.join(root, "maze"), self.cfg, self.brain_args["state_dir"], unit, STOCK_COMMAND_IDS, self._brain_make_session, self._brain_log, bars_path=self.brain_args.get("bars_file"))
+        return self.brain_demo
+
+    def brain_round(self) -> None:
+        try:
+            d = self._brain_demo()
+            sweep, shape = d.next()
+            self._brain_log(f"--- round {d.arm.round_no + 1}: sweep {sweep}, shape '{COMMANDS[shape]}' ---")
+            d.round()
+        except _BrainStopped:
+            self._brain_log("stopped: this round is not counted")
+
+    def brain_sweep(self) -> None:
+        k = len(STOCK_COMMAND_IDS)
+        for _ in range(k - (self._brain_demo().arm.round_no % k)):
+            self.brain_round()
+            if self._stop_requested:
+                break
+
     def warmup(self) -> None:
         B = self.app.batch_size
         n = self.warmup_n
@@ -691,13 +772,24 @@ class DrawInteractiveApp:
 
 
 def main() -> int:
-    cfg = Path(__file__).resolve().parent / "config_draw_interactive.yaml"
-    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
-        cfg = Path(sys.argv[1])
+    ap = argparse.ArgumentParser(description="Interactive closed-loop draw window")
+    ap.add_argument("config", nargs="?", default=str(Path(__file__).resolve().parent / "config_draw_interactive.yaml"))
+    ap.add_argument("--brain", choices=("c4",), default=None, help="steer runs with the current brain (the C4 walker of the Training Manager's maze) and sleep between sweeps")
+    ap.add_argument("--tm-root", default=os.environ.get("TM_HARNESS_ROOT"), help="training-manager/brain_rl_data_engine (or env TM_HARNESS_ROOT)")
+    ap.add_argument("--brain-dir", default=os.path.expanduser("~/.draw_brain"), help="where the arm keeps its ledger, memory rows and log (the sleep survives closing the window)")
+    ap.add_argument("--bars-file", default=None, help="the draw bars (draw_bars.json); without it the bank bars are used and the log says so")
+    ap.add_argument("--null-result", default=None, help="the unsteered-null result JSON (its noise unit); without it the runs are shown but nothing is judged")
+    a = ap.parse_args()
+    brain = None
+    if a.brain:
+        if not a.tm_root:
+            raise SystemExit("--brain c4 needs --tm-root (training-manager/brain_rl_data_engine) or TM_HARNESS_ROOT")
+        brain = {"tm_root": a.tm_root, "state_dir": a.brain_dir, "null_result": a.null_result, "bars_file": a.bars_file}
+    cfg = Path(a.config)
     print(f"[interactive] config={cfg}")
     print("[interactive] commands:", ", ".join(COMMANDS[i] for i in sorted(COMMANDS)))
     print("[interactive] draw on the left pad → Use as target → Train / Draw")
-    DrawInteractiveApp(cfg).run()
+    DrawInteractiveApp(cfg, brain=brain).run()
     return 0
 
 
