@@ -7,7 +7,8 @@ what it means for every closed-loop fit. The draw rollout has no sampling noise 
 mean of k identical rollouts and ``k`` buys nothing; the spread between runs comes from the seed (the initial weights), not from the rollout.
 
 ``fork``/``restore`` copy EVERYTHING that decides the next update: the weights and Adam moments of the MHSA (``capture_state``) plus the adapters', the conditioning
-bank's and the CNN optimiser's moments and step counters, which ``capture_state`` does not carry. A restore followed by the same trajectories gives the same losses.
+bank's and the CNN optimiser's moments and step counters, which ``capture_state`` does not carry. A restore followed by the same trajectories gives the same losses. ``fork`` refuses (TypeError) a part whose moments sit in a container it would silently skip; ``restore`` refuses (ValueError) a moment list whose length or None slots changed since the fork.
+Tests: test_session.py. The guards run on stand-in parts (no kernels, no assets); the exact-trajectory tests need the native kernels and are skipped where they are not built. The ml CI workflows do not collect examples/, so none of these run in CI today.
 """
 from __future__ import annotations
 
@@ -35,6 +36,15 @@ class Fork:
 
 
 _STATE_ATTRS = {"adapter": ("W", "b", "_mW", "_vW", "_mb", "_vb", "_t"), "action_embed": ("W", "b", "_mW", "_vW", "_mb", "_vb", "_t"), "conditioning": ("embeddings", "_m", "_v", "_t")}      # the weights and Adam state of the small modules; NOT their forward caches (``_last_x``) or gradients
+
+
+def _holds_arrays(v: Any) -> bool:
+    """True for a container (dict, list, tuple) with an array anywhere inside: a moment store that ``_copyable`` would silently skip."""
+    if isinstance(v, np.ndarray):
+        return True
+    if isinstance(v, dict):
+        v = list(v.values())
+    return isinstance(v, (list, tuple)) and any(_holds_arrays(x) for x in v)
 
 
 def _copyable(v: Any) -> bool:
@@ -96,7 +106,19 @@ class DrawSession:
         return {"adapter": a.adapter, "action_embed": a.action_embed, "conditioning": a.conditioning, "cnn_opt": getattr(a.cnn, "optimizer", None)}
 
     def fork(self) -> Fork:
-        extra = {name: {k: copy.deepcopy(v) for k, v in vars(o).items() if _copyable(v) and (name not in _STATE_ATTRS or k in _STATE_ATTRS[name])} for name, o in self._parts().items() if o is not None}
+        extra = {}
+        for name, o in self._parts().items():
+            if o is None:
+                continue
+            kept = {}
+            for k, v in vars(o).items():
+                if name in _STATE_ATTRS and k not in _STATE_ATTRS[name]:
+                    continue
+                if _copyable(v):
+                    kept[k] = copy.deepcopy(v)
+                elif _holds_arrays(v):
+                    raise TypeError(f"{name}.{k} holds arrays in a {type(v).__name__}: fork() copies plain arrays, scalars and lists of arrays only, so its moments would not be restored; extend _copyable")
+            extra[name] = kept
         return Fork(capture_state(self.app.actor), extra)
 
     def restore(self, f: Fork) -> None:
@@ -109,6 +131,8 @@ class DrawSession:
                 if isinstance(cur, np.ndarray):
                     cur[...] = v
                 elif isinstance(cur, list):
+                    if len(cur) != len(v) or any((d is None) != (x is None) for d, x in zip(cur, v)):
+                        raise ValueError(f"restore: {name}.{k} changed shape since the fork ({len(v)} slots then, {len(cur)} now, or a slot became None)")
                     for dst, src in zip(cur, v):
                         if dst is not None:
                             dst[...] = src
