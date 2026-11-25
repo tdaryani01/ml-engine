@@ -8,7 +8,7 @@ mean of k identical rollouts and ``k`` buys nothing; the spread between runs com
 
 ``fork``/``restore`` copy EVERYTHING that decides the next update: the weights and Adam moments of the MHSA (``capture_state``) plus the adapters', the conditioning
 bank's and the CNN optimiser's moments and step counters, which ``capture_state`` does not carry. A restore followed by the same trajectories gives the same losses. ``fork`` refuses (TypeError) a part whose moments sit in a container it would silently skip; ``restore`` refuses (ValueError) a moment list whose length or None slots changed since the fork.
-Tests: test_session.py. The guards run on stand-in parts (no kernels, no assets); the exact-trajectory tests need the native kernels and are skipped where they are not built. The ml CI workflows do not collect examples/, so none of these run in CI today.
+Tests: test_session.py. The guards run on stand-in parts (no kernels, no assets); the exact-trajectory tests need the native kernels and are skipped where they are not built. The ml CI collects testing/, not examples/: the guards are in testing/test_closed_loop_draw_session_guards.py (they run in CI); the exact-trajectory tests here do not.
 """
 from __future__ import annotations
 
