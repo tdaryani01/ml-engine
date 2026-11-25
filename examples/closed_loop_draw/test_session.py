@@ -57,3 +57,16 @@ def test_the_validation_shape_must_differ_from_the_training_shape():
 
     with pytest.raises(ValueError):
         DrawSession(CFG, seed=0, train_command=0, val_command=0)
+
+
+def test_tick_runs_after_each_trajectory_and_the_canvas_does_not_move_the_weights(session):
+    seen = []
+    session.tick = seen.append
+    session.train(3)
+    v = session.val()
+    assert seen == ["train"] * 3 + ["val"]
+    f = session.fork()
+    c = session.canvas()
+    assert c.shape[0] == 1 and session.target().shape[0] == 1
+    session.restore(f)
+    assert session.val() == v

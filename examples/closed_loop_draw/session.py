@@ -34,6 +34,9 @@ class Fork:
     extra: dict[str, dict[str, Any]]
 
 
+_STATE_ATTRS = {"adapter": ("W", "b", "_mW", "_vW", "_mb", "_vb", "_t"), "action_embed": ("W", "b", "_mW", "_vW", "_mb", "_vb", "_t"), "conditioning": ("embeddings", "_m", "_v", "_t")}      # the weights and Adam state of the small modules; NOT their forward caches (``_last_x``) or gradients
+
+
 def _copyable(v: Any) -> bool:
     if isinstance(v, np.ndarray) or isinstance(v, _PLAIN):
         return True
@@ -51,6 +54,7 @@ class DrawSession:
         self.app = assemble(self.cfg, seed=self.seed)
         self.lr = float(lr if lr is not None else self.app.lr)
         self.trained = 0
+        self.tick = None            # optional callback ``tick(kind)`` after each train trajectory (kind 'train') and each val rollout ('val'): the window pumps its events there; it may raise to stop the run
         self._ids = {c: np.full(self.app.batch_size, c, dtype=np.int64) for c in (self.train_command, self.val_command)}
         C, H, W = (int(x) for x in self.cfg["closed_loop"]["canvas"])
         self._target = {c: load_command_target(c, batch_size=self.app.batch_size, height=H, width=W, channels=C) for c in self._ids}
@@ -60,20 +64,39 @@ class DrawSession:
 
     def train(self, n: int) -> list[float]:
         """n update trajectories on the training shape at the current rate; the terminal loss of each."""
-        out = [terminal_loss(self.app.trainer.rollout_train(goal=self._goal(self.train_command), lr=self.lr, apply_updates=True)) for _ in range(int(n))]
-        self.trained += int(n)
+        out = []
+        for _ in range(int(n)):
+            out.append(terminal_loss(self.app.trainer.rollout_train(goal=self._goal(self.train_command), lr=self.lr, apply_updates=True)))
+            self.trained += 1
+            if self.tick is not None:
+                self.tick("train")
         return out
 
     def val(self, k: int = 1) -> float:
         """Mean terminal loss of k no-update rollouts on the held-out shape (identical rollouts: the draw has no sampling noise)."""
-        return float(np.mean([terminal_loss(self.app.trainer.rollout_train(goal=self._goal(self.val_command), lr=self.lr, apply_updates=False)) for _ in range(max(1, int(k)))]))
+        vals = []
+        for _ in range(max(1, int(k))):
+            vals.append(terminal_loss(self.app.trainer.rollout_train(goal=self._goal(self.val_command), lr=self.lr, apply_updates=False)))
+            if self.tick is not None:
+                self.tick("val")
+        return float(np.mean(vals))
+
+    def canvas(self) -> np.ndarray:
+        """What the model draws now for the training shape: the last frame of an inference rollout, (1, C, H, W). Does not touch the weights or the optimiser."""
+        from examples.closed_loop_draw.goal import DrawGoal as _G
+
+        frames = self.app.trainer.rollout_eval(goal=_G.render(self._ids[self.train_command][:1])).extras["frames"]
+        return frames[-1]
+
+    def target(self) -> np.ndarray:
+        return self._target[self.train_command][:1]
 
     def _parts(self) -> dict[str, Any]:
         a = self.app
         return {"adapter": a.adapter, "action_embed": a.action_embed, "conditioning": a.conditioning, "cnn_opt": getattr(a.cnn, "optimizer", None)}
 
     def fork(self) -> Fork:
-        extra = {name: {k: copy.deepcopy(v) for k, v in vars(o).items() if _copyable(v)} for name, o in self._parts().items() if o is not None}
+        extra = {name: {k: copy.deepcopy(v) for k, v in vars(o).items() if _copyable(v) and (name not in _STATE_ATTRS or k in _STATE_ATTRS[name])} for name, o in self._parts().items() if o is not None}
         return Fork(capture_state(self.app.actor), extra)
 
     def restore(self, f: Fork) -> None:
