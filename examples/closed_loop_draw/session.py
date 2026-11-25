@@ -127,8 +127,10 @@ class DrawSession:
             if o is None:
                 continue
             for k, v in f.extra[name].items():
-                cur = getattr(o, k)
-                if isinstance(cur, np.ndarray):
+                cur = getattr(o, k, None)
+                if cur is None or (isinstance(cur, list) and not cur and v):      # a fresh session: the optimiser creates its moment arrays on its first step, so they do not exist yet (found on the real engine, 2026-11-25): take the stored ones
+                    setattr(o, k, copy.deepcopy(v))
+                elif isinstance(cur, np.ndarray):
                     cur[...] = v
                 elif isinstance(cur, list):
                     if len(cur) != len(v) or any((d is None) != (x is None) for d, x in zip(cur, v)):

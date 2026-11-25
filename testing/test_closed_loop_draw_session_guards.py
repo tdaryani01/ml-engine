@@ -48,3 +48,17 @@ def test_restore_refuses_a_moment_list_that_changed_shape(monkeypatch):
     opt.m = [np.ones(2), np.ones(2)]
     with pytest.raises(ValueError, match="changed shape"):
         s.restore(f)
+
+
+def test_restore_into_a_fresh_session_creates_the_moments_the_optimiser_makes_lazily(monkeypatch):
+    opt = types.SimpleNamespace(ms_w=[np.ones(2), None], t=3)
+    s = _fake_session(monkeypatch, opt)
+    f = s.fork()
+    fresh = types.SimpleNamespace(t=0)                    # no ms_w yet: the real optimiser makes it on its first step
+    s.app.cnn.optimizer = fresh
+    s.restore(f)
+    assert fresh.ms_w[0].tolist() == [1.0, 1.0] and fresh.ms_w[1] is None and fresh.t == 3
+    empty = types.SimpleNamespace(ms_w=[], t=0)
+    s.app.cnn.optimizer = empty
+    s.restore(f)
+    assert len(empty.ms_w) == 2
