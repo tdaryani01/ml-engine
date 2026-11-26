@@ -727,6 +727,7 @@ class DrawInteractiveApp:
         if self.custom_target is None:
             raise RuntimeError("Draw something on the pad and press Set first")
         name = self._drawing_name()      # the same drawing keeps one record, another drawing starts its own
+        self._save_drawing(name)
         try:
             d = self._brain_demo()
             self._brain_log(f"--- train on your drawing ({name}): {'continues from where it got to, if it has been here before' if resume else 'fresh'} ---")
@@ -773,7 +774,9 @@ class DrawInteractiveApp:
                 self._show_target(self.custom_target)
                 self._brain_log(f"--- auto round {i}: a random drawing ---")
                 try:
-                    r = demo.try_drawing(resolve_command("sketch")[0], self._drawing_name(), resume=True)
+                    name = self._drawing_name()
+                    self._save_drawing(name)
+                    r = demo.try_drawing(resolve_command("sketch")[0], name, resume=True)
                 except _BrainStopped:
                     self._brain_log("stopped: this round is not counted")
                     break
@@ -799,13 +802,14 @@ class DrawInteractiveApp:
         import hashlib
 
         # the name is per drawing (a hash of its pixels), not per window or per model: the same drawing keeps one record across tries and windows
-        name = "mine_" + hashlib.sha256(np.ascontiguousarray(self.custom_target).tobytes()).hexdigest()[:8]
-        if self.brain_args:      # the drawing itself is kept beside the trace, so any round can be replayed
-            d = Path(self.brain_args["state_dir"]) / "drawings"
-            d.mkdir(parents=True, exist_ok=True)
-            if not (d / f"{name}.npy").exists():
-                np.save(d / f"{name}.npy", np.asarray(self.custom_target))
-        return name
+        return "mine_" + hashlib.sha256(np.ascontiguousarray(self.custom_target).tobytes()).hexdigest()[:8]
+
+    def _save_drawing(self, name: str) -> None:
+        """Keep the drawing beside the trace (``drawings/<name>.npy`` in the state directory), so any round can be replayed. Auto saves one file per random drawing."""
+        d = Path(self.brain_args["state_dir"]) / "drawings"
+        d.mkdir(parents=True, exist_ok=True)
+        if not (d / f"{name}.npy").exists():
+            np.save(d / f"{name}.npy", np.asarray(self.custom_target))
 
     def brain_start_over(self) -> None:
         self._brain_demo().start_over()
