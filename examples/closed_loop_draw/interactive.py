@@ -125,11 +125,13 @@ class DrawInteractiveApp:
         )
         self.btn_warm = ttk.Button(top, text="Warmup", command=lambda: self._run_action(self.warmup))
         self.btn_stop = ttk.Button(top, text="Stop", command=self._request_stop)
-        self.btn_brain = self.btn_sweep = None
-        if self.brain_args:      # --brain c4: Try = one run steered by the brain that trains to match the drawing (shows its guess, the trials and the result), Sleep = the brain goes over the runs so far and keeps what it can trust
+        self.btn_brain = self.btn_sweep = self.btn_cont = None
+        if self.brain_args:      # --brain c4: Try = one run from a fresh model, steered by the brain, that trains to match the drawing (shows its guess, the trials and the result); Continue = the same, starting from the best point of the earlier runs on this drawing; Sleep = the brain goes over the runs so far and keeps what it can trust
             self.btn_brain = ttk.Button(top, text="Try", command=lambda: self._run_action(self.brain_try, label="try"))
             self.btn_sweep = ttk.Button(top, text="Sleep", command=lambda: self._run_action(self.brain_sleep, label="sleep"))
+            self.btn_cont = ttk.Button(top, text="Continue", command=lambda: self._run_action(lambda: self.brain_try(resume=True), label="continue"))
             self.btn_brain.pack(side=tk.LEFT, padx=(14, 2))
+            self.btn_cont.pack(side=tk.LEFT, padx=2)
             self.btn_sweep.pack(side=tk.LEFT, padx=2)
         else:
             self.btn_draw.pack(side=tk.LEFT, padx=4)
@@ -321,7 +323,7 @@ class DrawInteractiveApp:
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
-        for b in (self.btn_draw, self.btn_train, self.btn_warm, self.btn_brain, self.btn_sweep):
+        for b in (self.btn_draw, self.btn_train, self.btn_warm, self.btn_brain, self.btn_sweep, self.btn_cont):
             if b is not None:
                 b.configure(state=state)
         self.entry.configure(state=state)
@@ -709,7 +711,7 @@ class DrawInteractiveApp:
         except _BrainStopped:
             self._brain_log("stopped: this round is not counted")
 
-    def brain_try(self) -> None:
+    def brain_try(self, resume: bool = False) -> None:
         if self.custom_target is None:
             raise RuntimeError("Draw something on the pad and press Set first")
         import hashlib
@@ -717,8 +719,8 @@ class DrawInteractiveApp:
         name = "mine_" + hashlib.sha256(np.ascontiguousarray(self.custom_target).tobytes()).hexdigest()[:8]      # the same drawing keeps one record, another drawing starts its own
         try:
             d = self._brain_demo()
-            self._brain_log(f"--- try on your drawing ({name}) ---")
-            d.try_drawing(resolve_command("sketch")[0], name)
+            self._brain_log(f"--- {'continue' if resume else 'try'} on your drawing ({name}) ---")
+            d.try_drawing(resolve_command("sketch")[0], name, resume=resume)
         except _BrainStopped:
             self._brain_log("stopped: this try is not counted")
 
