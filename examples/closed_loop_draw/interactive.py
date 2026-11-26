@@ -103,7 +103,7 @@ class DrawInteractiveApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
         self._apply_command(self.command_name)
-        if self.auto_warmup:
+        if self.auto_warmup and not self.brain_args:      # the brain's Try builds a fresh model per run: the window's own warmup would train a model nothing uses
             self.root.after(200, lambda: self._run_action(self.warmup, label="auto-warmup"))
 
     def _build_ui(self) -> None:
