@@ -30,6 +30,8 @@ class DrawActor:
         action_embed: LinearAdapter,
         conditioning: ConditioningBank,
         checkpoint_fn: Callable[[int, float], bytes] | None = None,
+        goal_adapter: LinearAdapter | None = None,
+        target_pool: int = 7,
     ) -> None:
         if adapter.d_out != mhsa.d_model:
             raise ValueError("adapter.d_out must equal mhsa.d_model")
@@ -42,6 +44,8 @@ class DrawActor:
         self.adapter = adapter
         self.action_embed = action_embed
         self.conditioning = conditioning
+        self.goal_adapter = goal_adapter
+        self.target_pool = int(target_pool)
         self.interleaver = TokenInterleaver(mhsa.d_model)
         self.action_dim = int(mhsa.action_dim)
         self.max_seq_len = int(mhsa.max_seq_len)
@@ -59,6 +63,7 @@ class DrawActor:
         self._B = 0
         self._command_ids: np.ndarray | None = None
         self._goal: np.ndarray | None = None
+        self._goal_feat: np.ndarray | None = None
         self._states_S: list[np.ndarray] = []
         self._action_embs: list[np.ndarray] = []
         self._Xs: list[np.ndarray] = []
@@ -76,6 +81,20 @@ class DrawActor:
         self.adapter.zero_grad()
         self.action_embed.zero_grad()
         self.conditioning.zero_grad()
+        if self.goal_adapter is not None:
+            self.goal_adapter.zero_grad()
+
+    def _target_features(self, goal: Any) -> np.ndarray | None:
+        """The goal's target image, average-pooled to (B, C*pool*pool); None when the goal has no target."""
+        t = getattr(goal, "target", None)
+        if t is None:
+            return None
+        t = np.asarray(t, dtype=np.float32)
+        B, C, H, W = t.shape
+        p = self.target_pool
+        hs, ws = H // p, W // p
+        t = t[:, :, : hs * p, : ws * p].reshape(B, C, p, hs, p, ws).mean(axis=(3, 5))
+        return np.ascontiguousarray(t.reshape(B, -1), dtype=np.float32)
 
     @staticmethod
     def _command_ids_from(goal: Any) -> np.ndarray:
@@ -93,6 +112,9 @@ class DrawActor:
         self._max_steps = max(1, int(max_steps))
         self._command_ids = command_ids
         self._goal = self.conditioning.embed(command_ids)
+        self._goal_feat = self._target_features(goal) if self.goal_adapter is not None else None
+        if self._goal_feat is not None:
+            self._goal = self._goal + self.goal_adapter.forward(self._goal_feat)
         self._dA_emb_pending = [None] * max(0, self._max_steps - 1)
 
     def act(self, obs: np.ndarray) -> np.ndarray:
@@ -155,10 +177,15 @@ class DrawActor:
             self._mhsa_acc = self._new_mhsa_grad_acc()
         if self._dG_acc is not None:
             self.conditioning.backward(self._dG_acc, self._command_ids)
+            if self._goal_feat is not None:
+                self.goal_adapter.forward(self._goal_feat)
+                self.goal_adapter.backward(self._dG_acc)
 
     def apply_updates(self, lr: float) -> None:
         """One optimizer step over every actor parameter."""
         self.conditioning.apply_pending(lr)
+        if self.goal_adapter is not None:
+            self.goal_adapter.apply_pending(lr)
         self.adapter.apply_pending(lr)
         self.action_embed.apply_pending(lr)
         self.encoder.apply_pending(lr)

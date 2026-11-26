@@ -103,35 +103,44 @@ class DrawInteractiveApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_ui()
         self._apply_command(self.command_name)
-        if self.auto_warmup:
+        if self.auto_warmup and not self.brain_args:      # the brain's Try builds a fresh model per run: the window's own warmup would train a model nothing uses
             self.root.after(200, lambda: self._run_action(self.warmup, label="auto-warmup"))
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=8)
         top.pack(fill=tk.X)
 
-        ttk.Label(top, text="Command:").pack(side=tk.LEFT)
         self.cmd_var = tk.StringVar(value=self.command_name)
         self.entry = ttk.Entry(top, textvariable=self.cmd_var, width=18)
-        self.entry.pack(side=tk.LEFT, padx=6)
-        self.entry.bind("<Return>", lambda _e: self._on_set_command())
-
-        ttk.Button(top, text="Set", command=self._on_set_command).pack(side=tk.LEFT, padx=2)
+        if not self.brain_args:
+            ttk.Label(top, text="Command:").pack(side=tk.LEFT)
+            self.entry.pack(side=tk.LEFT, padx=6)
+            self.entry.bind("<Return>", lambda _e: self._on_set_command())
+            ttk.Button(top, text="Set", command=self._on_set_command).pack(side=tk.LEFT, padx=2)
+        else:      # --brain c4: draw anything on the pad; Set takes it as the target, Try lets the brain train to match it, Sleep lets the brain keep what it can trust
+            ttk.Button(top, text="Set", command=self._use_sketch_as_target).pack(side=tk.LEFT, padx=2)
         self.btn_draw = ttk.Button(top, text="Draw", command=lambda: self._run_action(self.animate_draw))
         self.btn_train = ttk.Button(
             top, text="Auto-train", command=lambda: self._run_action(self.train_then_draw)
         )
         self.btn_warm = ttk.Button(top, text="Warmup", command=lambda: self._run_action(self.warmup))
         self.btn_stop = ttk.Button(top, text="Stop", command=self._request_stop)
-        self.btn_brain = self.btn_sweep = None
-        if self.brain_args:      # --brain c4: the current brain steers a run, shows its guess, the try and the result, and sleeps after each sweep of the five shapes
-            self.btn_brain = ttk.Button(top, text="Brain round", command=lambda: self._run_action(self.brain_round, label="brain round"))
-            self.btn_sweep = ttk.Button(top, text="Brain sweep (5)", command=lambda: self._run_action(self.brain_sweep, label="brain sweep"))
+        self.btn_brain = self.btn_sweep = self.btn_cont = self.btn_auto = None
+        if self.brain_args:      # --brain c4: Train = one round steered by the brain that trains to match the drawing, continuing the one model from where the last round ended, whatever the drawing was (saved on disk), with a plain RESULT line saying whether it improved; Start over = forget the model; Sleep = the brain goes over the runs so far and keeps what it can trust
+            self.btn_brain = ttk.Button(top, text="Train", command=lambda: self._run_action(lambda: self.brain_try(resume=True), label="train"))
+            self.btn_sweep = ttk.Button(top, text="Sleep", command=lambda: self._run_action(self.brain_sleep, label="sleep"))
+            self.btn_cont = ttk.Button(top, text="Start over", command=lambda: self._run_action(self.brain_start_over, label="start over"))
+            self.auto_var = tk.BooleanVar(value=False)
+            self.btn_auto = None      # Auto is a switch (a check button), not a button: it is never disabled while a round runs, so it can be turned off
+            self.auto_switch = ttk.Checkbutton(top, text="Auto (random drawings)", variable=self.auto_var, command=self._on_auto_toggle)
             self.btn_brain.pack(side=tk.LEFT, padx=(14, 2))
             self.btn_sweep.pack(side=tk.LEFT, padx=2)
-        self.btn_draw.pack(side=tk.LEFT, padx=4)
-        self.btn_train.pack(side=tk.LEFT, padx=2)
-        self.btn_warm.pack(side=tk.LEFT, padx=2)
+            self.btn_cont.pack(side=tk.LEFT, padx=2)
+            self.auto_switch.pack(side=tk.LEFT, padx=(14, 2))
+        else:
+            self.btn_draw.pack(side=tk.LEFT, padx=4)
+            self.btn_train.pack(side=tk.LEFT, padx=2)
+            self.btn_warm.pack(side=tk.LEFT, padx=2)
         self.btn_stop.pack(side=tk.LEFT, padx=6)
         self.btn_stop.configure(state=tk.DISABLED)
 
@@ -194,6 +203,8 @@ class DrawInteractiveApp:
         )
         self.sketch.pack(side=tk.LEFT, padx=(0, 12))
         self.sketch.set_use_command(self._use_sketch_as_target)
+        if self.brain_args:      # Set does this; one button
+            self.sketch.use_btn.pack_forget()
 
         right = ttk.Frame(body)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -280,7 +291,7 @@ class DrawInteractiveApp:
         self._show_canvas(blank)
         ink = float(self.custom_target.mean())
         self.status_var.set(
-            f"sketch set as target (ink={ink:.3f}) — Auto-train (or Warmup)"
+            f"drawing set as target (ink={ink:.3f}) — press Train" if self.brain_args else f"sketch set as target (ink={ink:.3f}) — Auto-train (or Warmup)"
         )
 
     def _apply_command(self, text: str) -> None:
@@ -316,7 +327,7 @@ class DrawInteractiveApp:
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
-        for b in (self.btn_draw, self.btn_train, self.btn_warm, self.btn_brain, self.btn_sweep):
+        for b in (self.btn_draw, self.btn_train, self.btn_warm, self.btn_brain, self.btn_sweep, self.btn_cont):
             if b is not None:
                 b.configure(state=state)
         self.entry.configure(state=state)
@@ -658,7 +669,10 @@ class DrawInteractiveApp:
     def _brain_make_session(self, shape: int, seed: int, val_shape: int):
         from examples.closed_loop_draw.session import DrawSession
 
-        s = DrawSession(copy.deepcopy(self.cfg), seed=seed, train_command=shape, val_command=val_shape)
+        cfg = copy.deepcopy(self.cfg)
+        cfg["closed_loop"]["target_conditioning"] = True      # the brain window's model sees the drawing it is asked for (a learned map of the target image into its goal), so one model can learn many drawings; the plain window is unchanged
+        s = DrawSession(cfg, seed=seed, train_command=shape, val_command=val_shape, train_target=self.custom_target if shape == resolve_command("sketch")[0] else None)
+        s.record_ring = False      # the window skips the ring-next rollout per boundary (a recorded column only, nothing reads it): faster rounds; the stage runs keep it
         self._brain_calls = 0
         self._show_target(s.target())
 
@@ -666,6 +680,9 @@ class DrawInteractiveApp:
             self._brain_calls += 1
             if self._stop_requested:
                 raise _BrainStopped()
+            if self._brain_calls % 5 == 0:      # a round takes minutes: say what it is doing and move the bar (the bar is an estimate: about 500 steps of training and rollouts per run)
+                self.status_var.set(f"working: {self._brain_calls} steps so far in this run ({'training' if kind == 'train' else 'checking the result'})")
+                self._set_progress(min(self._brain_calls / 500.0, 1.0))
             if kind == "train" and self._brain_calls % 10 == 0:
                 self._show_canvas(s.canvas())
             self._pump()
@@ -685,8 +702,17 @@ class DrawInteractiveApp:
             unit = None
             if self.brain_args.get("null_result"):
                 unit = json.loads(Path(self.brain_args["null_result"]).read_text())["noise_unit"]["unit"]
-            self.brain_demo = draw_window.BrainDemo(os.path.join(root, "maze"), self.cfg, self.brain_args["state_dir"], unit, STOCK_COMMAND_IDS, self._brain_make_session, self._brain_log, bars_path=self.brain_args.get("bars_file"))
+            fresh = not any(Path(self.brain_args["state_dir"]).glob("*")) if Path(self.brain_args["state_dir"]).exists() else True
+            self.brain_demo = draw_window.BrainDemo(os.path.join(root, "maze"), self.cfg, self.brain_args["state_dir"], unit, STOCK_COMMAND_IDS, self._brain_make_session, self._brain_log, bars_path=self.brain_args.get("bars_file"), unit_by_shape=self._brain_units(), baseline_skills=True)
+            self._brain_log("This window starts from a fresh state: nothing is remembered yet. Every number here is how well the model draws the drawing it is trained on (lower is better)." if fresh else "This window continues its saved state: the model and what the brain learned are kept. Every number is how well the model draws the drawing it is trained on (lower is better).")
         return self.brain_demo
+
+    def _brain_units(self) -> dict | None:
+        """Per-shape noise units from the null result's cells (position in the stock shapes), as the registered stage 2 uses them. The window is judged on the fit to the trained drawing (``DrawSession.fit``), so ``--null-result`` must be the fit-unit file (``null_read_fit.json``); the ring-next units of ``null_read.json`` would mis-scale every score."""
+        if not self.brain_args.get("null_result"):
+            return None
+        cells = json.loads(Path(self.brain_args["null_result"]).read_text())["noise_unit"]["cells"]
+        return {cid: float(cells[str(i)]["median_abs_d"]) for i, cid in enumerate(STOCK_COMMAND_IDS)}
 
     def brain_round(self) -> None:
         try:
@@ -696,6 +722,102 @@ class DrawInteractiveApp:
             d.round()
         except _BrainStopped:
             self._brain_log("stopped: this round is not counted")
+
+    def brain_try(self, resume: bool = False) -> None:
+        if self.custom_target is None:
+            raise RuntimeError("Draw something on the pad and press Set first")
+        name = self._drawing_name()      # the same drawing keeps one record, another drawing starts its own
+        self._save_drawing(name)
+        try:
+            d = self._brain_demo()
+            self._brain_log(f"--- train on your drawing ({name}): {'continues from where it got to, if it has been here before' if resume else 'fresh'} ---")
+            d.try_drawing(resolve_command("sketch")[0], name, resume=resume)
+        except _BrainStopped:
+            self._brain_log("stopped: this try is not counted")
+
+    def _random_target(self) -> np.ndarray:
+        """A random drawing: one to three strokes (straight or bent) of 2-3 px, as (1, C, H, W) in [0, 1]."""
+        rng = np.random.default_rng()
+        yy, xx = np.mgrid[0:self.H, 0:self.W]
+        img = np.zeros((self.H, self.W), dtype=np.float32)
+        for _ in range(int(rng.integers(1, 4))):
+            pts = rng.uniform(3, [self.H - 3, self.W - 3], size=(int(rng.integers(2, 4)), 2))
+            for a, b in zip(pts[:-1], pts[1:]):
+                d = b - a
+                t = np.clip(((yy - a[0]) * d[0] + (xx - a[1]) * d[1]) / max(float(d @ d), 1e-6), 0.0, 1.0)
+                dist = np.hypot(yy - (a[0] + t * d[0]), xx - (a[1] + t * d[1]))
+                img = np.maximum(img, np.clip(1.6 - dist, 0.0, 1.0).astype(np.float32))
+        return np.repeat(img[None, None, :, :], self.C, axis=1)
+
+    AUTO_SLEEP_EVERY = 5      # Auto sleeps after every 5 rounds (the demo's sweep of five)
+
+    def _on_auto_toggle(self) -> None:
+        """Auto on: rounds on new random drawings, one after the other, the one model carrying on, a sleep after every 5 rounds, until it is switched off (the running round finishes first) or Stop is pressed (the running round is dropped)."""
+        if self.auto_var.get():
+            if self.busy:
+                self.auto_var.set(False)
+                self.status_var.set("busy — wait for the current action to finish, then switch Auto on")
+                return
+            self._run_action(self.brain_auto, label="auto")
+        else:
+            self.status_var.set("auto: stopping after the current round…")
+
+    def brain_auto(self) -> None:
+        errs: list[float] = []
+        demo = self._brain_demo()
+        i = 0
+        try:
+            while self.auto_var.get() and not self._stop_requested:
+                i += 1
+                self.custom_target = self._random_target()
+                self.command_id, self.command_name = resolve_command("sketch")
+                self._show_target(self.custom_target)
+                self._brain_log(f"--- auto round {i}: a random drawing ---")
+                try:
+                    name = self._drawing_name()
+                    self._save_drawing(name)
+                    r = demo.try_drawing(resolve_command("sketch")[0], name, resume=True)
+                except _BrainStopped:
+                    self._brain_log("stopped: this round is not counted")
+                    break
+                if r.get("ratio") is not None and r["ratio"] > 0:
+                    errs.append(float(r["ratio"]))      # error of the carried model / error of a fresh model on the same drawing with the same effort: the difficulty of the drawing cancels
+                if i % self.AUTO_SLEEP_EVERY == 0 and self.auto_var.get() and not self._stop_requested:      # the sleep between rounds: the brain goes over the rows so far and keeps what it can trust
+                    self._brain_log(f"--- auto: sleep after round {i} ---")
+                    demo.sleep_now()
+        finally:
+            self.auto_var.set(False)
+        if len(errs) >= 4:
+            import math
+
+            h = len(errs) // 2
+            a, b = math.exp(sum(math.log(x) for x in errs[:h]) / h), math.exp(sum(math.log(x) for x in errs[-h:]) / h)
+            self._brain_log(f"AUTO SUMMARY {len(errs)} random drawings, error as a multiple of a fresh model's on the same drawing (below 1 = better than a beginner): first {h} rounds {a:.2f}x, last {h} rounds {b:.2f}x -> " + (f"improving ({(1 - b / a) * 100:.0f}% lower)" if b < a else f"not improving ({(b / a - 1) * 100:.0f}% higher)"))
+        elif errs:
+            self._brain_log(f"AUTO SUMMARY {len(errs)} round(s), error vs a fresh model: " + ", ".join(f"{e:.2f}x" for e in errs))
+
+    def _drawing_name(self) -> str:
+        if self.custom_target is None:
+            raise RuntimeError("Draw something on the pad and press Set first")
+        import hashlib
+
+        # the name is per drawing (a hash of its pixels), not per window or per model: the same drawing keeps one record across tries and windows
+        return "mine_" + hashlib.sha256(np.ascontiguousarray(self.custom_target).tobytes()).hexdigest()[:8]
+
+    def _save_drawing(self, name: str) -> None:
+        """Keep the drawing beside the trace (``drawings/<name>.npy`` in the state directory), so any round can be replayed. Auto saves one file per random drawing."""
+        d = Path(self.brain_args["state_dir"]) / "drawings"
+        d.mkdir(parents=True, exist_ok=True)
+        if not (d / f"{name}.npy").exists():
+            np.save(d / f"{name}.npy", np.asarray(self.custom_target))
+
+    def brain_start_over(self) -> None:
+        self._brain_demo().start_over()
+        self._brain_log("--- start over: forgot the model (its weights) and the round history; the next Train starts from a fresh model. What the brain learned about decisions stays ---")
+
+    def brain_sleep(self) -> None:
+        self._brain_log("--- sleep ---")
+        self._brain_demo().sleep_now()
 
     def brain_sweep(self) -> None:
         k = len(STOCK_COMMAND_IDS)

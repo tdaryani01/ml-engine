@@ -62,3 +62,12 @@ def test_restore_into_a_fresh_session_creates_the_moments_the_optimiser_makes_la
     s.app.cnn.optimizer = empty
     s.restore(f)
     assert len(empty.ms_w) == 2
+
+
+def test_a_drawing_of_ones_own_needs_the_sketch_command():
+    from examples.closed_loop_draw.session import DrawSession
+
+    with pytest.raises(ValueError):
+        DrawSession({}, seed=1, train_command=0, val_command=1, train_target=np.zeros((1, 1, 28, 28), dtype=np.float32))
+    with pytest.raises(ValueError):
+        DrawSession({}, seed=1, train_command=0, val_command=0)      # without a drawing the validation shape still differs from the training shape
