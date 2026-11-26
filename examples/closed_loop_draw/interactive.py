@@ -110,13 +110,15 @@ class DrawInteractiveApp:
         top = ttk.Frame(self.root, padding=8)
         top.pack(fill=tk.X)
 
-        ttk.Label(top, text="Command:").pack(side=tk.LEFT)
         self.cmd_var = tk.StringVar(value=self.command_name)
         self.entry = ttk.Entry(top, textvariable=self.cmd_var, width=18)
-        self.entry.pack(side=tk.LEFT, padx=6)
-        self.entry.bind("<Return>", lambda _e: self._on_set_command())
-
-        ttk.Button(top, text="Set", command=self._on_set_command).pack(side=tk.LEFT, padx=2)
+        if not self.brain_args:
+            ttk.Label(top, text="Command:").pack(side=tk.LEFT)
+            self.entry.pack(side=tk.LEFT, padx=6)
+            self.entry.bind("<Return>", lambda _e: self._on_set_command())
+            ttk.Button(top, text="Set", command=self._on_set_command).pack(side=tk.LEFT, padx=2)
+        else:      # --brain c4: draw anything on the pad; Set takes it as the target, Try lets the brain train to match it, Sleep lets the brain keep what it can trust
+            ttk.Button(top, text="Set", command=self._use_sketch_as_target).pack(side=tk.LEFT, padx=2)
         self.btn_draw = ttk.Button(top, text="Draw", command=lambda: self._run_action(self.animate_draw))
         self.btn_train = ttk.Button(
             top, text="Auto-train", command=lambda: self._run_action(self.train_then_draw)
@@ -124,7 +126,7 @@ class DrawInteractiveApp:
         self.btn_warm = ttk.Button(top, text="Warmup", command=lambda: self._run_action(self.warmup))
         self.btn_stop = ttk.Button(top, text="Stop", command=self._request_stop)
         self.btn_brain = self.btn_sweep = None
-        if self.brain_args:      # --brain c4: three buttons. Set picks the shape, Try = one run steered by the brain on that shape (shows its guess, the trials and the result), Sleep = the brain goes over the runs so far and keeps what it can trust
+        if self.brain_args:      # --brain c4: Try = one run steered by the brain that trains to match the drawing (shows its guess, the trials and the result), Sleep = the brain goes over the runs so far and keeps what it can trust
             self.btn_brain = ttk.Button(top, text="Try", command=lambda: self._run_action(self.brain_try, label="try"))
             self.btn_sweep = ttk.Button(top, text="Sleep", command=lambda: self._run_action(self.brain_sleep, label="sleep"))
             self.btn_brain.pack(side=tk.LEFT, padx=(14, 2))
@@ -195,6 +197,8 @@ class DrawInteractiveApp:
         )
         self.sketch.pack(side=tk.LEFT, padx=(0, 12))
         self.sketch.set_use_command(self._use_sketch_as_target)
+        if self.brain_args:      # Set does this; one button
+            self.sketch.use_btn.pack_forget()
 
         right = ttk.Frame(body)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -281,7 +285,7 @@ class DrawInteractiveApp:
         self._show_canvas(blank)
         ink = float(self.custom_target.mean())
         self.status_var.set(
-            f"sketch set as target (ink={ink:.3f}) — Auto-train (or Warmup)"
+            f"drawing set as target (ink={ink:.3f}) — press Try" if self.brain_args else f"sketch set as target (ink={ink:.3f}) — Auto-train (or Warmup)"
         )
 
     def _apply_command(self, text: str) -> None:
@@ -659,7 +663,7 @@ class DrawInteractiveApp:
     def _brain_make_session(self, shape: int, seed: int, val_shape: int):
         from examples.closed_loop_draw.session import DrawSession
 
-        s = DrawSession(copy.deepcopy(self.cfg), seed=seed, train_command=shape, val_command=val_shape)
+        s = DrawSession(copy.deepcopy(self.cfg), seed=seed, train_command=shape, val_command=val_shape, train_target=self.custom_target if shape == resolve_command("sketch")[0] else None)
         self._brain_calls = 0
         self._show_target(s.target())
 
@@ -706,13 +710,15 @@ class DrawInteractiveApp:
             self._brain_log("stopped: this round is not counted")
 
     def brain_try(self) -> None:
-        shape = self.command_id
-        if shape not in STOCK_COMMAND_IDS:
-            raise RuntimeError("Try runs on the five stock shapes: Set one of them first")
+        if self.custom_target is None:
+            raise RuntimeError("Draw something on the pad and press Set first")
+        import hashlib
+
+        name = "mine_" + hashlib.sha256(np.ascontiguousarray(self.custom_target).tobytes()).hexdigest()[:8]      # the same drawing keeps one record, another drawing starts its own
         try:
             d = self._brain_demo()
-            self._brain_log(f"--- try on '{COMMANDS[shape]}' ---")
-            d.try_shape(shape)
+            self._brain_log(f"--- try on your drawing ({name}) ---")
+            d.try_drawing(resolve_command("sketch")[0], name)
         except _BrainStopped:
             self._brain_log("stopped: this try is not counted")
 

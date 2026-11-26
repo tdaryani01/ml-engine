@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 
 from examples.closed_loop_draw.assemble import assemble, load_config
-from examples.closed_loop_draw.commands import STOCK_COMMAND_IDS, load_command_target
+from examples.closed_loop_draw.commands import STOCK_COMMAND_IDS, load_command_target, resolve_command
 from examples.closed_loop_draw.goal import DrawGoal
 from src.closed_loop.fit import terminal_loss
 from src.closed_loop.state import capture_state, restore_state
@@ -54,12 +54,15 @@ def _copyable(v: Any) -> bool:
 
 
 class DrawSession:
-    def __init__(self, cfg: dict[str, Any] | str | Path, *, seed: int, train_command: int, val_command: int, lr: float | None = None) -> None:
+    def __init__(self, cfg: dict[str, Any] | str | Path, *, seed: int, train_command: int, val_command: int, lr: float | None = None, train_target: np.ndarray | None = None) -> None:
         self.cfg = load_config(cfg) if isinstance(cfg, (str, Path)) else cfg
-        if train_command == val_command:
-            raise ValueError("the validation shape must differ from the training shape")
-        if train_command not in STOCK_COMMAND_IDS or val_command not in STOCK_COMMAND_IDS:
-            raise ValueError("train_command and val_command must be stock commands")
+        if train_command == val_command and train_target is None:
+            raise ValueError("the validation shape must differ from the training shape (only a drawing of one's own is validated on itself: what you want matched is the drawing)")
+        sketch = resolve_command("sketch")[0]
+        if train_target is not None and train_command != sketch:
+            raise ValueError("a custom train_target goes with the sketch command")
+        if (train_command not in STOCK_COMMAND_IDS and train_target is None) or (val_command not in STOCK_COMMAND_IDS and val_command != train_command):
+            raise ValueError("train_command and val_command must be stock commands (the training shape may be the sketch command with its own train_target)")
         self.seed, self.train_command, self.val_command = int(seed), int(train_command), int(val_command)
         self.app = assemble(self.cfg, seed=self.seed)
         self.lr = float(lr if lr is not None else self.app.lr)
@@ -67,7 +70,9 @@ class DrawSession:
         self.tick = None            # optional callback ``tick(kind)`` after each train trajectory (kind 'train') and each val rollout ('val'): the window pumps its events there; it may raise to stop the run
         self._ids = {c: np.full(self.app.batch_size, c, dtype=np.int64) for c in (self.train_command, self.val_command)}
         C, H, W = (int(x) for x in self.cfg["closed_loop"]["canvas"])
-        self._target = {c: load_command_target(c, batch_size=self.app.batch_size, height=H, width=W, channels=C) for c in self._ids}
+        self._target = {c: load_command_target(c, batch_size=self.app.batch_size, height=H, width=W, channels=C) for c in self._ids if c != sketch or train_target is None}
+        if train_target is not None:      # the user's own drawing: (1, C, H, W), the training shape of this session
+            self._target[sketch] = np.repeat(np.asarray(train_target, dtype=np.float32), self.app.batch_size, axis=0)
 
     def _goal(self, command: int) -> DrawGoal:
         return DrawGoal(command_ids=self._ids[command], target=self._target[command])
