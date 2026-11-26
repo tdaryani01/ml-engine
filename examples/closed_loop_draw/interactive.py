@@ -740,8 +740,10 @@ class DrawInteractiveApp:
                 img = np.maximum(img, np.clip(1.6 - dist, 0.0, 1.0).astype(np.float32))
         return np.repeat(img[None, None, :, :], self.C, axis=1)
 
+    AUTO_SLEEP_EVERY = 5      # Auto sleeps after every 5 rounds (the demo's sweep of five)
+
     def _on_auto_toggle(self) -> None:
-        """Auto on: rounds on new random drawings, one after the other, the one model carrying on, until it is switched off (the running round finishes first) or Stop is pressed (the running round is dropped)."""
+        """Auto on: rounds on new random drawings, one after the other, the one model carrying on, a sleep after every 5 rounds, until it is switched off (the running round finishes first) or Stop is pressed (the running round is dropped)."""
         if self.auto_var.get():
             if self.busy:
                 self.auto_var.set(False)
@@ -768,6 +770,9 @@ class DrawInteractiveApp:
                     self._brain_log("stopped: this round is not counted")
                     break
                 errs.append(float(r["run"]["best_val"]))
+                if i % self.AUTO_SLEEP_EVERY == 0 and self.auto_var.get() and not self._stop_requested:      # the sleep between rounds: the brain goes over the rows so far and keeps what it can trust
+                    self._brain_log(f"--- auto: sleep after round {i} ---")
+                    demo.sleep_now()
         finally:
             self.auto_var.set(False)
         if len(errs) >= 4:
