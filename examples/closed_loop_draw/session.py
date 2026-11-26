@@ -35,7 +35,7 @@ class Fork:
     extra: dict[str, dict[str, Any]]
 
 
-_STATE_ATTRS = {"adapter": ("W", "b", "_mW", "_vW", "_mb", "_vb", "_t"), "action_embed": ("W", "b", "_mW", "_vW", "_mb", "_vb", "_t"), "conditioning": ("embeddings", "_m", "_v", "_t")}      # the weights and Adam state of the small modules; NOT their forward caches (``_last_x``) or gradients
+_STATE_ATTRS = {"adapter": ("W", "b", "_mW", "_vW", "_mb", "_vb", "_t"), "action_embed": ("W", "b", "_mW", "_vW", "_mb", "_vb", "_t"), "goal_adapter": ("W", "b", "_mW", "_vW", "_mb", "_vb", "_t"), "conditioning": ("embeddings", "_m", "_v", "_t")}      # the weights and Adam state of the small modules; NOT their forward caches (``_last_x``) or gradients
 
 
 def _holds_arrays(v: Any) -> bool:
@@ -96,6 +96,13 @@ class DrawSession:
                 self.tick("val")
         return float(np.mean(vals))
 
+    def fit(self) -> float:
+        """Terminal loss of one no-update rollout on the TRAINING shape's own target: the fit to the trained drawing, NOT held out (the draw is deterministic, one fixed target, no sampling). The draw test is judged on this; ``val`` (the ring-next shape) stays as a recorded column."""
+        v = terminal_loss(self.app.trainer.rollout_train(goal=self._goal(self.train_command), lr=self.lr, apply_updates=False))
+        if self.tick is not None:
+            self.tick("val")
+        return float(v)
+
     def canvas(self) -> np.ndarray:
         """What the model draws now for the training shape: the last frame of an inference rollout, (1, C, H, W). Does not touch the weights or the optimiser."""
         from examples.closed_loop_draw.goal import DrawGoal as _G
@@ -108,7 +115,7 @@ class DrawSession:
 
     def _parts(self) -> dict[str, Any]:
         a = self.app
-        return {"adapter": a.adapter, "action_embed": a.action_embed, "conditioning": a.conditioning, "cnn_opt": getattr(a.cnn, "optimizer", None)}
+        return {"adapter": a.adapter, "action_embed": a.action_embed, "conditioning": a.conditioning, "goal_adapter": getattr(a, "goal_adapter", None), "cnn_opt": getattr(a.cnn, "optimizer", None)}
 
     def fork(self) -> Fork:
         extra = {}

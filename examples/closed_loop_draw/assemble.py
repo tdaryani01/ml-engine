@@ -36,6 +36,7 @@ class DrawApp:
     loss_fn: CanvasReconstructionLoss
     actor: DrawActor
     cfg: dict[str, Any]
+    goal_adapter: Any = None            # only with closed_loop.target_conditioning: a learned map from the pooled target image to the goal embedding (the model sees WHICH drawing it is asked for, not only the command id)
 
     @property
     def max_steps(self) -> int:
@@ -236,6 +237,10 @@ def assemble(cfg: dict[str, Any], *, seed: int = 0) -> DrawApp:
         d_model=mhsa.d_model,
         seed=seed + 4,
     )
+    goal_adapter = None
+    if bool(cl.get("target_conditioning", False)):
+        pool = int(cl.get("target_pool", 7))
+        goal_adapter = LinearAdapter(C * pool * pool, mhsa.d_model, seed=seed + 5)
     env = SoftCanvasEnv(
         height=H,
         width=W,
@@ -265,6 +270,8 @@ def assemble(cfg: dict[str, Any], *, seed: int = 0) -> DrawApp:
         adapter=adapter,
         action_embed=action_embed,
         conditioning=conditioning,
+        goal_adapter=goal_adapter,
+        target_pool=int(cl.get("target_pool", 7)),
     )
     trainer = ClosedLoopTrainer(
         actor=actor,
@@ -284,6 +291,7 @@ def assemble(cfg: dict[str, Any], *, seed: int = 0) -> DrawApp:
         loss_fn=loss_fn,
         actor=actor,
         cfg=cfg,
+        goal_adapter=goal_adapter,
     )
 
     # Deferred import avoids the assemble <-> draw_checkpoint cycle.

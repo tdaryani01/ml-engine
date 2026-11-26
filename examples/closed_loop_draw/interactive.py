@@ -669,7 +669,10 @@ class DrawInteractiveApp:
     def _brain_make_session(self, shape: int, seed: int, val_shape: int):
         from examples.closed_loop_draw.session import DrawSession
 
-        s = DrawSession(copy.deepcopy(self.cfg), seed=seed, train_command=shape, val_command=val_shape, train_target=self.custom_target if shape == resolve_command("sketch")[0] else None)
+        cfg = copy.deepcopy(self.cfg)
+        cfg["closed_loop"]["target_conditioning"] = True      # the brain window's model sees the drawing it is asked for (a learned map of the target image into its goal), so one model can learn many drawings; the plain window is unchanged
+        s = DrawSession(cfg, seed=seed, train_command=shape, val_command=val_shape, train_target=self.custom_target if shape == resolve_command("sketch")[0] else None)
+        s.record_ring = False      # the window skips the ring-next rollout per boundary (a recorded column only, nothing reads it): faster rounds; the stage runs keep it
         self._brain_calls = 0
         self._show_target(s.target())
 
@@ -677,6 +680,9 @@ class DrawInteractiveApp:
             self._brain_calls += 1
             if self._stop_requested:
                 raise _BrainStopped()
+            if self._brain_calls % 5 == 0:      # a round takes minutes: say what it is doing and move the bar (the bar is an estimate: about 500 steps of training and rollouts per run)
+                self.status_var.set(f"working: {self._brain_calls} steps so far in this run ({'training' if kind == 'train' else 'checking the result'})")
+                self._set_progress(min(self._brain_calls / 500.0, 1.0))
             if kind == "train" and self._brain_calls % 10 == 0:
                 self._show_canvas(s.canvas())
             self._pump()
@@ -696,11 +702,13 @@ class DrawInteractiveApp:
             unit = None
             if self.brain_args.get("null_result"):
                 unit = json.loads(Path(self.brain_args["null_result"]).read_text())["noise_unit"]["unit"]
+            fresh = not any(Path(self.brain_args["state_dir"]).glob("*")) if Path(self.brain_args["state_dir"]).exists() else True
             self.brain_demo = draw_window.BrainDemo(os.path.join(root, "maze"), self.cfg, self.brain_args["state_dir"], unit, STOCK_COMMAND_IDS, self._brain_make_session, self._brain_log, bars_path=self.brain_args.get("bars_file"), unit_by_shape=self._brain_units(), baseline_skills=True)
+            self._brain_log("This window starts from a fresh state: nothing is remembered yet. Every number here is how well the model draws the drawing it is trained on (lower is better)." if fresh else "This window continues its saved state: the model and what the brain learned are kept. Every number is how well the model draws the drawing it is trained on (lower is better).")
         return self.brain_demo
 
     def _brain_units(self) -> dict | None:
-        """Per-shape noise units from the null result's cells (position in the stock shapes), as the registered stage 2 uses them."""
+        """Per-shape noise units from the null result's cells (position in the stock shapes), as the registered stage 2 uses them. The window is judged on the fit to the trained drawing (``DrawSession.fit``), so ``--null-result`` must be the fit-unit file (``null_read_fit.json``); the ring-next units of ``null_read.json`` would mis-scale every score."""
         if not self.brain_args.get("null_result"):
             return None
         cells = json.loads(Path(self.brain_args["null_result"]).read_text())["noise_unit"]["cells"]
@@ -790,7 +798,14 @@ class DrawInteractiveApp:
             raise RuntimeError("Draw something on the pad and press Set first")
         import hashlib
 
-        return "mine_" + hashlib.sha256(np.ascontiguousarray(self.custom_target).tobytes()).hexdigest()[:8]
+        # the name is per drawing (a hash of its pixels), not per window or per model: the same drawing keeps one record across tries and windows
+        name = "mine_" + hashlib.sha256(np.ascontiguousarray(self.custom_target).tobytes()).hexdigest()[:8]
+        if self.brain_args:      # the drawing itself is kept beside the trace, so any round can be replayed
+            d = Path(self.brain_args["state_dir"]) / "drawings"
+            d.mkdir(parents=True, exist_ok=True)
+            if not (d / f"{name}.npy").exists():
+                np.save(d / f"{name}.npy", np.asarray(self.custom_target))
+        return name
 
     def brain_start_over(self) -> None:
         self._brain_demo().start_over()
