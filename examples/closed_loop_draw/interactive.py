@@ -126,7 +126,7 @@ class DrawInteractiveApp:
         self.btn_warm = ttk.Button(top, text="Warmup", command=lambda: self._run_action(self.warmup))
         self.btn_stop = ttk.Button(top, text="Stop", command=self._request_stop)
         self.btn_brain = self.btn_sweep = self.btn_cont = None
-        if self.brain_args:      # --brain c4: Train = one round steered by the brain that trains to match the drawing, continuing from where the earlier rounds on this drawing got to (saved on disk), with a plain RESULT line saying whether it improved; Start over = forget this drawing's weights; Sleep = the brain goes over the runs so far and keeps what it can trust
+        if self.brain_args:      # --brain c4: Train = one round steered by the brain that trains to match the drawing, continuing the one model from where the last round ended, whatever the drawing was (saved on disk), with a plain RESULT line saying whether it improved; Start over = forget the model; Sleep = the brain goes over the runs so far and keeps what it can trust
             self.btn_brain = ttk.Button(top, text="Train", command=lambda: self._run_action(lambda: self.brain_try(resume=True), label="train"))
             self.btn_sweep = ttk.Button(top, text="Sleep", command=lambda: self._run_action(self.brain_sleep, label="sleep"))
             self.btn_cont = ttk.Button(top, text="Start over", command=lambda: self._run_action(self.brain_start_over, label="start over"))
@@ -730,9 +730,8 @@ class DrawInteractiveApp:
         return "mine_" + hashlib.sha256(np.ascontiguousarray(self.custom_target).tobytes()).hexdigest()[:8]
 
     def brain_start_over(self) -> None:
-        name = self._drawing_name()
-        self._brain_demo().start_over(name)
-        self._brain_log(f"--- start over: forgot the weights and the round history of this drawing ({name}); the next Train starts from a fresh model ---")
+        self._brain_demo().start_over()
+        self._brain_log("--- start over: forgot the model (its weights) and the round history; the next Train starts from a fresh model. What the brain learned about decisions stays ---")
 
     def brain_sleep(self) -> None:
         self._brain_log("--- sleep ---")
