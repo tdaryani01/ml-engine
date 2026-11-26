@@ -126,13 +126,13 @@ class DrawInteractiveApp:
         self.btn_warm = ttk.Button(top, text="Warmup", command=lambda: self._run_action(self.warmup))
         self.btn_stop = ttk.Button(top, text="Stop", command=self._request_stop)
         self.btn_brain = self.btn_sweep = self.btn_cont = None
-        if self.brain_args:      # --brain c4: Try = one run from a fresh model, steered by the brain, that trains to match the drawing (shows its guess, the trials and the result); Continue = the same, starting from the best point of the earlier runs on this drawing; Sleep = the brain goes over the runs so far and keeps what it can trust
-            self.btn_brain = ttk.Button(top, text="Try", command=lambda: self._run_action(self.brain_try, label="try"))
+        if self.brain_args:      # --brain c4: Train = one round steered by the brain that trains to match the drawing, continuing from where the earlier rounds on this drawing got to (saved on disk), with a plain RESULT line saying whether it improved; Start over = forget this drawing's weights; Sleep = the brain goes over the runs so far and keeps what it can trust
+            self.btn_brain = ttk.Button(top, text="Train", command=lambda: self._run_action(lambda: self.brain_try(resume=True), label="train"))
             self.btn_sweep = ttk.Button(top, text="Sleep", command=lambda: self._run_action(self.brain_sleep, label="sleep"))
-            self.btn_cont = ttk.Button(top, text="Continue", command=lambda: self._run_action(lambda: self.brain_try(resume=True), label="continue"))
+            self.btn_cont = ttk.Button(top, text="Start over", command=lambda: self._run_action(self.brain_start_over, label="start over"))
             self.btn_brain.pack(side=tk.LEFT, padx=(14, 2))
-            self.btn_cont.pack(side=tk.LEFT, padx=2)
             self.btn_sweep.pack(side=tk.LEFT, padx=2)
+            self.btn_cont.pack(side=tk.LEFT, padx=2)
         else:
             self.btn_draw.pack(side=tk.LEFT, padx=4)
             self.btn_train.pack(side=tk.LEFT, padx=2)
@@ -287,7 +287,7 @@ class DrawInteractiveApp:
         self._show_canvas(blank)
         ink = float(self.custom_target.mean())
         self.status_var.set(
-            f"drawing set as target (ink={ink:.3f}) — press Try" if self.brain_args else f"sketch set as target (ink={ink:.3f}) — Auto-train (or Warmup)"
+            f"drawing set as target (ink={ink:.3f}) — press Train" if self.brain_args else f"sketch set as target (ink={ink:.3f}) — Auto-train (or Warmup)"
         )
 
     def _apply_command(self, text: str) -> None:
@@ -714,15 +714,25 @@ class DrawInteractiveApp:
     def brain_try(self, resume: bool = False) -> None:
         if self.custom_target is None:
             raise RuntimeError("Draw something on the pad and press Set first")
-        import hashlib
-
-        name = "mine_" + hashlib.sha256(np.ascontiguousarray(self.custom_target).tobytes()).hexdigest()[:8]      # the same drawing keeps one record, another drawing starts its own
+        name = self._drawing_name()      # the same drawing keeps one record, another drawing starts its own
         try:
             d = self._brain_demo()
-            self._brain_log(f"--- {'continue' if resume else 'try'} on your drawing ({name}) ---")
+            self._brain_log(f"--- train on your drawing ({name}): {'continues from where it got to, if it has been here before' if resume else 'fresh'} ---")
             d.try_drawing(resolve_command("sketch")[0], name, resume=resume)
         except _BrainStopped:
             self._brain_log("stopped: this try is not counted")
+
+    def _drawing_name(self) -> str:
+        if self.custom_target is None:
+            raise RuntimeError("Draw something on the pad and press Set first")
+        import hashlib
+
+        return "mine_" + hashlib.sha256(np.ascontiguousarray(self.custom_target).tobytes()).hexdigest()[:8]
+
+    def brain_start_over(self) -> None:
+        name = self._drawing_name()
+        self._brain_demo().start_over(name)
+        self._brain_log(f"--- start over: forgot the weights and the round history of this drawing ({name}); the next Train starts from a fresh model ---")
 
     def brain_sleep(self) -> None:
         self._brain_log("--- sleep ---")
