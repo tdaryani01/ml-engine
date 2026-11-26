@@ -124,14 +124,15 @@ class DrawInteractiveApp:
         self.btn_warm = ttk.Button(top, text="Warmup", command=lambda: self._run_action(self.warmup))
         self.btn_stop = ttk.Button(top, text="Stop", command=self._request_stop)
         self.btn_brain = self.btn_sweep = None
-        if self.brain_args:      # --brain c4: the current brain steers a run, shows its guess, the try and the result, and sleeps after each sweep of the five shapes
-            self.btn_brain = ttk.Button(top, text="Brain round", command=lambda: self._run_action(self.brain_round, label="brain round"))
-            self.btn_sweep = ttk.Button(top, text="Brain sweep (5)", command=lambda: self._run_action(self.brain_sweep, label="brain sweep"))
+        if self.brain_args:      # --brain c4: three buttons. Set picks the shape, Try = one run steered by the brain on that shape (shows its guess, the trials and the result), Sleep = the brain goes over the runs so far and keeps what it can trust
+            self.btn_brain = ttk.Button(top, text="Try", command=lambda: self._run_action(self.brain_try, label="try"))
+            self.btn_sweep = ttk.Button(top, text="Sleep", command=lambda: self._run_action(self.brain_sleep, label="sleep"))
             self.btn_brain.pack(side=tk.LEFT, padx=(14, 2))
             self.btn_sweep.pack(side=tk.LEFT, padx=2)
-        self.btn_draw.pack(side=tk.LEFT, padx=4)
-        self.btn_train.pack(side=tk.LEFT, padx=2)
-        self.btn_warm.pack(side=tk.LEFT, padx=2)
+        else:
+            self.btn_draw.pack(side=tk.LEFT, padx=4)
+            self.btn_train.pack(side=tk.LEFT, padx=2)
+            self.btn_warm.pack(side=tk.LEFT, padx=2)
         self.btn_stop.pack(side=tk.LEFT, padx=6)
         self.btn_stop.configure(state=tk.DISABLED)
 
@@ -685,8 +686,15 @@ class DrawInteractiveApp:
             unit = None
             if self.brain_args.get("null_result"):
                 unit = json.loads(Path(self.brain_args["null_result"]).read_text())["noise_unit"]["unit"]
-            self.brain_demo = draw_window.BrainDemo(os.path.join(root, "maze"), self.cfg, self.brain_args["state_dir"], unit, STOCK_COMMAND_IDS, self._brain_make_session, self._brain_log, bars_path=self.brain_args.get("bars_file"))
+            self.brain_demo = draw_window.BrainDemo(os.path.join(root, "maze"), self.cfg, self.brain_args["state_dir"], unit, STOCK_COMMAND_IDS, self._brain_make_session, self._brain_log, bars_path=self.brain_args.get("bars_file"), unit_by_shape=self._brain_units(), baseline_skills=True)
         return self.brain_demo
+
+    def _brain_units(self) -> dict | None:
+        """Per-shape noise units from the null result's cells (position in the stock shapes), as the registered stage 2 uses them."""
+        if not self.brain_args.get("null_result"):
+            return None
+        cells = json.loads(Path(self.brain_args["null_result"]).read_text())["noise_unit"]["cells"]
+        return {cid: float(cells[str(i)]["median_abs_d"]) for i, cid in enumerate(STOCK_COMMAND_IDS)}
 
     def brain_round(self) -> None:
         try:
@@ -696,6 +704,21 @@ class DrawInteractiveApp:
             d.round()
         except _BrainStopped:
             self._brain_log("stopped: this round is not counted")
+
+    def brain_try(self) -> None:
+        shape = self.command_id
+        if shape not in STOCK_COMMAND_IDS:
+            raise RuntimeError("Try runs on the five stock shapes: Set one of them first")
+        try:
+            d = self._brain_demo()
+            self._brain_log(f"--- try on '{COMMANDS[shape]}' ---")
+            d.try_shape(shape)
+        except _BrainStopped:
+            self._brain_log("stopped: this try is not counted")
+
+    def brain_sleep(self) -> None:
+        self._brain_log("--- sleep ---")
+        self._brain_demo().sleep_now()
 
     def brain_sweep(self) -> None:
         k = len(STOCK_COMMAND_IDS)
