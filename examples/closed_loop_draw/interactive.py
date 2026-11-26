@@ -769,18 +769,21 @@ class DrawInteractiveApp:
                 except _BrainStopped:
                     self._brain_log("stopped: this round is not counted")
                     break
-                errs.append(float(r["run"]["best_val"]))
+                if r.get("ratio") is not None and r["ratio"] > 0:
+                    errs.append(float(r["ratio"]))      # error of the carried model / error of a fresh model on the same drawing with the same effort: the difficulty of the drawing cancels
                 if i % self.AUTO_SLEEP_EVERY == 0 and self.auto_var.get() and not self._stop_requested:      # the sleep between rounds: the brain goes over the rows so far and keeps what it can trust
                     self._brain_log(f"--- auto: sleep after round {i} ---")
                     demo.sleep_now()
         finally:
             self.auto_var.set(False)
         if len(errs) >= 4:
+            import math
+
             h = len(errs) // 2
-            a, b = sum(errs[:h]) / h, sum(errs[-h:]) / h
-            self._brain_log(f"AUTO SUMMARY {len(errs)} random drawings: average error of the first {h} rounds {a:.4f}, of the last {h} rounds {b:.4f} -> " + (f"better by {(a - b) / a * 100:.0f}%" if b < a else f"not better ({(b - a) / a * 100:.0f}% worse)"))
+            a, b = math.exp(sum(math.log(x) for x in errs[:h]) / h), math.exp(sum(math.log(x) for x in errs[-h:]) / h)
+            self._brain_log(f"AUTO SUMMARY {len(errs)} random drawings, error as a multiple of a fresh model's on the same drawing (below 1 = better than a beginner): first {h} rounds {a:.2f}x, last {h} rounds {b:.2f}x -> " + (f"improving ({(1 - b / a) * 100:.0f}% lower)" if b < a else f"not improving ({(b / a - 1) * 100:.0f}% higher)"))
         elif errs:
-            self._brain_log(f"AUTO SUMMARY {len(errs)} round(s): errors " + ", ".join(f"{e:.4f}" for e in errs))
+            self._brain_log(f"AUTO SUMMARY {len(errs)} round(s), error vs a fresh model: " + ", ".join(f"{e:.2f}x" for e in errs))
 
     def _drawing_name(self) -> str:
         if self.custom_target is None:
