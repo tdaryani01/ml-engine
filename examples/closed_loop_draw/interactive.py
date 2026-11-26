@@ -125,14 +125,20 @@ class DrawInteractiveApp:
         )
         self.btn_warm = ttk.Button(top, text="Warmup", command=lambda: self._run_action(self.warmup))
         self.btn_stop = ttk.Button(top, text="Stop", command=self._request_stop)
-        self.btn_brain = self.btn_sweep = self.btn_cont = None
+        self.btn_brain = self.btn_sweep = self.btn_cont = self.btn_auto = None
         if self.brain_args:      # --brain c4: Train = one round steered by the brain that trains to match the drawing, continuing the one model from where the last round ended, whatever the drawing was (saved on disk), with a plain RESULT line saying whether it improved; Start over = forget the model; Sleep = the brain goes over the runs so far and keeps what it can trust
             self.btn_brain = ttk.Button(top, text="Train", command=lambda: self._run_action(lambda: self.brain_try(resume=True), label="train"))
             self.btn_sweep = ttk.Button(top, text="Sleep", command=lambda: self._run_action(self.brain_sleep, label="sleep"))
             self.btn_cont = ttk.Button(top, text="Start over", command=lambda: self._run_action(self.brain_start_over, label="start over"))
+            self.rounds_var = tk.StringVar(value="10")
+            self.btn_auto = ttk.Button(top, text="Auto", command=lambda: self._run_action(self.brain_auto, label="auto"))
+            self.rounds_box = ttk.Spinbox(top, from_=1, to=500, width=4, textvariable=self.rounds_var)
             self.btn_brain.pack(side=tk.LEFT, padx=(14, 2))
             self.btn_sweep.pack(side=tk.LEFT, padx=2)
             self.btn_cont.pack(side=tk.LEFT, padx=2)
+            self.btn_auto.pack(side=tk.LEFT, padx=(14, 2))
+            ttk.Label(top, text="rounds:").pack(side=tk.LEFT)
+            self.rounds_box.pack(side=tk.LEFT, padx=2)
         else:
             self.btn_draw.pack(side=tk.LEFT, padx=4)
             self.btn_train.pack(side=tk.LEFT, padx=2)
@@ -323,7 +329,7 @@ class DrawInteractiveApp:
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
         state = tk.DISABLED if busy else tk.NORMAL
-        for b in (self.btn_draw, self.btn_train, self.btn_warm, self.btn_brain, self.btn_sweep, self.btn_cont):
+        for b in (self.btn_draw, self.btn_train, self.btn_warm, self.btn_brain, self.btn_sweep, self.btn_cont, self.btn_auto):
             if b is not None:
                 b.configure(state=state)
         self.entry.configure(state=state)
@@ -721,6 +727,48 @@ class DrawInteractiveApp:
             d.try_drawing(resolve_command("sketch")[0], name, resume=resume)
         except _BrainStopped:
             self._brain_log("stopped: this try is not counted")
+
+    def _random_target(self) -> np.ndarray:
+        """A random drawing: one to three strokes (straight or bent) of 2-3 px, as (1, C, H, W) in [0, 1]."""
+        rng = np.random.default_rng()
+        yy, xx = np.mgrid[0:self.H, 0:self.W]
+        img = np.zeros((self.H, self.W), dtype=np.float32)
+        for _ in range(int(rng.integers(1, 4))):
+            pts = rng.uniform(3, [self.H - 3, self.W - 3], size=(int(rng.integers(2, 4)), 2))
+            for a, b in zip(pts[:-1], pts[1:]):
+                d = b - a
+                t = np.clip(((yy - a[0]) * d[0] + (xx - a[1]) * d[1]) / max(float(d @ d), 1e-6), 0.0, 1.0)
+                dist = np.hypot(yy - (a[0] + t * d[0]), xx - (a[1] + t * d[1]))
+                img = np.maximum(img, np.clip(1.6 - dist, 0.0, 1.0).astype(np.float32))
+        return np.repeat(img[None, None, :, :], self.C, axis=1)
+
+    def brain_auto(self) -> None:
+        """Auto: a number of rounds, each on a NEW random drawing; the one model carries on (like Train). The log ends with the average error of the first and of the last half of the rounds."""
+        try:
+            n = max(1, int(self.rounds_var.get()))
+        except ValueError:
+            raise RuntimeError("rounds must be a number")
+        errs: list[float] = []
+        demo = self._brain_demo()
+        for i in range(1, n + 1):
+            if self._stop_requested:
+                break
+            self.custom_target = self._random_target()
+            self.command_id, self.command_name = resolve_command("sketch")
+            self._show_target(self.custom_target)
+            self._brain_log(f"--- auto round {i} of {n}: a random drawing ---")
+            try:
+                r = demo.try_drawing(resolve_command("sketch")[0], self._drawing_name(), resume=True)
+            except _BrainStopped:
+                self._brain_log("stopped: this round is not counted")
+                break
+            errs.append(float(r["run"]["best_val"]))
+        if len(errs) >= 4:
+            h = len(errs) // 2
+            a, b = sum(errs[:h]) / h, sum(errs[-h:]) / h
+            self._brain_log(f"AUTO SUMMARY {len(errs)} random drawings: average error of the first {h} rounds {a:.4f}, of the last {h} rounds {b:.4f} -> " + (f"better by {(a - b) / a * 100:.0f}%" if b < a else f"not better ({(b - a) / a * 100:.0f}% worse)"))
+        else:
+            self._brain_log(f"AUTO SUMMARY {len(errs)} round(s): errors " + ", ".join(f"{e:.4f}" for e in errs))
 
     def _drawing_name(self) -> str:
         if self.custom_target is None:
