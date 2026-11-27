@@ -104,3 +104,35 @@ def test_closing_the_window_stops_auto_after_the_round_in_flight():
     app._save_drawing = lambda n: None
     app.brain_auto()
     assert rounds == ["mine_x"]          # exactly the round in flight; no second round, no widget call after the close
+
+
+def test_the_canvas_title_says_whose_picture_it_is():
+    import numpy as np
+
+    class Ax:
+        def __init__(self):
+            self.t = "Canvas (model)"
+
+        def get_title(self):
+            return self.t
+
+        def set_title(self, t):
+            self.t = t
+
+    class Im:
+        def set_data(self, d):
+            pass
+
+    app = _app()
+    app.ax_canvas, app.im_canvas = Ax(), Im()
+    app.mpl_canvas = type("C", (), {"draw_idle": lambda self: None})()
+    app.brain_demo = type("D", (), {"phase": "carried model"})()
+    x = np.zeros((1, 3, 4, 4), dtype=np.float32)
+    app._show_canvas(x)
+    assert app.ax_canvas.t == "Canvas (carried model)"
+    app.brain_demo.phase = "fresh comparison model"
+    app._show_canvas(x)
+    assert app.ax_canvas.t == "Canvas (fresh comparison model)"
+    app.brain_demo = None      # the plain window: its own model
+    app._show_canvas(x)
+    assert app.ax_canvas.t == "Canvas (model)"
