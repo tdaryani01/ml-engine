@@ -104,7 +104,7 @@ class DrawInteractiveApp:
         self._build_ui()
         self._apply_command(self.command_name)
         if self.auto_warmup and not self.brain_args:      # the brain's Try builds a fresh model per run: the window's own warmup would train a model nothing uses
-            self.root.after(200, lambda: self._run_action(self.warmup, label="auto-warmup"))
+            self._after_ids = [self.root.after(200, lambda: self._run_action(self.warmup, label="auto-warmup"))]
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=8)
@@ -249,10 +249,14 @@ class DrawInteractiveApp:
         self.progress["value"] = float(np.clip(frac, 0.0, 1.0) * 100.0)
 
     def _show_canvas(self, nchw: np.ndarray) -> None:
+        if self._closing:
+            return
         self.im_canvas.set_data(canvas_to_u8(nchw, sample=0))
         self.mpl_canvas.draw_idle()
 
     def _show_target(self, nchw: np.ndarray) -> None:
+        if self._closing:
+            return
         self.im_target.set_data(canvas_to_u8(nchw, sample=0))
         self.mpl_canvas.draw_idle()
 
@@ -343,6 +347,8 @@ class DrawInteractiveApp:
             pass
 
     def _run_action(self, fn, *, label: str | None = None) -> None:
+        if self._closing:       # a root.after callback that fired between the close and its cancel
+            return
         if self.busy:
             self.status_var.set("busy — wait for current action to finish")
             return
@@ -892,6 +898,11 @@ class DrawInteractiveApp:
 
     def _on_close(self) -> None:
         self._closing = True
+        for i in getattr(self, "_after_ids", []):      # callbacks scheduled with root.after must not fire on a destroyed window
+            try:
+                self.root.after_cancel(i)
+            except Exception:
+                pass
         try:
             self.app.close()
         except Exception:

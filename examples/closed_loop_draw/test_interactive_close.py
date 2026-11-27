@@ -59,3 +59,26 @@ def test_error_after_close_is_printed_not_raised(capsys):
 
     DrawInteractiveApp._run_action(app, boom)
     assert "round broke" in capsys.readouterr().out and app.busy is False
+
+
+def test_canvas_and_target_writes_skip_the_dead_widgets():
+    import numpy as np
+    app = _app()
+    app.im_canvas = app.im_target = app.mpl_canvas = _Widget(app)
+    app._closing = True
+    x = np.zeros((1, 3, 4, 4), dtype=np.float32)
+    app._show_canvas(x)
+    app._show_target(x)
+
+
+def test_a_scheduled_callback_is_cancelled_on_close_and_does_not_run_after_it():
+    app = _app()
+    cancelled = []
+    app.root = type("R", (), {"after_cancel": lambda self, i: cancelled.append(i), "destroy": lambda self: None})()
+    app.app = type("A", (), {"close": lambda self: None})()
+    app._after_ids = ["after#1"]
+    ran = []
+    app._on_close()
+    assert cancelled == ["after#1"] and app._closing
+    app._run_action(lambda: ran.append(1))          # the callback fired anyway before the cancel took effect
+    assert ran == []
