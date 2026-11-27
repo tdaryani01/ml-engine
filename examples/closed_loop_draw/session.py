@@ -104,10 +104,8 @@ class DrawSession:
         return float(v)
 
     def canvas(self) -> np.ndarray:
-        """What the model draws now for the training shape: the last frame of an inference rollout, (1, C, H, W). Does not touch the weights or the optimiser."""
-        from examples.closed_loop_draw.goal import DrawGoal as _G
-
-        frames = self.app.trainer.rollout_eval(goal=_G.render(self._ids[self.train_command][:1])).extras["frames"]
+        """What the model draws now for the training shape: the last frame of an inference rollout, (1, C, H, W). Does not touch the weights or the optimiser. The goal carries the training target, as the scored rollouts' goal does (``fit``): with ``closed_loop.target_conditioning`` the model sees the target image, and a goal without it would make this the picture of a different drawing than the one ``fit`` scores (without target conditioning the target is not read and the canvas is what it was)."""
+        frames = self.app.trainer.rollout_eval(goal=DrawGoal(command_ids=self._ids[self.train_command][:1], target=self._target[self.train_command][:1])).extras["frames"]
         return frames[-1]
 
     def target(self) -> np.ndarray:
