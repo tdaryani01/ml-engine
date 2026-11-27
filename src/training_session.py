@@ -26,6 +26,7 @@ from utils.seeding import separate_streams
 from config.constants import DataKeys, ModelType
 from src import recordings
 from src import step_loss_stats as _step_loss_stats
+from src import val_dump as _val_dump
 
 # The losses a fit reports (train per step, validation per epoch) are the raw cost; the L2 term is not added (a caller reading an older engine finds this name missing and must
 # take the reported losses as penalised, ml-engine#52).
@@ -485,6 +486,7 @@ class TrainingSession:
         # The reported validation loss is the raw cost, the same quantity the training loss reports (the L2 term is not part of either).
         current_val_raw_cost = self.model.calculate_raw_cost(val_preds, y_val_target)
         current_val_loss = current_val_raw_cost
+        _val_dump.maybe_dump(val_preds, y_val_target, current_val_raw_cost)      # ML_DUMP_VAL_PREDS: off unless set; reads only
         self.val_history.append(current_val_loss)
         if getattr(self.model, "recordings", False):
             self._record_epoch()
