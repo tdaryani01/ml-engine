@@ -104,7 +104,7 @@ class DrawInteractiveApp:
         self._build_ui()
         self._apply_command(self.command_name)
         if self.auto_warmup and not self.brain_args:      # the brain's Try builds a fresh model per run: the window's own warmup would train a model nothing uses
-            self.root.after(200, lambda: self._run_action(self.warmup, label="auto-warmup"))
+            self._after_ids = [self.root.after(200, lambda: self._run_action(self.warmup, label="auto-warmup"))]
 
     def _build_ui(self) -> None:
         top = ttk.Frame(self.root, padding=8)
@@ -244,13 +244,19 @@ class DrawInteractiveApp:
             self.root.update()
 
     def _set_progress(self, frac: float) -> None:
+        if self._closing:
+            return
         self.progress["value"] = float(np.clip(frac, 0.0, 1.0) * 100.0)
 
     def _show_canvas(self, nchw: np.ndarray) -> None:
+        if self._closing:
+            return
         self.im_canvas.set_data(canvas_to_u8(nchw, sample=0))
         self.mpl_canvas.draw_idle()
 
     def _show_target(self, nchw: np.ndarray) -> None:
+        if self._closing:
+            return
         self.im_target.set_data(canvas_to_u8(nchw, sample=0))
         self.mpl_canvas.draw_idle()
 
@@ -326,6 +332,8 @@ class DrawInteractiveApp:
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
+        if self._closing:       # the window was closed mid-round: its widgets are gone, the round goes on without them
+            return
         state = tk.DISABLED if busy else tk.NORMAL
         for b in (self.btn_draw, self.btn_train, self.btn_warm, self.btn_brain, self.btn_sweep, self.btn_cont):
             if b is not None:
@@ -339,6 +347,8 @@ class DrawInteractiveApp:
             pass
 
     def _run_action(self, fn, *, label: str | None = None) -> None:
+        if self._closing:       # a root.after callback that fired between the close and its cancel
+            return
         if self.busy:
             self.status_var.set("busy — wait for current action to finish")
             return
@@ -348,8 +358,11 @@ class DrawInteractiveApp:
         try:
             fn()
         except Exception as e:
-            self.status_var.set(f"error: {e}")
-            messagebox.showerror("Error", str(e))
+            if not self._closing:
+                self.status_var.set(f"error: {e}")
+                messagebox.showerror("Error", str(e))
+            else:
+                print(f"error after the window was closed: {e}", flush=True)
         finally:
             self._stop_requested = False
             self._set_busy(False)
@@ -658,6 +671,8 @@ class DrawInteractiveApp:
     # -- the current brain (maze design points 4c, 7, 8, 9, 9a, 11): rounds steered by the C4 walker, the sleep between sweeps ---------------------------------------------
     def _brain_log(self, line: str) -> None:
         print(line, flush=True)
+        if self._closing:       # window closed mid-round: the line is printed, the widgets are gone
+            return
         if self.log_box is not None:
             self.log_box.configure(state="normal")
             self.log_box.insert("end", line + "\n")
@@ -883,6 +898,11 @@ class DrawInteractiveApp:
 
     def _on_close(self) -> None:
         self._closing = True
+        for i in getattr(self, "_after_ids", []):      # callbacks scheduled with root.after must not fire on a destroyed window
+            try:
+                self.root.after_cancel(i)
+            except Exception:
+                pass
         try:
             self.app.close()
         except Exception:
