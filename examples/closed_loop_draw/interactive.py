@@ -244,6 +244,8 @@ class DrawInteractiveApp:
             self.root.update()
 
     def _set_progress(self, frac: float) -> None:
+        if self._closing:
+            return
         self.progress["value"] = float(np.clip(frac, 0.0, 1.0) * 100.0)
 
     def _show_canvas(self, nchw: np.ndarray) -> None:
@@ -326,6 +328,8 @@ class DrawInteractiveApp:
 
     def _set_busy(self, busy: bool) -> None:
         self.busy = busy
+        if self._closing:       # the window was closed mid-round: its widgets are gone, the round goes on without them
+            return
         state = tk.DISABLED if busy else tk.NORMAL
         for b in (self.btn_draw, self.btn_train, self.btn_warm, self.btn_brain, self.btn_sweep, self.btn_cont):
             if b is not None:
@@ -348,8 +352,11 @@ class DrawInteractiveApp:
         try:
             fn()
         except Exception as e:
-            self.status_var.set(f"error: {e}")
-            messagebox.showerror("Error", str(e))
+            if not self._closing:
+                self.status_var.set(f"error: {e}")
+                messagebox.showerror("Error", str(e))
+            else:
+                print(f"error after the window was closed: {e}", flush=True)
         finally:
             self._stop_requested = False
             self._set_busy(False)
@@ -658,6 +665,8 @@ class DrawInteractiveApp:
     # -- the current brain (maze design points 4c, 7, 8, 9, 9a, 11): rounds steered by the C4 walker, the sleep between sweeps ---------------------------------------------
     def _brain_log(self, line: str) -> None:
         print(line, flush=True)
+        if self._closing:       # window closed mid-round: the line is printed, the widgets are gone
+            return
         if self.log_box is not None:
             self.log_box.configure(state="normal")
             self.log_box.insert("end", line + "\n")
