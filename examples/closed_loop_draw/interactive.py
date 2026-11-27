@@ -248,9 +248,17 @@ class DrawInteractiveApp:
             return
         self.progress["value"] = float(np.clip(frac, 0.0, 1.0) * 100.0)
 
+    def _canvas_title(self) -> str:
+        """Whose picture the canvas shows: the brain demo says what is training ("carried model" while a round runs, "fresh comparison model" while the beginner trains; the owner twice read the beginner's picture as the carried model's); the plain window's canvas is its model."""
+        phase = getattr(getattr(self, "brain_demo", None), "phase", None)
+        return f"Canvas ({phase})" if phase else "Canvas (model)"
+
     def _show_canvas(self, nchw: np.ndarray) -> None:
         if self._closing:
             return
+        title = self._canvas_title()
+        if self.ax_canvas.get_title() != title:
+            self.ax_canvas.set_title(title)
         self.im_canvas.set_data(canvas_to_u8(nchw, sample=0))
         self.mpl_canvas.draw_idle()
 
