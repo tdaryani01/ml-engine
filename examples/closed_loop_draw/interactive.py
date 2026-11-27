@@ -782,7 +782,7 @@ class DrawInteractiveApp:
         demo = self._brain_demo()
         i = 0
         try:
-            while self.auto_var.get() and not self._stop_requested:
+            while not self._closing and not self._stop_requested and self.auto_var.get():      # a closed window starts no further round (the one in flight finishes whole: only Stop drops a round)
                 i += 1
                 self.custom_target = self._random_target()
                 self.command_id, self.command_name = resolve_command("sketch")
@@ -797,11 +797,12 @@ class DrawInteractiveApp:
                     break
                 if r.get("ratio") is not None and r["ratio"] > 0:
                     errs.append(float(r["ratio"]))      # error of the carried model / error of a fresh model on the same drawing with the same effort: the difficulty of the drawing cancels
-                if i % self.AUTO_SLEEP_EVERY == 0 and self.auto_var.get() and not self._stop_requested:      # the sleep between rounds: the brain goes over the rows so far and keeps what it can trust
+                if i % self.AUTO_SLEEP_EVERY == 0 and not self._closing and not self._stop_requested and self.auto_var.get():      # the sleep between rounds: the brain goes over the rows so far and keeps what it can trust
                     self._brain_log(f"--- auto: sleep after round {i} ---")
                     demo.sleep_now()
         finally:
-            self.auto_var.set(False)
+            if not self._closing:
+                self.auto_var.set(False)
         if len(errs) >= 4:
             import math
 

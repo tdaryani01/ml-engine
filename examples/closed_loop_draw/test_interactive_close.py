@@ -82,3 +82,25 @@ def test_a_scheduled_callback_is_cancelled_on_close_and_does_not_run_after_it():
     assert cancelled == ["after#1"] and app._closing
     app._run_action(lambda: ran.append(1))          # the callback fired anyway before the cancel took effect
     assert ran == []
+
+
+def test_closing_the_window_stops_auto_after_the_round_in_flight():
+    app = _app()
+    app.auto_var = type("V", (), {"get": lambda self: (_ for _ in ()).throw(tk.TclError("dead")) if app._closing else True, "set": lambda self, v: None})()
+    app.custom_target = None
+    rounds = []
+
+    class Demo:
+        def try_drawing(self, shape, name, resume=False):
+            rounds.append(name)
+            app._on_close_flag()          # the window is closed while this round runs
+            return {"ratio": 1.0}
+
+    app._on_close_flag = lambda: setattr(app, "_closing", True)
+    app._brain_demo = lambda: Demo()
+    app._random_target = lambda: None
+    app._show_target = lambda t: None
+    app._drawing_name = lambda: "mine_x"
+    app._save_drawing = lambda n: None
+    app.brain_auto()
+    assert rounds == ["mine_x"]          # exactly the round in flight; no second round, no widget call after the close
