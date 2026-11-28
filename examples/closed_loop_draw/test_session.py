@@ -71,3 +71,31 @@ def test_tick_runs_after_each_trajectory_and_the_canvas_does_not_move_the_weight
     session.restore(f)
     assert session.val() == v
 
+
+
+def test_the_canvas_is_the_drawing_fit_scores_when_the_model_sees_its_target():
+    """With ``target_conditioning`` the model's goal includes the target image. The canvas must be drawn with that same goal: it is then the last frame of the rollout ``fit`` scores, not a drawing made without the target (the window showed the latter: its picture drifted from the scored one as the model learned to use the target)."""
+    import numpy as np
+
+    try:
+        from utils.conv_dispatch import bootstrap_im2col_gemm_runtime
+
+        bootstrap_im2col_gemm_runtime()
+        from examples.closed_loop_draw.assemble import load_config
+        from examples.closed_loop_draw.goal import DrawGoal
+        from examples.closed_loop_draw.session import DrawSession
+
+        cfg = load_config(CFG)
+        cfg["closed_loop"]["target_conditioning"] = True
+        s = DrawSession(cfg, seed=0, train_command=0, val_command=1)
+    except FileNotFoundError as exc:      # conv_kernels.so is not built here
+        pytest.skip(f"native kernels not available: {exc}")
+    try:
+        s.train(6)
+        scored = s.app.trainer.rollout_train(goal=s._goal(s.train_command), lr=s.lr, apply_updates=False).extras["frames"][-1][:1]
+        blind = s.app.trainer.rollout_eval(goal=DrawGoal.render(s._ids[s.train_command][:1])).extras["frames"][-1]
+        c = s.canvas()
+        assert np.allclose(c, scored, atol=1e-6)
+        assert not np.allclose(blind, scored, atol=1e-6)      # the goal without the target draws something else: the test would pass trivially otherwise
+    finally:
+        s.close()
